@@ -81,7 +81,7 @@ clap = { version = "4", features = ["derive"] }
 # webview2-com 0.38 传递依赖 windows 0.61，与 workspace 声明的 windows 0.58 不兼容
 # （Param<PCWSTR> trait 跨版本不互通，编译报 E0277）。升级需同步 windows 0.58→0.61，
 # 跨 3 个 minor 版本 API 改名风险高，收益小，按 Low 风险保守不升。
-webview2-com = "0.34"
+webview2-com = "0.38"
 
 # Tauri
 # v16-D-011：移除 "protocol-asset" feature（前端全面切换 wpfile，asset 协议为死代码）
