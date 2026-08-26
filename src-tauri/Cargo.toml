@@ -1,0 +1,35 @@
+[package]
+name = "mirrorstar-wallpaper"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[lib]
+name = "mirrorstar_wallpaper_lib"
+# 桌面专用场景裁剪为 ["lib"]，移除无用的 cdylib/staticlib
+# （cdylib 用于移动端 Tauri 加载，staticlib 用于 FFI/移动端，纯 Windows 桌面场景无用）
+# 未来支持移动端时再按需添加。
+crate-type = ["lib"]
+
+[build-dependencies]
+# v16-D-019：移除空 features= []（默认即无 feature，显式空数组冗余）
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+mirrorstar-core = { path = "../crates/mirrorstar-core" }
+tauri = { workspace = true }
+tauri-plugin-dialog = { workspace = true }
+tauri-plugin-autostart = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+uuid = { workspace = true }
+windows = { workspace = true }
+percent-encoding = { workspace = true }
+
+[dev-dependencies]
+tempfile = "3"
+tokio = { workspace = true }

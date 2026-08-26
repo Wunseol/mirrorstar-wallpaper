@@ -1,0 +1,74 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  # 前置门：验证签名密钥已配置（fail-fast，避免 checks 通过后 build 才发现密钥缺失）
+  verify-secrets:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Verify release secrets
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        run: |
+          if [ -z "$TAURI_SIGNING_PRIVATE_KEY" ]; then
+            echo "::error::TAURI_SIGNING_PRIVATE_KEY secret is not set. Release build cannot sign the installer."
+            echo "::error::Configure this secret in repository settings → Secrets and variables → Actions."
+            exit 1
+          fi
+          if [ -z "$TAURI_SIGNING_PRIVATE_KEY_PASSWORD" ]; then
+            echo "::error::TAURI_SIGNING_PRIVATE_KEY_PASSWORD secret is not set."
+            exit 1
+          fi
+          echo "Release secrets verified."
+        shell: bash
+
+  # 复用 checks.yml 工作流（B-TD-005）：rust-checks + frontend-checks 与 CI 完全一致
+  # 包含 ignored tests（continue-on-error: true），release 质量门与 CI 对齐（B-TD-027）
+  checks:
+    needs: verify-secrets
+    uses: ./.github/workflows/checks.yml
+
+  # 构建 + 起草 Release（需重新 setup 构建环境，因 checks 在独立 runner 上执行）
+  build-and-release:
+    needs: checks
+    runs-on: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js 20
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+
+      - name: Setup Rust stable
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: Install frontend dependencies
+        run: npm ci
+
+      - name: Build Tauri app
+        uses: tauri-apps/tauri-action@v0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        with:
+          tagName: ${{ github.ref_name }}
+          releaseName: 'MirrorStar Wallpaper ${{ github.ref_name }}'
+          releaseDraft: true
+          prerelease: false

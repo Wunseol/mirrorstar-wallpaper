@@ -1,0 +1,34 @@
+{
+  "$schema": "https://raw.githubusercontent.com/tauri-apps/tauri/tauri-v2.11.2/crates/tauri-config-schema/schema.json",
+  "productName": "镜星壁纸",
+  "identifier": "com.mirrorstar.wallpaper",
+  "build": {
+    "beforeDevCommand": "npm run dev",
+    "devUrl": "http://localhost:1420",
+    "beforeBuildCommand": "npm run build",
+    "frontendDist": "../dist"
+  },
+  "app": {
+    "withGlobalTauri": false,
+    "windows": [],
+    "security": {
+      "csp": "default-src 'self'; img-src 'self' wpfile: http://wpfile.localhost https://wpfile.localhost; media-src 'self' wpfile: http://wpfile.localhost https://wpfile.localhost; frame-src 'self' wpfile: http://wpfile.localhost https://wpfile.localhost; style-src 'self'; script-src 'self'"
+    }
+  },
+  "bundle": {
+    "active": true,
+    "targets": ["nsis"],
+    "resources": {
+      "../mpv/mpv.exe": "mpv/mpv.exe",
+      "../mpv/license.txt": "mpv/license.txt",
+      "../target/release/mirrorstar-wp-proc.exe": "mirrorstar-wp-proc.exe"
+    },
+    "icon": [
+      "icons/32x32.png",
+      "icons/128x128.png",
+      "icons/128x128@2x.png",
+      "icons/icon.icns",
+      "icons/icon.ico"
+    ]
+  }
+}

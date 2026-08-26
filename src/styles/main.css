@@ -1,0 +1,699 @@
+:root {
+  --bg-primary: #1a1a2e;
+  --bg-secondary: #16213e;
+  --bg-card: #0f3460;
+  --text-primary: #e0e0e0;
+  --text-secondary: #a0a0a0;
+  --accent: #4fc3f7;
+  --accent-hover: #29b6f6;
+  --border: #2a2a4a;
+}
+
+* {
+  margin: 0;
+  padding: 0;
+  box-sizing: border-box;
+}
+
+body {
+  font-family: "Microsoft YaHei", "Segoe UI", sans-serif;
+  background-color: var(--bg-primary);
+  color: var(--text-primary);
+  overflow: hidden;
+  height: 100vh;
+  user-select: none;
+}
+
+#app {
+  display: flex;
+  flex-direction: column;
+  height: 100vh;
+}
+
+.app-header {
+  display: flex;
+  align-items: center;
+  padding: 12px 20px;
+  background: var(--bg-secondary);
+  border-bottom: 1px solid var(--border);
+}
+
+.app-header h1 {
+  font-size: 18px;
+  font-weight: 600;
+  color: var(--accent);
+}
+
+.app-main {
+  display: flex;
+  flex: 1;
+  overflow: hidden;
+}
+
+.wallpaper-list {
+  flex: 1;
+  padding: 16px;
+  overflow-y: auto;
+}
+
+.wallpaper-list-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: 12px;
+}
+
+.wallpaper-list-header h2 {
+  font-size: 14px;
+  color: var(--text-secondary);
+  margin: 0;
+}
+
+.btn-primary {
+  padding: 6px 14px;
+  font-size: 12px;
+  color: #fff;
+  background: var(--accent);
+  border: none;
+  border-radius: 6px;
+  cursor: pointer;
+  transition: background 0.2s;
+}
+
+.btn-primary:hover {
+  background: var(--accent-hover);
+}
+
+.wallpaper-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(160px, 1fr));
+  gap: 12px;
+  min-height: 200px;
+  border: 2px dashed transparent;
+  border-radius: 8px;
+  padding: 4px;
+  transition: border-color 0.2s, background 0.2s;
+}
+
+.wallpaper-grid.drag-over {
+  border-color: var(--accent);
+  background: rgba(79, 195, 247, 0.05);
+}
+
+.empty-hint {
+  color: var(--text-secondary);
+  font-size: 14px;
+  text-align: center;
+  padding: 40px 20px;
+  grid-column: 1 / -1;
+}
+
+.wallpaper-card {
+  position: relative;
+  background: var(--bg-card);
+  border-radius: 8px;
+  overflow: hidden;
+  cursor: pointer;
+  transition: transform 0.15s, box-shadow 0.15s;
+}
+
+.wallpaper-card:hover {
+  transform: translateY(-2px);
+  box-shadow: 0 4px 12px rgba(0, 0, 0, 0.3);
+}
+
+.wallpaper-card.active {
+  outline: 2px solid var(--accent);
+  outline-offset: -2px;
+}
+
+.wallpaper-card-thumb {
+  width: 100%;
+  aspect-ratio: 16 / 9;
+  background: var(--bg-secondary);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  color: var(--text-secondary);
+  font-size: 28px;
+  overflow: hidden;
+}
+
+.wallpaper-card-thumb img,
+.wallpaper-card-thumb video {
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+  display: block;
+}
+
+.wallpaper-card-info {
+  padding: 8px;
+}
+
+.wallpaper-card-name {
+  font-size: 12px;
+  color: var(--text-primary);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.wallpaper-card-footer {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-top: 4px;
+}
+
+.type-badge {
+  display: inline-block;
+  font-size: 10px;
+  padding: 1px 6px;
+  border-radius: 4px;
+  color: #fff;
+  font-weight: 500;
+}
+
+.type-badge.image { background: #66bb6a; }
+.type-badge.video { background: #42a5f5; }
+.type-badge.gif { background: #ffa726; }
+.type-badge.web { background: #ab47bc; }
+
+.wallpaper-card-delete {
+  background: none;
+  border: none;
+  color: var(--text-secondary);
+  font-size: 14px;
+  cursor: pointer;
+  padding: 2px 4px;
+  border-radius: 4px;
+  line-height: 1;
+  transition: color 0.15s, background 0.15s;
+}
+
+.wallpaper-card-delete:hover {
+  color: #ef5350;
+  background: rgba(239, 83, 80, 0.1);
+}
+
+.status-message {
+  position: fixed;
+  bottom: 20px;
+  left: 50%;
+  transform: translateX(-50%);
+  padding: 8px 20px;
+  border-radius: 8px;
+  font-size: 13px;
+  z-index: 1000;
+  transition: opacity 0.3s;
+  pointer-events: none;
+}
+
+.status-message.error {
+  background: rgba(239, 83, 80, 0.9);
+  color: #fff;
+}
+
+.status-message.success {
+  background: rgba(102, 187, 106, 0.9);
+  color: #fff;
+}
+
+.status-message.info {
+  background: rgba(66, 165, 245, 0.9);
+  color: #fff;
+}
+
+.status-message.warning {
+  background: rgba(255, 152, 0, 0.9);
+  color: #fff;
+}
+
+.settings-panel {
+  width: 260px;
+  padding: 16px;
+  background: var(--bg-secondary);
+  border-left: 1px solid var(--border);
+  overflow-y: auto;
+}
+
+.settings-panel h2 {
+  font-size: 14px;
+  color: var(--text-secondary);
+  margin-bottom: 16px;
+}
+
+.settings-group {
+  margin-bottom: 16px;
+}
+
+.settings-group label {
+  display: block;
+  font-size: 13px;
+  color: var(--text-primary);
+  margin-bottom: 6px;
+}
+
+.settings-group input[type="range"] {
+  width: 100%;
+  accent-color: var(--accent);
+}
+
+.settings-group input[type="checkbox"] {
+  accent-color: var(--accent);
+  margin-right: 6px;
+}
+
+.settings-group select {
+  width: 100%;
+  padding: 6px 8px;
+  font-size: 12px;
+  background: var(--bg-primary);
+  color: var(--text-primary);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  outline: none;
+  cursor: pointer;
+}
+
+.settings-group select:focus {
+    border-color: var(--accent);
+}
+
+.settings-hint {
+  font-size: 11px;
+  color: var(--text-secondary);
+  margin-top: 6px;
+  line-height: 1.5;
+}
+
+.settings-btn {
+  width: 100%;
+  padding: 6px 14px;
+  font-size: 12px;
+  color: #fff;
+  background: var(--accent);
+  border: none;
+  border-radius: 6px;
+  cursor: pointer;
+  transition: background 0.2s;
+}
+
+.settings-btn:hover {
+  background: var(--accent-hover);
+}
+
+.settings-btn:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+/* v16-A-011: 批量缩略图重生成进度条 */
+.regenerate-progress {
+  width: 100%;
+  margin-top: 8px;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.regenerate-progress[hidden] {
+  display: none;
+}
+
+.regenerate-progress-track {
+  width: 100%;
+  height: 6px;
+  background: var(--border);
+  border-radius: 3px;
+  overflow: hidden;
+}
+
+.regenerate-progress-bar {
+  height: 100%;
+  width: 0%;
+  background: var(--accent);
+  border-radius: 3px;
+  transition: width 0.2s ease;
+}
+
+.regenerate-progress-text {
+  font-size: 11px;
+  color: var(--text-secondary);
+  text-align: center;
+}
+
+.about-section {
+    margin-top: auto;
+    padding-top: 12px;
+    border-top: 1px solid var(--border);
+}
+
+.about-info {
+    text-align: center;
+}
+
+.about-info .app-name {
+    font-size: 14px;
+    font-weight: 600;
+    color: var(--text-primary);
+    margin: 4px 0;
+}
+
+.about-info .app-version {
+    font-size: 11px;
+    color: var(--text-secondary);
+    margin: 2px 0;
+}
+
+.about-info .app-desc {
+    font-size: 11px;
+    color: var(--text-secondary);
+    margin: 2px 0;
+}
+
+.wallpaper-list-empty {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    height: 100%;
+    color: var(--text-secondary);
+    font-size: 14px;
+    gap: 8px;
+}
+
+.wallpaper-list-empty .empty-icon {
+    font-size: 48px;
+    opacity: 0.3;
+}
+
+/* ST-016: class replaces inline style to avoid CSP unsafe-inline */
+.wallpaper-list-empty-hint {
+    font-size: 12px;
+    opacity: 0.6;
+}
+
+.playback-controls {
+  display: flex;
+  gap: 8px;
+}
+.btn-primary:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+.mute-btn {
+  background: none;
+  border: none;
+  cursor: pointer;
+  font-size: 16px;
+  padding: 0 4px;
+  color: var(--text-primary);
+  vertical-align: middle;
+}
+.mute-btn:hover {
+  opacity: 0.7;
+}
+
+/* ── 功能1: 壁纸预览模态框 ─────────────────────────────────────────────────── */
+
+/* ST-016: class replaces inline style="display:none" to avoid CSP unsafe-inline */
+.preview-media-hidden {
+  display: none;
+}
+
+
+.preview-modal {
+  display: none;
+  position: fixed;
+  top: 0;
+  left: 0;
+  width: 100vw;
+  height: 100vh;
+  z-index: 1000;
+  align-items: center;
+  justify-content: center;
+}
+
+.preview-modal.active {
+  display: flex;
+  animation: fadeIn 0.2s ease;
+}
+
+.preview-overlay {
+  position: absolute;
+  top: 0;
+  left: 0;
+  width: 100%;
+  height: 100%;
+  background: rgba(0, 0, 0, 0.85);
+}
+
+.preview-content {
+  position: relative;
+  max-width: 90vw;
+  max-height: 90vh;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  z-index: 1;
+}
+
+.preview-image {
+  max-width: 90vw;
+  max-height: 80vh;
+  object-fit: contain;
+  border-radius: 8px;
+}
+
+.preview-video {
+  max-width: 90vw;
+  max-height: 80vh;
+  object-fit: contain;
+  border-radius: 8px;
+}
+
+.preview-web {
+  max-width: 90vw;
+  max-height: 80vh;
+  border: none;
+  border-radius: 8px;
+  background: #fff;
+}
+
+/* 媒体加载失败（如文件不在 asset protocol scope 内）时显示的友好提示 */
+.preview-notice {
+  max-width: 90vw;
+  padding: 24px 32px;
+  border-radius: 8px;
+  background: rgba(0, 0, 0, 0.6);
+  color: #fff;
+  font-size: 14px;
+  text-align: center;
+}
+
+.preview-close {
+  position: absolute;
+  top: -40px;
+  right: -10px;
+  background: none;
+  border: none;
+  color: #fff;
+  font-size: 32px;
+  cursor: pointer;
+  line-height: 1;
+  padding: 4px 8px;
+  transition: opacity 0.15s;
+}
+
+.preview-close:hover {
+  opacity: 0.7;
+}
+
+.preview-info {
+  display: flex;
+  gap: 12px;
+  margin-top: 12px;
+  color: #fff;
+  font-size: 13px;
+}
+
+.preview-name {
+  font-weight: 600;
+}
+
+.preview-type {
+  color: var(--text-secondary);
+}
+
+.preview-set-btn {
+  margin-top: 12px;
+  padding: 8px 24px;
+  font-size: 13px;
+}
+
+@keyframes fadeIn {
+  from { opacity: 0; }
+  to { opacity: 1; }
+}
+
+/* ── 功能2: 壁纸搜索框 ─────────────────────────────────────────────────────── */
+
+.wallpaper-search {
+  padding: 0 0 12px 0;
+}
+
+.search-input {
+  width: 100%;
+  padding: 8px 12px;
+  font-size: 13px;
+  background: var(--bg-primary);
+  color: var(--text-primary);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  outline: none;
+  transition: border-color 0.2s;
+}
+
+.search-input:focus {
+  border-color: var(--accent);
+}
+
+.search-input::placeholder {
+  color: var(--text-secondary);
+}
+
+/* ── 功能3: 响应式设计 - 设置折叠按钮 ─────────────────────────────────────── */
+
+.settings-toggle {
+  margin-left: auto;
+  background: none;
+  border: none;
+  color: var(--text-primary);
+  font-size: 18px;
+  cursor: pointer;
+  padding: 4px 8px;
+  border-radius: 4px;
+  transition: background 0.2s;
+}
+
+.settings-toggle:hover {
+  background: rgba(255, 255, 255, 0.1);
+}
+
+/* ── 功能4: 关于页面技术栈与仓库链接 ─────────────────────────────────────── */
+
+.about-info .app-tech {
+  font-size: 11px;
+  color: var(--text-secondary);
+  margin: 2px 0;
+}
+
+.about-info .app-repo {
+  font-size: 11px;
+  margin: 4px 0 2px 0;
+}
+
+.about-info .app-repo a {
+  color: var(--accent);
+  text-decoration: none;
+  transition: color 0.2s;
+}
+
+.about-info .app-repo a:hover {
+  color: var(--accent-hover);
+  text-decoration: underline;
+}
+
+/* ── 功能5: 加载动画 - 骨架屏与缩略图渐显 ─────────────────────────────────── */
+
+.skeleton-card {
+  background: linear-gradient(90deg, #2a2a2a 25%, #3a3a3a 50%, #2a2a2a 75%);
+  background-size: 200% 100%;
+  animation: shimmer 1.5s infinite;
+  border-radius: 8px;
+  height: 120px;
+}
+
+@keyframes shimmer {
+  0% { background-position: 200% 0; }
+  100% { background-position: -200% 0; }
+}
+
+.wallpaper-thumb {
+  opacity: 0;
+  transition: opacity 0.3s ease;
+}
+
+.wallpaper-thumb.loaded {
+  opacity: 1;
+}
+
+.wallpaper-thumb-error {
+  color: var(--text-secondary);
+  font-size: 28px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 100%;
+  height: 100%;
+}
+
+.wallpaper-source-missing {
+  color: var(--text-secondary);
+  font-size: 12px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 100%;
+  height: 100%;
+}
+
+/* ── 功能3: 响应式设计 - 媒体查询 ─────────────────────────────────────────── */
+
+@media (max-width: 768px) {
+  .settings-panel {
+    position: absolute;
+    right: 0;
+    top: 0;
+    height: 100%;
+    z-index: 100;
+    transform: translateX(0);
+    transition: transform 0.25s ease;
+  }
+
+  .settings-panel.collapsed {
+    transform: translateX(100%);
+  }
+
+  .wallpaper-grid {
+    grid-template-columns: repeat(auto-fill, minmax(120px, 1fr));
+  }
+
+  .app-header h1 {
+    font-size: 16px;
+  }
+}
+
+@media (max-width: 480px) {
+  .wallpaper-grid {
+    grid-template-columns: repeat(auto-fill, minmax(100px, 1fr));
+  }
+
+  .app-header {
+    padding: 10px 12px;
+  }
+}
+
+/* ── 可访问性: 键盘焦点指示器 ─────────────────────────────────────────── */
+:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+  border-radius: 4px;
+}
+/* 鼠标点击不显示焦点指示器（:focus-visible 仅匹配键盘导航） */
+:focus:not(:focus-visible) {
+  outline: none;
+}

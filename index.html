@@ -1,0 +1,131 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>镜星壁纸</title>
+    <link rel="stylesheet" href="src/styles/main.css" />
+  </head>
+  <body>
+    <div id="app">
+      <header class="app-header">
+        <h1>镜星壁纸</h1>
+        <button id="settings-toggle" class="settings-toggle">☰</button>
+      </header>
+      <main class="app-main">
+        <section class="wallpaper-list">
+          <div class="wallpaper-list-header">
+            <h2>壁纸库</h2>
+            <button id="add-wallpaper-btn" class="btn-primary">+ 添加壁纸</button>
+          </div>
+          <div class="wallpaper-search">
+            <input type="text" id="wallpaper-search" class="search-input" placeholder="搜索壁纸..." />
+          </div>
+          <div class="wallpaper-grid" id="wallpaper-grid">
+            <p class="empty-hint">暂无壁纸，拖放文件或点击添加</p>
+          </div>
+        </section>
+        <aside class="settings-panel">
+          <h2>设置</h2>
+          <div class="settings-group">
+            <label for="display-select">目标显示器</label>
+            <select id="display-select">
+              <option value="">默认</option>
+            </select>
+          </div>
+          <div class="settings-group">
+            <label for="arrangement-select">排列模式</label>
+            <select id="arrangement-select">
+              <option value="per_monitor">每屏独立</option>
+              <option value="span">跨屏合并</option>
+            </select>
+          </div>
+          <div class="settings-group">
+            <label for="scaling-mode-select">缩放模式</label>
+            <select id="scaling-mode-select">
+              <option value="fill">填充</option>
+              <option value="fit">适应</option>
+              <option value="stretch">拉伸</option>
+              <option value="center">居中</option>
+              <option value="original">原始</option>
+            </select>
+          </div>
+          <div class="settings-group">
+            <label>播放控制</label>
+            <div class="playback-controls">
+              <button id="pause-btn" class="btn-primary">暂停</button>
+              <button id="resume-btn" class="btn-primary">恢复</button>
+            </div>
+          </div>
+          <div class="settings-group">
+            <label for="volume-slider">音量 <button id="mute-btn" class="mute-btn" title="静音" aria-label="切换静音">🔊</button></label>
+            <input type="range" id="volume-slider" min="0" max="100" value="80" />
+          </div>
+          <div class="settings-group">
+            <label for="speed-slider">播放速度: <span id="speed-value">1.0x</span></label>
+            <input type="range" id="speed-slider" min="0.25" max="4.0" step="0.25" value="1.0" />
+          </div>
+          <div class="settings-group">
+            <label>
+              <input type="checkbox" id="auto-start" /> 开机自启
+            </label>
+          </div>
+          <div class="settings-group">
+            <label for="fullscreen-action-select">全屏时处置</label>
+            <select id="fullscreen-action-select">
+              <option value="terminate">释放（终止进程）</option>
+              <option value="pause">暂停（进程驻留）</option>
+              <option value="none">持续（保持播放）</option>
+            </select>
+            <p class="settings-hint">终止：进程退出，释放内存；暂停：进程驻留，即时恢复；持续：进程驻留，保持播放</p>
+          </div>
+          <div class="settings-group">
+            <label>
+              <input type="checkbox" id="pause-on-battery" /> 电池供电时暂停
+            </label>
+          </div>
+          <div class="settings-group">
+            <label>
+              <input type="checkbox" id="interaction-mode" /> 鼠标交互模式
+            </label>
+          </div>
+          <div class="settings-group">
+            <label>壁纸库</label>
+            <button id="regenerate-thumbs-btn" class="settings-btn">重新生成缩略图</button>
+            <div id="regenerate-progress" class="regenerate-progress" hidden>
+              <div class="regenerate-progress-track">
+                <div class="regenerate-progress-bar" id="regenerate-progress-bar"></div>
+              </div>
+              <span class="regenerate-progress-text" id="regenerate-progress-text"></span>
+            </div>
+          </div>
+          <div class="settings-group about-section">
+            <label>关于</label>
+            <div class="about-info">
+              <p class="app-name">镜星壁纸</p>
+              <p class="app-version">MirrorStar Wallpaper v0.1.0</p>
+              <p class="app-desc">轻量级动态壁纸应用</p>
+              <p class="app-tech">Rust + Tauri v2 + WebView2</p>
+              <p class="app-repo"><a href="https://github.com/mirrorstar-wallpaper/mirrorstar-wallpaper" target="_blank" rel="noopener noreferrer">项目仓库</a></p>
+            </div>
+          </div>
+        </aside>
+      </main>
+    </div>
+    <div id="preview-modal" class="preview-modal" role="dialog" aria-modal="true" aria-labelledby="preview-name">
+      <div class="preview-overlay"></div>
+      <div class="preview-content">
+        <button class="preview-close" id="preview-close" aria-label="关闭预览">&times;</button>
+        <img id="preview-image" class="preview-image" alt="预览" />
+        <video id="preview-video" class="preview-video preview-media-hidden" controls></video>
+        <iframe id="preview-web" class="preview-web preview-media-hidden" title="Web 壁纸预览" sandbox=""></iframe>
+        <div class="preview-info">
+          <span id="preview-name" class="preview-name"></span>
+          <span id="preview-type" class="preview-type"></span>
+        </div>
+        <button class="btn-primary preview-set-btn" id="preview-set-btn">设为壁纸</button>
+      </div>
+    </div>
+    <script type="module" src="src/scripts/main.ts"></script>
+  </body>
+</html>

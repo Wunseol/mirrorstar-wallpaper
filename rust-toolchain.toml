@@ -1,0 +1,8 @@
+# v16-D-017：固定 toolchain channel 为 stable，CI 与本地开发统一使用最新 stable。
+# 不固定具体版本号（如 1.80.0），避免过严约束与频繁手动升级；rust-version 字段
+# 在 Cargo.toml 中已声明 MSRV（1.80），cargo 会在低于 MSRV 时给出明确错误。
+#
+# components 字段确保 rustfmt/clippy 在 CI 与本地一致可用（无需额外安装步骤）。
+[toolchain]
+channel = "stable"
+components = ["rustfmt", "clippy"]

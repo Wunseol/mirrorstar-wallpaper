@@ -1,0 +1,14 @@
+# 本文件提交入库，仅包含不影响构建正确性的全局配置。
+#
+# 不在仓库中配置 crates.io 镜像替换（原 rsproxy.cn 镜像对 GitHub Actions
+# 美国 runner 是跨地域访问，增加 CI 延迟与单一故障点）。开发者如需使用国内镜像，
+# 请在用户级配置文件（~/.cargo/config.toml）中添加：
+#
+# [source.crates-io]
+# replace-with = 'rsproxy-sparse'
+#
+# [source.rsproxy-sparse]
+# registry = "sparse+https://rsproxy.cn/index/"
+
+[net]
+git-fetch-with-cli = true

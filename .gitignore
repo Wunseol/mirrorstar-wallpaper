@@ -1,0 +1,78 @@
+# .gitignore 分类文档化
+# ──────────────────────────────────────────────────────────────────────────
+# 本文件按类别分组组织忽略规则。每个分类用 `#` 注释说明：
+#   1. 包含的路径
+#   2. 忽略理由（避免构建产物/敏感信息/环境差异入库）
+# 新增规则时请归入对应分类，无合适分类则新建并补充说明。
+# ──────────────────────────────────────────────────────────────────────────
+
+# Rust 构建产物（cargo build 输出，包含 deps / incremental / .fingerprint 等）
+# workspace 根 target/ 统一收纳所有 crate 的构建产物
+/target/
+# rustfmt 备份文件（仅 nightly rustfmt 在格式化失败时生成）
+**/*.rs.bk
+
+# Node 依赖与前端构建产物
+# node_modules: npm install 安装的依赖，体积大且可由 package-lock.json 复现
+/node_modules/
+# dist: Vite 生产构建产物（npm run build 生成），由 CI/release 重新生成
+/dist/
+
+# Tauri 构建产物（src-tauri 独立 target，避免与 workspace target 混淆）
+/src-tauri/target/
+
+# IDE 配置（开发者工具特定，团队约定不一，不应入库）
+# VS Code 工作区设置
+.vscode/
+# JetBrains IDE（IntelliJ IDEA / RustRover / CLion / WebStorm）项目配置
+.idea/
+# Trae IDE 元数据目录（specs / 任务计划 / 临时草稿）
+.trae/
+# Vim / Neovim 交换文件（编辑过程中产生，含未保存内容）
+*.swp
+*.swo
+
+# OS 临时文件
+# Windows 资源管理器缩略图缓存
+Thumbs.db
+# macOS Finder 文件夹元数据
+.DS_Store
+
+# 日志文件
+# 单文件日志（如 cargo_*.log / 测试输出重定向）
+*.log
+# logs/ 目录日志（应用运行时日志输出目录）
+logs/
+
+# Debug outputs（PowerShell 重定向 / 临时调试脚本，不应入库）
+# 根目录下的 .txt 文件（构建检查结果、测试输出重定向、临时检查输出等历史遗留模式统一收敛）
+/*.txt
+# 调试用临时 PowerShell 脚本（按 _tmp_ 前缀批量忽略）
+_tmp_*.ps1
+# 以点开头的临时检查文件（如 .tmp_check.ps1 / .tmp_hot_reload_inspect.txt）
+.tmp_*
+
+# 一次性修复/调试脚本（历史遗留的 Node.js / PowerShell 一次性补丁脚本，不应入库）
+# fix_*.cjs / fix_*.js：一次性修复脚本（fix_wp03.js / fix_msg.cjs / fix_visibility.ps1 / refactor_tests.cjs 等）
+fix_*.cjs
+fix_*.js
+# 一次性调试脚本（debugN.cjs 系列，用于打印 client.rs 中错误消息的字符码）
+debug*.cjs
+debug*.js
+# 一次性 PowerShell 补丁脚本（双下划线前缀，与 _tmp_*.ps1 区分）
+__tmp_patch_*.ps1
+
+# 环境变量与密钥（含 secrets / API keys / 数据库连接串，泄露风险高）
+.env
+.env.local
+
+# Binaries（外部二进制依赖，体积大且版本/平台特定）
+# mpv 播放器（视频壁纸渲染依赖，按 README 指引单独下载解压）
+mpv/
+
+# Reference projects（第三方参考源码，仅本地保留用于对照实现）
+# 不属于本仓库构建，应通过 external link 或 git submodule 跟踪
+lively-reference/
+
+# 前端测试覆盖率报告（vitest --coverage 生成，由 CI 重新生成）
+/coverage/

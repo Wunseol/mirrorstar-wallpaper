@@ -1,0 +1,76 @@
+name: Checks
+
+# 可复用工作流：CI 与 Release 共用同一套检查定义，避免重复维护（B-TD-005/007-011）
+# 调用方：ci.yml（push/PR 触发）、release.yml（tag 触发，build 前置门）
+on:
+  workflow_call:
+
+jobs:
+  rust-checks:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # Rust stable 通道：满足 MSRV 1.80（Cargo.toml rust-version），同时跟进新版编译优化与 lints
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+
+      # Swatinem/rust-cache@v2 自动管理 cargo 缓存（cache-key 含 Cargo.lock / Cargo.toml / runner.os）
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+
+      # cargo test 已隐含编译，无需独立 Build 步骤；共享资源类测试标记 #[ignore] 由下方串行执行
+      - name: Test
+        run: cargo test --workspace
+
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: Format check
+        run: cargo fmt --all --check
+
+      # 共享资源类测试串行执行（continue-on-error: true，不阻断 CI/release 流程）
+      - name: Run ignored tests
+        run: cargo test --workspace -- --ignored
+        continue-on-error: true
+
+      - name: Install cargo-audit
+        uses: taiki-e/install-action@cargo-audit
+
+      - name: Security audit
+        run: cargo audit
+
+  frontend-checks:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # Node 20 LTS：覆盖 Vite 5 / Vitest 2 / TypeScript 5.5 / ESLint 9 官方支持矩阵
+      - name: Setup Node.js 20
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Security audit
+        run: npm audit --omit=dev --audit-level=high
+
+      - name: Security audit (dev dependencies)
+        run: npm audit --audit-level=critical
+
+      - name: Build
+        run: npm run build
+
+      - name: TypeScript type check
+        run: npx tsc --noEmit
+
+      - name: Run ESLint
+        run: npm run lint
+
+      - name: Run tests
+        run: npm run test

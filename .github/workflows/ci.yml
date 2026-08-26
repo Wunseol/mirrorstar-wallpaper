@@ -1,0 +1,12 @@
+name: CI
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+    branches: [main, master]
+
+jobs:
+  # 复用 checks.yml 工作流（B-TD-005），消除 ci.yml / release.yml 检查步骤重复
+  checks:
+    uses: ./.github/workflows/checks.yml

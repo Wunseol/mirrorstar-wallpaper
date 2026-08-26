@@ -1,0 +1,4 @@
+# pnpm 11 允许构建脚本的白名单（allowBuilds，布尔值 true=放行 / false=禁止）
+# esbuild 需要 postinstall 下载平台原生二进制，vite 构建依赖它，必须放行
+allowBuilds:
+  esbuild: true
