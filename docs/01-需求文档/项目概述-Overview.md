@@ -1,15 +1,16 @@
-# MirrorStar Wallpaper（镜星壁纸）需求文档 — 项目概述
+# MirrorStar Wallpaper（镜星壁纸）需求文档 — 项目概述 / Project Overview
 
-[← 返回文档索引](../README.md) > [需求文档](./overview.md)
+[← 返回文档索引](../index.md) > [需求文档](./项目概述-Overview.md)
 
-> 相关文档：[功能性需求](./functional-requirements.md) | [非功能性需求](./non-functional-requirements.md) | [用例](./use-cases.md) | [约束与术语](./constraints.md)
+> 相关文档：[功能性需求](./功能性需求-Functional-Requirements.md) | [非功能性需求](./非功能性需求-Non-Functional-Requirements.md) | [用例](./用例-Use-Cases.md) | [约束与术语](./约束与术语-Constraints-and-Terminology.md)
 
 | 项目 | 内容 |
 |------|------|
 | 项目名称 | MirrorStar Wallpaper（镜星壁纸） |
-| 文档版本 | v2.0 |
+| 文档版本 | v3.0 |
 | 创建日期 | 2026-06-10 |
-| 文档状态 | 已实现（基于代码审计） |
+| 更新日期 | 2026-08-29 |
+| 文档状态 | 已实现（基于最新代码审计，2026-08） |
 
 ---
 
@@ -53,9 +54,21 @@ MirrorStar Wallpaper（镜星壁纸）是一款基于 Rust + Tauri v2 开发的�
 
 | 目标 | 指标 | 说明 | 实测 |
 |------|------|------|------|
-| 轻量 | 主进程暂停态 < 20MB 内存 | 远低于 Lively Wallpaper 的 50MB+ | ⚠️ Debug 构建实测 22.03/22.17MB（略超，Release 待复测） |
+| 轻量 | 主进程暂停态 < 20MB 内存 | 远低于 Lively Wallpaper 的 50MB+ | ⚠️ Debug 实测 22.03/22.17MB（略超，Release 待复测） |
 | 高性能 | 暂停态 CPU 占用 0% | 无后台轮询，事件驱动架构 | ✅ 0%（事件驱动 + PauseSender 快速通道） |
 | 高性能 | 视频壁纸播放 CPU < 5% | 利用硬件解码 | 待测量（mpv --hwdec=auto） |
 | 原生安全 | Rust 编写，无 GC | 零成本抽象，无运行时开销 | ✅ 纯 Rust，无 GC |
 | 小体积 | 二进制 < 10MB | 无 .NET 依赖，单文件部署 | 待测量（Release 编译） |
 | 快启动 | 冷启动 < 2 秒 | 无运行时初始化延迟 | ✅ < 1 秒（托盘图标出现） |
+| 快速切换 | 壁纸切换时间 < 1 秒 | 平滑切换不闪烁 | ⚠️ 实测约 3s（子进程启动 + 窗口嵌入开销，待优化） |
+
+**说明**：壁纸切换时间（~3s）超出 1s 目标，主要瓶颈在子进程启动与窗口嵌入开销，已在架构优化路线图中列入重点改进项。
+
+---
+
+## 4. 项目状态
+
+- **当前版本**：0.1.0（开发中）
+- **目标平台**：Windows 10 (1809+) / Windows 11，x86_64
+- **项目状态**：积极开发中，API 与功能可能调整
+- **Rust workspace**：三个成员 `src-tauri`（应用主进程）/ `mirrorstar-core`（核心库）/ `mirrorstar-wp-proc`（壁纸渲染子进程）

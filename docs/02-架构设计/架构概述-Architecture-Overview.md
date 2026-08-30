@@ -1,13 +1,13 @@
-[← 返回文档索引](../README.md) > [架构设计](./overview.md)
+[← 返回文档索引](../../README.md) > [架构设计](./架构概述-Architecture-Overview.md) > 架构概述
 
 # MirrorStar Wallpaper（镜星壁纸）架构设计 — 架构概述
 
 | 项目   | 内容                        |
 | ---- | ------------------------- |
 | 项目名称 | MirrorStar Wallpaper（镜星壁纸） |
-| 文档版本 | v1.0                      |
-| 创建日期 | 2026-06-10                |
-| 文档状态 | 初稿                        |
+| 文档版本 | v2.0                      |
+| 更新日期 | 2026-08-29                |
+| 文档状态 | 已实现（基于最新代码审计）        |
 
 ***
 
@@ -74,6 +74,11 @@ MirrorStar Wallpaper 的架构设计遵循 **"少即是多"** 的哲学——通
 
 **相关文档：**
 
-- [系统架构图](./system-architecture.md)
-- [模块设计](./module-design.md)
-- [进程架构](./process-architecture.md)
+- [系统架构](./系统架构-System-Architecture.md)
+- [模块设计](./模块设计-Module-Design.md)
+- [进程架构](./进程架构-Process-Architecture.md)
+- [依赖与数据流](./依赖与数据流-Dependency-and-Data-Flow.md)
+- [桌面集成](./桌面集成-Desktop-Integration.md)
+- [暂停恢复机制](./暂停恢复机制-Pause-Resume.md)
+- [错误处理](./错误处理-Error-Handling.md)
+- [性能优化](./性能优化-Performance.md)

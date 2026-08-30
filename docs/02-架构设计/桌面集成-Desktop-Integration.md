@@ -1,6 +1,13 @@
-[← 返回文档索引](../README.md) > [架构设计](./overview.md) > 桌面集成
+[← 返回文档索引](../../README.md) > [架构设计](./架构概述-Architecture-Overview.md) > 桌面集成
 
 # MirrorStar Wallpaper（镜星壁纸）架构设计 — 桌面集成详细设计
+
+| 项目   | 内容                        |
+| ---- | ------------------------- |
+| 项目名称 | MirrorStar Wallpaper（镜星壁纸） |
+| 文档版本 | v2.0                      |
+| 更新日期 | 2026-08-29                |
+| 文档状态 | 已实现（基于最新代码审计）        |
 
 ## 8. 桌面集成详细设计
 
@@ -348,7 +355,7 @@ Windows Explorer（explorer.exe）可能在运行期间重启（如用户通过�
 
 #### 8.6.1 检测方案
 
-使用 `SetWinEventHook` 监听 `EVENT_SYSTEM_MINIMIZEEND` 或通过定时验证 WorkerW 句柄有效性来检测 Explorer 重启：
+通过 `start_workerw_check()`（`crates/mirrorstar-core/src/desktop/workerw_check.rs`，236 行）实现：使用 `tokio interval(300s)` + `Notify` 事件触发结构，事件驱动为主（`TaskbarCreated` 消息），并在超时（5 分钟）后周期性地调用`check_and_reinitialize()` 校验/重建 WorkerW。辅助地通过定时验证 WorkerW 句柄有效性来兜底检测 Explorer 重启：
 
 ```rust
 impl DesktopIntegrator {
@@ -390,12 +397,12 @@ impl DesktopIntegrator {
 
 | 方式 | 优点 | 缺点 |
 |------|------|------|
-| SetWinEventHook 监听 | 事件驱动，即时响应 | Explorer 重启不一定触发此事件 |
-| 定时验证句柄（30秒间隔） | 简单可靠 | 有延迟（最多30秒） |
+| TaskbarCreated 消息（事件驱动） | 精确，Explorer 重启时系统必定广播此消息 | 需要注册消息接收 |
+| 5 分钟（300 秒）定时兜底 | 简单可靠 | 有延迟（最多 5 分钟） |
 | 监听 Progman 窗口重建 | 精确 | 实现复杂 |
-| WM_TASKBARCREATED 消息 | 精确，Explorer 重启时系统广播此消息 | 需要注册消息接收 |
+| SetWinEventHook 监听 | 事件驱动，即时响应 | Explorer 重启不一定触发此事件 |
 
-**推荐方案**：使用 WM_TASKBARCREATED 消息作为主要检测方式（Explorer 重启时系统必定广播此消息），辅以 30 秒间隔的句柄有效性验证作为兜底（`Duration::from_secs(30)`）。SetWinEventHook 用于全屏检测，不用于 Explorer 重启检测。
+**推荐方案**：使用 `TaskbarCreated` 消息作为主要检测方式（Explorer 重启时系统必定广播此消息），辅以 `start_workerw_check()`（将 Explorer 重启事件通知触发 + tokio interval 300 秒 + Notify，`is_workerw_valid()` + `check_and_reinitialize()`）作为兜底。
 
 #### 8.6.3 重嵌入流程
 
@@ -516,8 +523,19 @@ impl DesktopIntegrator {
 
 ***
 
-**相关文档：**
+### 包结构规模参考
 
-- [模块设计](./module-design.md)
-- [进程架构](./process-architecture.md)
-- [暂停/恢复机制](./pause-resume.md)
+- `desktop` 模块：`mod.rs` 948 行 / `native_wallpaper.rs` 547 行 / `window.rs` 257 行 / `worker_w.rs` 910 行
+- 全屏检测：`fullscreen.rs` 1145 行，纯 `SetWinEventHook(EVENT_SYSTEM_FOREGROUND)` 事件驱动，失败仅记录并退出监控线程（无轮询回退）
+
+***
+
+**相关文档：**
+- [架构概述](./架构概述-Architecture-Overview.md)
+- [系统架构](./系统架构-System-Architecture.md)
+- [模块设计](./模块设计-Module-Design.md)
+- [进程架构](./进程架构-Process-Architecture.md)
+- [依赖与数据流](./依赖与数据流-Dependency-and-Data-Flow.md)
+- [暂停恢复机制](./暂停恢复机制-Pause-Resume.md)
+- [错误处理](./错误处理-Error-Handling.md)
+- [性能优化](./性能优化-Performance.md)

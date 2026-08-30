@@ -1,6 +1,8 @@
-[← 返回文档索引](../README.md) > [架构设计](./overview.md) > 暂停/恢复机制
+[← 返回文档索引](../../README.md) > [架构设计](./架构概述-Architecture-Overview.md) > 暂停恢复机制
 
 # MirrorStar Wallpaper（镜星壁纸）架构设计 — 暂停/恢复机制详细设计
+
+> 文档版本：v2.0 ｜ 更新日期：2026-08-29 ｜ 状态：已实现（基于最新代码审计）
 
 ## 9. 暂停/恢复机制详细设计
 
@@ -51,7 +53,11 @@ pub(crate) fn start_fullscreen_monitor(
         })
         .ok();
 }
+```
 
+> **注意**：纯 `SetWinEventHook(EVENT_SYSTEM_FOREGROUND)` 事件驱动，无任何轮询回退。`SetWinEventHook` 失败时仅记录错误并退出全屏监控线程（详见《错误处理-Error-Handling.md》§10.3）。
+
+```rust
 /// WinEvent 回调函数（独立的 extern "system" 函数，非 ProcessMonitor 方法）
 /// src-tauri/src/platform/fullscreen.rs:15
 unsafe extern "system" fn foreground_event_callback(
@@ -437,7 +443,11 @@ sequenceDiagram
 
 **相关文档：**
 
-- [模块设计](./module-design.md)
-- [进程架构](./process-architecture.md)
-- [桌面集成详细设计](./desktop-integration.md)
-- [错误处理策略](./error-handling.md)
+- [架构概述](./架构概述-Architecture-Overview.md)
+- [系统架构](./系统架构-System-Architecture.md)
+- [模块设计](./模块设计-Module-Design.md)
+- [进程架构](./进程架构-Process-Architecture.md)
+- [依赖与数据流](./依赖与数据流-Dependency-and-Data-Flow.md)
+- [桌面集成](./桌面集成-Desktop-Integration.md)
+- [错误处理](./错误处理-Error-Handling.md)
+- [性能优化](./性能优化-Performance.md)

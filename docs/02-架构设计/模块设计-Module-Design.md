@@ -1,8 +1,14 @@
-[← 返回文档索引](../README.md) > [架构设计](./overview.md) > 模块设计
+[← 返回文档索引](../../README.md) > [架构设计](./架构概述-Architecture-Overview.md) > 模块设计
 
 # 模块设计
 
 > 基于真实代码审计 + Lively 架构对比
+
+| 项目   | 内容                        |
+| ---- | ------------------------- |
+| 文档版本 | v2.0                      |
+| 更新日期 | 2026-08-29                |
+| 文档状态 | 已实现（基于最新代码审计）        |
 
 本文档描述 MirrorStar Wallpaper（镜星壁纸）的模块划分、各模块详细状态，以及与参考项目 Lively Wallpaper 的核心模块对比。所有数据均基于真实代码审计，反映当前实现状态。
 
@@ -60,8 +66,8 @@
 **设计原则：**
 - 主进程（`mirrorstar-wallpaper.exe`）内通过 WallpaperEngine 管理所有壁纸渲染
 - Image/Gif 渲染器在主进程专用线程中运行（GDI + 双缓冲）
-- Video 渲染器通过 ProcessManager 直接 spawn `mpv.exe` 子进程（按需），通过 mpv 原生命名管道 IPC（`MpvIpcClient`）控制，**不使用 libmpv2 FFI 库嵌入**
-- **Web 渲染器已重构为代理层**：通过 ProcessManager spawn `mirrorstar-wp-proc.exe` 子进程（按需），通过 `WpProcIpcClient` 命名管道通信
+- Video 渲染器通过 ProcessManager 直接 spawn `mpv.exe` 子进程（按需），通过 mpv 原生命名管道 IPC（`MpvIpcClient`，定义于 `ipc/mpv_protocol.rs`）控制，**不使用 libmpv2 FFI 库嵌入**
+- **Web 渲染器已重构为代理层**：通过 ProcessManager spawn `mirrorstar-wp-proc.exe` 子进程（按需），通过 `WpProcIpcClient`（定义于 `ipc/wp_proc.rs`）命名管道通信
 - HWND 通过 FindWindowW 获取后，主进程执行 WorkerW 嵌入（与 mpv 窗口嵌入逻辑一致）
 
 **内存优化：**
@@ -76,7 +82,7 @@
 
 ### 2.1 config (配置管理) — ✅ 已实现 100%
 
-**代码规模：** 3909 行代码，6 个文件（detect.rs 517 / hot_reload.rs 493 / manager.rs 1775 / mod.rs 14 / settings.rs 555 / thumbnail.rs 555）
+**代码规模：** 5801 行代码，7 个文件（detect.rs 738 / hot_reload.rs 549 / manager.rs 2533 / mod.rs 45 / settings.rs 735 / thumbnail.rs 1168 / validation.rs 33）
 
 **已实现：**
 - AppConfig 完整结构（6 个子配置：General/Audio/Pause/Display/Video/Web）
@@ -93,7 +99,7 @@
 
 ### 2.2 desktop (桌面集成) — ✅ 已实现 100%
 
-**代码规模：** 1674 行代码，4 个文件（mod.rs 564 / native_wallpaper.rs 494 / window.rs 101 / worker_w.rs 515）
+**代码规模：** 2662 行代码，4 个文件（mod.rs 948 / native_wallpaper.rs 547 / window.rs 257 / worker_w.rs 910）
 
 **已实现：**
 - WorkerW 查找三重策略：直接 EnumWindows 查找 → 发送 0x052C 消息触发创建 → 5 次重试（50ms 间隔）→ 备用回调方法
@@ -109,24 +115,25 @@
 
 ### 2.3 wallpaper (壁纸引擎) — ✅ 已实现 100%
 
-**代码规模：** 7711 行代码，13 个文件（fast_path.rs 605 / gdi_base.rs 617 / gdi_cache.rs 152 / gif.rs 864 / gif_decode.rs 573 / gif_memory.rs 381 / image.rs 615 / manager.rs 1741 / mod.rs 624 / mode_dispatch.rs 405 / subprocess_base.rs 272 / video.rs 555 / web.rs 307）
+**代码规模：** 16162 行代码，13 个文件（fast_path.rs 1316 / gdi_base.rs 860 / gdi_cache.rs 192 / gif.rs 2172 / gif_decode.rs 2689 / gif_memory.rs 808 / image.rs 1104 / manager.rs 2591 / mod.rs 1511 / mode_dispatch.rs 514 / subprocess_base.rs 494 / video.rs 1259 / web.rs 652）
 
 **已实现：**
 
 **核心抽象：**
 - WallpaperRenderer trait 完整生命周期定义（play/pause/resume/set_volume/set_position/terminate/hwnd/state/set_speed/navigate/set_scaling_mode/set_mouse_passthrough/set_interaction_mode/create_pause_sender）
-- WallpaperEngine 管理器（1741 行，manager.rs）：set/close/pause/resume/shutdown + 快速路径控制
+- WallpaperEngine 管理器（2591 行，manager.rs）：set/close/pause/resume/shutdown + 快速路径控制
 - **PauseSender 快速通道**：绕过引擎互斥锁，直接发送暂停/恢复/音量命令
 - 5 种缩放模式（Fill/Fit/Stretch/Center/Original）
 - WallpaperMode 双路径（Native/WorkerW）
 - `update_positions` 多显示器位置更新（span 和 per_monitor）
+- **子进程退出监听**：仅存在 `spawn_proc_exit_monitor`（`wallpaper/mod.rs` L186）退出监听，监听子进程状态，异常退出时更新为 `Terminated` 状态并 `notify_state_changed` 通知引擎；**无自动 respawn（无自动重启逻辑），异常后的恢复依赖用户或后续交互触发**
 - 0 个单元测试（无单元测试）
 
 **四种渲染器：**
-- **ImageRenderer**（615 行）：GDI + 双缓冲 + HALFTONE + 专用线程消息循环 + 超屏幕分辨率降采样 + 暂停时释放像素数据
-- **GifRenderer**（864 行）：image crate GIF 解码 + GDI 双缓冲 + WM_TIMER 帧驱动 + 40MB 内存预算限制 + 暂停时释放帧数据 + 速度控制
-- **VideoRenderer**（555 行）：mpv 子进程 + 命名管道 IPC + WASAPI 音量控制 + 7 个单元测试
-- **WebRenderer**（307 行，✅ 代理层）：通过 ProcessManager 启动 `mirrorstar-wp-proc.exe` 子进程 + WpProcIpcClient 命名管道 IPC 通信 + FindWindowW + PID 验证获取 HWND，实现崩溃隔离和内存优化
+- **ImageRenderer**（1104 行）：GDI + 双缓冲 + HALFTONE + 专用线程消息循环 + 超屏幕分辨率降采样 + 暂停时释放像素数据
+- **GifRenderer**（2172 行）：image crate GIF 解码 + GDI 双缓冲 + WM_TIMER 帧驱动 + 40MB 内存预算限制 + 暂停时释放帧数据 + 速度控制
+- **VideoRenderer**（1259 行）：mpv 子进程 + 命名管道 IPC + WASAPI 音量控制 + 7 个单元测试
+- **WebRenderer**（652 行，✅ 代理层）：通过 ProcessManager 启动 `mirrorstar-wp-proc.exe` 子进程 + WpProcIpcClient 命名管道 IPC 通信 + FindWindowW + PID 验证获取 HWND，实现崩溃隔离和内存优化
 
 ---
 
@@ -138,7 +145,7 @@
 
 ### 2.5 audio (音频控制) — ✅ 已实现 95%
 
-**代码规模：** 472 行代码，2 个文件（mod.rs 1 / volume.rs 471）
+**代码规模：** 1042 行代码，2 个文件（mod.rs 1 / volume.rs 1041）
 
 **已实现：**
 - VolumeControl WASAPI 进程级音量控制
@@ -154,31 +161,31 @@
 
 ### 2.6 ipc (进程间通信) — ✅ 已实现 100%
 
-**代码规模：** 1542 行代码，4 个文件（client.rs 654 / mod.rs 4 / mpv_protocol.rs 270 / wp_proc.rs 614）
+**代码规模：** 2103 行代码，4 个文件（client.rs 1021 / mod.rs 28 / mpv_protocol.rs 355 / wp_proc.rs 699）
 
 > **重要说明**：项目中存在**两套独立的 IPC 协议**，并非统一协议：
-> - **mpv 原生 IPC**（管道名 `mirrorstar-mpv-{uuid}`）：由 `MpvIpcClient` 实现，用于主进程与 mpv.exe 子进程通信
-> - **wp-proc WpProcCommand 协议**：由 `WpProcIpcClient` 实现，用于主进程与 mirrorstar-wp-proc.exe 子进程通信
+> - **mpv 原生 IPC**（管道名 `mirrorstar-mpv-{uuid}`）：由 `MpvIpcClient` 实现（定义于 `ipc/mpv_protocol.rs` L27），用于主进程与 mpv.exe 子进程通信
+> - **wp-proc WpProcCommand 协议**：由 `WpProcIpcClient` 实现（定义于 `ipc/wp_proc.rs` L73），用于主进程与 mirrorstar-wp-proc.exe 子进程通信
 >
-> 两者均采用命名管道 + JSON + 换行分隔的传输格式，并复用连接重试 + request_id 响应匹配模式，但命令集与协议语义各自独立。
+> 两者均采用命名管道 + JSON + 换行分隔的传输格式，并复用连接重试 + request_id 响应匹配模式，但命令集与协议语义各自独立。**注意：不存在 `ipc/protocol.rs` 文件**，协议定义位于 `mpv_protocol.rs` 与 `wp_proc.rs` 中。
 
 **已实现：**
-- MpvIpcClient mpv 命名管道 IPC 客户端
-- WpProcIpcClient Web 壁纸子进程 IPC 客户端（复用 MpvIpcClient 的连接重试 + request_id 模式）
-- 连接重试机制
+- MpvIpcClient mpv 命名管道 IPC 客户端（mpv_protocol.rs）
+- WpProcIpcClient Web 壁纸子进程 IPC 客户端（wp_proc.rs，复用 MpvIpcClient 的连接重试 + request_id 模式）
+- 连接重试机制（详见下方重试参数）：mpv `MPV_CONNECT_RETRIES` = 40 × 50ms = 2s；wp-proc `WP_PROC_CONNECT_RETRIES` = 160 × 50ms = 8s；窗口查找重试 = 20 × 100ms = 2s（均位于 `wallpaper/subprocess_base.rs`）
 - `send_command` 命令发送 + request_id 响应匹配
 - `get_property` / `set_property` 属性读写
-- `pause` / `resume` / `set_volume` / `set_loop_file` / `set_speed` / `quit` 控制命令
+- `pause` / `resume` / `set_volume` / `set_loop_file` / `set_speed` / `quit` 控制命令（wp-proc 另有 play/terminate/set_position/navigate）
 - 9 + 17 个单元测试
 
 ---
 
 ### 2.7 process (进程管理) — ✅ 已实现 95%
 
-**代码规模：** 732 行代码，2 个文件（manager.rs 731 / mod.rs 1，阶段2清理后）
+**代码规模：** 1205 行代码，2 个文件（manager.rs 1204 / mod.rs 1，阶段2清理后）
 
 **已实现：**
-- ProcessManager（731 行）：CreateProcessW 启动子进程 + 3 秒等待 + TerminateProcess 强制终止
+- ProcessManager（1204 行）：CreateProcessW 启动子进程 + 3 秒等待 + TerminateProcess 强制终止
 - `is_running()` / `pid()` / `handle()` 进程状态查询
 
 **阶段2清理：**
@@ -186,21 +193,21 @@
 - 移除 `monitor.rs`（30 行死代码，ProcessMonitor 从未被使用）
 - 移除 `mirrorstar-watchdog` 独立 crate（空壳，不再需要独立看门狗进程）
 
-> **注意**：实际架构中不存在 `ProcessMonitor` 结构体，也不存在 `PauseReason` bitflags 组合状态机。全屏暂停状态通过 `AtomicBool`（`FULLSCREEN_WAS`）记录上一次状态实现去抖，电池暂停状态由独立的 bool 跟踪，二者并非位掩码组合。详见 [2.8 Tauri 应用层](#28-tauri-应用层--已实现-95) 与 [暂停/恢复机制](./pause-resume.md)。
+> **注意**：实际架构中不存在 `ProcessMonitor` 结构体，也不存在 `PauseReason` bitflags 组合状态机。全屏暂停状态通过 `AtomicBool`（`FULLSCREEN_WAS`）记录上一次状态实现去抖，电池暂停状态由独立的 bool 跟踪，二者并非位掩码组合。详见 [2.8 Tauri 应用层](#28-tauri-应用层--已实现-95) 与 [暂停恢复机制](./暂停恢复机制-Pause-Resume.md)。
 
 ---
 
 ### 2.8 Tauri 应用层 — ✅ 已实现 95%
 
-**代码规模：** 12 个文件——`lib.rs`（402 行）+ `main.rs`（57 行）+ `state.rs`（750 行）+ `commands/`（4 个文件：config.rs 71/system.rs 116/wallpaper.rs 1262/mod.rs 6）+ `platform/`（5 个文件：explorer.rs 261/fullscreen.rs 465/power.rs 155/workerw_check.rs 78/mod.rs 7），共 3630 行
+**代码规模：** 12 个文件——`lib.rs`（1220 行）+ `main.rs`（57 行）+ `state.rs`（1031 行）+ `commands/`（4 个文件：config.rs 152/system.rs 226/wallpaper.rs 2285/mod.rs 100）+ `platform/`（5 个文件：explorer.rs 271/fullscreen.rs 1145/power.rs 222/workerw_check.rs 236/mod.rs 7），共 6952 行
 
 **已实现：**
 - **24 个 Tauri 命令全部完整实现**（无空操作），均为 `#[tauri::command]` 注解命令；托盘菜单的"暂停/恢复壁纸"复用 `pause_wallpaper`/`resume_wallpaper` 命令，并非独立命令：
   `get_wallpapers`, `add_wallpaper`, `generate_thumbnail`, `regenerate_thumbnails`, `remove_wallpaper`, `set_wallpaper`, `pause_wallpaper`, `resume_wallpaper`, `get_config`, `update_config`, `set_volume`, `toggle_mute`, `set_interaction_mode`, `toggle_interaction`, `get_displays`, `get_wallpaper_state`, `open_file_dialog`, `toggle_auto_start`, `get_auto_start_status`, `set_scaling_mode`, `set_speed`, `update_positions`, `check_desktop_status`, `quit_app`
-- 系统托盘（**在 lib.rs setup 中构建（state.rs 管理状态），原描述为内联在 lib.rs 中**，使用 Tauri 的 `TrayIconBuilder`，菜单仅 3 项：打开主窗口 / 暂停-恢复壁纸 / 退出；**无音量子菜单、无显示器子菜单**）+ 点击图标显示窗口
+- 系统托盘（**在 lib.rs setup 中构建（state.rs 管理状态），菜单仅 3 项：打开主窗口 / 暂停-恢复壁纸 / 退出；无音量子菜单、无显示器子菜单**，托盘菜单项定义于 lib.rs L967-976）+ 点击图标显示窗口
 - 单实例保护（Win32 CreateMutexW）
-- Explorer 重启后台检测（TaskbarCreated 事件驱动 + WorkerW 5 分钟轮询兜底）
-- 全屏应用检测（SetWinEventHook 事件驱动 + 状态去抖 + 自身窗口排除）— **全局暂停/恢复**（`pause_all_fast`），**非按显示器粒度**
+- Explorer 重启后台检测（TaskbarCreated 事件驱动 + WorkerW 5 分钟轮询兜底；`start_workerw_check` 使用 tokio interval 300 秒 + Notify 唤醒，失效时调用 `check_and_reinitialize` 重建，**无 30 秒轮询**）
+- 全屏应用检测（**纯 SetWinEventHook(EVENT_SYSTEM_FOREGROUND) 事件驱动** + 状态去抖 + 自身窗口排除；**无 2 秒轮询回退**，Hook 失败仅记录并退出监控线程）— **全局暂停/恢复**（`pause_all_fast`），**非按显示器粒度**
 - 退出时壁纸恢复（`perform_shutdown`）
 - 配置热重载已启用
 - 主窗口懒创建 + 关闭即隐藏（hide）释放 WebView2 内存
@@ -273,7 +280,7 @@
 
 ### 2.10 mirrorstar-wp-proc — ✅ 已实现 100%（Web 壁纸子进程）
 
-**状态：** 完整实现（5 个文件，3144 行：com.rs 98 / command.rs 741 / ipc_server.rs 1120 / main.rs 338 / webview.rs 847），CLI 参数 + 命名管道服务端 + IPC 线程 + WebView2 渲染 + 消息循环 + 命令处理
+**状态：** 完整实现（5 个文件，4588 行：com.rs 103 / command.rs 1145 / ipc_server.rs 1466 / main.rs 422 / webview.rs 1452），CLI 参数 + 命名管道服务端 + IPC 线程 + WebView2 渲染 + 消息循环 + 命令处理
 
 **实现要点：**
 - clap CLI 参数：`--source`（初始网页源）、`--pipe-name`（管道名称）、`--title`（窗口标题）、`--rect`（初始位置）
@@ -284,6 +291,7 @@
 - 主消息循环：`GetMessageW` + `WM_WEB_COMMAND`（`WM_USER + 20`）处理
 - 命令处理：Play（导航到源）、Terminate（销毁窗口+退出）、SetPosition（`SetWindowPos` + `SetBounds`）、Navigate（`webview.Navigate`）、Pause/Resume（状态标记）
 - **COM 初始化**：`CoInitializeEx(None, COINIT_APARTMENTTHREADED)`（STA，与主进程一致）
+- **崩溃隔离**：子进程异常退出时，主进程 `wallpaper/mod.rs` 的 `spawn_proc_exit_monitor` 会检测到退出并把状态更新为 `Terminated` 并 `notify_state_changed` 通知引擎，**无自动重启逻辑**
 
 **IPC 协议（JSON + 换行分隔，与 mpv IPC 传输格式一致）：**
 
@@ -314,7 +322,7 @@
 | 维度 | MirrorStar | Lively |
 |------|-----------|--------|
 | **实现文件** | `desktop/` 目录（4 个文件） | `wp_lib/SetupDesktop.cs` |
-| **代码行数** | 1674 行（mod.rs 564、window.rs 101、worker_w.rs 515、native_wallpaper.rs 494） | 2788 行（1 文件） |
+| **代码行数** | 2662 行（mod.rs 948、window.rs 257、worker_w.rs 910、native_wallpaper.rs 547） | 2788 行（1 文件） |
 | **WorkerW 查找** | 三重策略：直接 EnumWindows → 发送 0x052C 消息 → 5 次重试 → 备用回调 | 发消息触发 → EnumWindows 查找 |
 | **超时策略** | SendMessageTimeoutW 200ms + 5次重试(50ms间隔) | SendMessageTimeout 2s + 固定等待 |
 | **原生壁纸 API** | SystemParametersInfoW + 注册表设置（零资源占用） | 无 |
@@ -329,7 +337,7 @@
 
 **关键差异：**
 
-1. **原生壁纸 API 创新**：MirrorStar 实现了 `native_wallpaper.rs`（494 行），对 JPG/PNG 等静态图片通过 `SystemParametersInfoW` + 注册表设置直接使用系统壁纸 API，零资源占用。这是 MirrorStar 的独创点，Lively 无此优化。
+1. **原生壁纸 API 创新**：MirrorStar 实现了 `native_wallpaper.rs`（547 行），对 JPG/PNG 等静态图片通过 `SystemParametersInfoW` + 注册表设置直接使用系统壁纸 API，零资源占用。这是 MirrorStar 的独创点，Lively 无此优化。
 
 2. **WallpaperMode 双路径**：MirrorStar 区分 Native（原生 API，适用于静态图片）和 WorkerW（窗口嵌入，适用于动态内容）两种路径，根据壁纸类型自动选择最优方案。Lively 仅使用 WorkerW 嵌入方式。
 
@@ -346,13 +354,13 @@
 | 维度 | MirrorStar | Lively |
 |------|-----------|--------|
 | **实现文件** | `wallpaper/` 目录（13 个文件） | 多个 WPBaseClass 子类 |
-| **代码行数** | 7711 行 | 未统计（分散在多个类中） |
+| **代码行数** | 16162 行 | 未统计（分散在多个类中） |
 | **架构模式** | 策略模式（WallpaperRenderer trait），4 种渲染器统一接口 | 类型分支（if/switch）+ 类继承体系（WPBaseClass） |
-| **图片渲染** | ImageRenderer（615 行）：GDI 双缓冲 + HALFTONE + 专用线程 + 超屏幕降采样 + 暂停释放像素 | WPF Image 控件 |
-| **GIF 渲染** | GifRenderer（864 行）：image crate 解码 + GDI 双缓冲 + WM_TIMER + 40MB 内存预算 + 暂停释放帧 + 速度控制 | XamlAnimatedGIF 库 |
-| **视频渲染** | VideoRenderer（555 行）：mpv 子进程 + 命名管道 IPC + WASAPI 音量 + find_mpv 捆绑/PATH 回退 | WPF MediaElement / WPFMediaKit (DirectShow) |
-| **Web 渲染** | WebRenderer（307 行，✅ 代理层）：通过 ProcessManager 启动 mirrorstar-wp-proc.exe 子进程 + WpProcIpcClient 命名管道 IPC 通信 + FindWindowW + PID 验证获取 HWND | CefSharp（独立子进程） |
-| **引擎层** | WallpaperEngine（1741 行，manager.rs）：set/close/pause/resume/shutdown + 快速路径控制 | WPBaseClass 基类 |
+| **图片渲染** | ImageRenderer（1104 行）：GDI 双缓冲 + HALFTONE + 专用线程 + 超屏幕降采样 + 暂停释放像素 | WPF Image 控件 |
+| **GIF 渲染** | GifRenderer（2172 行）：image crate 解码 + GDI 双缓冲 + WM_TIMER + 40MB 内存预算 + 暂停释放帧 + 速度控制 | XamlAnimatedGIF 库 |
+| **视频渲染** | VideoRenderer（1259 行）：mpv 子进程 + 命名管道 IPC + WASAPI 音量 + find_mpv 捆绑/PATH 回退 | WPF MediaElement / WPFMediaKit (DirectShow) |
+| **Web 渲染** | WebRenderer（652 行，✅ 代理层）：通过 ProcessManager 启动 mirrorstar-wp-proc.exe 子进程 + WpProcIpcClient 命名管道 IPC 通信 + FindWindowW + PID 验证获取 HWND | CefSharp（独立子进程） |
+| **引擎层** | WallpaperEngine（2591 行，manager.rs）：set/close/pause/resume/shutdown + 快速路径控制 | WPBaseClass 基类 |
 | **缩放模式** | 5种（Fill/Fit/Stretch/Center/Original） | WPF Stretch 枚举 |
 | **降采样** | 超屏幕分辨率自动降采样 | 无 |
 | **帧数限制** | GIF 40MB 内存预算 | 无 |
@@ -361,7 +369,7 @@
 
 **关键差异：**
 
-1. **渲染架构**：MirrorStar 使用策略模式（`WallpaperRenderer` trait），4 种渲染器（ImageRenderer 615行、GifRenderer 864行、VideoRenderer 555行、WebRenderer 307行）实现统一接口，引擎层（WallpaperEngine 1741行，manager.rs）通过 `Box<dyn WallpaperRenderer>` 多态调度。Lively 使用 if/switch 分支 + 类继承体系（WPBaseClass），每种类型有不同的处理逻辑，代码重复较多。
+1. **渲染架构**：MirrorStar 使用策略模式（`WallpaperRenderer` trait），4 种渲染器（ImageRenderer 990行、GifRenderer 2003行、VideoRenderer 1152行、WebRenderer 580行）实现统一接口，引擎层（WallpaperEngine 2387行，manager.rs）通过 `Box<dyn WallpaperRenderer>` 多态调度。Lively 使用 if/switch 分支 + 类继承体系（WPBaseClass），每种类型有不同的处理逻辑，代码重复较多。
 
 2. **PauseSender 快速通道创新**：MirrorStar 实现了 PauseSender 快速通道，绕过引擎互斥锁，直接发送暂停/恢复/音量命令。这避免了高优先级操作（如全屏暂停）被引擎锁阻塞，显著降低响应延迟。Lively 无此机制。
 
@@ -378,7 +386,7 @@
 | 维度 | MirrorStar | Lively |
 |------|-----------|--------|
 | **实现文件** | `src-tauri/src/platform/fullscreen.rs` + `lib.rs` | `wp_lib/Pause.cs` + `SetupDesktop.cs` |
-| **代码行数** | platform/fullscreen.rs（465 行）+ lib.rs（402 行） | Pause.cs 551 行 + SetupDesktop.cs |
+| **代码行数** | platform/fullscreen.rs（1145 行）+ lib.rs（1220 行） | Pause.cs 551 行 + SetupDesktop.cs |
 | **检测方式** | SetWinEventHook(EVENT_SYSTEM_FOREGROUND) 事件驱动 | System.Threading.Timer 轮询（500ms 间隔） |
 | **检测算法** | GetForegroundWindow + GetWindowRect + MonitorFromWindow + GetMonitorInfoW，比较窗口矩形与显示器矩形 | IsZoomedCustom() 检查窗口面积是否超过屏幕 95% |
 | **暂停方式** | 逻辑暂停（PauseSender 快速通道，全局 `pause_all_fast`） | SuspendThread/ResumeThread 挂起所有线程 + 静音 |
@@ -411,7 +419,7 @@
 | 维度 | MirrorStar | Lively |
 |------|-----------|--------|
 | **实现文件** | `audio/volume.rs` | `wp_lib/VolumeMixer.cs` |
-| **代码行数** | 472 行（volume.rs 471 + mod.rs 1） | 230 行 |
+| **代码行数** | 1042 行（volume.rs 1041 + mod.rs 1） | 230 行 |
 | **API** | WASAPI (windows crate COM) | Core Audio API (P/Invoke COM) |
 | **接口链** | IMMDeviceEnumerator → IMMDevice → IAudioSessionManager2 → IAudioSessionEnumerator → ISimpleAudioVolume | 相同 |
 | **控制粒度** | 进程级音量 + 静音 | 进程级音量 + 静音 |
@@ -424,8 +432,8 @@
 
 | 维度 | MirrorStar | Lively |
 |------|-----------|--------|
-| **实现文件** | `config/` 目录（6 个文件） | `save/SaveData.cs` |
-| **代码行数** | 3909 行 | 1322 行 |
+| **实现文件** | `config/` 目录（7 个文件） | `save/SaveData.cs` |
+| **代码行数** | 5801 行 | 1322 行 |
 | **配置格式** | TOML | JSON |
 | **持久化文件** | `config.toml` + `wallpapers.toml` | `lively_config.json` + `lively_config_b.json` + 多个独立文件 |
 | **写入安全** | 文件锁 + 临时文件 + rename（原子写入） | 双写备份（主文件 + _b 备份文件） |
@@ -491,14 +499,14 @@
 | 维度 | MirrorStar | Lively |
 |------|-----------|--------|
 | **实现文件** | `process/` 目录（2 个文件，阶段2清理后） | livelySubProcess |
-| **代码行数** | 732 行 | 未统计 |
-| **ProcessManager** | 731 行：CreateProcessW + 3 秒等待 + TerminateProcess | WaitForExit |
+| **代码行数** | 1205 行 | 未统计 |
+| **ProcessManager** | 1204 行：CreateProcessW + 3 秒等待 + TerminateProcess | WaitForExit |
 | **子进程管理对象** | mpv.exe（视频壁纸）+ mirrorstar-wp-proc.exe（Web 壁纸，已实现） | CefSharp + 外部程序 |
 | **独立看门狗进程** | 无（watchdog crate 已在阶段2移除） | 有（livelySubProcess） |
 
 **关键差异：**
 
-1. **实现完整度**：MirrorStar 的 ProcessManager（731 行）已完整实现，用于管理 mpv 子进程和 wp-proc 子进程。阶段2已清理 watchdog/monitor 死代码，移除 mirrorstar-watchdog 独立 crate。Lively 的 livelySubProcess 完整实现并实际运行。
+1. **实现完整度**：MirrorStar 的 ProcessManager（1204 行）已完整实现，用于管理 mpv 子进程和 wp-proc 子进程。阶段2已清理 watchdog/monitor 死代码，移除 mirrorstar-watchdog 独立 crate。Lively 的 livelySubProcess 完整实现并实际运行。
 
 2. **架构决策**：MirrorStar 采用混合架构——仅 Web 壁纸在独立子进程（mirrorstar-wp-proc）中运行，按需启动；Image/Gif/Video 在主进程内。独立看门狗进程不再需要（watchdog crate 已在阶段2移除），因为主进程崩溃时操作系统会自动回收子进程。Lively 的多进程架构（CefSharp + 看门狗 + 外部程序）已完整实现。
 
@@ -507,40 +515,42 @@
 | 维度 | MirrorStar | Lively |
 |------|-----------|--------|
 | **实现文件** | `ipc/` 目录（4 个文件：client.rs/mpv_protocol.rs/wp_proc.rs/mod.rs） | CefSharp stdin/stdout |
-| **代码行数** | 1542 行 | 未统计 |
+| **代码行数** | 2103 行 | 未统计 |
 | **通信对象** | mpv（已实现）+ wp-proc（已实现） | CefSharp + 外部程序 |
 | **通信方式** | 命名管道（JSON + 换行分隔） | stdin/stdout 管道 |
-| **功能** | MpvIpcClient：pause/resume/set_volume/set_speed/quit 等命令；WpProcIpcClient：play/terminate/set_position/navigate/pause/resume | 消息传递 |
-| **连接重试** | 有 + request_id 响应匹配 | 无 |
+| **功能** | MpvIpcClient（mpv_protocol.rs）：pause/resume/set_volume/set_speed/quit 等命令；WpProcIpcClient（wp_proc.rs）：play/terminate/set_position/navigate/pause/resume | 消息传递 |
+| **连接重试** | 有 + request_id 响应匹配（mpv 40×50ms / wp-proc 160×50ms / 窗口查找 20×100ms） | 无 |
 | **事件通知** | 无（wp-proc 不发送异步事件，HWND 通过 FindWindowW 获取） | 无 |
 
-**关键差异：** MirrorStar 的 IPC 用于两类子进程通信——mpv（已实现）和 wp-proc（已实现），均采用命名管道 + JSON + 换行分隔协议，实现连接重试 + request_id 响应匹配机制。wp-proc 的 HWND 通过 FindWindowW + PID 验证获取，不通过 IPC 回传。Lively 使用 stdin/stdout 管道与 CefSharp 和外部程序通信。
+**关键差异：** MirrorStar 的 IPC 用于两类子进程通信——mpv（已实现）和 wp-proc（已实现），均采用命名管道 + JSON + 换行分隔协议，实现连接重试 + request_id 响应匹配机制（重试参数见 `wallpaper/subprocess_base.rs`：mpv `MPV_CONNECT_RETRIES` 40×50ms=2s / wp-proc `WP_PROC_CONNECT_RETRIES` 160×50ms=8s / 窗口查找 20×100ms=2s）。wp-proc 的 HWND 通过 FindWindowW + PID 验证获取，不通过 IPC 回传。Lively 使用 stdin/stdout 管道与 CefSharp 和外部程序通信。
 
 ### 3.10 Tauri 应用层对比
 
 | 维度 | MirrorStar | Lively |
 |------|-----------|--------|
 | **实现文件** | `src-tauri/src/` 目录（12 个文件：lib.rs + main.rs + state.rs + commands/ + platform/） | `App.xaml.cs` |
-| **代码行数** | 12 个文件共 3630 行（lib.rs 402 + main.rs 57 + state.rs 750 + commands/ 4 文件 + platform/ 5 文件） | 未统计 |
+| **代码行数** | 12 个文件共 6952 行（lib.rs 1220 + main.rs 57 + state.rs 1031 + commands/ 4 文件 + platform/ 5 文件） | 未统计 |
 | **Tauri 命令** | 24 个全部完整实现（均为 `#[tauri::command]` 注解命令，托盘暂停/恢复复用 `pause_wallpaper`/`resume_wallpaper`） | - |
-| **系统托盘** | 在 lib.rs setup 中构建（state.rs 管理状态），原描述为内联在 lib.rs（TrayIconBuilder，3 项菜单：打开/暂停-恢复/退出） | 完整 |
+| **系统托盘** | 在 lib.rs setup 中构建（state.rs 管理状态），托盘菜单项定义于 lib.rs L967-976（TrayIconBuilder，3 项菜单：打开/暂停-恢复/退出，无音量子菜单） | 完整 |
 | **单实例保护** | Win32 CreateMutexW | Mutex |
-| **Explorer 重启检测** | TaskbarCreated 事件驱动 + WorkerW 5 分钟轮询兜底 | 无 |
-| **全屏检测** | SetWinEventHook 事件驱动 | Timer 轮询 |
+| **Explorer 重启检测** | TaskbarCreated 事件驱动 + WorkerW 5 分钟轮询兜底（start_workerw_check：interval 300s + Notify，check_and_reinitialize） | 无 |
+| **全屏检测** | SetWinEventHook 事件驱动（Hook 失败仅记录并退出监控线程，无轮询回退） | Timer 轮询 |
 | **主窗口** | 懒创建 + 关闭即隐藏（hide） | 常驻 |
 | **DPI 感知** | PerMonitorV2 | DpiHelper |
 | **COM 初始化** | 主进程显式 `CoInitializeEx(None, COINIT_APARTMENTTHREADED)`（STA），wp-proc 同样 STA | - |
 | **前端事件** | 4 个 emit | - |
 
-**关键差异：** MirrorStar 的 Tauri 应用层实现了 24 个命令（均为 `#[tauri::command]` 注解命令，托盘"暂停/恢复壁纸"复用 `pause_wallpaper`/`resume_wallpaper` 命令，全部完整实现），系统托盘在 lib.rs setup 中构建（state.rs 管理状态），原描述为内联在 lib.rs 中（使用 Tauri 的 `TrayIconBuilder`，菜单仅 3 项：打开主窗口/暂停-恢复壁纸/退出，无音量子菜单、无显示器子菜单），单实例保护（Win32 CreateMutexW），Explorer 重启检测（TaskbarCreated 事件驱动 + WorkerW 5 分钟轮询兜底），全屏检测（SetWinEventHook 事件驱动，全局 `pause_all_fast` 暂停所有壁纸），主窗口懒创建 + 关闭即隐藏（hide），PerMonitorV2 DPI 感知，主进程显式 COM STA 初始化（`CoInitializeEx(None, COINIT_APARTMENTTHREADED)`），4 个前端事件 emit。
+**关键差异：** MirrorStar 的 Tauri 应用层实现了 24 个命令（均为 `#[tauri::command]` 注解命令，托盘"暂停/恢复壁纸"复用 `pause_wallpaper`/`resume_wallpaper` 命令，全部完整实现），系统托盘在 lib.rs setup 中构建（state.rs 管理状态），托盘菜单仅 3 项（打开/暂停-恢复/退出，无音量子菜单、无显示器子菜单，定义于 lib.rs L967-976），单实例保护（Win32 CreateMutexW），Explorer 重启检测（TaskbarCreated 事件驱动 + WorkerW 5 分钟轮询兜底，`start_workerw_check` 使用 interval 300 秒 + Notify，失效时 `check_and_reinitialize`，无 30 秒轮询），全屏检测（纯 SetWinEventHook 事件驱动，全局 `pause_all_fast` 暂停所有壁纸，Hook 失败仅记录并退出监控线程，无轮询回退），主窗口懒创建 + 关闭即隐藏（hide），PerMonitorV2 DPI 感知，主进程显式 COM STA 初始化（`CoInitializeEx(None, COINIT_APARTMENTTHREADED)`），4 个前端事件 emit。
 
 ---
 
 **相关文档：**
 
-- [架构概述](./overview.md)
-- [系统架构图](./system-architecture.md)
-- [依赖图与数据流](./dependency-graph.md)
-- [进程架构](./process-architecture.md)
-- [桌面集成详细设计](./desktop-integration.md)
-- [暂停/恢复机制](./pause-resume.md)
+- [架构概述](./架构概述-Architecture-Overview.md)
+- [系统架构](./系统架构-System-Architecture.md)
+- [进程架构](./进程架构-Process-Architecture.md)
+- [依赖与数据流](./依赖与数据流-Dependency-and-Data-Flow.md)
+- [桌面集成](./桌面集成-Desktop-Integration.md)
+- [暂停恢复机制](./暂停恢复机制-Pause-Resume.md)
+- [错误处理](./错误处理-Error-Handling.md)
+- [性能优化](./性能优化-Performance.md)

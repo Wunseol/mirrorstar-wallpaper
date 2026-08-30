@@ -1,6 +1,13 @@
-[← 返回文档索引](../README.md) > [架构设计](./overview.md) > 进程架构
+[← 返回文档索引](../../README.md) > [架构设计](./架构概述-Architecture-Overview.md) > 进程架构
 
-# 进程架构
+# MirrorStar Wallpaper（镜星壁纸）架构设计 — 进程架构
+
+| 项目   | 内容                        |
+| ---- | ------------------------- |
+| 项目名称 | MirrorStar Wallpaper（镜星壁纸） |
+| 文档版本 | v2.0                      |
+| 更新日期 | 2026-08-29                |
+| 文档状态 | 已实现（基于最新代码审计）        |
 
 > 基于真实代码审计 + 混合架构实现 + Lively 对比
 
@@ -102,12 +109,12 @@ fn ensure_single_instance() -> bool {
 
 ### 1.3 壁纸子进程架构
 
-实际架构中存在**两种**按需启动的子进程，由 `ProcessManager`（`crates/mirrorstar-core/src/process/`，458 行）统一管理：`CreateProcessW` 启动 + 3 秒等待 + `TerminateProcess` 强制终止，提供 `is_running()` / `pid()` / `handle()` 状态查询。
+实际架构中存在**两种**按需启动的子进程，由 `ProcessManager`（`crates/mirrorstar-core/src/process/manager.rs`，1204 行）统一管理：`CreateProcessW` 启动 + 3 秒等待 + `TerminateProcess` 强制终止，提供 `is_running()` / `pid()` / `handle()` 状态查询。
 
 #### mpv.exe（视频壁纸子进程）
 
-- **启动方式**：由 `VideoRenderer`（`crates/mirrorstar-core/src/wallpaper/video.rs`，511 行）通过 `ProcessManager` spawn
-- **控制方式**：`MpvIpcClient`（`crates/mirrorstar-core/src/ipc/protocol.rs`）通过 mpv 原生 JSON IPC 控制
+- **启动方式**：由 `VideoRenderer`（`crates/mirrorstar-core/src/wallpaper/video.rs`，1259 行）通过 `ProcessManager` spawn
+- **控制方式**：`MpvIpcClient`（`crates/mirrorstar-core/src/ipc/mpv_protocol.rs`，L27）通过 mpv 原生 JSON IPC 控制
 - **命名管道**：`\\.\pipe\mirrorstar-mpv-{uuid}`（UUID 由主进程生成，通过 `--input-ipc-server` 参数传给 mpv）
 - **窗口标题**：`MirrorStarVideo`（通过 `--title=MirrorStarVideo` 参数设置，用于 `FindWindowW` 查找）
 - **find_mpv() 路径查找策略**：
@@ -117,10 +124,10 @@ fn ensure_single_instance() -> bool {
 
 #### mirrorstar-wp-proc.exe（Web 壁纸子进程）
 
-- **启动方式**：由 `WebRenderer`（`crates/mirrorstar-core/src/wallpaper/web.rs`，255 行，代理层）通过 `ProcessManager` spawn
-- **控制方式**：`WpProcIpcClient`（`crates/mirrorstar-core/src/ipc/wp_proc.rs`，385 行）通过自定义 `WpProcCommand` 协议控制
+- **启动方式**：由 `WebRenderer`（`crates/mirrorstar-core/src/wallpaper/web.rs`，652 行，代理层）通过 `ProcessManager` spawn
+- **控制方式**：`WpProcIpcClient`（`crates/mirrorstar-core/src/ipc/wp_proc.rs`，699 行，L73）通过自定义 `WpProcCommand` 协议控制
 - **命名管道**：`\\.\pipe\{pipe_name}`（pipe_name 通过 `--pipe-name` CLI 参数传入）
-- **代码规模**：1665 行（`crates/mirrorstar-wp-proc/`），使用 `webview2-com` crate
+- **代码规模**：4588 行（`crates/mirrorstar-wp-proc/` 5 个文件：com 103 / command 1145 / ipc_server 1466 / main 422 / webview 1452，CLI/src 位于 main.rs），使用 `webview2-com` crate
 - **CLI 参数**：
   - `--source`：初始网页源（URL 或 file:// 路径）
   - `--pipe-name`：命名管道名称
@@ -181,12 +188,19 @@ let hr = unsafe { CoInitializeEx(None, COINIT_APARTMENTTHREADED) };
 8. **`ConfigManager::new()` + `start_watching()`** — 配置管理器初始化 + 启动 notify crate 文件监视（热重载，500ms 防抖）
 9. **`start_fullscreen_monitor()`** — `SetWinEventHook(EVENT_SYSTEM_FOREGROUND)` 事件驱动全屏检测 + AtomicBool 状态去抖 + 自身窗口排除
 10. **`WM_POWERBROADCAST` 事件驱动** — 在 explorer 监控窗口的 wndproc 中处理 `PBT_APMPOWERSTATUSCHANGE` 消息，事件触发时一次性调用 `GetSystemPowerStatus` 读取状态（非轮询），电池供电时暂停壁纸
-11. **`start_explorer_restart_monitor()`** — 监听 `TaskbarCreated` 消息（事件驱动，Explorer 重启后重建 WorkerW）；**独立函数 `start_workerw_check()`** — 5 分钟轮询兜底（`is_workerw_valid()` + `check_and_reinitialize()`）
+11. **`start_explorer_restart_monitor()`** — 监听 `TaskbarCreated` 消息（事件驱动，Explorer 重启后重建 WorkerW）；**独立函数 `start_workerw_check()`** — 5 分钟（300 秒）轮询兜底（`is_workerw_valid()` + `check_and_reinitialize()`）
 
 **关键说明：**
 - 启动序列中**无**看门狗进程 spawn 步骤（`mirrorstar-watchdog` crate 已在阶段2移除）
 - 主进程崩溃时操作系统自动回收子进程（父子进程关系），不需要独立看门狗进程清理资源
 - 主窗口懒创建：启动时仅创建系统托盘图标，主窗口在用户点击托盘"打开主窗口"时通过 `WebviewWindowBuilder` 动态创建，关闭即隐藏（hide）以保留 WebView2 实例
+
+### 1.6 崩溃恢复（退出监听）
+
+针对壁纸子进程（mpv / wp-proc）的崩溃，仅通过 `spawn_proc_exit_monitor()`（`crates/mirrorstar-core/src/wallpaper/mod.rs` L186）监听其退出：当子进程以异常状态退出时，更新壁纸状态为 `Terminated` 并调用 `notify_state_changed` 通知壁纸引擎。
+
+- **无自动 respawn**：子进程崩溃后不会被自动重启，由引擎/用户在收到终止通知后决定后续处理
+- 资源回收由操作系统自动完成（父子进程关系），无需独立看门狗进程
 
 ---
 
@@ -198,19 +212,19 @@ MirrorStar 使用**两套完全独立**的 IPC 协议，分别对应两种子进
 
 #### 协议一：mpv 原生 IPC（视频壁纸）
 
-- **客户端**：`MpvIpcClient`（`crates/mirrorstar-core/src/ipc/protocol.rs`，246 行）
+- **客户端**：`MpvIpcClient`（`crates/mirrorstar-core/src/ipc/mpv_protocol.rs`，355 行，L27）
 - **管道**：`\\.\pipe\mirrorstar-mpv-{uuid}`（UUID 由主进程生成，通过 mpv `--input-ipc-server` 参数创建）
 - **格式**：mpv 原生 JSON 协议（JSON 行，request_id 匹配响应）
-- **连接重试**：5 次尝试 × 200ms 间隔（`ipc.connect(MPV_CONNECT_RETRIES, MPV_CONNECT_INTERVAL_MS) = 1s`）
+- **连接重试**：40 次尝试 × 50ms 间隔（`ipc.connect(MPV_CONNECT_RETRIES, MPV_CONNECT_INTERVAL_MS) = 2s` 总超时）
 - **命令**：`pause` / `resume` / `set_volume` / `set_loop_file` / `set_speed` / `quit` / `get_property` / `set_property`
 - **响应结构**：`{ error, data?, request_id }`（mpv 原生格式）
 
 #### 协议二：wp-proc WpProcCommand（Web 壁纸）
 
-- **客户端**：`WpProcIpcClient`（`crates/mirrorstar-core/src/ipc/wp_proc.rs`，385 行）
+- **客户端**：`WpProcIpcClient`（`crates/mirrorstar-core/src/ipc/wp_proc.rs`，699 行，L73）
 - **管道**：`\\.\pipe\{pipe_name}`（pipe_name 通过 `--pipe-name` CLI 参数传入子进程）
 - **格式**：自定义 JSON + 换行分隔，request_id 匹配响应
-- **连接重试**：100 次尝试 × 200ms 间隔（`ipc.connect(WP_PROC_CONNECT_RETRIES, WP_PROC_CONNECT_INTERVAL_MS) = 20s`，覆盖 WebView2 冷启动）
+- **连接重试**：160 次尝试 × 50ms 间隔（`ipc.connect(WP_PROC_CONNECT_RETRIES, WP_PROC_CONNECT_INTERVAL_MS) = 8s` 总超时，覆盖 WebView2 冷启动）
 - **命令**：`Play{source}` / `Terminate` / `SetPosition{x,y,w,h}` / `Navigate{url}` / `Pause` / `Resume`
 
 **命令示例**（主进程 → 子进程）：
@@ -239,13 +253,13 @@ MirrorStar 使用**两套完全独立**的 IPC 协议，分别对应两种子进
 
 **mpv（视频壁纸）**：
 - 通过窗口标题 `MirrorStarVideo` 查找（`FindWindowW`）
-- 重试：20 次 × 100ms = 2 秒
+- 重试：20 次 × 100ms = 2 秒（`WINDOW_FIND_RETRIES`，窗口查找参数）
 - PID 验证：`GetWindowThreadProcessId` 确认窗口属于 mpv 子进程
 - 实现位置：`VideoRenderer::find_mpv_window()`
 
 **wp-proc（Web 壁纸）**：
 - 通过 `--title` 参数传入的 UUID 标题查找（`FindWindowW`）
-- 重试：20 次 × 100ms = 2 秒
+- 重试：20 次 × 100ms = 2 秒（`WINDOW_FIND_RETRIES`）
 - PID 验证：`GetWindowThreadProcessId` 确认窗口属于 wp-proc 子进程
 - 实现位置：`WebRenderer` 中对应查找逻辑
 
@@ -339,7 +353,7 @@ MirrorStar 使用**两套完全独立**的 IPC 协议，分别对应两种子进
 | 壁纸渲染位置 | 主进程专用线程（Image/Gif/Video）+ 独立子进程（Web） | 主进程 WPF 窗口 + 外部进程 |
 | 子进程数量 | 0-2（mpv + wp-proc，均按需启动） | 2+（CefSharp + 看门狗 + 外部程序） |
 | 崩溃隔离 | Web 壁纸崩溃隔离（子进程），Image/Gif/Video 在主进程 | 子进程崩溃不影响主进程 + 看门狗进程 |
-| 看门狗机制 | 无独立看门狗进程（watchdog crate 已在阶段2移除） | 有（livelySubProcess 完整实现） |
+| 起进程监控 | 退出监听（spawn_proc_exit_monitor）+ OS 自动回收，无独立看门狗进程（watchdog crate 已在阶段2移除） | 有（livelySubProcess 完整实现） |
 | 暂停机制 | 逻辑暂停（PauseSender 快速通道） | 线程挂起（SuspendThread） |
 | 内存优化 | 无 Web 壁纸时零子进程开销，WebView2 仅按需加载 | CefSharp 启动即加载 |
 
@@ -351,7 +365,11 @@ MirrorStar 使用**两套完全独立**的 IPC 协议，分别对应两种子进
 ---
 
 **相关文档：**
-- [模块设计](./module-design.md)
-- [依赖图与数据流](./dependency-graph.md)
-- [暂停/恢复机制](./pause-resume.md)
-- [错误处理策略](./error-handling.md)
+- [架构概述](./架构概述-Architecture-Overview.md)
+- [系统架构](./系统架构-System-Architecture.md)
+- [模块设计](./模块设计-Module-Design.md)
+- [依赖与数据流](./依赖与数据流-Dependency-and-Data-Flow.md)
+- [桌面集成](./桌面集成-Desktop-Integration.md)
+- [暂停恢复机制](./暂停恢复机制-Pause-Resume.md)
+- [错误处理](./错误处理-Error-Handling.md)
+- [性能优化](./性能优化-Performance.md)

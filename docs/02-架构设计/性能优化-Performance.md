@@ -1,6 +1,8 @@
-[← 返回文档索引](../README.md) > [架构设计](./overview.md) > 性能优化
+[← 返回文档索引](../../README.md) > [架构设计](./架构概述-Architecture-Overview.md) > 性能优化
 
 # MirrorStar Wallpaper（镜星壁纸）架构设计 — 性能优化策略
+
+> 文档版本：v2.0 ｜ 更新日期：2026-08-29 ｜ 状态：已实现（基于最新代码审计）
 
 ## 11. 性能优化策略
 
@@ -140,18 +142,18 @@ GIF 内存预算从 200MB 降至 40MB（`MAX_GIF_MEMORY_MB`）。暂停时释放
 ### 11.11 子进程 IPC 连接超时优化
 
 视频壁纸（mpv）与网页壁纸（wp-proc）子进程的 IPC 连接超时参数差异化配置，减少壁纸切换等待时间。两类子进程的管道就绪特性不同：
-- **mpv**：外部进程，启动后 `--input-ipc-server` 创建命名管道典型 200-500ms 即就绪，1s 超时足够
-- **wp-proc**：内部 Rust 子进程，但需启动 WebView2 运行时（冷启动 5-15s），需 20s 兜底
+- **mpv**：外部进程，启动后 `--input-ipc-server` 创建命名管道典型 200-500ms 即就绪，2s 超时足够
+- **wp-proc**：内部 Rust 子进程，但需启动 WebView2 运行时（冷启动较慢），定为 8s 兜底
 
 | 操作 | 渲染器 | 参数 | 总超时 | 说明 |
 |------|--------|------|--------|------|
-| IPC 连接 | Video (mpv) | 5 次 * 200ms | 1000ms (1s) | mpv 管道就绪典型 200-500ms，1s 足够 |
-| IPC 连接 | Web (wp-proc) | 100 次 * 200ms | 20000ms (20s) | WebView2 冷启动需 5-15s，20s 兜底 |
+| IPC 连接 | Video (mpv) | 40 次 * 50ms | 2000ms (2s) | mpv 管道就绪典型 200-500ms，2s 足够 |
+| IPC 连接 | Web (wp-proc) | 160 次 * 50ms | 8000ms (8s) | 需覆盖 WebView2 冷启动，定为 8s |
 | 窗口查找 | Video (mpv) | 20 次 * 100ms | 2000ms (2s) | mpv 窗口创建典型 < 500ms |
 
 参数通过常量定义（`MPV_CONNECT_RETRIES` / `MPV_CONNECT_INTERVAL_MS` / `WP_PROC_CONNECT_RETRIES` / `WP_PROC_CONNECT_INTERVAL_MS`），调用点 `ipc.connect(...)` 使用常量而非魔法数字，便于后续调整。
 
-**优化效果**：mpv 视频壁纸切换最坏情况等待时间从 ~20s 降至 ~3s（IPC 1s + 窗口查找 2s）；wp-proc 保留 20s 超时以兼容 WebView2 冷启动场景。
+**优化效果**：mpv 视频壁纸切换最坏情况等待时间约为 IPC 2s + 窗口查找 2s = 4s；wp-proc 保留 8s 超时以兼容 WebView2 冷启动场景。
 
 ### 11.12 图片像素数据暂停释放
 
@@ -234,6 +236,11 @@ GIF 内存预算从 200MB 降至 40MB（`MAX_GIF_MEMORY_MB`）。暂停时释放
 
 **相关文档：**
 
-- [架构概述](./overview.md)
-- [错误处理策略](./error-handling.md)
-- [暂停/恢复机制](./pause-resume.md)
+- [架构概述](./架构概述-Architecture-Overview.md)
+- [系统架构](./系统架构-System-Architecture.md)
+- [模块设计](./模块设计-Module-Design.md)
+- [进程架构](./进程架构-Process-Architecture.md)
+- [依赖与数据流](./依赖与数据流-Dependency-and-Data-Flow.md)
+- [桌面集成](./桌面集成-Desktop-Integration.md)
+- [暂停恢复机制](./暂停恢复机制-Pause-Resume.md)
+- [错误处理](./错误处理-Error-Handling.md)

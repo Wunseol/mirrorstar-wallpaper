@@ -189,7 +189,7 @@ match unsafe { ctrl.CoreWebView2() } {
 
 - `src-tauri/src/error.rs` — `MirrorStarError` 枚举定义（`thiserror::Error` derive、`Into<InvokeError>` 实现）
 - `src-tauri/src/commands/` — Tauri 命令层 `Result<T, MirrorStarError>` 返回
-- `crates/mirrorstar-core/src/ipc/protocol.rs` — `WpProcResponse` / `ResponseStatus` 枚举定义
+- `crates/mirrorstar-core/src/ipc/wp_proc.rs` — `WpProcResponse` / `ResponseStatus` 枚举定义
 - `crates/mirrorstar-wp-proc/src/ipc_server.rs` — 子进程 IPC 响应构造（`ResponseStatus::Error` 使用范例）
 - `docs/优化文档/06-src-tauri应用层.md` — ST-004 Wave 2C 修复说明（`MirrorStarError::InvalidArgument` 引入）
 - `docs/优化文档/05-audio-ipc-process模块.md` — IPC 错误处理与 `ResponseStatus::Error` 使用约定

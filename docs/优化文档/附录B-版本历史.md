@@ -55,7 +55,7 @@
 7. **新增 dead deps 清理建议**：anyhow、raw-window-handle（Rust）、@vitest/ui（前端）为未使用依赖。
 8. **新增 release.yml 改进建议**：添加 `cargo fmt --check` 和 `cargo audit` 步骤。
 9. **文档导航完善**：docs/README.md 新增 优化文档/ 和 测试报告/ 目录链接。
-10. **架构文档同步**：module-design.md、dependency-graph.md、pause-resume.md、system-architecture.md、quality.md 中行数、位置等全部更正。
+10. **架构文档同步**：模块设计-Module-Design.md、依赖与数据流-Dependency-and-Data-Flow.md、暂停恢复机制-Pause-Resume.md、系统架构-System-Architecture.md、quality.md 中行数、位置等全部更正。
 
 ---
 

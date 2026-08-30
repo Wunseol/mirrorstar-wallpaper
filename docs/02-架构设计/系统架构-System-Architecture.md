@@ -1,6 +1,14 @@
-[← 返回文档索引](../README.md) > [架构设计](./overview.md) > 系统架构
+[← 返回文档索引](../../README.md) > [架构设计](./架构概述-Architecture-Overview.md) > 系统架构
 
 # MirrorStar Wallpaper（镜星壁纸）架构设计 — 系统架构图
+
+| 项目   | 内容                        |
+| ---- | ------------------------- |
+| 文档版本 | v2.0                      |
+| 更新日期 | 2026-08-29                |
+| 文档状态 | 已实现（基于最新代码审计）        |
+
+***
 
 ## 2. 系统架构图
 
@@ -60,6 +68,11 @@ graph TB
 
 **相关文档：**
 
-- [架构概述](./overview.md)
-- [模块设计](./module-design.md)
-- [桌面集成详细设计](./desktop-integration.md)
+- [架构概述](./架构概述-Architecture-Overview.md)
+- [模块设计](./模块设计-Module-Design.md)
+- [桌面集成](./桌面集成-Desktop-Integration.md)
+- [进程架构](./进程架构-Process-Architecture.md)
+- [依赖与数据流](./依赖与数据流-Dependency-and-Data-Flow.md)
+- [暂停恢复机制](./暂停恢复机制-Pause-Resume.md)
+- [错误处理](./错误处理-Error-Handling.md)
+- [性能优化](./性能优化-Performance.md)

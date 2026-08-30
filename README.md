@@ -79,7 +79,7 @@ cargo clean   # 删除整个 target/，下次构建自动复现
 
 ## 文档入口
 
-详细文档请参阅 [docs/README.md](./docs/README.md)。
+详细文档请参阅 [docs/index.md](./docs/index.md)。
 
 `docs/` 目录按以下四大类组织，覆盖从需求到实施的完整设计资料：
 

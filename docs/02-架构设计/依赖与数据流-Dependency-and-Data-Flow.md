@@ -1,6 +1,13 @@
-[← 返回文档索引](../README.md) > [架构设计](./overview.md) > 依赖与数据流
+[← 返回文档索引](../../README.md) > [架构设计](./架构概述-Architecture-Overview.md) > 依赖与数据流
 
 # MirrorStar Wallpaper（镜星壁纸）架构设计 — 依赖图与数据流
+
+| 项目   | 内容                        |
+| ---- | ------------------------- |
+| 项目名称 | MirrorStar Wallpaper（镜星壁纸） |
+| 文档版本 | v2.0                      |
+| 更新日期 | 2026-08-29                |
+| 文档状态 | 已实现（基于最新代码审计）        |
 
 ## 4. 模块依赖图
 
@@ -55,7 +62,7 @@ graph LR
 | 壁纸引擎 → 配置管理 | 单向 | 引擎读取壁纸配置和用户设置           |
 | 壁纸引擎 → 音频控制 | 单向 | 引擎控制壁纸音频的音量和静音          |
 | 进程管理 → IPC  | 单向 | 进程管理器通过两套独立 IPC 与子进程通信（mpv 原生 JSON IPC + wp-proc 自定义协议）      |
-| 系统托盘 → 壁纸引擎 | 单向 | 托盘菜单操作（内联于 lib.rs）触发引擎暂停/恢复         |
+| 系统托盘 → 壁纸引擎 | 单向 | 托盘菜单操作（内联于 lib.rs，仅 open / pause_resume / quit 三项）触发引擎暂停/恢复         |
 | 系统托盘 → 配置管理 | 单向 | 托盘菜单修改设置（如开机自启）         |
 | 配置管理 → 壁纸引擎 | 事件 | 配置热重载时通知引擎应用新配置         |
 
@@ -199,29 +206,35 @@ MirrorStar 与 Lively Wallpaper 在通信机制上存在根本性差异。Mirror
 |----------|-----------|--------|
 | **前端 ↔ 后端** | Tauri invoke (IPC) | WPF 数据绑定 + 事件 |
 | **主线程 → 渲染线程** | mpsc 通道 + PostMessageW | 直接方法调用（同进程） |
-| **视频播放控制** | 命名管道 JSON IPC（MpvIpcClient，mpv 原生协议） | WPF MediaElement 属性 |
-| **Web 壁纸通信** | 命名管道 JSON IPC（WpProcIpcClient，wp-proc 自定义协议） | CefSharp stdin/stdout 管道 |
+| **视频播放控制** | 命名管道 JSON IPC（MpvIpcClient，mpv 原生协议，`ipc/mpv_protocol.rs`） | WPF MediaElement 属性 |
+| **Web 壁纸通信** | 命名管道 JSON IPC（WpProcIpcClient，wp-proc 自定义协议，`ipc/wp_proc.rs`） | CefSharp stdin/stdout 管道 |
 | **全屏检测通知** | SetWinEventHook 回调 → AtomicBool 去抖 | Timer 轮询 → 直接调用 |
 | **配置变更通知** | notify crate → RwLock（500ms 防抖） | 无 |
 | **暂停/恢复控制** | PauseSender 快速通道（绕过引擎互斥锁） | SuspendThread/ResumeThread |
-| **崩溃恢复** | Web 子进程崩溃通过 IPC 管道断开检测 | JSON 文件（运行进程列表） + 看门狗进程 |
+| **崩溃恢复** | Web 子进程异常退出通过退出监听（spawn_proc_exit_monitor）识别，OS 自动回收子进程，无自动 respawn | JSON 文件（运行进程列表） + 看门狗进程 |
 
 ### 6.2 关键差异说明
 
-1. **两套独立 IPC 协议**：MirrorStar 的视频壁纸通过 `MpvIpcClient` 使用 mpv 原生 JSON IPC 协议与 mpv.exe 通信；Web 壁纸通过 `WpProcIpcClient` 使用 wp-proc 自定义协议与 wp-proc.exe 通信。两套协议独立设计，分别针对不同子进程的通信需求。
+1. **两套独立 IPC 协议**：MirrorStar 的视频壁纸通过 `MpvIpcClient`（`ipc/mpv_protocol.rs`）使用 mpv 原生 JSON IPC 协议与 mpv.exe 通信；Web 壁纸通过 `WpProcIpcClient`（`ipc/wp_proc.rs`）使用 wp-proc 自定义协议与 wp-proc.exe 通信。两套协议独立设计，分别针对不同子进程的通信需求。
 
-2. **前端-后端通信**：MirrorStar 使用 Tauri 的 `invoke` IPC 机制，前端 TypeScript 通过异步函数调用 Rust 后端命令，天然跨进程安全。Lively 使用 WPF 数据绑定和事件，前后端在同一进程，通信更直接但耦合更高。
+2. **IPC 连接重试参数**：`ipc/mod.rs`（28 行）与 `client.rs`（1021 行）提供共用连接重试模式，`subprocess_base.rs` 定义具体参数——mpv 连接重试 `MPV_CONNECT_RETRIES=40×50ms=2s` 总超时；wp-proc 连接重试 `WP_PROC_CONNECT_RETRIES=160×50ms=8s` 总超时；窗口查找 `WINDOW_FIND_RETRIES=20×100ms=2s`。
 
-3. **渲染线程通信**：MirrorStar 的图片/GIF 渲染器在专用线程中运行，通过 mpsc 通道发送命令，PostMessageW 唤醒消息循环处理。这种设计线程安全但增加复杂度。Lively 的壁纸窗口是 WPF Window，在 UI 线程上直接操作，简单但可能阻塞 UI。
+3. **前端-后端通信**：MirrorStar 使用 Tauri 的 `invoke` IPC 机制，前端 TypeScript 通过异步函数调用 Rust 后端命令，天然跨进程安全。Lively 使用 WPF 数据绑定和事件，前后端在同一进程，通信更直接但耦合更高。
 
-4. **PauseSender 快速通道**：MirrorStar 创新性地实现了 PauseSender 快速通道，绕过引擎互斥锁直接发送暂停/恢复/音量命令。这避免了高优先级操作被引擎锁阻塞，显著降低响应延迟。Lively 无此机制。
+4. **渲染线程通信**：MirrorStar 的图片/GIF 渲染器在专用线程中运行，通过 mpsc 通道发送命令，PostMessageW 唤醒消息循环处理。这种设计线程安全但增加复杂度。Lively 的壁纸窗口是 WPF Window，在 UI 线程上直接操作，简单但可能阻塞 UI。
 
-5. **崩溃恢复**：Lively 通过 JSON 文件记录运行中的外部进程，主进程崩溃后看门狗进程读取该文件清理资源。MirrorStar 的 Web 壁纸子进程崩溃可通过 IPC 管道断开检测，主进程崩溃时操作系统自动回收子进程（父子进程关系）。MirrorStar 不需要独立看门狗进程，依赖 Rust 的线程安全和 RAII 保证资源释放。
+5. **PauseSender 快速通道**：MirrorStar 创新性地实现了 PauseSender 快速通道，绕过引擎互斥锁直接发送暂停/恢复/音量命令。这避免了高优先级操作被引擎锁阻塞，显著降低响应延迟。Lively 无此机制。
+
+6. **崩溃恢复**：Lively 通过 JSON 文件记录运行中的外部进程，主进程崩溃后看门狗进程读取该文件清理资源。MirrorStar 的 Web 壁纸子进程异常退出由退出监听（`spawn_proc_exit_monitor`）识别并通知引擎，主进程崩溃时操作系统自动回收子进程（父子进程关系）。MirrorStar 不需要独立看门狗进程，依赖 Rust 的线程安全和 RAII 保证资源释放。
 
 ***
 
 **相关文档：**
-
-- [模块设计](./module-design.md)
-- [进程架构](./process-architecture.md)
-- [暂停/恢复机制](./pause-resume.md)
+- [架构概述](./架构概述-Architecture-Overview.md)
+- [系统架构](./系统架构-System-Architecture.md)
+- [模块设计](./模块设计-Module-Design.md)
+- [进程架构](./进程架构-Process-Architecture.md)
+- [桌面集成](./桌面集成-Desktop-Integration.md)
+- [暂停恢复机制](./暂停恢复机制-Pause-Resume.md)
+- [错误处理](./错误处理-Error-Handling.md)
+- [性能优化](./性能优化-Performance.md)

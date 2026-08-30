@@ -56,7 +56,7 @@
 2. 后续 `with_session` 通过该 stale `session_manager` 枚举会话，可能枚举到旧设备的会话或 `GetSessionEnumerator` 返回错误/空列表，导致 `set_process_volume` 对新设备上的 mpv 进程失效。
 3. `device_enumerator` 字段在构造后即成为「死字段」——占内存但不产生任何效果，其存在给人「设备变更已被处理」的错觉。
 
-**影响**：用户在播放视频壁纸期间切换音频输出设备（极常见场景：插耳机、连蓝牙音箱），壁纸进程音量控制静默失效，且无任何日志或刷新机制自愈。`docs/02-架构设计/module-design.md:147` 将「`refresh_session_manager` 音频设备变更处理」列为已实现能力，与实际不符（文档债务）。
+**影响**：用户在播放视频壁纸期间切换音频输出设备（极常见场景：插耳机、连蓝牙音箱），壁纸进程音量控制静默失效，且无任何日志或刷新机制自愈。`docs/02-架构设计/模块设计-Module-Design.md:147` 将「`refresh_session_manager` 音频设备变更处理」列为已实现能力，与实际不符（文档债务）。
 
 **建议**：
 - 方案 A（推荐）：实现 `IMMNotificationClient`，在 `OnDefaultDeviceChanged` 回调中触发 `refresh_session_manager`。注意回调来自 WASAPI 线程，需通过 channel/poster 转发到持有 `VolumeControl` 锁的线程，避免在回调中直接加锁导致死锁。
