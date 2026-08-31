@@ -9,7 +9,7 @@ jobs:
   rust-checks:
     runs-on: windows-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       # Rust stable 通道：满足 MSRV 1.80（Cargo.toml rust-version），同时跟进新版编译优化与 lints
       - name: Install Rust stable
@@ -45,11 +45,11 @@ jobs:
   frontend-checks:
     runs-on: windows-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       # Node 20 LTS：覆盖 Vite 5 / Vitest 2 / TypeScript 5.5 / ESLint 9 官方支持矩阵
       - name: Setup Node.js 20
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@v7
         with:
           node-version: '20'
           cache: npm
