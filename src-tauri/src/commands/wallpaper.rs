@@ -596,7 +596,7 @@ pub async fn add_wallpaper(
     // Generate thumbnail in background for image/gif/video types
     // ST-014: 保存 JoinHandle 到全局 THUMBNAIL_TASK，shutdown 时 take + 5s 超时等待，
     // 避免 update_thumbnail 被截断导致 wallpaper entry 的 thumbnail 字段保持为空。
-    // 详见 docs/优化文档/06-src-tauri应用层.md ST-014。
+    // 详见 docs/05-优化文档/06-src-tauri应用层.md ST-014。
     // 扩展为支持 Video 类型（通过 ffmpeg 抽帧），
     // 失败时 emit `wallpaper-thumbnail-failed` 事件通知前端展示降级占位图。
     if matches!(

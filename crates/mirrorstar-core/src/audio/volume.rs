@@ -8,7 +8,7 @@ use windows::Win32::System::Threading::{
     GetExitCodeProcess, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
 };
 
-// 历史修复标记见 docs/优化文档/v6-技术债审查/04-audio-ipc-process模块.md §5
+// 修复历史与 A-TD 技术债明细见 docs/05-优化文档/05-audio-ipc-process模块.md §2.1
 
 // TODO(A-001): 未实现 IMMNotificationClient 主动监听；A-001 后 `refresh_session_manager`
 // 在 WASAPI 调用失败时尝试 COM 重新初始化 + 设备重连，作为惰性自愈方案。
