@@ -978,6 +978,10 @@ pub fn run() {
             // Create tray icon
             let mut tray_builder = tauri::tray::TrayIconBuilder::new()
                 .menu(&menu)
+                // 关闭左键点击弹菜单（tray-icon 默认 menu_on_left_click=true，会在
+                // WM_LBUTTONUP 时弹出菜单）。左键仅通过 on_tray_icon_event 打开主窗口，
+                // 右键保留系统原生菜单。
+                .show_menu_on_left_click(false)
                 .on_menu_event(move |app, event| {
                     match event.id.as_ref() {
                         "open" => {
@@ -1054,7 +1058,12 @@ pub fn run() {
                     }
                 })
                 .on_tray_icon_event(|tray, event| {
-                    if let tauri::tray::TrayIconEvent::Click { .. } = event {
+                    if let tauri::tray::TrayIconEvent::Click {
+                        button: tauri::tray::MouseButton::Left,
+                        button_state: tauri::tray::MouseButtonState::Up,
+                        ..
+                    } = event
+                    {
                         let app = tray.app_handle();
                         create_or_show_main_window(app);
                     }

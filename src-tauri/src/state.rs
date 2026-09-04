@@ -177,11 +177,12 @@ pub struct AppState {
 /// 设置一次。workerw_check 任务在 reinit 成功后读取此 handle emit 事件。
 pub(crate) static SHARED_APP_HANDLE: OnceLock<AppHandle> = OnceLock::new();
 
-/// 全屏时是否销毁了主窗口（退出全屏后需重建以恢复 UI）
+/// 全屏时是否隐藏了主窗口（退出全屏后需恢复以还原 UI）
 ///
-/// 全屏动作生效（pause/terminate）时若主窗口打开则销毁其 WebView2 释放内存，
-/// 此标志记录"需在退出全屏后重建"。`swap(false)` 消费标志，避免重复重建。
-pub(crate) static FULLSCREEN_DESTROYED_MAIN_WINDOW: AtomicBool = AtomicBool::new(false);
+/// 全屏动作生效（pause/terminate）时若主窗口打开则隐藏其 WebView2，
+/// 接受瞬时内存占用，避免销毁聚焦 WebView2 窗口触发 wry 空指针崩溃。
+/// 此标志记录"需在退出全屏后恢复"。`swap(false)` 消费标志，避免重复恢复。
+pub(crate) static FULLSCREEN_MAIN_WINDOW_HIDDEN: AtomicBool = AtomicBool::new(false);
 
 /// 全局状态用于 Win32 回调（回调需要函数指针，无法使用闭包）
 /// 全屏检测和电源监控共享同一个 wallpaper_engine Arc
@@ -786,29 +787,29 @@ pub(crate) fn create_or_show_main_window(app: &tauri::AppHandle) {
     }
 }
 
-/// 全屏进入：若主窗口打开则销毁，释放其 WebView2 进程树（约 6 进程 / 150-300MB）。
+/// 全屏进入：若主窗口打开则隐藏。原销毁路径会在销毁聚焦/最大化 WebView2 窗口时
+/// 触发 wry-0.55.1 空指针崩溃（进程 abort），现改为隐藏以避免崩溃。
 ///
-/// 仅在主窗口打开时置 `FULLSCREEN_DESTROYED_MAIN_WINDOW` 标志，供退出全屏后重建。
-/// `close()` 走 CloseRequested → `RunEvent::ExitRequested(None)` → `prevent_exit()`
-/// 保持托盘驻留，与用户手动关闭窗口行为一致。
-pub(crate) fn destroy_main_window_on_fullscreen() {
+/// 仅在主窗口打开时置 `FULLSCREEN_MAIN_WINDOW_HIDDEN` 标志，供退出全屏后恢复。
+/// 隐藏窗口保留其 WebView2 进程（约 6 进程 / 150-300MB 内存占用）但避免空指针崩溃。
+pub(crate) fn hide_main_window_on_fullscreen() {
     let Some(app) = SHARED_APP_HANDLE.get() else {
         return;
     };
     if app.get_webview_window("main").is_none() {
         return;
     }
-    FULLSCREEN_DESTROYED_MAIN_WINDOW.store(true, Ordering::SeqCst);
+    FULLSCREEN_MAIN_WINDOW_HIDDEN.store(true, Ordering::SeqCst);
     if let Some(window) = app.get_webview_window("main") {
-        if let Err(e) = window.close() {
-            tracing::warn!(error = %e, "全屏销毁主窗口失败");
+        if let Err(e) = window.hide() {
+            tracing::warn!(error = %e, "全屏隐藏主窗口失败");
         }
     }
 }
 
-/// 全屏退出：若此前销毁了主窗口则重建（恢复 UI）。
+/// 全屏退出：若此前隐藏了主窗口则恢复（还原 UI）。
 pub(crate) fn restore_main_window_after_fullscreen() {
-    if FULLSCREEN_DESTROYED_MAIN_WINDOW.swap(false, Ordering::SeqCst) {
+    if FULLSCREEN_MAIN_WINDOW_HIDDEN.swap(false, Ordering::SeqCst) {
         if let Some(app) = SHARED_APP_HANDLE.get() {
             create_or_show_main_window(app);
         }

@@ -3,7 +3,7 @@ use std::sync::atomic::Ordering;
 use std::sync::Arc;
 
 use crate::state::{
-    destroy_main_window_on_fullscreen, resume_all_fast_blocking, restore_main_window_after_fullscreen,
+    hide_main_window_on_fullscreen, resume_all_fast_blocking, restore_main_window_after_fullscreen,
     try_pause_all_fast, try_terminate_all_fast, SendWinEventHook, FULLSCREEN_MONITOR_RUNNING,
     FULLSCREEN_MONITOR_THREAD, FULLSCREEN_MONITOR_THREAD_ID, FULLSCREEN_WAS, SHARED_CONFIG,
     SHARED_ENGINE, WIN_EVENT_HOOK,
@@ -174,7 +174,7 @@ unsafe extern "system" fn foreground_event_callback(
                         FULLSCREEN_WAS.store(true, Ordering::Release);
                         *FULLSCREEN_LEVEL.lock().unwrap_or_else(|e| e.into_inner()) = level;
                         update_last_fullscreen_hwnd();
-                        destroy_main_window_on_fullscreen();
+                        hide_main_window_on_fullscreen();
                     } else {
                         tracing::warn!(
                             failed_count = failed.len(),
@@ -194,7 +194,7 @@ unsafe extern "system" fn foreground_event_callback(
                         FULLSCREEN_WAS.store(true, Ordering::Release);
                         *FULLSCREEN_LEVEL.lock().unwrap_or_else(|e| e.into_inner()) = level;
                         update_last_fullscreen_hwnd();
-                        destroy_main_window_on_fullscreen();
+                        hide_main_window_on_fullscreen();
                     } else {
                         tracing::warn!(
                             failed_count = failed.len(),
