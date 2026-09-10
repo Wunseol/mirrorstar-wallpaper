@@ -63,6 +63,7 @@ const sampleImageWp: WallpaperEntry = {
   thumbnail: "",
   file_size: 1024,
   metadata: null,
+  groups: [],
 };
 
 const sampleVideoWp: WallpaperEntry = {
@@ -74,6 +75,7 @@ const sampleVideoWp: WallpaperEntry = {
   thumbnail: "",
   file_size: 2048,
   metadata: null,
+  groups: [],
 };
 
 function setupModalDOM() {
@@ -270,6 +272,7 @@ describe("v41-F-003 openPreview iframe 安全属性加固", () => {
     thumbnail: "",
     file_size: 512,
     metadata: null,
+    groups: [],
   };
 
   beforeEach(() => {

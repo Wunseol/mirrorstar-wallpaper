@@ -458,10 +458,12 @@ mod tests {
             thumbnail: String::new(),
             file_size: 0,
             metadata: None,
+            groups: Vec::new(),
             normalized_path: String::new(),
         };
         let library = Arc::new(RwLock::new(WallpaperLibrary {
             wallpapers: vec![original_entry.clone()],
+            pools: Vec::new(),
         }));
         let on_config_changed: Arc<RwLock<Option<ConfigChangedCallback>>> =
             Arc::new(RwLock::new(None));

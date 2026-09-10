@@ -42,6 +42,8 @@ pub struct AppConfig {
     pub video: VideoConfig,
     #[serde(default)]
     pub gif: GifConfig,
+    #[serde(default)]
+    pub rotation: RotationConfig,
 }
 
 impl AppConfig {
@@ -59,6 +61,7 @@ impl AppConfig {
         self.audio.validate();
         self.video.validate();
         self.gif.validate();
+        self.rotation.validate();
     }
 }
 
@@ -166,16 +169,41 @@ impl Default for PauseConfig {
     }
 }
 
-/// 壁纸排列方式
+/// 壁纸排列方式（三值编排，DR-2 / 设计 §4.4）
+///
+/// - `PerMonitor`：每屏一个调度单元，1 屏 = 1 次 apply，N 渲染器。
+/// - `AllSame`：全体员工一个调度单元，1 张壁纸 → 每屏各 apply 一次（顺序执行），N 渲染器；
+///   换图窗口期各屏瞬时新/旧混杂为已知接受项（DR-39）。
+/// - `Span`：全体员工一个调度单元，1 个跨屏渲染器贯通虚拟桌面，1 次 apply。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub enum Arrangement {
     /// 每个显示器独立壁纸
     #[default]
     #[serde(rename = "per_monitor")]
     PerMonitor,
+    /// 全体员工同图（每个显示器各设一次）
+    #[serde(rename = "all_same")]
+    AllSame,
     /// 跨显示器单张壁纸
     #[serde(rename = "span")]
     Span,
+}
+
+/// 采样算法（DR-4，设计 §7）
+///
+/// - `Sequential`：顺序循环，游览标追随用户自定义池顺序，id 锚定（DR-5）。
+/// - `ShuffleBag`：洗牌袋，袋内不重复，袋空重洗，初始化剔除 Web（DR-18）。
+/// - `PseudoRandom`：纯随机，每次独立抽取，可能连续同张。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Order {
+    /// 顺序循环
+    Sequential,
+    /// 洗牌袋
+    #[default]
+    ShuffleBag,
+    /// 纯随机
+    PseudoRandom,
 }
 
 /// 显示配置
@@ -331,6 +359,66 @@ fn default_gif_max_memory_mb() -> usize {
     DEFAULT_GIF_MEMORY_MB
 }
 
+/// 轮换配置（设计 §4.1 / DR-37）
+///
+/// 配置壁纸轮换调度器的全局开关、定时、采样算法与编排。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RotationConfig {
+    /// 全局主开关；false 时仍执行"开机恢复当前壁纸"（见设计 §9）
+    #[serde(default)]
+    pub enabled: bool,
+    /// 开机/唤醒是否"推进下一张"（而非仅恢复当前）
+    #[serde(default)]
+    pub on_boot: bool,
+    /// 定时间隔（分钟）；下限 clamp 1 分钟（60s，防短间隔反复 spawn/kill 视频进程，DR-16）
+    #[serde(default = "default_interval_minutes")]
+    pub interval_minutes: u32,
+    /// 采样算法：sequential | shuffle_bag | pseudo_random（DR-4）
+    #[serde(default)]
+    pub order: Order,
+    /// 编排：per_monitor | all_same | span（DR-2）
+    #[serde(default)]
+    pub arrangement: Arrangement,
+}
+
+/// 定时间隔默认值（分钟）
+const DEFAULT_INTERVAL_MINUTES: u32 = 30;
+/// 定时间隔下限（分钟），DR-16：clamp 到 1 分钟，防短间隔反复 spawn/kill 视频进程
+const MIN_INTERVAL_MINUTES: u32 = 1;
+
+fn default_interval_minutes() -> u32 {
+    DEFAULT_INTERVAL_MINUTES
+}
+
+impl Default for RotationConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            on_boot: false,
+            interval_minutes: DEFAULT_INTERVAL_MINUTES,
+            order: Order::default(),
+            arrangement: Arrangement::default(),
+        }
+    }
+}
+
+impl RotationConfig {
+    /// DR-16：`interval_minutes` 范围校验，下限 clamp 到 1 分钟（60s）。
+    ///
+    /// 遵循现有 `validate()` 策略：就地修正 + `tracing::warn!`，调用方透明。
+    pub fn validate(&mut self) {
+        if self.interval_minutes < MIN_INTERVAL_MINUTES {
+            tracing::warn!(
+                value = self.interval_minutes,
+                min = MIN_INTERVAL_MINUTES,
+                default = DEFAULT_INTERVAL_MINUTES,
+                "RotationConfig.interval_minutes < 下限（1 分钟，DR-16），回退到默认值"
+            );
+            self.interval_minutes = MIN_INTERVAL_MINUTES;
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -416,6 +504,7 @@ mod tests {
             display: DisplayConfig {
                 arrangement: Arrangement::Span,
             },
+            rotation: RotationConfig::default(),
             video: VideoConfig {
                 hwdec: false,
                 speed: 1.5,
@@ -797,5 +886,87 @@ balanced_keep_frames = 0
             config.gif.max_memory_mb, 100,
             "合法 max_memory_mb 100 不应被修改"
         );
+    }
+
+    // ── RotationConfig 轮换配置（DR-37/DR-16）───────────────────────────────
+
+    #[test]
+    fn rotation_config_default_values() {
+        let config = RotationConfig::default();
+        assert!(!config.enabled, "enabled 默认 false（DR-37，避免开箱即动）");
+        assert!(!config.on_boot, "on_boot 默认 false");
+        assert_eq!(config.interval_minutes, 30, "interval 默认 30 分钟");
+        assert_eq!(config.order, Order::ShuffleBag, "order 默认 shuffle_bag");
+        assert_eq!(
+            config.arrangement,
+            Arrangement::PerMonitor,
+            "arrangement 默认 per_monitor"
+        );
+    }
+
+    #[test]
+    fn rotation_config_validate_clamps_zero_interval() {
+        // DR-16：interval_minutes = 0 应 clamp 到 1 分钟
+        let mut config = RotationConfig {
+            interval_minutes: 0,
+            ..RotationConfig::default()
+        };
+        config.validate();
+        assert_eq!(
+            config.interval_minutes, 1,
+            "interval_minutes 0 应 clamp 到 1 分钟"
+        );
+    }
+
+    #[test]
+    fn rotation_config_validate_keeps_normal_interval() {
+        let mut config = RotationConfig {
+            interval_minutes: 45,
+            ..RotationConfig::default()
+        };
+        config.validate();
+        assert_eq!(config.interval_minutes, 45, "合法 interval 45 不应被修改");
+    }
+
+    #[test]
+    fn app_config_toml_roundtrip_rotation() {
+        let config = AppConfig {
+            rotation: RotationConfig {
+                enabled: true,
+                on_boot: true,
+                interval_minutes: 60,
+                order: Order::Sequential,
+                arrangement: Arrangement::AllSame,
+            },
+            ..AppConfig::default()
+        };
+        let toml_str = toml::to_string_pretty(&config).expect("serialize config");
+        let deserialized: AppConfig = toml::from_str(&toml_str).expect("deserialize config");
+        assert_eq!(
+            deserialized.rotation.enabled, config.rotation.enabled,
+            "rotation.enabled round-trip"
+        );
+        assert_eq!(
+            deserialized.rotation.interval_minutes, config.rotation.interval_minutes,
+            "rotation.interval_minutes round-trip"
+        );
+        assert_eq!(
+            deserialized.rotation.order, config.rotation.order,
+            "rotation.order round-trip"
+        );
+        assert_eq!(
+            deserialized.rotation.arrangement, config.rotation.arrangement,
+            "rotation.arrangement round-trip"
+        );
+    }
+
+    #[test]
+    fn missing_rotation_table_uses_defaults() {
+        let config: AppConfig = toml::from_str("[display]\n[video]\n").expect("no rotation table");
+        let default = RotationConfig::default();
+        assert_eq!(config.rotation.enabled, default.enabled);
+        assert_eq!(config.rotation.interval_minutes, default.interval_minutes);
+        assert_eq!(config.rotation.order, default.order);
+        assert_eq!(config.rotation.arrangement, default.arrangement);
     }
 }

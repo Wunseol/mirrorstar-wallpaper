@@ -94,9 +94,11 @@
 //!   `resolve_display_id` 回退到首个活跃壁纸。
 
 pub mod config;
+pub mod rotation;
 pub mod system;
 pub mod wallpaper;
 
 pub use config::*;
+pub use rotation::*;
 pub use system::*;
 pub use wallpaper::*;

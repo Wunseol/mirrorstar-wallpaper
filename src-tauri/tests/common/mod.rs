@@ -217,6 +217,7 @@ pub fn make_test_entry(
         thumbnail: String::new(),
         file_size: 0,
         metadata: None,
+        groups: Vec::new(),
         normalized_path: String::new(),
     }
 }

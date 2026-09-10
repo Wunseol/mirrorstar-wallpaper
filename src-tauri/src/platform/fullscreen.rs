@@ -97,8 +97,22 @@ enum FullscreenLevel {
     TrueFullscreen,
 }
 
-/// 记录最近一个全屏窗口句柄，用于区分"临时覆盖层"与"真正退出全屏"
-static LAST_FULLSCREEN_HWND: std::sync::Mutex<Option<SendHwnd>> = std::sync::Mutex::new(None);
+/// 记录最近一个全屏窗口的句柄及其触发处置时的级别
+///
+/// 用于区分"临时覆盖层"与"真正退出全屏"。注意这里额外保存处置时的级别：
+/// 最大化（Maximized）级别的暂停在用户离开窗口后应允许恢复（IsZoomed 对仍在后台
+/// 保持最大化的窗口恒为 true，若不区分级别会误判"仍覆盖桌面"导致壁纸卡死暂停），
+/// 仅 TrueFullscreen 级别才保留"后台窗口仍覆盖/仍最大化即拦截恢复"的覆盖层语义。
+#[derive(Clone, Copy)]
+struct LastFullscreen {
+    hwnd: Option<SendHwnd>,
+    level: FullscreenLevel,
+}
+
+static LAST_FULLSCREEN: std::sync::Mutex<LastFullscreen> = std::sync::Mutex::new(LastFullscreen {
+    hwnd: None,
+    level: FullscreenLevel::None,
+});
 /// 当前检测到的全屏级别（分级状态机的状态，供事件回调/周期复查/后台恢复共享）
 static FULLSCREEN_LEVEL: std::sync::Mutex<FullscreenLevel> =
     std::sync::Mutex::new(FullscreenLevel::None);
@@ -162,7 +176,7 @@ unsafe extern "system" fn foreground_event_callback(
             Transition::NoOp => {
                 // 同级别或无可处置：仅更新 HWND 与级别
                 if level != FullscreenLevel::None {
-                    update_last_fullscreen_hwnd();
+                    update_last_fullscreen_hwnd(level);
                 }
                 *FULLSCREEN_LEVEL.lock().unwrap_or_else(|e| e.into_inner()) = level;
             }
@@ -173,7 +187,7 @@ unsafe extern "system" fn foreground_event_callback(
                         tracing::info!("检测到最大化/近全屏窗口，暂停壁纸（进程驻留）");
                         FULLSCREEN_WAS.store(true, Ordering::Release);
                         *FULLSCREEN_LEVEL.lock().unwrap_or_else(|e| e.into_inner()) = level;
-                        update_last_fullscreen_hwnd();
+                        update_last_fullscreen_hwnd(level);
                         hide_main_window_on_fullscreen();
                     } else {
                         tracing::warn!(
@@ -193,7 +207,7 @@ unsafe extern "system" fn foreground_event_callback(
                         tracing::info!("检测到真全屏应用，终止壁纸释放内存");
                         FULLSCREEN_WAS.store(true, Ordering::Release);
                         *FULLSCREEN_LEVEL.lock().unwrap_or_else(|e| e.into_inner()) = level;
-                        update_last_fullscreen_hwnd();
+                        update_last_fullscreen_hwnd(level);
                         hide_main_window_on_fullscreen();
                     } else {
                         tracing::warn!(
@@ -208,7 +222,7 @@ unsafe extern "system" fn foreground_event_callback(
             Transition::DowngradeToMaximized => {
                 tracing::info!("级别降级 TrueFullscreen→Maximized，壁纸保持终止不恢复");
                 *FULLSCREEN_LEVEL.lock().unwrap_or_else(|e| e.into_inner()) = FullscreenLevel::Maximized;
-                update_last_fullscreen_hwnd();
+                update_last_fullscreen_hwnd(FullscreenLevel::Maximized);
             }
             Transition::Exit => {
                 // 临时覆盖层校验：原全屏窗口仍覆盖显示器 → 跳过恢复
@@ -503,19 +517,35 @@ fn foreground_fullscreen_level() -> FullscreenLevel {
     }
 }
 
-/// 更新记录的全屏窗口句柄为当前前台窗口（处置/降级时记录，供退出分支区分临时覆盖层）
-fn update_last_fullscreen_hwnd() {
+/// 记录最近一个全屏窗口的句柄及其处置级别（处置/降级时调用，供退出分支区分临时覆盖层）
+fn update_last_fullscreen_hwnd(level: FullscreenLevel) {
     let fg = unsafe { windows::Win32::UI::WindowsAndMessaging::GetForegroundWindow() };
-    if let Ok(mut g) = LAST_FULLSCREEN_HWND.lock() {
-        *g = Some(SendHwnd(fg));
+    if let Ok(mut g) = LAST_FULLSCREEN.lock() {
+        *g = LastFullscreen {
+            hwnd: Some(SendHwnd(fg)),
+            level,
+        };
     }
 }
 
-/// 判断最近记录的全屏窗口是否仍覆盖其所在显示器（即游戏仍全屏、只是被临时覆盖）
+/// 级别感知的恢复拦截决策（纯函数，便于单元测试；Maximized/None→false，TrueFullscreen→true）
+///
+/// 最大化级别的暂停：`IsZoomed` 对仍在后台保持最大化的窗口恒为 true，若不区分级别，
+/// 会在用户 Alt-Tab/点桌面离开该窗口时仍判定"覆盖桌面"，导致壁纸卡死暂停无法恢复。
+/// 故 Maximized 级别不拦截恢复（前台级别转为 None 即恢复）；仅 TrueFullscreen 保留
+/// "后台窗口仍覆盖/仍最大化即拦截恢复"的临时覆盖层语义（区分任务管理器/Alt-Tab 覆盖层）。
+fn should_intercept_resume(recorded_level: FullscreenLevel) -> bool {
+    match recorded_level {
+        FullscreenLevel::Maximized | FullscreenLevel::None => false,
+        FullscreenLevel::TrueFullscreen => true,
+    }
+}
+
+/// 判断最近记录的全屏窗口是否仍覆盖其所在显示器（仅 TrueFullscreen 级别拦截）
 ///
 /// 用于区分"临时覆盖层"（任务管理器/Alt-Tab，原全屏窗口仍存在并覆盖显示器）与
 /// "真正退出全屏"（原全屏窗口已销毁/最小化/不再覆盖显示器）。
-/// 事件回调与周期复查线程都会调用，只读取 `LAST_FULLSCREEN_HWND` 的值，不 take 消费。
+/// 事件回调与周期复查线程都会调用，只读取 `LAST_FULLSCREEN` 的值，不 take 消费。
 fn is_previous_fullscreen_window_still_active() -> bool {
     use windows::Win32::Graphics::Gdi::{
         GetMonitorInfoW, MonitorFromWindow, MONITORINFO, MONITOR_DEFAULTTONEAREST,
@@ -524,10 +554,19 @@ fn is_previous_fullscreen_window_still_active() -> bool {
         GetWindowRect, IsWindow, IsWindowVisible, IsZoomed,
     };
 
-    let hwnd = match LAST_FULLSCREEN_HWND.lock().ok().and_then(|g| *g) {
+    let last = match LAST_FULLSCREEN.lock().ok() {
+        Some(g) => *g,
+        None => return false,
+    };
+    let hwnd = match last.hwnd {
         Some(SendHwnd(h)) => h,
         None => return false,
     };
+
+    // 级别感知：仅当处置级别为 TrueFullscreen 时才做覆盖层拦截（见 should_intercept_resume）
+    if !should_intercept_resume(last.level) {
+        return false;
+    }
 
     unsafe {
         // 原全屏窗口已销毁 → 真正退出全屏
@@ -579,17 +618,18 @@ fn should_trigger_resume(
     was_fullscreen && !is_fullscreen && !previous_fullscreen_still_active
 }
 
-/// 清除记录的全屏窗口句柄（真正退出全屏时调用，避免句柄悬空）
+/// 清除记录的全屏窗口句柄与级别（真正退出全屏时调用，避免句柄悬空）
 fn clear_last_fullscreen_hwnd() {
-    if let Ok(mut g) = LAST_FULLSCREEN_HWND.lock() {
-        *g = None;
+    if let Ok(mut g) = LAST_FULLSCREEN.lock() {
+        g.hwnd = None;
+        g.level = FullscreenLevel::None;
     }
 }
 
 /// 退出全屏后的壁纸恢复统一入口（Task 7.2：异步后台执行）
 ///
 /// C-008：仅当 resume_all_fast 全部成功时才更新 FULLSCREEN_WAS，并清理
-/// LAST_FULLSCREEN_HWND、重建主窗口（若此前销毁过）。
+/// LAST_FULLSCREEN、重建主窗口（若此前销毁过）。
 /// 供前台事件回调退出分支与周期复查线程共用，保证两处逻辑一致。
 ///
 /// # 异步化设计（Task 7.2，修复"退出游戏后壁纸黑屏不恢复"根因）
@@ -601,7 +641,7 @@ fn clear_last_fullscreen_hwnd() {
 ///
 /// 现改为 spawn 专用后台线程 `mirrorstar-fullscreen-resume` 执行
 /// `resume_all_fast_blocking`（阻塞式获取 engine 锁，不因锁忙偶发跳过）：
-/// - 成功 → 清 `FULLSCREEN_WAS` / `LAST_FULLSCREEN_HWND` / 重建主窗口
+/// - 成功 → 清 `FULLSCREEN_WAS` / `LAST_FULLSCREEN` / 重建主窗口
 /// - 失败 → 保留 `FULLSCREEN_WAS=true`，由周期复查线程（2s 间隔）自动重试
 /// - 通过 `RESUME_IN_PROGRESS` 标志去重，防止事件回调与复查线程并发重复恢复
 fn resume_from_fullscreen_exit() {
@@ -952,6 +992,65 @@ mod tests {
         // 前台仍全屏 → 不恢复（无论原全屏窗口是否仍覆盖显示器）
         assert!(!should_trigger_resume(true, true, false));
         assert!(!should_trigger_resume(true, true, true));
+    }
+
+    // ── should_intercept_resume: 级别感知的恢复拦截决策 ──────────────────────
+
+    #[test]
+    fn should_intercept_resume_true_fullscreen_intercepts() {
+        // TrueFullscreen：保留"后台窗口仍覆盖/仍最大化即拦截恢复"的临时覆盖层语义
+        assert!(should_intercept_resume(FullscreenLevel::TrueFullscreen));
+    }
+
+    #[test]
+    fn should_intercept_resume_maximized_does_not_intercept() {
+        // 修复"壁纸莫名卡在暂停"：Maximized 级别不拦截恢复（前台级别转 None 即恢复），
+        // 避免 IsZoomed 对后台保持最大化的窗口恒为 true 导致恢复被永久跳过
+        assert!(!should_intercept_resume(FullscreenLevel::Maximized));
+    }
+
+    #[test]
+    fn should_intercept_resume_none_does_not_intercept() {
+        // None / 无记录：不拦截恢复
+        assert!(!should_intercept_resume(FullscreenLevel::None));
+    }
+
+    // ── LAST_FULLSCREEN: 记录句柄 + 级别的存储与读取一致性 ────────────────────
+
+    #[test]
+    fn test_last_fullscreen_records_hwnd_and_level() {
+        // 验证 update_last_fullscreen_hwnd 同时保存句柄与级别，读取一致
+        let fg = unsafe { windows::Win32::UI::WindowsAndMessaging::GetForegroundWindow() };
+        update_last_fullscreen_hwnd(FullscreenLevel::Maximized);
+        {
+            let g = LAST_FULLSCREEN.lock().unwrap();
+            match g.hwnd {
+                Some(SendHwnd(h)) => assert_eq!(h, fg),
+                None => panic!("应记录全屏窗口句柄"),
+            }
+            assert_eq!(g.level, FullscreenLevel::Maximized);
+        }
+    }
+
+    #[test]
+    fn test_last_fullscreen_overwrites_level_on_reupdate() {
+        // 再次记录（如降级 Maximized）会覆盖之前的级别，不残留旧值
+        update_last_fullscreen_hwnd(FullscreenLevel::TrueFullscreen);
+        update_last_fullscreen_hwnd(FullscreenLevel::Maximized);
+        {
+            let g = LAST_FULLSCREEN.lock().unwrap();
+            assert_eq!(g.level, FullscreenLevel::Maximized);
+        }
+    }
+
+    #[test]
+    fn test_last_fullscreen_clear_resets_hwnd_and_level() {
+        // clear_last_fullscreen_hwnd 同时清理句柄与级别
+        update_last_fullscreen_hwnd(FullscreenLevel::TrueFullscreen);
+        clear_last_fullscreen_hwnd();
+        let g = LAST_FULLSCREEN.lock().unwrap();
+        assert!(g.hwnd.is_none());
+        assert_eq!(g.level, FullscreenLevel::None);
     }
 
     // ── is_rect_covering_95_percent: 近全屏（≥95%）矩形判断 ─────────────────────

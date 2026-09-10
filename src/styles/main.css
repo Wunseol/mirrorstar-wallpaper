@@ -697,3 +697,261 @@ body {
 :focus:not(:focus-visible) {
   outline: none;
 }
+
+/* ── 壁纸轮换调度器前端样式（Task 10）──────────────────────────────────────── */
+
+/* 壁纸库头部动作行（"下一张" + "添加壁纸"） */
+.wallpaper-list-actions {
+  display: flex;
+  gap: 8px;
+}
+
+/* 壁纸卡片池名 / 轮换标注标签 */
+.wallpaper-card-tags {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+  margin-top: 4px;
+  min-height: 0;
+}
+
+.wallpaper-card-tag {
+  display: inline-block;
+  font-size: 10px;
+  padding: 1px 6px;
+  border-radius: 4px;
+  background: rgba(79, 195, 247, 0.15);
+  color: #81d4fa;
+  max-width: 100%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.wallpaper-card-tag.web-excluded {
+  background: rgba(158, 158, 158, 0.18);
+  color: var(--text-secondary);
+}
+
+/* 轮换设置分组 */
+.rotation-section-title {
+  font-size: 13px;
+  color: var(--text-primary);
+  font-weight: 600;
+  margin-bottom: 8px;
+  display: block;
+}
+
+.rotation-row {
+  margin-top: 8px;
+}
+
+.rotation-row label {
+  display: block;
+  font-size: 12px;
+  color: var(--text-primary);
+  margin-bottom: 4px;
+}
+
+.rotation-row input[type="number"] {
+  width: 100%;
+  padding: 6px 8px;
+  font-size: 12px;
+  background: var(--bg-primary);
+  color: var(--text-primary);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  outline: none;
+  box-sizing: border-box;
+}
+
+.rotation-row input[type="number"]:focus {
+  border-color: var(--accent);
+}
+
+.rotation-row input[type="checkbox"] {
+  accent-color: var(--accent);
+  margin-right: 6px;
+}
+
+/* 池编辑器：创建行 */
+.rotation-pool-create {
+  display: flex;
+  gap: 6px;
+  margin-bottom: 8px;
+}
+
+.rotation-pool-create input[type="text"] {
+  flex: 1;
+  min-width: 0;
+  padding: 6px 8px;
+  font-size: 12px;
+  background: var(--bg-primary);
+  color: var(--text-primary);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  outline: none;
+}
+
+.rotation-pool-create input[type="text"]:focus {
+  border-color: var(--accent);
+}
+
+.rotation-pool-list {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.rotation-pool {
+  background: var(--bg-card);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 8px;
+}
+
+.rotation-pool-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: 6px;
+}
+
+.rotation-pool-name {
+  font-size: 12px;
+  color: var(--text-primary);
+  font-weight: 600;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.rotation-pool-actions {
+  display: flex;
+  gap: 4px;
+}
+
+.rotation-pool-actions button,
+.rotation-member-remove {
+  background: none;
+  border: none;
+  color: var(--text-secondary);
+  font-size: 13px;
+  line-height: 1;
+  padding: 2px 5px;
+  border-radius: 4px;
+  cursor: pointer;
+}
+
+.rotation-pool-actions button:hover,
+.rotation-member-remove:hover {
+  color: #ef5350;
+  background: rgba(239, 83, 80, 0.1);
+}
+
+.rotation-pool-add {
+  margin-bottom: 6px;
+}
+
+.rotation-pool-member-add {
+  width: 100%;
+  padding: 4px 6px;
+  font-size: 12px;
+  background: var(--bg-primary);
+  color: var(--text-primary);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  outline: none;
+}
+
+.rotation-pool-members {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.rotation-member {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 6px;
+  padding: 4px 6px;
+  font-size: 12px;
+  color: var(--text-primary);
+  border-radius: 4px;
+  cursor: grab;
+  background: var(--bg-secondary);
+}
+
+.rotation-member:hover {
+  background: rgba(79, 195, 247, 0.08);
+}
+
+.rotation-member.dragging {
+  opacity: 0.5;
+  cursor: grabbing;
+}
+
+.rotation-member-name {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.rotation-pool-empty {
+  font-size: 12px;
+  color: var(--text-secondary);
+  padding: 8px 4px;
+  text-align: center;
+}
+
+/* 单元配置：激活池 / 单元开关 */
+.rotation-unit-config {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.unit-config-item {
+  background: var(--bg-card);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 8px;
+}
+
+.unit-config-title {
+  font-size: 12px;
+  color: var(--text-primary);
+  font-weight: 600;
+  margin-bottom: 6px;
+}
+
+.unit-config-row {
+  margin-top: 6px;
+}
+
+.unit-config-row label {
+  display: block;
+  font-size: 12px;
+  color: var(--text-primary);
+  margin-bottom: 2px;
+}
+
+.unit-config-row input[type="checkbox"] {
+  accent-color: var(--accent);
+  margin-right: 6px;
+}
+
+.unit-active-pool {
+  width: 100%;
+  padding: 4px 6px;
+  font-size: 12px;
+  background: var(--bg-primary);
+  color: var(--text-primary);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  outline: none;
+}

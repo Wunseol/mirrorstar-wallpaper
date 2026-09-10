@@ -19,13 +19,19 @@ vi.mock("./ui/mod", () => ({
   updateWallpaperCard: vi.fn(),
   debounce: vi.fn((fn: (...args: unknown[]) => void) => fn),
   extractFileName: vi.fn(),
+  isOrder: vi.fn(),
   loadConfig: vi.fn(),
+  loadPools: vi.fn(),
   patchConfig: vi.fn(),
+  patchRotation: vi.fn(),
   populateDisplaySelect: vi.fn(),
   refreshWallpaperList: vi.fn(),
+  renderUnitConfig: vi.fn(),
   renderWallpaperList: vi.fn(),
   setupAddButton: vi.fn(),
   setupDragAndDrop: vi.fn(),
+  setupNextWallpaperButton: vi.fn(),
+  setupPoolCreate: vi.fn(),
   setupPreviewModal: vi.fn(),
   showStatus: vi.fn(),
 }));
@@ -50,6 +56,7 @@ import { getVersion } from "@tauri-apps/api/app";
 import { log } from "./utils/logger";
 import { showStatus, loadConfig, patchConfig } from "./ui/mod";
 import { updatePlaybackButtons, init } from "./main";
+import { listenWithCleanup } from "./utils/listeners";
 
 describe("updatePlaybackButtons", () => {
   let pauseBtn: HTMLButtonElement;
@@ -678,5 +685,44 @@ describe("v41-F-002 speed slider IPC 失败 UI 回滚", () => {
     });
     expect(showStatus).toHaveBeenCalledWith("设置速度失败，请重试", "error");
     expect(log.error).toHaveBeenCalledWith("设置速度失败", expect.any(Error));
+  });
+});
+
+// ── wallpaper-rotated 成功 toast（DR-30 / P2-2）────────────────────────────────
+
+describe("wallpaper-rotated 成功 toast（DR-30 / P2-2）", () => {
+  type RotatedPayload = { key: string; wallpaper_id: string };
+  let onRotated: ((payload: RotatedPayload) => void) | undefined;
+
+  beforeEach(() => {
+    document.body.innerHTML = "";
+    vi.clearAllMocks();
+    vi.mocked(invoke).mockResolvedValue(undefined);
+    vi.mocked(getVersion).mockResolvedValue("1.0.0");
+    vi.mocked(loadConfig).mockResolvedValue(undefined);
+    onRotated = undefined;
+    // 捕获 wallpaper-rotated 监听回调（debounce mock 透传函数，回调可同步触发）
+    vi.mocked(listenWithCleanup).mockImplementation(
+      (event: string, cb: (payload: RotatedPayload) => void) => {
+        if (event === "wallpaper-rotated") {
+          onRotated = cb;
+        }
+        return Promise.resolve(vi.fn());
+      }
+    );
+  });
+
+  afterEach(() => {
+    document.body.innerHTML = "";
+    onRotated = undefined;
+  });
+
+  it("PerMonitor（非 all 的 key）轮换也应触发成功 toast", async () => {
+    await init();
+
+    expect(onRotated).toBeDefined();
+    onRotated!({ key: "display-1", wallpaper_id: "w-1" });
+
+    expect(showStatus).toHaveBeenCalledWith("已切换到下一张壁纸", "success");
   });
 });

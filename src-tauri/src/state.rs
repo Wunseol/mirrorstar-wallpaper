@@ -1,3 +1,4 @@
+use crate::scheduler::SchedulerHandle;
 use mirrorstar_core::{ConfigManager, DesktopIntegrator, PauseReason, WallpaperEngine};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
@@ -117,6 +118,8 @@ pub struct AppState {
     pub(crate) config_manager: Arc<ConfigManager>,
     pub(crate) wallpaper_engine: Arc<tokio::sync::Mutex<WallpaperEngine>>,
     pub(crate) desktop: Arc<Mutex<DesktopIntegrator>>,
+    /// 壁纸轮换调度器句柄（命令层 / 托盘 / setup 与调度器任务通信的唯一入口）
+    pub(crate) scheduler: Arc<SchedulerHandle>,
     /// 托盘"暂停/恢复壁纸"菜单项的当前暂停状态
     pub tray_paused: AtomicBool,
     /// 托盘"暂停/恢复壁纸"菜单项引用，用于在切换状态后更新菜单文本
@@ -191,6 +194,16 @@ pub(crate) static SHARED_ENGINE: OnceLock<Arc<tokio::sync::Mutex<WallpaperEngine
 /// 全局状态用于 Win32 回调（回调需要函数指针，无法使用闭包）
 /// 全屏检测和电源监控共享同一个 config_manager Arc
 pub(crate) static SHARED_CONFIG: OnceLock<Arc<ConfigManager>> = OnceLock::new();
+/// B3：调度器句柄全局引用，供 Win32 回调路径（全屏 / 电源 resume）唤醒调度器
+/// 重算 deadline（DR-38）。Setup 中 `set` 一次；回调上下文无法访问 AppState。
+pub(crate) static SHARED_SCHEDULER: OnceLock<Arc<SchedulerHandle>> = OnceLock::new();
+/// 唤醒调度器（若存在）。恢复路径在成功清除暂停位图后调用，通知主循环重算 deadline。
+/// `Notify::notify_waiters` 非阻塞、极廉价，可安全在 Win32 回调上下文调用。
+fn notify_scheduler_wake() {
+    if let Some(scheduler) = SHARED_SCHEDULER.get() {
+        scheduler.wake.notify_waiters();
+    }
+}
 pub(crate) static FULLSCREEN_WAS: AtomicBool = AtomicBool::new(false);
 
 /// 全局状态用于 Explorer 重启监控窗口过程（窗口过程是函数指针，无法使用闭包）
@@ -420,7 +433,11 @@ pub(crate) fn try_resume_all_fast(reason: PauseReason) -> Option<Vec<String>> {
             return None;
         }
     };
-    Some(engine.resume_all_fast(reason).unwrap_or_default())
+    let failed = engine.resume_all_fast(reason).unwrap_or_default();
+    // B3 / DR-38：恢复成功后唤醒调度器重算 deadline（不补时）。即使部分失败，
+    // 提示成本极低；调度器会重读暂停位图自行判断，无需精确判定位图已空。
+    notify_scheduler_wake();
+    Some(failed)
 }
 
 /// 阻塞式恢复所有壁纸（供后台恢复线程使用，Task 7.1/7.2）
@@ -443,7 +460,10 @@ pub(crate) fn resume_all_fast_blocking(reason: PauseReason) -> Option<Vec<String
     // 与 Win32 回调路径的 try_lock 不同，此处允许等待 engine 锁释放
     // （如 set_wallpaper 短暂持锁），保证恢复不因锁忙被偶发跳过。
     let mut engine = engine.blocking_lock();
-    Some(engine.resume_all_fast(reason).unwrap_or_default())
+    let failed = engine.resume_all_fast(reason).unwrap_or_default();
+    // B3 / DR-38：恢复成功后唤醒调度器重算 deadline（不补时）。
+    notify_scheduler_wake();
+    Some(failed)
 }
 
 /// 尝试终止所有壁纸子进程的快速路径（全屏终止释放内存）

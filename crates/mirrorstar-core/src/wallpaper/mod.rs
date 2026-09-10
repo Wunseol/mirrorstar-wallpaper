@@ -698,6 +698,22 @@ pub trait WallpaperRenderer: Send {
     fn after_embed(&mut self) -> Result<(), crate::MirrorStarError> {
         Ok(())
     }
+
+    /// 查询待换槽的新渲染器是否已就绪首帧（默认实现 = 立即就绪）。
+    ///
+    /// 由"原子交换"（DR-33，`crates/mirrorstar-core/src/wallpaper/manager.rs`
+    /// 的 `commit_atomic_swap`）在锁外调用，用于决定何时才能 `terminate` 旧壁纸。
+    ///
+    /// - **图片 / GIF / 网页**：无"嵌入后首帧延迟"，默认实现直接返回 `true`。
+    /// - **视频（mpv）**：`after_embed` 通过 IPC `loadfile` 加载文件（fire-and-forget，
+    ///   不保证首帧已渲染），须覆写本方法轮询 mpv 至 `width>0 且 idle-active=no`
+    ///   才返回 `true`，确保 terminate 旧时新窗已显示首帧、瞬时无黑屏。
+    ///
+    /// 返回 `Err` 表示无法确认就绪状态（如 mpv IPC 中断），调用方应超时/失败终止
+    /// 新渲染器；旧壁纸原地保持，零回滚。
+    fn poll_first_frame_ready(&mut self) -> Result<bool, crate::MirrorStarError> {
+        Ok(true)
+    }
 }
 
 /// 壁纸类型

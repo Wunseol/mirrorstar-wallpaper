@@ -4,6 +4,7 @@ pub mod desktop;
 pub mod ipc;
 pub mod perf;
 pub mod process;
+pub mod scheduler;
 pub mod wallpaper;
 
 pub use audio::volume::VolumeControl;
@@ -14,8 +15,10 @@ pub use config::ConfigKind;
 pub use config::ConfigLoadError;
 pub use config::ConfigManager;
 pub use desktop::DesktopIntegrator;
-pub use wallpaper::manager::WallpaperEngine;
-pub use wallpaper::manager::WallpaperMode;
+pub use wallpaper::manager::{
+    build_new_renderer, renderer_id, wait_new_ready, AtomicSwapPending, AtomicSwapPrepare,
+    BuildOutcome, SwapOutcome, WallpaperEngine, WallpaperMode, ATOMIC_SWAP_READY_TIMEOUT,
+};
 pub use wallpaper::{
     GifMemoryStrategy, PauseCommand, PauseReason, PauseSender, ScalingMode, WallpaperRenderer,
     WallpaperSource, WallpaperState, WallpaperType,

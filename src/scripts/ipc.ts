@@ -1,5 +1,14 @@
 import { invoke } from "@tauri-apps/api/core";
-import type { AppConfig, DisplayInfo, ScalingMode, WallpaperEntry, WallpaperState } from "./types";
+import type {
+  AppConfig,
+  DisplayInfo,
+  Pool,
+  RotationConfig,
+  ScalingMode,
+  UnitState,
+  WallpaperEntry,
+  WallpaperState,
+} from "./types";
 
 /**
  * FE-001: 统一将 displayId 空串/undefined 转为 null，与后端 Option<String> 对齐。
@@ -338,4 +347,68 @@ export function getErrorMessage(e: unknown): string {
     raw = String(e);
   }
   return sanitizeErrorMessage(raw);
+}
+
+// ── 壁纸轮换调度器命令封装（Task 8 / DR-3、DR-30、DR-36）───────────────────────
+// 纯内存操作命令（get_rotation_config / list_pools）无需超时包装；写命令走
+// invokeWithTimeout 短超时（如 set_wallpaper 般的进程级操作不涉及，用默认 10s）。
+
+/** 读取轮换配置（enabled / on_boot / interval / order / arrangement） */
+export async function getRotationConfig(): Promise<RotationConfig> {
+  return invoke<RotationConfig>("get_rotation_config");
+}
+
+/** 整体更新轮换配置（后端合并进完整 AppConfig 后落盘 + 唤醒调度器） */
+export async function updateRotationConfig(config: RotationConfig): Promise<void> {
+  await invokeWithTimeout<void>("update_rotation_config", { config });
+}
+
+/** 列出全部轮换池 */
+export async function listPools(): Promise<Pool[]> {
+  return invoke<Pool[]>("list_pools");
+}
+
+/** 创建轮换池；返回新建的池（后端生成 UUID id，空名默认"池 N"） */
+export async function createPool(name: string | null, memberIds: string[]): Promise<Pool> {
+  return invokeWithTimeout<Pool>("create_pool", { name, memberIds });
+}
+
+/** 更新轮换池（name / memberIds 仅更新传入的非空字段；memberIds 顺序即播放顺序） */
+export async function updatePool(
+  id: string,
+  name: string | null,
+  memberIds: string[] | null,
+): Promise<void> {
+  await invokeWithTimeout<void>("update_pool", { id, name, memberIds });
+}
+
+/** 删除轮换池 */
+export async function deletePool(id: string): Promise<void> {
+  await invokeWithTimeout<void>("delete_pool", { id });
+}
+
+/**
+ * 回读全部调度单元的状态（激活池 / 轮换开关），供渲染单元面板时回填初始值。
+ * 纯内存读，无需超时包装。
+ */
+export async function getUnitStates(): Promise<UnitState[]> {
+  return invoke<UnitState[]>("get_unit_states");
+}
+
+/**
+ * 绑定某调度单元 key（PerMonitor 下为显示器 id，AllSame/Span 下为 "all"）的激活池。
+ * pool_id 为 null 或空串 → 全部壁纸池（DR-35）。
+ */
+export async function setActivePool(key: string, poolId: string | null): Promise<void> {
+  await invokeWithTimeout<void>("set_active_pool", { key, poolId });
+}
+
+/** 开启/关闭某调度单元的轮换开关 */
+export async function setRotationEnabled(key: string, enabled: boolean): Promise<void> {
+  await invokeWithTimeout<void>("set_rotation_enabled", { key, enabled });
+}
+
+/** 手动触发下一张（缺省主屏单元，DR-36；不受暂停限制） */
+export async function nextWallpaper(key?: string): Promise<void> {
+  await invokeWithTimeout<void>("next_wallpaper", { key });
 }

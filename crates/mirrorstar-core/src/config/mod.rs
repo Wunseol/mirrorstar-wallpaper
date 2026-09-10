@@ -32,6 +32,7 @@
 pub mod detect;
 pub mod hot_reload;
 pub mod manager;
+pub mod playback;
 pub mod settings;
 pub mod thumbnail;
 pub mod validation;
@@ -42,7 +43,9 @@ pub use crate::wallpaper::WallpaperType;
 // Re-export public API to preserve backward compatibility
 pub use detect::detect_wallpaper_type;
 pub use manager::{
-    ConfigKind, ConfigLoadError, ConfigManager, DisplayInfo, WallpaperEntry, WallpaperLibrary,
-    WallpaperMetadata, data_root, init_data_root, resolve_data_root,
+    ConfigKind, ConfigLoadError, ConfigManager, DisplayInfo, Pool, WallpaperEntry,
+    WallpaperLibrary, WallpaperMetadata, data_root, init_data_root, resolve_data_root,
+    resolve_pool,
 };
+pub use playback::{PlaybackState, PlaybackStore, Unit, PLAYBACK_SCHEMA_VERSION};
 pub use thumbnail::{generate_thumbnail, generate_video_thumbnail, is_ffmpeg_available};

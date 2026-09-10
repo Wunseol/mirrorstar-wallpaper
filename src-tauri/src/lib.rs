@@ -1,5 +1,6 @@
 mod commands;
 mod platform;
+mod scheduler;
 mod state;
 
 use mirrorstar_core::{
@@ -647,10 +648,22 @@ pub fn run() {
     // 当前进程刚启动尚未 spawn 任何子进程，任何同名存活进程均为崩溃残留。
     cleanup_stale_child_processes();
 
+    // 壁纸轮换调度器：构造共享句柄（playback / 池 / 编排状态），后台主循环在
+    // setup 闭包中 `start()`（需 AppHandle）。§16 启动时序见 scheduler.rs。
+    let scheduler = scheduler::SchedulerHandle::new(
+        config_manager.clone(),
+        wallpaper_engine.clone(),
+        desktop.clone(),
+    );
+
+    // B3：暴露调度器全局引用，供全屏 / 电源 Win32 回调路径在恢复后唤醒它重算 deadline。
+    let _ = state::SHARED_SCHEDULER.set(scheduler.clone());
+
     let app_state = AppState {
         config_manager,
         wallpaper_engine,
         desktop,
+        scheduler,
         tray_paused: AtomicBool::new(false),
         tray_pause_resume_item: OnceLock::new(),
     };
@@ -905,14 +918,17 @@ pub fn run() {
                 });
             }
 
-            // 设置配置变更回调：热重载成功后通知前端刷新 UI
+            // 设置配置变更回调：热重载成功后通知前端刷新 UI，并唤醒调度器重算 deadline。
             {
                 let state = app.state::<AppState>();
                 let app_handle = app.handle().clone();
+                // B3 / DR-38：捕获调度器 wake，配置热重载后同步唤醒调度器（与 §13 统一通道）。
+                let scheduler_wake = state.scheduler.wake.clone();
                 state.config_manager.set_on_config_changed(Arc::new(move || {
                     if let Err(e) = app_handle.emit("config-changed", ()) {
                         tracing::warn!(error = %e, "emit config-changed 失败：前端 UI 可能不刷新");
                     }
+                    scheduler_wake.notify_waiters();
                 }));
             }
 
@@ -967,13 +983,18 @@ pub fn run() {
             let open_item = tauri::menu::MenuItem::with_id(app, "open", "打开主窗口", true, None::<&str>)?;
             let pause_resume_item = tauri::menu::MenuItem::with_id(app, "pause_resume", "暂停壁纸", true, None::<&str>)?;
             let quit_item = tauri::menu::MenuItem::with_id(app, "quit", "退出", true, None::<&str>)?;
+            // DR-28：托盘"下一张壁纸"项，点击触发手动换图（不受暂停限制）。
+            let next_item = tauri::menu::MenuItem::with_id(app, "next_wallpaper", "下一张壁纸", true, None::<&str>)?;
             // 存储菜单项引用以便后续更新文本
             {
                 let state = app.state::<AppState>();
                 // OnceLock 首次 set 必成功；setup 仅执行一次，无需处理 Err
                 let _ = state.tray_pause_resume_item.set(pause_resume_item.clone());
             }
-            let menu = tauri::menu::Menu::with_items(app, &[&open_item, &pause_resume_item, &quit_item])?;
+            let menu = tauri::menu::Menu::with_items(
+                app,
+                &[&open_item, &next_item, &pause_resume_item, &quit_item],
+            )?;
 
             // Create tray icon
             let mut tray_builder = tauri::tray::TrayIconBuilder::new()
@@ -994,6 +1015,8 @@ pub fn run() {
                                 state.tray_paused.store(now_paused, Ordering::SeqCst);
                                 // 通过异步任务获取 engine 锁后调用快速路径方法
                                 let engine = state.wallpaper_engine.clone();
+                                // B3 / DR-38：恢复成功后唤醒调度器重算 deadline。
+                                let scheduler_wake = state.scheduler.wake.clone();
                                 // 菜单事件闭包参数 app 即 &AppHandle，直接 clone 得到 owned 句柄供 spawn 使用
                                 let app_handle = app.clone();
                                 tauri::async_runtime::spawn(async move {
@@ -1004,6 +1027,10 @@ pub fn run() {
                                     } else {
                                         engine.resume_all_fast(PauseReason::TRAY).unwrap_or_default()
                                     };
+                                    // B3 / DR-38：托盘恢复成功后唤醒调度器重算 deadline（不补时）。
+                                    if !now_paused {
+                                        scheduler_wake.notify_waiters();
+                                    }
                                     if !failed.is_empty() {
                                         tracing::warn!(
                                             failed_count = failed.len(),
@@ -1054,6 +1081,13 @@ pub fn run() {
                             // （perform_shutdown_blocking），确保 mpv 子进程终止与资源释放。
                             app.exit(0);
                         }
+                        "next_wallpaper" => {
+                            // DR-28：手动"下一张壁纸"；None = 主/唯一单元（DR-36）。
+                            // 经 manual_tx 由调度器主循环消费，不受暂停抑制（DR-9/DR-20）。
+                            if let Some(state) = app.try_state::<AppState>() {
+                                let _ = state.scheduler.manual_tx.send(None);
+                            }
+                        }
                         _ => {}
                     }
                 })
@@ -1085,6 +1119,13 @@ pub fn run() {
             // 主要监控由 TaskbarCreated 事件驱动，此检查仅作为事件遗漏的最终兜底
             let desktop_clone = app.state::<AppState>().desktop.clone();
             start_workerw_check(desktop_clone);
+
+            // 启动壁纸轮换调度器主循环（§16 启动时序：读 playback/config → 对账 DR-34 →
+            // 对齐单元 → resolve_boot() 一次 apply → 进入主循环）。
+            {
+                let state = app.state::<AppState>();
+                state.scheduler.start(app.handle().clone());
+            }
 
             // v17 性能埋点：应用就绪（setup 闭包完成），输出总启动时间 + RSS
             tracing::info!(
@@ -1128,6 +1169,16 @@ pub fn run() {
             set_scaling_mode,
             set_speed,
             check_desktop_status,
+            get_rotation_config,
+            update_rotation_config,
+            list_pools,
+            create_pool,
+            update_pool,
+            delete_pool,
+            get_unit_states,
+            set_active_pool,
+            set_rotation_enabled,
+            next_wallpaper,
         ])
         .build(tauri::generate_context!())
         .expect("error while building tauri application")

@@ -107,6 +107,7 @@ fn test_add_wallpaper_persists_fields() {
         thumbnail: "thumb_1.jpg".to_string(),
         file_size: 4096,
         metadata: None,
+        groups: Vec::new(),
         normalized_path: String::new(),
     };
 

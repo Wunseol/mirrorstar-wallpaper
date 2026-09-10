@@ -22,7 +22,19 @@ import {
   openFileDialog,
   getAutoStartStatus,
   invokeWithTimeout,
+  checkDesktopStatus,
+  regenerateThumbnails,
+  getRotationConfig,
+  updateRotationConfig,
+  listPools,
+  createPool,
+  updatePool,
+  deletePool,
+  setActivePool,
+  setRotationEnabled,
+  nextWallpaper,
 } from "./ipc";
+import type { RotationConfig } from "./types";
 
 // mock @tauri-apps/api/core 的 invoke，避免真实 IPC 调用
 vi.mock("@tauri-apps/api/core", () => ({
@@ -335,6 +347,13 @@ describe("IPC wrappers", () => {
       display: { arrangement: "span" as const },
       video: { hwdec: false, speed: 2 },
       gif: { memory_strategy: "Performance" as const, balanced_keep_frames: 10, max_memory_mb: 40 },
+      rotation: {
+        enabled: true,
+        on_boot: false,
+        interval_minutes: 30,
+        order: "sequential" as const,
+        arrangement: "span" as const,
+      },
     };
     vi.mocked(invoke).mockResolvedValue(undefined);
     await updateConfig(config);
@@ -703,5 +722,136 @@ describe("v41-F-017: invokeWithTimeout boundary scenarios", () => {
     expect(clearTimeoutSpy).toHaveBeenCalledTimes(1);
 
     clearTimeoutSpy.mockRestore();
+  });
+});
+
+// ── v16-C-007: checkDesktopStatus ─────────────────────────────────────────────
+
+describe("checkDesktopStatus", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+  });
+
+  it("调用 check_desktop_status 并透传布尔返回值", async () => {
+    vi.mocked(invoke).mockResolvedValue(true);
+    expect(await checkDesktopStatus()).toBe(true);
+    expect(invoke).toHaveBeenCalledWith("check_desktop_status");
+  });
+
+  it("返回 false（WorkerW 有效，无需重初始化）", async () => {
+    vi.mocked(invoke).mockResolvedValue(false);
+    expect(await checkDesktopStatus()).toBe(false);
+  });
+});
+
+// ── F09: regenerateThumbnails ─────────────────────────────────────────────────
+
+describe("regenerateThumbnails", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+  });
+
+  it("调用 regenerate_thumbnails 并透传结果对象", async () => {
+    const result = { total: 10, success: 8, failed: 2 };
+    vi.mocked(invoke).mockResolvedValue(result);
+    expect(await regenerateThumbnails()).toBe(result);
+    expect(invoke).toHaveBeenCalledWith("regenerate_thumbnails", undefined);
+  });
+});
+
+// ── 壁纸轮换调度器命令封装（Task 8）───────────────────────────────────────────
+
+describe("轮换调度器 IPC 命令封装", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+  });
+
+  it("getRotationConfig 调用 get_rotation_config 并透传返回值", async () => {
+    const cfg = {
+      enabled: false,
+      on_boot: false,
+      interval_minutes: 30,
+      order: "sequential",
+      arrangement: "per_monitor",
+    };
+    vi.mocked(invoke).mockResolvedValue(cfg);
+    expect(await getRotationConfig()).toBe(cfg);
+    expect(invoke).toHaveBeenCalledWith("get_rotation_config");
+  });
+
+  it("updateRotationConfig 调用 update_rotation_config 并透传 config", async () => {
+    const cfg: RotationConfig = {
+      enabled: true,
+      on_boot: false,
+      interval_minutes: 30,
+      order: "sequential",
+      arrangement: "per_monitor",
+    };
+    vi.mocked(invoke).mockResolvedValue(undefined);
+    await updateRotationConfig(cfg);
+    expect(invoke).toHaveBeenCalledWith("update_rotation_config", { config: cfg });
+  });
+
+  it("listPools 调用 list_pools 并透传返回值", async () => {
+    const pools = [{ id: "p1", name: "风景", member_ids: [] }];
+    vi.mocked(invoke).mockResolvedValue(pools);
+    expect(await listPools()).toBe(pools);
+    expect(invoke).toHaveBeenCalledWith("list_pools");
+  });
+
+  it("createPool 调用 create_pool 并透传返回值", async () => {
+    const pool = { id: "p-9", name: "池 1", member_ids: [] };
+    vi.mocked(invoke).mockResolvedValue(pool);
+    expect(await createPool("池 1", [])).toBe(pool);
+    expect(invoke).toHaveBeenCalledWith("create_pool", { name: "池 1", memberIds: [] });
+  });
+
+  it("createPool 空名传 null", async () => {
+    const pool = { id: "p-1", name: "池 1", member_ids: [] };
+    vi.mocked(invoke).mockResolvedValue(pool);
+    await createPool(null, []);
+    expect(invoke).toHaveBeenCalledWith("create_pool", { name: null, memberIds: [] });
+  });
+
+  it("updatePool 调用 update_pool 并透传 id/name/memberIds", async () => {
+    vi.mocked(invoke).mockResolvedValue(undefined);
+    await updatePool("p1", "新名", ["w1", "w2"]);
+    expect(invoke).toHaveBeenCalledWith("update_pool", { id: "p1", name: "新名", memberIds: ["w1", "w2"] });
+  });
+
+  it("deletePool 调用 delete_pool 并透传 id", async () => {
+    vi.mocked(invoke).mockResolvedValue(undefined);
+    await deletePool("p1");
+    expect(invoke).toHaveBeenCalledWith("delete_pool", { id: "p1" });
+  });
+
+  it("setActivePool 调用 set_active_pool 并透传 key/poolId", async () => {
+    vi.mocked(invoke).mockResolvedValue(undefined);
+    await setActivePool("all", null);
+    expect(invoke).toHaveBeenCalledWith("set_active_pool", { key: "all", poolId: null });
+  });
+
+  it("setActivePool 非 null poolId 透传", async () => {
+    vi.mocked(invoke).mockResolvedValue(undefined);
+    await setActivePool("d1", "p1");
+    expect(invoke).toHaveBeenCalledWith("set_active_pool", { key: "d1", poolId: "p1" });
+  });
+
+  it("setRotationEnabled 调用 set_rotation_enabled 并透传 key/enabled", async () => {
+    vi.mocked(invoke).mockResolvedValue(undefined);
+    await setRotationEnabled("d1", true);
+    expect(invoke).toHaveBeenCalledWith("set_rotation_enabled", { key: "d1", enabled: true });
+  });
+
+  it("nextWallpaper 缺省 key 时透传 {}（缺省主屏单元）", async () => {
+    vi.mocked(invoke).mockResolvedValue(undefined);
+    await nextWallpaper();
+    expect(invoke).toHaveBeenCalledWith("next_wallpaper", { key: undefined });
+  });
+
+  it("nextWallpaper 带 key 时透传 key", async () => {
+    vi.mocked(invoke).mockResolvedValue(undefined);
+    await nextWallpaper("d1");
+    expect(invoke).toHaveBeenCalledWith("next_wallpaper", { key: "d1" });
   });
 });

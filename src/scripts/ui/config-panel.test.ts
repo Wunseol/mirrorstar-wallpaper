@@ -29,6 +29,13 @@ function baseConfig(): AppConfig {
     display: { arrangement: "per_monitor" },
     video: { hwdec: false, speed: 1.0 },
     gif: { memory_strategy: "Balanced", balanced_keep_frames: 20, max_memory_mb: 40 },
+    rotation: {
+      enabled: false,
+      on_boot: false,
+      interval_minutes: 30,
+      order: "sequential",
+      arrangement: "per_monitor",
+    },
   };
 }
 

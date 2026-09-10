@@ -79,6 +79,7 @@ const sampleWp: WallpaperEntry = {
   thumbnail: "",
   file_size: 1024,
   metadata: null,
+  groups: [],
 };
 
 // ── F05: IntersectionObserver mock ───────────────────────────────────────────

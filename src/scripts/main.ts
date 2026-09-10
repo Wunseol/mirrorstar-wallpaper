@@ -29,15 +29,21 @@ import {
   debounce,
   extractFileName,
   getLowercasedFileName,
+  isOrder,
   loadConfig,
+  loadPools,
   markSourceMissingCard,
   patchConfig,
+  patchRotation,
   populateDisplaySelect,
   refreshWallpaperList,
   removeWallpaperCard,
+  renderUnitConfig,
   renderWallpaperList,
   setupAddButton,
   setupDragAndDrop,
+  setupNextWallpaperButton,
+  setupPoolCreate,
   setupPreviewModal,
   showStatus,
   updateWallpaperCard,
@@ -79,7 +85,7 @@ import {
 // 采用 Array.includes 模式，对常量数组做安全放宽转换后包含判断。
 
 /// 合法的排列模式集合（与 Arrangement 类型保持同步）
-const ARRANGEMENTS: readonly Arrangement[] = ["per_monitor", "span"];
+const ARRANGEMENTS: readonly Arrangement[] = ["per_monitor", "all_same", "span"];
 function isArrangement(v: string): v is Arrangement {
   return (ARRANGEMENTS as readonly string[]).includes(v);
 }
@@ -356,6 +362,122 @@ export async function init() {
     });
   }
 
+  // 壁纸轮换设置（Task 10.1）：经 get/update_rotation_config 读写（patchRotation 串行化）
+  const rotationEnabledCheckbox = document.getElementById(
+    "rotation-enabled",
+  ) as HTMLInputElement | null;
+  if (rotationEnabledCheckbox) {
+    rotationEnabledCheckbox.addEventListener("change", async () => {
+      const prev = !rotationEnabledCheckbox.checked;
+      try {
+        await patchRotation({ enabled: rotationEnabledCheckbox.checked });
+        showStatus(
+          rotationEnabledCheckbox.checked ? "壁纸轮换已开启" : "壁纸轮换已关闭",
+          "success",
+        );
+      } catch (e) {
+        log.error("更新轮换开关失败:", e);
+        showStatus("更新轮换开关失败", "error");
+        rotationEnabledCheckbox.checked = prev;
+      }
+    });
+  }
+
+  const rotationOnBootCheckbox = document.getElementById(
+    "rotation-on-boot",
+  ) as HTMLInputElement | null;
+  if (rotationOnBootCheckbox) {
+    rotationOnBootCheckbox.addEventListener("change", async () => {
+      const prev = !rotationOnBootCheckbox.checked;
+      try {
+        await patchRotation({ on_boot: rotationOnBootCheckbox.checked });
+        showStatus("开机换图设置已更新", "success");
+      } catch (e) {
+        log.error("更新开机换图设置失败:", e);
+        showStatus("更新开机换图设置失败", "error");
+        rotationOnBootCheckbox.checked = prev;
+      }
+    });
+  }
+
+  const rotationIntervalInput = document.getElementById(
+    "rotation-interval",
+  ) as HTMLInputElement | null;
+  if (rotationIntervalInput) {
+    // 追踪上次成功提交值，失败时回滚
+    let lastInterval = rotationIntervalInput.value;
+    // 300ms 防抖，避免连续输入时每次触发 IPC
+    const debouncedInterval = debounce(async () => {
+      const old = lastInterval;
+      let minutes = parseInt(rotationIntervalInput.value, 10);
+      // DR-16: 下限 clamp 1 分钟；NaN 或 <1 一律修正为 1
+      if (Number.isNaN(minutes) || minutes < 1) minutes = 1;
+      try {
+        await patchRotation({ interval_minutes: minutes });
+        lastInterval = String(minutes);
+        // O9: 同步 clamp 后的值回输入框，保证 1 分钟下限下输入框与配置一致
+        rotationIntervalInput.value = String(minutes);
+      } catch (e) {
+        log.error("更新轮换间隔失败:", e);
+        showStatus("更新轮换间隔失败", "error");
+        rotationIntervalInput.value = old;
+      }
+    }, 300);
+    rotationIntervalInput.addEventListener("input", debouncedInterval);
+  }
+
+  const rotationOrderSelect = document.getElementById(
+    "rotation-order",
+  ) as HTMLSelectElement | null;
+  if (rotationOrderSelect) {
+    let lastOrder = rotationOrderSelect.value;
+    rotationOrderSelect.addEventListener("change", async () => {
+      const prev = lastOrder;
+      const value = rotationOrderSelect.value;
+      if (!isOrder(value)) {
+        showStatus("无效的采样算法", "error");
+        rotationOrderSelect.value = prev;
+        return;
+      }
+      try {
+        await patchRotation({ order: value });
+        showStatus("采样算法已更新", "success");
+        lastOrder = value;
+      } catch (e) {
+        log.error("更新采样算法失败:", e);
+        showStatus("更新采样算法失败", "error");
+        rotationOrderSelect.value = prev;
+      }
+    });
+  }
+
+  const rotationArrangementSelect = document.getElementById(
+    "rotation-arrangement-select",
+  ) as HTMLSelectElement | null;
+  if (rotationArrangementSelect) {
+    let lastArrangement = rotationArrangementSelect.value;
+    rotationArrangementSelect.addEventListener("change", async () => {
+      const prev = lastArrangement;
+      const value = rotationArrangementSelect.value;
+      if (!isArrangement(value)) {
+        showStatus("无效的轮换编排", "error");
+        rotationArrangementSelect.value = prev;
+        return;
+      }
+      try {
+        await patchRotation({ arrangement: value });
+        showStatus("轮换编排已更新", "success");
+        lastArrangement = value;
+        // 编排变化 → 重建单元配置（单元 key 依编排而定）
+        runAsync(() => renderUnitConfig(), "renderUnitConfig 失败");
+      } catch (e) {
+        log.error("更新轮换编排失败:", e);
+        showStatus("更新轮换编排失败", "error");
+        rotationArrangementSelect.value = prev;
+      }
+    });
+  }
+
   // Pause/Resume wallpaper buttons
   const pauseBtn = document.getElementById("pause-btn");
   const resumeBtn = document.getElementById("resume-btn");
@@ -438,6 +560,13 @@ export async function init() {
   setupAddButton();
   // 功能1: 初始化预览模态框
   setupPreviewModal();
+
+  // 壁纸轮换调度器 UI（Task 10）：下一张按钮 / 池编辑器 / 单元配置
+  setupNextWallpaperButton();
+  setupPoolCreate();
+  // loadPools 内部会同步 appState.pools 并触发 renderUnitConfig；此处显式 await 初始渲染
+  await loadPools();
+  await renderUnitConfig();
 
   // 功能2: 壁纸搜索框
   const searchInput = document.getElementById("wallpaper-search") as HTMLInputElement;
@@ -604,6 +733,32 @@ export async function init() {
     runAsync(() => updatePlaybackButtons(appState.selectedDisplayId), "updatePlaybackButtons 失败");
   }, 150);
   await listenWithCleanup<string>("wallpaper-state-changed", () => debouncedUpdatePlayback());
+
+  // Task 10.5: 监听壁纸轮换完成事件（DR-30），刷新 UI 状态。
+  // payload { key, wallpaper_id }；AllSame 下可能对多个显示器各 emit 一次，
+  // 借助 debouncedUpdatePlayback（150ms 防抖）合并刷新，避免重复 IPC。
+  // P2-2: 以 150ms 防抖窗口合并 AllSame 下各显示器重复 emit（key 同为 "all"），
+  // 仅展示一次 toast 消除刷屏；非 "all" 的 PerMonitor 显示器亦在此窗口内提示。
+  const debouncedRotatedToast = debounce((...args: unknown[]) => {
+    const payload = args[0] as { key?: unknown } | undefined;
+    if (payload) {
+      showStatus("已切换到下一张壁纸", "success");
+    }
+  }, 150);
+  await listenWithCleanup<{ key: string; wallpaper_id: string }>(
+    "wallpaper-rotated",
+    (payload) => {
+      if (payload && typeof payload.wallpaper_id === "string") {
+        debouncedRotatedToast(payload);
+      }
+      debouncedUpdatePlayback();
+    }
+  );
+
+  // Task 10.2: 池读写后（rotation.ts 派发）触发壁纸列表重新标注池名。
+  await listenWithCleanup("rotation-pools-changed", () => {
+    runAsync(() => refreshWallpaperList(), "refreshWallpaperList 失败");
+  });
 
   // v16-C-009: Web 壁纸冷启动进度提示。
   // 后端 set_wallpaper 检测到 Web 类型冷启动时 emit

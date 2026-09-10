@@ -16,7 +16,10 @@
         <section class="wallpaper-list">
           <div class="wallpaper-list-header">
             <h2>壁纸库</h2>
-            <button id="add-wallpaper-btn" class="btn-primary">+ 添加壁纸</button>
+            <div class="wallpaper-list-actions">
+              <button id="next-wallpaper-btn" class="btn-primary" title="手动切换到下一张壁纸">下一张</button>
+              <button id="add-wallpaper-btn" class="btn-primary">+ 添加壁纸</button>
+            </div>
           </div>
           <div class="wallpaper-search">
             <input type="text" id="wallpaper-search" class="search-input" placeholder="搜索壁纸..." />
@@ -37,6 +40,7 @@
             <label for="arrangement-select">排列模式</label>
             <select id="arrangement-select">
               <option value="per_monitor">每屏独立</option>
+              <option value="all_same">全体员工同图</option>
               <option value="span">跨屏合并</option>
             </select>
           </div>
@@ -83,6 +87,48 @@
             <label>
               <input type="checkbox" id="pause-on-battery" /> 电池供电时暂停
             </label>
+          </div>
+          <div class="settings-group rotation-settings-group">
+            <label class="rotation-section-title">壁纸轮换</label>
+            <label class="rotation-row">
+              <input type="checkbox" id="rotation-enabled" /> 启用定时轮换
+            </label>
+            <div class="rotation-row">
+              <label for="rotation-interval">轮换间隔（分钟）</label>
+              <input type="number" id="rotation-interval" min="1" step="1" value="30" />
+            </div>
+            <div class="rotation-row">
+              <label for="rotation-order">采样算法</label>
+              <select id="rotation-order">
+                <option value="sequential">顺序循环</option>
+                <option value="shuffle_bag">洗牌袋</option>
+                <option value="pseudo_random">纯随机</option>
+              </select>
+            </div>
+            <label class="rotation-row">
+              <input type="checkbox" id="rotation-on-boot" /> 开机自动换图
+            </label>
+            <div class="rotation-row">
+              <label for="rotation-arrangement-select">轮换编排</label>
+              <select id="rotation-arrangement-select">
+                <option value="per_monitor">每屏独立</option>
+                <option value="all_same">全体员工同图</option>
+                <option value="span">跨屏合并</option>
+              </select>
+              <p class="settings-hint">决定调度单元：每屏一个（per_monitor）或全局一个（all_same/span）</p>
+            </div>
+          </div>
+          <div class="settings-group">
+            <label>轮换池</label>
+            <div class="rotation-pool-create">
+              <input type="text" id="pool-name-input" placeholder="新池名称" />
+              <button id="pool-create-btn" class="settings-btn">新建</button>
+            </div>
+            <div id="pool-list" class="rotation-pool-list"></div>
+          </div>
+          <div class="settings-group">
+            <label>激活池 / 单元开关</label>
+            <div id="unit-config" class="rotation-unit-config"></div>
           </div>
           <div class="settings-group">
             <label>

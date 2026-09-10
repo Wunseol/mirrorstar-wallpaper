@@ -36,8 +36,13 @@ export type WallpaperState = "Initializing" | "Playing" | "Paused" | "Terminated
 /// 缩放模式，与后端 Rust ScalingMode 枚举的 serde 序列化格式一致（lowercase）
 export type ScalingMode = "fill" | "fit" | "stretch" | "center" | "original";
 
-/// 显示器排列模式，与后端 Rust Arrangement 枚举的 serde 序列化格式一致（snake_case）
-export type Arrangement = "per_monitor" | "span";
+/// 显示器排列模式（三值编排，DR-2 / 设计 §4.4），与后端 Rust Arrangement
+/// 枚举的 serde 序列化格式一致（snake_case）。
+/// 注意：`all_same`（全体员工同图）为新增变体，旧前端类型缺失须补齐。
+export type Arrangement = "per_monitor" | "all_same" | "span";
+
+/// 采样算法（DR-4，设计 §7），与后端 Rust Order 枚举 serde 序列化格式一致（snake_case）。
+export type Order = "sequential" | "shuffle_bag" | "pseudo_random";
 
 /// GIF 内存管理策略，与后端 Rust GifMemoryStrategy 枚举的 serde 序列化格式一致（PascalCase）
 export type GifMemoryStrategy = "Aggressive" | "Balanced" | "Performance" | "Adaptive";
@@ -54,6 +59,32 @@ export interface WallpaperEntry {
   thumbnail: string;
   file_size: number;
   metadata: WallpaperMetadata | null;
+  /** 所属轮换池 id 列表（DR-24）。`serde(default)` 兼容旧库，反序列化缺失时为空数组 */
+  groups: string[];
+}
+
+/// 壁纸轮换池（DR-3/DR-24）：有序壁纸子集。`member_ids` 顺序即用户自定义播放顺序。
+export interface Pool {
+  id: string;
+  name: string;
+  member_ids: string[];
+}
+
+/// 轮换配置（设计 §4.1 / DR-37），与后端 Rust RotationConfig 结构体对应。
+export interface RotationConfig {
+  enabled: boolean;
+  on_boot: boolean;
+  interval_minutes: number;
+  order: Order;
+  arrangement: Arrangement;
+}
+
+/// 单调度单元配置回读（fix-rotation-scheduler Task 6），与后端 Rust UnitStateDto
+/// 结构体对应。`active_pool` 为 null = "全部"池（DR-35）。
+export interface UnitState {
+  key: string;
+  active_pool: string | null;
+  enabled: boolean;
 }
 
 export interface WallpaperMetadata {
@@ -82,6 +113,7 @@ export interface AppConfig {
   display: DisplayConfig;
   video: VideoConfig;
   gif: GifConfig;
+  rotation: RotationConfig;
 }
 
 export interface GeneralConfig {

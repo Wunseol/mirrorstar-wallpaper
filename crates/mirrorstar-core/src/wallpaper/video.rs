@@ -248,6 +248,24 @@ impl VideoRenderer {
     }
 }
 
+/// 判断视频首帧是否已就绪（DR-33 原子交换锁外就绪判断，纯函数）。
+///
+/// 解析 [`VideoRenderer::diagnostic_playback_status`] 返回的 JSON：
+/// - `width` > 0：视频解码完成、纹理已创建（无黑屏）
+/// - `idle-active` == "no"：mpv 已 `loadfile` 且正在解码（非空闲）
+///
+/// 任一属性查询失败（字段为 `{"error": ...}` 对象）或取不到有效值时返回 `false`，
+/// 由调用方继续轮询直至超时，而不会误判为就绪。
+pub fn video_first_frame_ready(status: &serde_json::Value) -> bool {
+    let width_ok = status
+        .get("width")
+        .and_then(|v| v.as_i64())
+        .map(|w| w > 0)
+        .unwrap_or(false);
+    let idle_ok = matches!(status.get("idle-active").and_then(|v| v.as_str()), Some("no"));
+    width_ok && idle_ok
+}
+
 impl WallpaperRenderer for VideoRenderer {
     fn play(&mut self) -> Result<(), crate::MirrorStarError> {
         // 1. 构建并启动 mpv 进程
@@ -517,6 +535,13 @@ impl WallpaperRenderer for VideoRenderer {
         }
     }
 
+    /// 原子交换就绪判断（DR-33）：轮询 mpv 至 `width>0 且 idle-active=no`
+    /// 才认为首帧已渲染，避免 terminate 旧壁纸时新窗未显示首帧导致黑屏。
+    fn poll_first_frame_ready(&mut self) -> Result<bool, crate::MirrorStarError> {
+        let status = self.diagnostic_playback_status()?;
+        Ok(video_first_frame_ready(&status))
+    }
+
     fn create_pause_sender(&mut self, display_id: &str) -> Option<crate::wallpaper::PauseSender> {
         let (sender, mut rx, shared_state) = create_pause_channel();
 
@@ -754,6 +779,26 @@ mod tests {
     fn create_renderer(mode: ScalingMode) -> VideoRenderer {
         // 测试中不需要 VolumeControl（不会实际调用 COM）
         VideoRenderer::new("test_video.mp4".to_string(), mode, None)
+    }
+
+    // ========== video_first_frame_ready 纯函数测试（DR-33 原子交换就绪判断） ==========
+
+    #[test]
+    fn video_first_frame_ready_pure_branches() {
+        use serde_json::json;
+        // 未 loadfile / 空闲：width=0 或缺失 → 未就绪
+        assert!(!video_first_frame_ready(&json!({"width": 0, "idle-active": "yes"})));
+        assert!(!video_first_frame_ready(&json!({"idle-active": "no"})));
+        assert!(!video_first_frame_ready(&json!({})));
+        // 就绪：width>0 且 idle-active=no
+        assert!(video_first_frame_ready(&json!({"width": 1920, "idle-active": "no"})));
+        // width>0 但仍在空闲 → 未就绪
+        assert!(!video_first_frame_ready(&json!({"width": 1920, "idle-active": "yes"})));
+        // 属性查询失败（error 对象）→ 未就绪，不应误判
+        assert!(!video_first_frame_ready(&json!({
+            "width": {"error": "property not found"},
+            "idle-active": {"error": "property not found"}
+        })));
     }
 
     // ========== Common args tests ==========

@@ -22,7 +22,7 @@
  *    - 或用 `Proxy` 拦截读写，实现自动日志 / 校验 / 响应式更新
  *    - 当前 `appState` 为简单对象字面量，足够覆盖现有需求；封装收益与复杂度需权衡
  */
-import type { WallpaperEntry } from "./types";
+import type { Pool, WallpaperEntry } from "./types";
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
 
@@ -39,6 +39,8 @@ export const appState = {
   _selectedDisplayId: "",
   allWallpapers: [] as WallpaperEntry[],
   currentPreviewId: null as string | null,
+  /** 壁纸轮换池列表（Task 2/10.2：供壁纸卡片标注所属池、单元配置下拉复用） */
+  pools: [] as Pool[],
 
   /** 当前选中的显示器 ID（空串表示未选择，由下游 ipc.ts 统一转 null） */
   get selectedDisplayId(): string {

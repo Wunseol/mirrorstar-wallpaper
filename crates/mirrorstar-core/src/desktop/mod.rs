@@ -64,7 +64,7 @@ use windows::Win32::Graphics::Gdi::{
 };
 use windows::Win32::UI::HiDpi::{GetDpiForMonitor, MDT_EFFECTIVE_DPI};
 use windows::Win32::UI::WindowsAndMessaging::{
-    IsWindow, SetParent, ShowWindow, MONITORINFOF_PRIMARY, SW_HIDE,
+    GetParent, IsWindow, SetParent, ShowWindow, MONITORINFOF_PRIMARY, SW_HIDE,
 };
 
 use crate::config::settings::Arrangement;
@@ -409,6 +409,16 @@ impl DesktopIntegrator {
             && self
                 .workerw_hwnd
                 .is_some_and(|h| unsafe { IsWindow(h).as_bool() })
+    }
+
+    /// 校验 `hwnd` 的父窗口是否为当前 WorkerW（DR-40 原子交换 commit 前校验）
+    ///
+    /// 若 WorkerW 已失效或 `hwnd` 已无效（父窗口被回收/桌面重建），返回 `false`，
+    /// 调用方应放弃原子交换并 terminate 新窗。
+    pub fn is_child_of_workerw(&self, hwnd: HWND) -> bool {
+        self.workerw_hwnd
+            .map(|w| unsafe { GetParent(hwnd) == Ok(w) && IsWindow(hwnd).as_bool() })
+            .unwrap_or(false)
     }
 
     /// 检测 Explorer 重启并重新初始化

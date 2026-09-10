@@ -5,6 +5,7 @@ import type { WallpaperEntry } from "../types";
 import { log } from "../utils/logger";
 import { extractFileName, releaseVideoElement, showStatus, typeIcon } from "./utils";
 import { openPreview } from "./preview-modal";
+import { poolNamesForWallpaper } from "./rotation";
 
 // ── Wallpaper List Rendering ─────────────────────────────────────────────────
 
@@ -83,6 +84,7 @@ cardTemplate.innerHTML = `
     <div class="wallpaper-card-thumb"></div>
     <div class="wallpaper-card-info">
       <div class="wallpaper-card-name"></div>
+      <div class="wallpaper-card-tags"></div>
       <div class="wallpaper-card-footer">
         <span class="type-badge"></span>
         <button class="wallpaper-card-delete" title="删除" aria-label="删除壁纸">✕</button>
@@ -207,6 +209,26 @@ function createCardShell(wp: WallpaperEntry): HTMLDivElement {
   name.title = wp.file_path;
   badge.textContent = wp.wallpaper_type;
   badge.className = `type-badge ${wp.wallpaper_type.toLowerCase()}`;
+
+  // v6.0 F-ROT-001: 轮换相关标注（Task 10.4）
+  // - Web 壁纸不参与轮换（DR-18），标注"不参与轮换"
+  // - 常规壁纸标注所属池名（按 WallpaperEntry.groups 映射池名）
+  const tags = card.querySelector<HTMLElement>(".wallpaper-card-tags");
+  if (tags) {
+    if (wp.wallpaper_type === "Web") {
+      const webTag = document.createElement("span");
+      webTag.className = "wallpaper-card-tag web-excluded";
+      webTag.textContent = "不参与轮换";
+      tags.appendChild(webTag);
+    } else {
+      for (const poolName of poolNamesForWallpaper(wp.groups, appState.pools)) {
+        const tag = document.createElement("span");
+        tag.className = "wallpaper-card-tag";
+        tag.textContent = poolName;
+        tags.appendChild(tag);
+      }
+    }
+  }
 
   // thumb 内容由 fillThumbContent 在 hydrateCard 中填充
   return card;

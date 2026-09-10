@@ -463,9 +463,10 @@ pub fn embed_wallpaper(
                     workerw_rect.bottom - workerw_rect.top,
                 )
             }
-            Arrangement::PerMonitor => {
+            Arrangement::PerMonitor | Arrangement::AllSame => {
                 // Per-monitor mode: find the specific monitor
                 // D-013: 使用调用方传入的 displays 缓存，避免每次调用 enumerate_displays()。
+                // AllSame 编排每个显示器各设一次独立渲染器，定位与 PerMonitor 一致。
                 if let Some(display) = displays.iter().find(|d| d.id == display_id) {
                     // D-002: SetParent 后 SetWindowPos 的坐标是相对 WorkerW 客户区
                     // 左上角的子窗口坐标，而非虚拟屏幕坐标。当 WorkerW 左上角

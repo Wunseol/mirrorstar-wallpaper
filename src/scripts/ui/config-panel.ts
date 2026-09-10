@@ -31,6 +31,11 @@ interface ConfigElements {
   speedSlider: HTMLInputElement | null;
   speedValue: HTMLElement | null;
   muteBtn: HTMLElement | null;
+  rotationEnabledCheckbox: HTMLInputElement | null;
+  rotationOnBootCheckbox: HTMLInputElement | null;
+  rotationIntervalInput: HTMLInputElement | null;
+  rotationOrderSelect: HTMLSelectElement | null;
+  rotationArrangementSelect: HTMLSelectElement | null;
 }
 
 let cachedConfigEls: ConfigElements | null = null;
@@ -48,6 +53,17 @@ function getConfigEls(): ConfigElements {
     speedSlider: document.getElementById("speed-slider") as HTMLInputElement | null,
     speedValue: document.getElementById("speed-value"),
     muteBtn: document.getElementById("mute-btn"),
+    rotationEnabledCheckbox: document.getElementById("rotation-enabled") as HTMLInputElement | null,
+    rotationOnBootCheckbox: document.getElementById(
+      "rotation-on-boot",
+    ) as HTMLInputElement | null,
+    rotationIntervalInput: document.getElementById(
+      "rotation-interval",
+    ) as HTMLInputElement | null,
+    rotationOrderSelect: document.getElementById("rotation-order") as HTMLSelectElement | null,
+    rotationArrangementSelect: document.getElementById(
+      "rotation-arrangement-select",
+    ) as HTMLSelectElement | null,
   };
   return cachedConfigEls;
 }
@@ -68,6 +84,11 @@ export async function loadConfig() {
       speedSlider,
       speedValue,
       muteBtn,
+      rotationEnabledCheckbox,
+      rotationOnBootCheckbox,
+      rotationIntervalInput,
+      rotationOrderSelect,
+      rotationArrangementSelect,
     } = getConfigEls();
     if (volumeSlider) volumeSlider.value = String(Math.round(config.audio.volume * 100));
     if (autoStartCheckbox) autoStartCheckbox.checked = config.general.auto_start;
@@ -76,7 +97,7 @@ export async function loadConfig() {
     // 功能6: 同步电池暂停复选框状态
     if (pauseOnBatteryCheckbox) pauseOnBatteryCheckbox.checked = config.pause.pause_on_battery;
     // FE-013: 移除 `|| "per_monitor"` dead code——arrangement 类型为 Arrangement 联合类型
-    // （"per_monitor" | "span"），始终 truthy，`|| "per_monitor"` 永不触发。
+    // （"per_monitor" | "all_same" | "span"），始终 truthy，`|| "per_monitor"` 永不触发。
     if (arrangementSelect) arrangementSelect.value = config.display.arrangement;
     if (speedSlider && speedValue) {
       speedSlider.value = String(config.video.speed || 1.0);
@@ -84,6 +105,16 @@ export async function loadConfig() {
     }
     // FE-005: 同步 mute 按钮图标与配置中的静音状态
     if (muteBtn) muteBtn.textContent = config.audio.muted ? "🔇" : "🔊";
+    // 壁纸轮换（Task 10.1）：从 config.rotation 同步轮换设置控件
+    if (rotationEnabledCheckbox) rotationEnabledCheckbox.checked = config.rotation.enabled;
+    if (rotationOnBootCheckbox) rotationOnBootCheckbox.checked = config.rotation.on_boot;
+    if (rotationIntervalInput) {
+      rotationIntervalInput.value = String(config.rotation.interval_minutes);
+    }
+    if (rotationOrderSelect) rotationOrderSelect.value = config.rotation.order;
+    if (rotationArrangementSelect) {
+      rotationArrangementSelect.value = config.rotation.arrangement;
+    }
     log.info("配置加载完成");
   } catch (e) {
     log.error("加载配置失败:", e);
@@ -105,6 +136,7 @@ async function doPatchConfig(patch: PartialAppConfig): Promise<void> {
     display: { ...config.display, ...(patch.display ?? {}) },
     video: { ...config.video, ...(patch.video ?? {}) },
     gif: { ...config.gif, ...(patch.gif ?? {}) },
+    rotation: { ...config.rotation, ...(patch.rotation ?? {}) },
   };
   await updateConfig(merged);
 }

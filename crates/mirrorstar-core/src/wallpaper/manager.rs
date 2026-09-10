@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use crate::audio::volume::VolumeControl;
 use crate::config::settings::Arrangement;
@@ -10,8 +11,8 @@ use crate::wallpaper::image::ImageRenderer;
 use crate::wallpaper::video::VideoRenderer;
 use crate::wallpaper::web::WebRenderer;
 use crate::wallpaper::{
-    GifMemoryStrategy, PauseReason, PauseSender, ScalingMode, WallpaperRenderer, WallpaperSource,
-    WallpaperType, DEFAULT_BALANCED_KEEP_FRAMES,
+    GifMemoryStrategy, PauseCommand, PauseReason, PauseSender, ScalingMode, WallpaperRenderer,
+    WallpaperSource, WallpaperType, DEFAULT_BALANCED_KEEP_FRAMES,
 };
 use crate::MirrorStarError;
 
@@ -78,6 +79,53 @@ pub struct SetWallpaperPending {
     pub config: RendererConfig,
     /// 是否需要在创建渲染器前清除原生壁纸
     pub clear_native: bool,
+}
+
+// ── 原子交换（DR-33 方案 C / DR-40 双窗安全）───────────────────────────────
+//
+// 供"壁纸轮换调度器"的 apply 使用，消除换壁纸时的无壁纸窗口。三段式：
+//   A `WallpaperEngine::embed_atomic_into`（锁内嵌入 + after_embed/loadfile）
+//   B `wait_new_ready`（锁外首帧就绪）
+//   C `WallpaperEngine::commit_atomic_swap`（锁内换槽 + terminate 旧）
+// 详见方法与 `build_new_renderer` / `wait_new_ready`。
+
+/// 原子交换的最大首帧就绪等待超时（视频 mpv 冷启动 + loadfile 渲染，锁外等待）
+pub const ATOMIC_SWAP_READY_TIMEOUT: Duration = Duration::from_secs(8);
+
+/// 原子交换准备结果（阶段 1 `prepare_atomic_swap` 的返回值）
+pub enum AtomicSwapPrepare {
+    /// 可进行原子交换：新渲染器就绪后可一键换槽，旧壁纸全程占位
+    Swap(AtomicSwapPending),
+    /// 无法原子交换（Native 模式无 hwnd 可压底 / 该 display 暂无壁纸），
+    /// 调用方应回退到现有 `set_wallpaper` 三阶段流程（先关后设）。
+    /// `old_renderer_id` 仍可由调用方用于"同目标短路"判断。
+    Fallback { old_renderer_id: Option<String> },
+}
+
+/// 阶段 1 产出的原子交换待办数据
+pub struct AtomicSwapPending {
+    /// 渲染器配置快照（供锁外构建新渲染器）
+    pub config: RendererConfig,
+    /// 是否需在创建新渲染器前清除原生壁纸（原子交换路径恒为 `false`）
+    pub clear_native: bool,
+    /// 当前旧渲染器 id（由 `wallpaper_sources` 派生），供 `build_new_renderer`
+    /// 短路"新图 == 旧图"以及 `commit_atomic_swap` 换槽。
+    pub old_renderer_id: Option<String>,
+}
+
+/// `build_new_renderer` 的返回值
+pub enum BuildOutcome {
+    /// 构建成功，新渲染器已 `play()`，待调用方锁外 `wait_new_ready`
+    Ready(Box<dyn WallpaperRenderer>),
+    /// 新图与旧图相同（id 一致），无需更换——短路跳过整个 swap
+    Skip,
+}
+
+/// `commit_atomic_swap` 的返回值
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SwapOutcome {
+    /// 换槽完成（old→new）
+    Committed,
 }
 
 /// 壁纸引擎，管理所有壁纸实例的生命周期
@@ -472,6 +520,32 @@ impl WallpaperEngine {
         )
     }
 
+    /// 读取当前全局暂停原因位图快照（调度器轮换抑制用，DR-9 / 设计 §10 Layer 2）。
+    ///
+    /// 位图仅由 `pause_all_fast` / `resume_all_fast` 在 engine 锁内读写，
+    /// 此处短暂加锁读取；锁中毒时中性回退为"无暂停"（`PauseReason(0)`），
+    /// 避免调度器因读取暂停状态而 panic（DR-32 健壮性）。
+    ///
+    /// 返回空位图表示轮换不被抑制；非空（FULLSCREEN / BATTERY / TRAY 任一）表示
+    /// 调度器应抑制定时间隔触发的轮换（手动下一张不受限，DR-9）。
+    pub fn pause_reasons_snapshot(&self) -> PauseReason {
+        self.pause_reasons
+            .lock()
+            .map(|g| *g)
+            .unwrap_or(PauseReason(0))
+    }
+
+    /// 读取指定显示器当前生效的缩放模式（DR-25，调度器轮换 apply 继承用）。
+    ///
+    /// 返回该显示器 per-display 记忆的缩放模式；未记录时回退 `ScalingMode::default()`
+    /// （与手动 `set_wallpaper` 的默认路径一致）。
+    pub fn scaling_mode_for(&self, display_id: &str) -> ScalingMode {
+        self.wallpaper_scaling_modes
+            .get(display_id)
+            .copied()
+            .unwrap_or_default()
+    }
+
     /// 获取创建渲染器所需的配置快照（用于在 engine 锁外创建渲染器）
     pub fn renderer_config(&self) -> RendererConfig {
         // gif_config 使用内部 Mutex 保护，锁持有时间极短（仅读取字段）
@@ -743,32 +817,8 @@ impl WallpaperEngine {
             .insert(display_id.to_string(), WallpaperMode::WorkerW);
         self.wallpaper_sources
             .insert(display_id.to_string(), (source.clone(), wallpaper_type));
-        let sender = renderer.create_pause_sender(display_id);
-        if let Some(s) = sender {
-            // 为新 PauseSender spawn 转发任务，将其 state_changed
-            // broadcast 通道转发到 WallpaperEngine 的全局通道。Tauri 层订阅全局
-            // 通道一次即可接收所有渲染器的状态变更通知。
-            //
-            // 使用 `Handle::try_current()` 而非直接 `tokio::spawn`：
-            // `embed_and_register_renderer` 可能从同步测试（无 tokio runtime）调用，
-            // 此时跳过 spawn（测试不依赖全局通道转发）；生产环境（Tauri async 命令）
-            // 必有 runtime，spawn 正常执行。
-            //
-            // 转发任务生命周期：PauseSender 在 `close_wallpaper` 中从 pause_senders
-            // 移除并被 drop，其内部 broadcast 通道关闭，转发任务的 `rx.recv().await`
-            // 返回 `Err(Closed)`，任务自动退出，无泄漏。
-            let rx = s.subscribe_state_changes();
-            let global_tx = self.global_state_changed.clone();
-            if let Ok(handle) = tokio::runtime::Handle::try_current() {
-                handle.spawn(async move {
-                    let mut rx = rx;
-                    while let Ok(display_id) = rx.recv().await {
-                        // send 失败仅因无订阅者（Tauri 层未启动或已退出），静默忽略
-                        let _ = global_tx.send(display_id);
-                    }
-                });
-            }
-            self.pause_senders.insert(display_id.to_string(), s);
+        if let Some(sender) = renderer.create_pause_sender(display_id) {
+            self.register_pause_sender(sender, display_id);
         }
         self.wallpapers.insert(display_id.to_string(), renderer);
         Ok(())
@@ -841,27 +891,220 @@ impl WallpaperEngine {
         }
 
         // 3. 重建 PauseSender（替换旧 sender；返回 None 时不插入、不视为失败）
-        if let Some(s) = renderer.create_pause_sender(display_id) {
-            // 为新 PauseSender spawn 转发任务，将其 state_changed broadcast 通道
-            // 转发到全局通道（与 embed_and_register_renderer 一致）。
-            // `Handle::try_current()`：同步测试（无 tokio runtime）跳过 spawn。
-            let rx = s.subscribe_state_changes();
-            let global_tx = self.global_state_changed.clone();
-            if let Ok(handle) = tokio::runtime::Handle::try_current() {
-                handle.spawn(async move {
-                    let mut rx = rx;
-                    while let Ok(display_id) = rx.recv().await {
-                        // send 失败仅因无订阅者（Tauri 层未启动或已退出），静默忽略
-                        let _ = global_tx.send(display_id);
-                    }
-                });
-            }
-            self.pause_senders.insert(display_id.to_string(), s);
+        if let Some(sender) = renderer.create_pause_sender(display_id) {
+            self.register_pause_sender(sender, display_id);
         }
 
         self.wallpapers.insert(display_id.to_string(), renderer);
         tracing::info!(display_id, "全屏恢复：渲染器已重新嵌入并注册");
         Ok(())
+    }
+
+    /// 为 PauseSender spawn 状态变更转发任务并注册到 `pause_senders`。
+    ///
+    /// 抽象自 `embed_and_register_renderer` / `reembed_and_register_renderer` 的
+    /// 公共逻辑（DR-33 原子交换 `commit_atomic_swap` 亦复用之）：将 PauseSender 的
+    /// `state_changed` broadcast 通道转发到全局通道。`Handle::try_current()` 使
+    /// 同步测试（无 tokio runtime）环境跳过 spawn。转发任务在 sender 被
+    /// `close_wallpaper` drop 时因 `recv()` 返回 `Closed` 自动退出，无泄漏。
+    fn register_pause_sender(&mut self, sender: PauseSender, display_id: &str) {
+        let rx = sender.subscribe_state_changes();
+        let global_tx = self.global_state_changed.clone();
+        if let Ok(handle) = tokio::runtime::Handle::try_current() {
+            handle.spawn(async move {
+                let mut rx = rx;
+                while let Ok(display_id) = rx.recv().await {
+                    // send 失败仅因无订阅者（Tauri 层未启动或已退出），静默忽略
+                    let _ = global_tx.send(display_id);
+                }
+            });
+        }
+        self.pause_senders.insert(display_id.to_string(), sender);
+    }
+
+    /// 将已完成嵌入的渲染器一次性注册进 engine 各 map（WorkerW 模式）。
+    ///
+    /// 抽象自 `embed_and_register_renderer` 的注册逻辑（DR-33 原子交换
+    /// `commit_atomic_swap` 亦复用之）。写入 `wallpaper_mode` / `wallpaper_sources` /
+    /// `pause_senders` / `wallpapers`；不负责嵌入（embed）与 `after_embed` 钩子，
+    /// 由调用方在达到会失败前完成。
+    fn register_renderer_maps(
+        &mut self,
+        mut renderer: Box<dyn WallpaperRenderer>,
+        display_id: &str,
+        source: &WallpaperSource,
+        wallpaper_type: WallpaperType,
+    ) {
+        self.wallpaper_mode
+            .insert(display_id.to_string(), WallpaperMode::WorkerW);
+        self.wallpaper_sources
+            .insert(display_id.to_string(), (source.clone(), wallpaper_type));
+        if let Some(sender) = renderer.create_pause_sender(display_id) {
+            self.register_pause_sender(sender, display_id);
+        }
+        self.wallpapers.insert(display_id.to_string(), renderer);
+    }
+
+    /// 阶段 1（锁内，廉价）：准备原子交换的配置快照，旧壁纸保持不动。
+    ///
+    /// 原子交换（方案 C，DR-33 §8.4）用于"轮换 apply"时消除无壁纸窗口：旧壁纸
+    /// 全程不 close/不 hide/不 pause、不离开槽位，继续盖住屏幕作为占位；返回的
+    /// `config` 快照供调用方在引擎锁外构建新渲染器。
+    ///
+    /// - **绝不关闭旧壁纸**（与 `prepare_set_wallpaper` 不同，那是阶段 1 先关旧）。
+    /// - 记录当前旧渲染器 `id`（由 `wallpaper_sources` 派生），供 `build_new_renderer`
+    ///   短路新图 == 旧图，以及 `commit_atomic_swap` 换槽。
+    ///
+    /// # 回退
+    ///
+    /// 仅当该 display 当前存在 WorkerW（含 hwnd 可压底）渲染器时才返回 `Swap`；
+    /// Native 模式（无 hwnd 可压底）或无现有壁纸时返回 `Fallback`，调用方应回退
+    /// 到现有 `set_wallpaper` 三阶段流程（先关后设）。
+    pub fn prepare_atomic_swap(
+        &mut self,
+        display_id: &str,
+        _source: &WallpaperSource,
+        _wallpaper_type: WallpaperType,
+    ) -> AtomicSwapPrepare {
+        let old_renderer_id = self
+            .wallpaper_sources
+            .get(display_id)
+            .map(|(s, t)| renderer_id(s, *t));
+
+        // 需要"旧 WorkerW 保持压底占位"才可原子交换；Native 无 hwnd 或暂无壁纸 → 回退
+        if !self.wallpapers.contains_key(display_id) || self.is_native_mode(display_id) {
+            return AtomicSwapPrepare::Fallback { old_renderer_id };
+        }
+
+        let config = self.renderer_config();
+        AtomicSwapPrepare::Swap(AtomicSwapPending {
+            config,
+            clear_native: false,
+            old_renderer_id,
+        })
+    }
+
+    /// 阶段 A（锁内）：嵌入新窗并点火（after_embed / loadfile），旧壁纸保持占位。
+    ///
+    /// 原子交换三段式的首段：在引擎锁内将新窗以 `HWND_BOTTOM` 藏入旧壁纸之下，
+    /// 然后触发 `after_embed`（视频：IPC `loadfile`）。返回后调用方可在引擎锁外
+    /// `wait_new_ready` 等待首帧就绪。
+    ///
+    /// 本方法**不登记新窗**、**不从 `self.wallpapers` 移除旧窗**、**不 terminate 旧窗**
+    /// ——这些留给 `commit_atomic_swap`（阶段 C）。任何失效步骤返回 `Err` 并
+    /// terminate 新窗，旧壁纸仍在 map、原封不动（DR-40：A/B 阶段旧窗始终占位）。
+    ///
+    /// 所有权：调用方传入 `new_renderer`，本方法借用执行嵌入后原样返回（仍由调用方持有），
+    /// 复用同一对象做 `wait_new_ready` 与 `commit_atomic_swap`。
+    pub fn embed_atomic_into(
+        &mut self,
+        mut new_renderer: Box<dyn WallpaperRenderer>,
+        display_id: &str,
+    ) -> Result<Box<dyn WallpaperRenderer>, MirrorStarError> {
+        // 1. 新窗藏入旧壁纸之下（HWND_BOTTOM）。嵌入失败 → 终止新窗并返回 Err，旧壁纸未动
+        if let Some(hwnd) = new_renderer.hwnd() {
+            let embed_result = {
+                let mut desktop = self.desktop.lock().map_err(|e| {
+                    MirrorStarError::DesktopIntegration(format!("获取桌面集成器锁失败: {}", e))
+                })?;
+                desktop.embed_wallpaper(hwnd, display_id, self.arrangement)
+            };
+            if let Err(e) = embed_result {
+                tracing::warn!(error = %e, display_id, "原子交换：阶段 A 新窗嵌入失败，终止新窗、保持旧壁纸");
+                let _ = new_renderer.terminate();
+                return Err(e);
+            }
+        }
+
+        // 2. after_embed（视频 loadfile；失败 terminate 新窗、旧壁纸未动）
+        if let Err(e) = new_renderer.after_embed() {
+            tracing::error!(error = %e, display_id, "原子交换：阶段 A after_embed 失败，终止新窗、保持旧壁纸");
+            let _ = new_renderer.terminate();
+            return Err(e);
+        }
+
+        tracing::info!(display_id, "原子交换：阶段 A 完成（新窗已嵌入并 loadfile）");
+        Ok(new_renderer)
+    }
+
+    /// 阶段 C（锁内）：一次性换槽 old→new（DR-33 步骤 C，DR-40 双窗安全）。
+    ///
+    /// 前置条件：新渲染器已由调用方完成阶段 A（`embed_atomic_into`：嵌入 + loadfile）
+    /// 与阶段 B（引擎锁外 `wait_new_ready`：首帧就绪）。
+    ///
+    /// 执行步骤（换槽临界区）：
+    /// 1. 在换槽临界区才 `self.wallpapers.remove(display_id)` 取旧（P1-5：A/B 阶段旧窗始终在 map）
+    /// 2. DR-40 commit 前校验：新窗父窗口仍为当前 WorkerW，否则放弃 commit（terminate 新窗）
+    /// 3. 一次换槽（复用 `register_renderer_maps`，不先关旧）
+    /// 4. 按当前全局 `PauseReason` 位图对新渲染器补发暂停（DR-20）
+    /// 5. terminate 旧渲染器（失败则强毁旧 hwnd 兜底）
+    ///
+    /// 任何失效步骤在换槽前返回 `Err` 并 terminate 新渲染器；旧壁纸全程在 map、未动，
+    /// 无需重嵌回滚。换槽后无 `Err` 路径，返回 `SwapOutcome::Committed`。
+    pub fn commit_atomic_swap(
+        &mut self,
+        mut new_renderer: Box<dyn WallpaperRenderer>,
+        display_id: &str,
+        source: &WallpaperSource,
+        wallpaper_type: WallpaperType,
+    ) -> Result<SwapOutcome, MirrorStarError> {
+        // 换槽临界区：此刻才把旧窗从 map 取出（P1-5）。A/B 阶段旧窗始终在 map 占位。
+        let old_renderer = self.wallpapers.remove(display_id);
+        let old_hwnd = old_renderer.as_ref().and_then(|r| r.hwnd());
+
+        // DR-40 commit 前校验：新窗父窗口仍为当前 WorkerW，否则放弃 commit（terminate 新窗）。
+        // 旧窗仍在 map（未动），无需重嵌回滚。
+        if let Some(hwnd) = new_renderer.hwnd() {
+            let parent_ok = {
+                let desktop = self.desktop.lock().map_err(|e| {
+                    MirrorStarError::DesktopIntegration(format!("获取桌面集成器锁失败: {}", e))
+                })?;
+                desktop.is_child_of_workerw(hwnd)
+            };
+            if !parent_ok {
+                tracing::warn!(display_id, "原子交换：commit 前校验失败（新窗父窗口已非当前 WorkerW），弃置新窗");
+                let _ = new_renderer.terminate();
+                return Err(MirrorStarError::DesktopIntegration(
+                    "原子交换 commit 前校验失败：新窗父窗口已非当前 WorkerW".to_string(),
+                ));
+            }
+        }
+
+        // 一次换槽（复用注册逻辑，不先关旧）
+        self.register_renderer_maps(new_renderer, display_id, source, wallpaper_type);
+
+        // 按当前全局 PauseReason 位图对新渲染器补发暂停（DR-20）
+        self.apply_pause_reasons_to(display_id);
+
+        // terminate 旧渲染器（失败强毁旧 hwnd 兜底）
+        if let Some(mut old) = old_renderer {
+            if let Err(e) = old.terminate() {
+                tracing::warn!(error = %e, display_id, "原子交换：终止旧渲染器失败，强毁旧窗口兜底");
+                if let Some(old_hwnd) = old_hwnd {
+                    unsafe {
+                        let _ = windows::Win32::UI::WindowsAndMessaging::DestroyWindow(old_hwnd);
+                    }
+                }
+            }
+        }
+
+        tracing::info!(display_id, "原子交换：换槽完成（old→new）");
+        Ok(SwapOutcome::Committed)
+    }
+
+    /// 按当前全局暂停原因位图，对指定显示器的渲染器补发暂停命令（DR-20）。
+    ///
+    /// 原子交换提交新渲染器时，若全局处于暂停态（位图非空），新壁纸须跟随暂停。
+    fn apply_pause_reasons_to(&self, display_id: &str) {
+        let reasons = self.pause_reasons.lock().unwrap_or_else(|e| e.into_inner());
+        if reasons.is_empty() {
+            return;
+        }
+        if let Some(sender) = self.pause_senders.get(display_id) {
+            if let Err(e) = sender.send(PauseCommand::Pause) {
+                tracing::warn!(error = %e, display_id, "原子交换：对新渲染器补发暂停失败");
+            }
+        }
     }
 
     /// 关闭指定显示器的壁纸
@@ -1197,6 +1440,68 @@ pub fn create_and_play_renderer(
     )
 }
 
+/// 依据壁纸来源与类型派生渲染器唯一 id（DR-33 同目标短路用，纯函数）
+///
+/// 由 `AtomicSwapPending::old_renderer_id`（`prepare_atomic_swap` 在锁内从
+/// `wallpaper_sources` 派生）与 `build_new_renderer` 各自计算，二者相等表示
+/// "新图与旧图相同"，可短路跳过整个 swap。
+pub fn renderer_id(source: &WallpaperSource, wallpaper_type: WallpaperType) -> String {
+    let src = match source {
+        WallpaperSource::File(p) => format!("file:{}", p),
+        WallpaperSource::Url(u) => format!("url:{}", u),
+    };
+    format!("{:?}:{}", wallpaper_type, src)
+}
+
+/// 阶段 2（锁外）：构建新渲染器并 `play()`（DR-33 步骤 build_new）。
+///
+/// 复用 `construct_renderer`。失败返回 `Err`（旧壁纸原封不动，零回滚）。
+/// 若新渲染器 id 与 `pending.old_renderer_id` 一致，返回 `BuildOutcome::Skip`
+/// （短路径跳过整个 swap），不创建渲染器。
+pub fn build_new_renderer(
+    source: &WallpaperSource,
+    wallpaper_type: WallpaperType,
+    scaling_mode: ScalingMode,
+    pending: &AtomicSwapPending,
+) -> Result<BuildOutcome, MirrorStarError> {
+    if pending.old_renderer_id.as_deref() == Some(renderer_id(source, wallpaper_type).as_str()) {
+        tracing::info!("原子交换：新图与旧图相同，短路跳过 swap");
+        return Ok(BuildOutcome::Skip);
+    }
+    let renderer =
+        construct_renderer(source, wallpaper_type, scaling_mode, &pending.config, pending.clear_native)?;
+    Ok(BuildOutcome::Ready(renderer))
+}
+
+/// 阶段 3（锁外）：等待新渲染器首帧就绪（DR-33 步骤 wait_new_ready）。
+///
+/// - 视频：复用 [`VideoRenderer::poll_first_frame_ready`]（trait 覆写，内部轮询
+///   mpv 至 `width>0 且 idle-active=no`）；每 `poll_interval` 查询一次。
+/// - 图片 / GIF / 网页：trait 默认实现立即返回就绪，一次查询即返回。
+///
+/// 失败或超时返回 `Err`（旧壁纸照常显示，零回滚），由调用方 `terminate` 新渲染器。
+pub fn wait_new_ready(
+    renderer: &mut Box<dyn WallpaperRenderer>,
+    timeout: Duration,
+    poll_interval: Duration,
+) -> Result<(), MirrorStarError> {
+    if renderer.poll_first_frame_ready()? {
+        return Ok(());
+    }
+    let deadline = Instant::now() + timeout;
+    loop {
+        std::thread::sleep(poll_interval);
+        if renderer.poll_first_frame_ready()? {
+            return Ok(());
+        }
+        if Instant::now() >= deadline {
+            return Err(MirrorStarError::DesktopIntegration(
+                "原子交换：新渲染器首帧就绪等待超时".to_string(),
+            ));
+        }
+    }
+}
+
 /// 规范化路径用于比较（W13 修复）
 ///
 /// 将路径转换为小写并将 `/` 替换为 `\\`，使 `C:/a/b.mp4` 与 `c:\a\b.mp4` 视为相等。
@@ -1287,6 +1592,25 @@ mod tests {
     use crate::wallpaper::{create_pause_channel, PauseSender, WallpaperState};
     use std::sync::{Arc, Mutex};
     use windows::Win32::Foundation::HWND;
+
+    // ── 原子交换同目标短路：renderer_id（DR-33 纯函数） ────────────────────
+
+    #[test]
+    fn renderer_id_deterministic_and_same_source_same_id() {
+        let vid_a = WallpaperType::Video;
+        let src_a = WallpaperSource::File("C:/w/cat.mp4".to_string());
+        // 相同来源+类型 → 相同 id（可从 wallpaper_sources 派生并稳定比较）
+        assert_eq!(renderer_id(&src_a, vid_a), renderer_id(&src_a, vid_a));
+        // 不同类型 → 不同 id
+        let gif_same_src = renderer_id(&src_a, WallpaperType::Gif);
+        assert_ne!(renderer_id(&src_a, vid_a), gif_same_src);
+        // 不同来源 → 不同 id
+        let src_b = WallpaperSource::File("C:/w/dog.mp4".to_string());
+        assert_ne!(renderer_id(&src_a, vid_a), renderer_id(&src_b, vid_a));
+        // Url 来源也稳定
+        let url = WallpaperSource::Url("https://x/x.mp4".to_string());
+        assert_eq!(renderer_id(&url, WallpaperType::Web), renderer_id(&url, WallpaperType::Web));
+    }
 
     // ── 测试辅助 ──────────────────────────────────────────────────────────
 
@@ -2587,5 +2911,80 @@ mod tests {
         );
         // 空路径
         assert_eq!(normalize_path_for_compare(""), "");
+    }
+
+    // ========== 原子交换三段式（B1 / DR-33 / P1-5）==========
+
+    #[test]
+    fn atomic_swap_three_phase_keeps_old_until_commit_and_terminates_it() {
+        // B1 三段式 + P1-5：旧壁纸在 A 阶段全程留在 map，仅到 C 换槽临界区才移除并 terminate。
+        let mut eng = create_test_engine();
+        let src = WallpaperSource::File("C:/w/scene.mp4".to_string());
+
+        // 阶段 1：先有旧 WorkerW 壁纸 → prepare 应返回 Swap（可原子交换）。
+        let (old, old_shared) = MockRenderer::new();
+        eng.register_renderer_maps(Box::new(old), "d1", &src, WallpaperType::Video);
+        assert!(eng.wallpapers.contains_key("d1"), "旧壁纸应在 map");
+
+        // 阶段 1（锁内快照）
+        match eng.prepare_atomic_swap("d1", &src, WallpaperType::Video) {
+            AtomicSwapPrepare::Swap(_) => {}
+            _ => panic!("WorkerW 旧壁纸 + 非 Native 应返回 Swap"),
+        }
+
+        // 阶段 A（锁内 embed + after_embed）：新窗未登记、旧窗仍在 map。
+        let (new, new_shared) = MockRenderer::new();
+        let new = eng.embed_atomic_into(Box::new(new), "d1").unwrap();
+        assert!(eng.wallpapers.contains_key("d1"), "A 阶段后旧壁纸仍应在 map 占位（P1-5）");
+        assert!(!old_shared.lock().unwrap().terminated, "A 阶段不应 terminate 旧窗");
+
+        // 阶段 C（锁内换槽）：一次换槽 → 新登记、旧 terminate。
+        assert_eq!(
+            eng.commit_atomic_swap(new, "d1", &src, WallpaperType::Video).unwrap(),
+            SwapOutcome::Committed
+        );
+        assert!(eng.wallpapers.contains_key("d1"), "换槽后新窗应在 map");
+        assert!(old_shared.lock().unwrap().terminated, "C 阶段应 terminate 旧窗");
+        assert!(!new_shared.lock().unwrap().terminated, "新窗不应被 terminate");
+        // 换槽后 wallpaper_sources 已更新为新来源/类型。
+        assert_eq!(
+            eng.wallpaper_sources.get("d1").map(|(_, t)| *t),
+            Some(WallpaperType::Video)
+        );
+    }
+
+    #[test]
+    fn atomic_swap_prepare_fallback_when_no_existing_wallpaper() {
+        // 无现有壁纸 → prepare 返回 Fallback，调用方回退现有 set_wallpaper（先关后设）。
+        let mut eng = create_test_engine();
+        let src = WallpaperSource::File("C:/w/a.mp4".to_string());
+        match eng.prepare_atomic_swap("d0", &src, WallpaperType::Video) {
+            AtomicSwapPrepare::Fallback { old_renderer_id } => {
+                assert_eq!(old_renderer_id, None, "无旧壁纸无 old_renderer_id");
+            }
+            _ => panic!("无现有壁纸应返回 Fallback"),
+        }
+    }
+
+    #[test]
+    fn atomic_swap_commit_succeeds_under_global_pause() {
+        // B1 × B3 兼容：全局暂停位图非空时 commit 换槽仍须成功（补发暂停不破坏换槽），
+        // 旧窗照常 terminate、新窗入槽。暂停补发经 `pause_senders` 通道下发。
+        let mut eng = create_test_engine();
+        let src = WallpaperSource::File("C:/w/b.mp4".to_string());
+
+        let (old, old_shared) = MockRenderer::new();
+        eng.register_renderer_maps(Box::new(old), "d1", &src, WallpaperType::Gif);
+        *eng.pause_reasons.lock().unwrap() |= PauseReason::FULLSCREEN; // PauseReason 支持位掩码（BitOrAssign）
+
+        let (new, new_shared) = MockRenderer::new();
+        let new = eng.embed_atomic_into(Box::new(new), "d1").unwrap();
+        assert_eq!(
+            eng.commit_atomic_swap(new, "d1", &src, WallpaperType::Gif).unwrap(),
+            SwapOutcome::Committed
+        );
+        assert!(eng.wallpapers.contains_key("d1"));
+        assert!(old_shared.lock().unwrap().terminated, "旧窗应 terminate");
+        assert!(!new_shared.lock().unwrap().terminated, "新窗不应被 terminate");
     }
 }

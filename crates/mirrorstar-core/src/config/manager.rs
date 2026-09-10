@@ -111,6 +111,10 @@ pub struct WallpaperEntry {
     /// 媒体元数据（可选）
     #[serde(default)]
     pub metadata: Option<WallpaperMetadata>,
+    /// 所属池 id 列表（DR-24）。`#[serde(default)]` 兼容旧版 `wallpapers.toml`
+    ///（反序列化缺失该段时回退为空）。
+    #[serde(default)]
+    pub groups: Vec<String>,
     /// v5.0 C-PERF-003: 规范化路径（小写 + 统一分隔符），用于快速查找。
     /// 派生字段，不参与序列化，load_library / add_wallpaper 时计算。
     #[serde(skip)]
@@ -133,6 +137,46 @@ pub struct WallpaperMetadata {
     pub frame_count: Option<u32>,
 }
 
+/// 壁纸池（DR-3/DR-24）
+///
+/// 池是壁纸的有序子集；`member_ids` 顺序即用户自定义播放顺序（DR-3）。
+/// 持久化于 `wallpapers.toml` 的 `pools` 段，由 `ConfigManager` 的 `RwLock` 保护。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct Pool {
+    /// 池唯一 ID（UUID v4 字符串）
+    pub id: String,
+    /// 池名称
+    pub name: String,
+    /// 成员壁纸 id 的有序列表（顺序即播放顺序）；写入时去重（保留首次出现顺序，DR-24）
+    #[serde(default)]
+    pub member_ids: Vec<String>,
+}
+
+impl Pool {
+    /// 成员去重（DR-24）：就地去重 `member_ids`，保留首次出现顺序。
+    ///
+    /// 写入池（`create_pool` / `update_pool`）前调用，供命令层 CRUD 复用。
+    pub fn validate(&mut self) {
+        let mut seen = std::collections::HashSet::with_capacity(self.member_ids.len());
+        self.member_ids.retain(|id| seen.insert(id.clone()));
+    }
+}
+
+/// 隐式"全部"池解析（DR-35）
+///
+/// `active_pool = Some(id)` 且该显式池在库中存在 → 返回该池；
+/// 否则（None，或指向已删除/不存在的池）→ 返回 `None`，调用方据此走"全部"池
+/// 语义（全集）。调用方不要手工构造"全部"池对象。
+pub fn resolve_pool<'a>(
+    library: &'a WallpaperLibrary,
+    active_pool: Option<&str>,
+) -> Option<&'a Pool> {
+    match active_pool {
+        Some(id) => library.pools.iter().find(|p| p.id == id),
+        None => None,
+    }
+}
+
 /// 壁纸库
 ///
 /// 持久化到 `wallpapers.toml`，由 `ConfigManager` 的 `RwLock` 保护并发访问。
@@ -141,6 +185,9 @@ pub struct WallpaperLibrary {
     /// 壁纸条目列表
     #[serde(default)]
     pub wallpapers: Vec<WallpaperEntry>,
+    /// 壁纸池列表；`#[serde(default)]` 兼容旧版 `wallpapers.toml`（无 pools 段回退为空）
+    #[serde(default)]
+    pub pools: Vec<Pool>,
 }
 
 /// 显示器信息
@@ -269,14 +316,46 @@ pub fn resolve_data_root() -> std::path::PathBuf {
             return p;
         }
     }
-    if let Ok(exe) = std::env::current_exe() {
-        if let Some(parent) = exe.parent() {
-            return parent.to_path_buf();
+    if let Some(exe_dir) = std::env::current_exe()
+        .ok()
+        .and_then(|exe| exe.parent().map(|p| p.to_path_buf()))
+    {
+        // 便携数据根的"exe 所在目录"语义仅对真正部署/安装的可执行文件有意义。
+        // cargo 构建产物目录（`<...>/target/<debug|release>/`）属于构建残留：把用户数据
+        // （config/wallpapers/playback/logs/缩略图/WebView2 缓存）落入其中会随
+        // `cargo clean` 或工作区清理随构建产物一起被删除，且与文档/测试期望的
+        // `%APPDATA%\mirrorstar` 相矛盾。识别到此类构建产物目录时不采用 exe 目录，
+        // 而是回退到 `%APPDATA%\mirrorstar`（dev/CI 环境发现修复）。
+        if !is_cargo_build_artifact_dir(&exe_dir) {
+            return exe_dir;
         }
     }
     dirs::data_dir()
         .map(|d| d.join("mirrorstar"))
         .unwrap_or_else(|| std::path::PathBuf::from("."))
+}
+
+/// 判断 `dir` 是否为 cargo 构建产物目录（存在 `target/` 祖先，且自身名为
+/// `debug` 或 `release`；目标三元组目录如 `target/x86_64-pc-windows-msvc/debug/`
+/// 由 `target/` 祖先扫描覆盖）。
+///
+/// 测试二进制位于 `target/<profile>/deps/`（自身名为 `deps`），生产安装于任意
+/// 目录，二者均不匹配，因此测试与生产行为不受影响。
+fn is_cargo_build_artifact_dir(dir: &std::path::Path) -> bool {
+    let is_profile_level = dir
+        .file_name()
+        .map(|s| {
+            let n = s.to_string_lossy().to_ascii_lowercase();
+            n == "debug" || n == "release"
+        })
+        .unwrap_or(false);
+    if !is_profile_level {
+        return false;
+    }
+    // 向上找一段名为 `target` 的祖先目录（跳过自身）。
+    dir.ancestors()
+        .skip(1)
+        .any(|anc| anc.file_name().map(|s| s.eq_ignore_ascii_case("target")).unwrap_or(false))
 }
 
 /// 获取数据根：显式设置优先，否则懒解析并缓存。
@@ -316,6 +395,23 @@ impl ConfigManager {
 
         let (config, config_err) = Self::load_config(&config_path)?;
         let (wallpaper_library, library_err) = Self::load_library(&library_path)?;
+
+        // Bug-01 修复：全新安装（data_root）首次启动时，`config.toml` / `wallpapers.toml`
+        // 并不存在——`new_in_dir` 原先只建目录、不落盘文件，导致 `start_watching`
+        // 对不存在的路径调用 notify::Watcher::watch 报
+        // "Input watch path is neither a file nor a directory"，热重载被静默禁用。
+        // 此处仅在文件确实缺失时落盘当前默认值，使监视路径始终存在；
+        // 文件存在（含损坏可解析失败）时绝不覆盖，保留既有数据与恢复路径。
+        if !config_path.exists() {
+            if let Err(e) = Self::save_config_to_file(&config, &config_path) {
+                tracing::warn!(error = %e, path = %config_path.display(), "首次启动落盘默认 config.toml 失败");
+            }
+        }
+        if !library_path.exists() {
+            if let Err(e) = Self::save_library_to_file(&wallpaper_library, &library_path) {
+                tracing::warn!(error = %e, path = %library_path.display(), "首次启动落盘默认 wallpapers.toml 失败");
+            }
+        }
 
         // C01 修复：捕获构造时的配置加载错误，待回调设置后通知前端。
         // 构造时 Tauri setup 尚未执行，on_config_error 回调未设置，
@@ -491,6 +587,122 @@ impl ConfigManager {
             .cloned()
     }
 
+    // ── 池读路径 ─────────────────────────────────────────────────────────────
+
+    /// 获取全部池（返回克隆，读路径持读锁后立即释放）
+    pub fn list_pools(&self) -> Vec<Pool> {
+        self.wallpaper_library
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .pools
+            .clone()
+    }
+
+    /// 按 id 查找单个池（返回克隆）；未找到时返回 `None`
+    pub fn get_pool(&self, id: &str) -> Option<Pool> {
+        self.wallpaper_library
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .pools
+            .iter()
+            .find(|p| p.id == id)
+            .cloned()
+    }
+
+    // ── 池写路径 ─────────────────────────────────────────────────────────────
+
+    /// 创建池
+    ///
+    /// `member_ids` 写入前就地去除重复 id（DR-24，保留首次出现顺序）。
+    /// `name` 为空时默认生成"池 N"。写后立即触发库保存（原子写）。
+    pub fn create_pool(
+        &self,
+        name: Option<String>,
+        mut member_ids: Vec<String>,
+    ) -> Result<Pool, MirrorStarError> {
+        // 成员去重（DR-24，保留首次出现顺序）
+        {
+            let mut seen = std::collections::HashSet::with_capacity(member_ids.len());
+            member_ids.retain(|m| seen.insert(m.clone()));
+        }
+        let next_num = {
+            let lib = self
+                .wallpaper_library
+                .read()
+                .unwrap_or_else(|e| e.into_inner());
+            lib.pools.len() + 1
+        };
+        let pool = Pool {
+            id: uuid::Uuid::new_v4().to_string(),
+            name: name.unwrap_or_else(|| format!("池 {}", next_num)),
+            member_ids,
+        };
+        {
+            let mut lib = self
+                .wallpaper_library
+                .write()
+                .unwrap_or_else(|e| e.into_inner());
+            lib.pools.push(pool.clone());
+        }
+        self.mark_library_dirty();
+        self.save_library()?;
+        Ok(pool)
+    }
+
+    /// 更新池名称与/或成员列表
+    ///
+    /// 仅更新传入的非空字段（`name` / `member_ids`）；`member_ids` 写入前去重（DR-24）。
+    /// 未找到池时返回 `Ok(None)` 且不落盘。写后立即触发库保存（原子写）。
+    pub fn update_pool(
+        &self,
+        id: &str,
+        name: Option<&str>,
+        mut member_ids: Option<Vec<String>>,
+    ) -> Result<Option<Pool>, MirrorStarError> {
+        let updated = {
+            let mut lib = self
+                .wallpaper_library
+                .write()
+                .unwrap_or_else(|e| e.into_inner());
+            let pool = match lib.pools.iter_mut().find(|p| p.id == id) {
+                Some(p) => p,
+                None => return Ok(None),
+            };
+            if let Some(n) = name {
+                pool.name = n.to_string();
+            }
+            if let Some(ids) = member_ids.take() {
+                let mut seen = std::collections::HashSet::with_capacity(ids.len());
+                pool.member_ids = ids;
+                pool.member_ids.retain(|m| seen.insert(m.clone()));
+            }
+            Some(pool.clone())
+        };
+        if updated.is_some() {
+            self.mark_library_dirty();
+            self.save_library()?;
+        }
+        Ok(updated)
+    }
+
+    /// 删除池
+    ///
+    /// 未找到池时返回 `Ok(None)` 且不落盘。写后立即触发库保存（原子写）。
+    pub fn delete_pool(&self, id: &str) -> Result<Option<Pool>, MirrorStarError> {
+        let removed = {
+            let mut lib = self
+                .wallpaper_library
+                .write()
+                .unwrap_or_else(|e| e.into_inner());
+            lib.pools.iter().position(|p| p.id == id).map(|i| lib.pools.remove(i))
+        };
+        if removed.is_some() {
+            self.mark_library_dirty();
+            self.save_library()?;
+        }
+        Ok(removed)
+    }
+
     // ── 壁纸库写路径 ────────────────────────────────────────────────────────
 
     /// 添加壁纸条目
@@ -531,6 +743,17 @@ impl ConfigManager {
                 None => return Ok(None),
             }
         };
+        // DR-11（D3）删除壁纸一致性：从所有 Pool.member_ids 移除该 id。
+        // 壁纸条目本身的 `groups`（所属池引用）随条目删除一并消失，无需额外清理。
+        {
+            let mut lib = self
+                .wallpaper_library
+                .write()
+                .unwrap_or_else(|e| e.into_inner());
+            for pool in lib.pools.iter_mut() {
+                pool.member_ids.retain(|m| m != id);
+            }
+        }
         // v5.0 C-PERF-002: 标记 dirty，由周期保存线程或显式 flush_library 落盘
         self.mark_library_dirty();
         Ok(removed)
@@ -1228,6 +1451,24 @@ mod tests {
     use super::test_support::make_temp_config_manager;
     use super::*;
 
+    // ── 数据根构建产物目录识别（环境发现修复） ─────────────────────────────
+
+    #[test]
+    fn cargo_build_artifact_dir_detection() {
+        // 携带 `target/<debug|release>` 的构建产物目录应被识别。
+        assert!(is_cargo_build_artifact_dir(Path::new(r"C:\Dev\foo\target\debug")));
+        assert!(is_cargo_build_artifact_dir(Path::new("C:/Dev/foo/target/release")));
+        assert!(is_cargo_build_artifact_dir(Path::new(r"C:\Dev\foo\target\x86_64-pc-windows-msvc\debug")));
+
+        // 测试二进制目录（`target/<profile>/deps/`）不应命中。
+        assert!(!is_cargo_build_artifact_dir(Path::new(r"C:\Dev\foo\target\debug\deps")));
+        // 普通安装目录不应命中（生产便携行为不变）。
+        assert!(!is_cargo_build_artifact_dir(Path::new(r"C:\Program Files\MirrorStar")));
+        assert!(!is_cargo_build_artifact_dir(Path::new(r"C:\Dev\foo\target")));
+        // 非 debug/release 且带 target 祖先也不命中。
+        assert!(!is_cargo_build_artifact_dir(Path::new(r"C:\Dev\foo\target\build")));
+    }
+
     // ── WallpaperEntry 序列化 ────────────────────────────────────────────────
 
     #[test]
@@ -1246,6 +1487,7 @@ mod tests {
                 duration: Some(120.5),
                 frame_count: None,
             }),
+            groups: Vec::new(),
             normalized_path: String::new(),
         };
 
@@ -1265,6 +1507,7 @@ mod tests {
             thumbnail: String::new(),
             file_size: 0,
             metadata: None,
+            groups: Vec::new(),
             normalized_path: String::new(),
         };
 
@@ -1296,6 +1539,7 @@ mod tests {
                 thumbnail: String::new(),
                 file_size: 100,
                 metadata: None,
+                groups: Vec::new(),
                 normalized_path: String::new(),
             },
             WallpaperEntry {
@@ -1312,11 +1556,13 @@ mod tests {
                     duration: None,
                     frame_count: Some(60),
                 }),
+                groups: Vec::new(),
                 normalized_path: String::new(),
             },
         ];
         let lib = WallpaperLibrary {
             wallpapers: entries,
+            pools: Vec::new(),
         };
 
         let toml_str = toml::to_string_pretty(&lib).expect("serialize");
@@ -1339,6 +1585,153 @@ mod tests {
         let toml_str = toml::to_string_pretty(&meta).expect("serialize");
         let deserialized: WallpaperMetadata = toml::from_str(&toml_str).expect("deserialize");
         assert_eq!(meta, deserialized);
+    }
+
+    // ── 池模型（DR-3 / DR-24 / DR-35 / DR-11-D3）────────────────────────────
+
+    #[test]
+    fn pool_validate_dedups_members_keeping_first_order() {
+        // DR-24：去重并保留首次出现顺序
+        let mut pool = Pool {
+            id: "p1".to_string(),
+            name: "每日精选".to_string(),
+            member_ids: vec![
+                "a".to_string(),
+                "b".to_string(),
+                "a".to_string(),
+                "c".to_string(),
+                "b".to_string(),
+            ],
+        };
+        pool.validate();
+        assert_eq!(
+            pool.member_ids,
+            vec!["a".to_string(), "b".to_string(), "c".to_string()],
+            "重复成员应被移除，保留首次出现顺序（DR-24）"
+        );
+    }
+
+    #[test]
+    fn old_library_toml_without_pools_falls_back_to_empty() {
+        // DR-35/兼容：旧版 wallpapers.toml 无 pools 段应回退为空
+        let toml_str = r#"
+[[wallpapers]]
+id = "w1"
+file_path = "C:/a.mp4"
+wallpaper_type = "Video"
+added_at = "1"
+"#;
+        let lib: WallpaperLibrary = toml::from_str(toml_str).expect("deserialize old library");
+        assert!(lib.pools.is_empty(), "无 pools 段应回退为空池列表");
+        assert_eq!(lib.wallpapers.len(), 1);
+        assert!(lib.wallpapers[0].groups.is_empty(), "groups 默认应为空");
+    }
+
+    #[test]
+    fn resolve_pool_returns_none_for_missing_or_any_deleted_pool() {
+        // DR-35：None / 指向不存在（已删）池 → 回退"全部"池语义（返回 None）
+        let lib = WallpaperLibrary {
+            wallpapers: Vec::new(),
+            pools: vec![Pool {
+                id: "p1".to_string(),
+                name: "池 1".to_string(),
+                member_ids: vec!["a".to_string()],
+            }],
+        };
+        // None → "全部"
+        assert!(resolve_pool(&lib, None).is_none());
+        // 显式存在的池 → Some
+        assert_eq!(resolve_pool(&lib, Some("p1")).map(|p| p.id.as_str()), Some("p1"));
+        // 指向已删/不存在的池 → None（回退"全部"）
+        assert!(resolve_pool(&lib, Some("deleted")).is_none());
+    }
+
+    #[test]
+    fn remove_wallpaper_cleans_pool_members() {
+        // DR-11（D3）：删除壁纸后，所有池的 member_ids 中的该 id 被同步移除
+        let cm = make_temp_config_manager();
+        let e1 = WallpaperEntry {
+            id: "w1".to_string(),
+            file_path: "C:/a.mp4".to_string(),
+            wallpaper_type: WallpaperType::Video,
+            display_id: None,
+            added_at: "1".to_string(),
+            thumbnail: String::new(),
+            file_size: 0,
+            metadata: None,
+            groups: Vec::new(),
+            normalized_path: String::new(),
+        };
+        let e2 = WallpaperEntry {
+            id: "w2".to_string(),
+            file_path: "C:/b.mp4".to_string(),
+            wallpaper_type: WallpaperType::Video,
+            display_id: None,
+            added_at: "2".to_string(),
+            thumbnail: String::new(),
+            file_size: 0,
+            metadata: None,
+            groups: Vec::new(),
+            normalized_path: String::new(),
+        };
+        cm.add_wallpaper(e1).unwrap();
+        cm.add_wallpaper(e2).unwrap();
+        cm.create_pool(None, vec!["w1".to_string(), "w2".to_string(), "w1".to_string()])
+            .expect("create pool");
+
+        // 池创建时成员已去重
+        let before = cm.list_pools();
+        assert_eq!(
+            before[0].member_ids,
+            vec!["w1".to_string(), "w2".to_string()],
+            "create_pool 应就地去除重复成员（DR-24）"
+        );
+
+        // 删除壁纸 w1 → 池成员应只剩 w2
+        let removed = cm.remove_wallpaper("w1").unwrap();
+        assert!(removed.is_some(), "w1 应被删除");
+        let after = cm.list_pools();
+        assert_eq!(
+            after[0].member_ids,
+            vec!["w2".to_string()],
+            "删除壁纸后池成员应同步移除该 id（DR-11-D3）"
+        );
+    }
+
+    #[test]
+    fn delete_pool_removes_it_from_library() {
+        let cm = make_temp_config_manager();
+        let pool = cm
+            .create_pool(Some("我的图库".to_string()), vec!["w1".to_string()])
+            .expect("create pool");
+        assert_eq!(cm.list_pools().len(), 1);
+
+        let removed = cm.delete_pool(&pool.id).unwrap();
+        assert!(removed.is_some());
+        assert_eq!(cm.list_pools().len(), 0);
+        // 再次删除已删除的池 → 返回 None
+        assert!(cm.delete_pool(&pool.id).unwrap().is_none());
+    }
+
+    #[test]
+    fn update_pool_changes_name_and_dedups_members() {
+        let cm = make_temp_config_manager();
+        let pool = cm
+            .create_pool(None, vec!["a".to_string(), "b".to_string()])
+            .expect("create pool");
+
+        let updated = cm
+            .update_pool(&pool.id, Some("新名字"), Some(vec!["b".to_string(), "a".to_string(), "b".to_string()]))
+            .expect("update pool")
+            .unwrap();
+        assert_eq!(updated.name, "新名字");
+        assert_eq!(
+            updated.member_ids,
+            vec!["b".to_string(), "a".to_string()],
+            "update_pool 应就地去重（DR-24）"
+        );
+        // 更新不存在的池 → None
+        assert!(cm.update_pool("no-such-pool", Some("x"), None).unwrap().is_none());
     }
 
     // ── DisplayInfo 序列化 ───────────────────────────────────────────────────
@@ -1395,6 +1788,7 @@ mod tests {
             thumbnail: String::new(),
             file_size: 0,
             metadata: None,
+            groups: Vec::new(),
             normalized_path: String::new(),
         };
         let toml_str = toml::to_string(&entry).unwrap();
@@ -1461,6 +1855,7 @@ mod tests {
             thumbnail: String::new(),
             file_size: 0,
             metadata: None,
+            groups: Vec::new(),
             normalized_path: String::new(),
         };
         cm.add_wallpaper(e1).unwrap();
@@ -1474,6 +1869,7 @@ mod tests {
             thumbnail: String::new(),
             file_size: 0,
             metadata: None,
+            groups: Vec::new(),
             normalized_path: String::new(),
         };
         cm.add_wallpaper(e2).unwrap();
@@ -1511,6 +1907,7 @@ mod tests {
             thumbnail: String::new(),
             file_size: 0,
             metadata: None,
+            groups: Vec::new(),
             normalized_path: String::new(),
         })
         .unwrap();
@@ -1523,6 +1920,7 @@ mod tests {
             thumbnail: String::new(),
             file_size: 0,
             metadata: None,
+            groups: Vec::new(),
             normalized_path: String::new(),
         })
         .unwrap();
@@ -1566,6 +1964,7 @@ mod tests {
             thumbnail: String::new(),
             file_size: 0,
             metadata: None,
+            groups: Vec::new(),
             normalized_path: String::new(),
         })
         .unwrap();
@@ -1715,6 +2114,7 @@ mod tests {
                 duration: Some(60.0),
                 frame_count: None,
             }),
+            groups: Vec::new(),
             normalized_path: String::new(),
         })
         .unwrap();
@@ -2213,6 +2613,66 @@ balanced_keep_frames = 0
     }
 
     #[test]
+    fn new_in_dir_materializes_config_and_library_on_first_start() {
+        // Bug-01 回归：全新安装首次用 new_in_dir 构造时，应落盘 config.toml 与
+        // wallpapers.toml，确保 start_watching 的监视路径存在（否则 notify 报
+        // "Input watch path is neither a file nor a directory"，热重载被静默禁用）。
+        let dir = std::env::temp_dir().join(format!(
+            "mirrorstar_bug01_{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let config_path = dir.join("config.toml");
+        let library_path = dir.join("wallpapers.toml");
+        assert!(!config_path.exists(), "前置：全新目录不应有 config.toml");
+        assert!(!library_path.exists(), "前置：全新目录不应有 wallpapers.toml");
+
+        let _cm = ConfigManager::new_in_dir(dir.clone()).expect("构造应成功");
+
+        assert!(config_path.exists(), "Bug-01：首次构造应落盘 config.toml");
+        assert!(library_path.exists(), "Bug-01：首次构造应落盘 wallpapers.toml");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn new_in_dir_does_not_overwrite_existing_config_or_library() {
+        // Bug-01 健壮性：文件已存在（含内容）时绝不覆盖，保留既有数据。
+        let dir = std::env::temp_dir().join(format!(
+            "mirrorstar_bug01_keep_{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let config_path = dir.join("config.toml");
+        // 预置一个合法但非默认（明显差异化）的配置：自定义旋转间隔
+        let pre = r#"disabled=false
+[rotation]
+period_seconds=1.0
+"#;
+        std::fs::write(&config_path, pre).expect("预置 config.toml 应成功");
+
+        let _cm = ConfigManager::new_in_dir(dir.clone()).expect("构造应成功");
+
+        let content = std::fs::read_to_string(&config_path).unwrap();
+        assert!(
+            content.contains("period_seconds"),
+            "已有 config.toml 不应被覆盖为默认值，实际内容 = {content}"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn cleanup_corrupted_thumbnails_returns_zero_when_dir_missing() {
         // C03：thumbnails 目录不存在时返回 0，且使用实例目录而非 data_dir
         let dir = std::env::temp_dir().join(format!(
@@ -2503,6 +2963,7 @@ balanced_keep_frames = 0
             thumbnail: String::new(),
             file_size: 0,
             metadata: None,
+            groups: Vec::new(),
             normalized_path: String::new(),
         })
         .unwrap();
@@ -2536,6 +2997,7 @@ balanced_keep_frames = 0
             thumbnail: String::new(),
             file_size: 0,
             metadata: None,
+            groups: Vec::new(),
             normalized_path: String::new(),
         })
         .unwrap();
@@ -2563,6 +3025,7 @@ balanced_keep_frames = 0
             thumbnail: String::new(),
             file_size: 0,
             metadata: None,
+            groups: Vec::new(),
             normalized_path: String::new(),
         })
         .unwrap();
@@ -2596,6 +3059,7 @@ balanced_keep_frames = 0
             thumbnail: String::new(),
             file_size: 0,
             metadata: None,
+            groups: Vec::new(),
             normalized_path: String::new(),
         })
         .unwrap();
@@ -2667,6 +3131,7 @@ balanced_keep_frames = 0
             thumbnail: String::new(),
             file_size: 0,
             metadata: None,
+            groups: Vec::new(),
             normalized_path: String::new(),
         })
         .unwrap();
@@ -2732,8 +3197,10 @@ balanced_keep_frames = 0
                 thumbnail: String::new(),
                 file_size: 0,
                 metadata: None,
+                groups: Vec::new(),
                 normalized_path: String::new(),
             }],
+            pools: Vec::new(),
         };
         let lib_toml = toml::to_string_pretty(&lib).unwrap();
         std::fs::write(&cm.library_path, lib_toml).unwrap();

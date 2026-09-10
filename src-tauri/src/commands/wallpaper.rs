@@ -256,7 +256,7 @@ impl Drop for ComGuard {
 /// 使用 `LazyLock`：`HashSet::new()` 非 const fn，无法直接初始化 static。
 /// `LazyLock<T>` 实现了 `Deref<Target = T>`，访问处 `DISPLAYS_SETTING.lock()`
 /// 通过自动 deref 调用 `Mutex::lock()`，与原 `Mutex` 直接访问语法一致。
-static DISPLAYS_SETTING: std::sync::LazyLock<std::sync::Mutex<HashSet<String>>> =
+pub(crate) static DISPLAYS_SETTING: std::sync::LazyLock<std::sync::Mutex<HashSet<String>>> =
     std::sync::LazyLock::new(|| std::sync::Mutex::new(HashSet::new()));
 
 /// T15：display 设置中标志的 RAII guard
@@ -268,7 +268,7 @@ static DISPLAYS_SETTING: std::sync::LazyLock<std::sync::Mutex<HashSet<String>>> 
 // `derive(Debug)`：单元测试中 `DisplaySettingGuard::acquire(...).expect_err(...)`
 // 需要 Ok 变体实现 `Debug`（`Result::expect_err` 的约束）。
 #[derive(Debug)]
-struct DisplaySettingGuard {
+pub(crate) struct DisplaySettingGuard {
     display_id: String,
 }
 
@@ -307,7 +307,7 @@ impl DisplaySettingGuard {
     ///    → 返回 Err `"显示器 A 正在切换壁纸，请稍后再试"`
     /// 3. 第一个 set_wallpaper 完成 → guard A Drop，标志移除
     /// 4. 用户重试 set_wallpaper("A") → 获取 guard A 成功
-    fn acquire(display_id: String) -> Result<Self, mirrorstar_core::MirrorStarError> {
+    pub(crate) fn acquire(display_id: String) -> Result<Self, mirrorstar_core::MirrorStarError> {
         let mut set = DISPLAYS_SETTING.lock().map_err(|e| {
             mirrorstar_core::MirrorStarError::LockPoisoned(format!("DISPLAYS_SETTING 锁中毒: {}", e))
         })?;
@@ -578,6 +578,7 @@ pub async fn add_wallpaper(
         thumbnail: String::new(),
         file_size,
         metadata: None,
+        groups: Vec::new(),
         // 派生字段，由 ConfigManager::add_wallpaper 内部计算覆盖
         normalized_path: String::new(),
     };
