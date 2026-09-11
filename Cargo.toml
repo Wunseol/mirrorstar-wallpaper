@@ -68,7 +68,7 @@ fs2 = "0.4"
 # Windows registry
 # v16-D-010 / v16-D-016：对齐 Cargo.lock 实际拉取的 0.55.0（其他传递依赖已引入），
 # 避免编译两份 winreg（0.52 + 0.55），减小编译产物与编译时间
-winreg = "0.55"
+winreg = "0.56"
 
 # UUID
 uuid = { version = "1", features = ["v4"] }
