@@ -2336,7 +2336,7 @@ dependencies = [
  "tracing-appender",
  "tracing-subscriber",
  "uuid",
- "windows 0.58.0",
+ "windows 0.61.3",
  "winreg 0.55.0",
 ]
 
@@ -2357,7 +2357,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "uuid",
- "windows 0.58.0",
+ "windows 0.61.3",
 ]
 
 [[package]]
@@ -2371,7 +2371,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "webview2-com 0.34.0",
- "windows 0.58.0",
+ "windows 0.61.3",
 ]
 
 [[package]]
