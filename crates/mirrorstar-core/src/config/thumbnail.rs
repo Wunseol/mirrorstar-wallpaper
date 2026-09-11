@@ -97,7 +97,10 @@ const MAX_DECODED_PIXEL_BUFFER_SIZE: u64 = 200 * 1024 * 1024;
 /// - C06：BMP/TIFF 未压缩格式超过 50MB 上限 → `MirrorStarError::ImageDecode`
 /// - SEC-003：图像尺寸超过 20000×20000 上限 → `MirrorStarError::ImageDecode`
 /// - C06：解码后像素缓冲区超过 200MB 上限 → `MirrorStarError::ImageDecode`
-pub fn generate_thumbnail(file_path: &str, thumbnail_dir: &Path) -> Result<String, MirrorStarError> {
+pub fn generate_thumbnail(
+    file_path: &str,
+    thumbnail_dir: &Path,
+) -> Result<String, MirrorStarError> {
     std::fs::create_dir_all(thumbnail_dir)?;
     generate_thumbnail_from_image_file(Path::new(file_path), file_path, thumbnail_dir)
 }
@@ -741,7 +744,8 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
 
         // 长中文含空格文件名（模拟「批注 2026-08-14 114650.png」场景），路径足够长以复现旧缺陷
-        let file_name = "批注 2026-08-14 114650 测试用例文件名 for os error regression one two three.png";
+        let file_name =
+            "批注 2026-08-14 114650 测试用例文件名 for os error regression one two three.png";
         let src_path = dir.join(file_name);
         let img = image::DynamicImage::new_rgb8(800, 600);
         img.save_with_format(&src_path, ImageFormat::Png).unwrap();

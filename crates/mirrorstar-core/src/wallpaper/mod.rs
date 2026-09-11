@@ -663,8 +663,13 @@ pub trait WallpaperRenderer: Send {
     /// 恢复壁纸
     fn resume(&mut self) -> Result<(), crate::MirrorStarError>;
     /// 设置壁纸窗口位置和大小
-    fn set_position(&mut self, x: i32, y: i32, w: i32, h: i32)
-        -> Result<(), crate::MirrorStarError>;
+    fn set_position(
+        &mut self,
+        x: i32,
+        y: i32,
+        w: i32,
+        h: i32,
+    ) -> Result<(), crate::MirrorStarError>;
     /// 终止壁纸渲染
     fn terminate(&mut self) -> Result<(), crate::MirrorStarError>;
     /// 获取壁纸窗口句柄
@@ -799,10 +804,7 @@ pub(crate) fn draw_rect_covers_full(
     client_w: i32,
     client_h: i32,
 ) -> bool {
-    draw_x <= 0
-        && draw_y <= 0
-        && draw_x + draw_w >= client_w
-        && draw_y + draw_h >= client_h
+    draw_x <= 0 && draw_y <= 0 && draw_x + draw_w >= client_w && draw_y + draw_h >= client_h
 }
 
 pub mod fast_path;
@@ -930,7 +932,8 @@ mod tests {
     fn covers_full_stretch_mode_always_covers() {
         // Stretch 拉伸模式：绘制矩形恒为客户区尺寸 → 覆盖
         for (img_w, img_h) in [(800u32, 600u32), (2560, 1440), (1920, 1080)] {
-            let (dx, dy, dw, dh) = calculate_scaling(img_w, img_h, 1920, 1080, ScalingMode::Stretch);
+            let (dx, dy, dw, dh) =
+                calculate_scaling(img_w, img_h, 1920, 1080, ScalingMode::Stretch);
             assert!(draw_rect_covers_full(dx, dy, dw, dh, 1920, 1080));
         }
     }

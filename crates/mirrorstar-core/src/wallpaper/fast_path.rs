@@ -328,7 +328,10 @@ impl WallpaperEngine {
     ///
     /// 调用方必须持有 `WallpaperEngine` 锁（`&mut self` 借用已保证）。先 clone
     /// `pause_senders` 的 key 列表，再通过 `wallpapers.get_mut` 访问渲染器，避免借用冲突。
-    pub fn terminate_all_fast(&mut self, reason: PauseReason) -> Result<Vec<String>, MirrorStarError> {
+    pub fn terminate_all_fast(
+        &mut self,
+        reason: PauseReason,
+    ) -> Result<Vec<String>, MirrorStarError> {
         // 锁内设置 reason 位（与 pause_all_fast 的 W06 TOCTOU 修复一致）
         let mut reasons = self
             .pause_reasons

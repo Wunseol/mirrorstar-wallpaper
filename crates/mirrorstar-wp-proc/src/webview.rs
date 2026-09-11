@@ -515,16 +515,17 @@ pub(crate) fn create_webview(
                     )
                     .map_err(webview2_com::Error::WindowsError)
                     .map_err(|e| {
-                        MirrorStarError::DesktopIntegration(format!("创建 WebView2 环境失败: {}", e))
+                        MirrorStarError::DesktopIntegration(format!(
+                            "创建 WebView2 环境失败: {}",
+                            e
+                        ))
                     })?;
                 }
             }
             // v15-C-002: UserDataFolder 可用但 options 构建失败——保留 UserDataFolder
             // （卸载清理路径仍有效），用默认 options（无 AdditionalBrowserArguments）。
             (Some(user_data_folder), None) => {
-                tracing::warn!(
-                    "环境选项构建失败, 保留 UserDataFolder 使用默认 options"
-                );
+                tracing::warn!("环境选项构建失败, 保留 UserDataFolder 使用默认 options");
                 let default_options: ICoreWebView2EnvironmentOptions =
                     webview2_com::CoreWebView2EnvironmentOptions::default().into();
                 unsafe {
@@ -536,15 +537,16 @@ pub(crate) fn create_webview(
                     )
                     .map_err(webview2_com::Error::WindowsError)
                     .map_err(|e| {
-                        MirrorStarError::DesktopIntegration(format!("创建 WebView2 环境失败: {}", e))
+                        MirrorStarError::DesktopIntegration(format!(
+                            "创建 WebView2 环境失败: {}",
+                            e
+                        ))
                     })?;
                 }
             }
             // v15-C-002: UserDataFolder 构建失败——完全回退到默认 CreateCoreWebView2Environment
             (None, _) => {
-                tracing::warn!(
-                    "UserDataFolder 构建失败, 回退到默认 CreateCoreWebView2Environment"
-                );
+                tracing::warn!("UserDataFolder 构建失败, 回退到默认 CreateCoreWebView2Environment");
                 unsafe {
                     CreateCoreWebView2Environment(&callback)
                         .map_err(webview2_com::Error::WindowsError)
@@ -1017,7 +1019,11 @@ mod tests {
             assert!(result.is_err(), "about: 变体应被拒绝（输入: {}）", input);
             match result {
                 Err(MirrorStarError::InvalidUrl { scheme }) => {
-                    assert_eq!(scheme, "about", "错误中应返回规范 scheme（输入: {}）", input);
+                    assert_eq!(
+                        scheme, "about",
+                        "错误中应返回规范 scheme（输入: {}）",
+                        input
+                    );
                 }
                 other => panic!("期望 InvalidUrl 错误（输入: {}），实际: {:?}", input, other),
             }

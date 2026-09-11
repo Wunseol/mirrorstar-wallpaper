@@ -1,4 +1,4 @@
-[← 返回文档索引](../../README.md) > [架构设计](./01-架构概述-Architecture-Overview.md) > 性能优化
+[← 返回文档索引](../../README.md) > [架构设计](./01-架构概述与系统架构-Architecture-Overview.md) > 性能优化
 
 # MirrorStar Wallpaper（镜星壁纸）架构设计 — 性能优化策略
 
@@ -43,7 +43,7 @@
 
 ```mermaid
 graph LR
-    subgraph Polling["轮询方案 (Lively)"]
+    subgraph Polling["轮询方案"]
         P1["DispatcherTimer (500ms)"]
         P2["GetForegroundWindow()"]
         P3["GetWindowThreadProcessId()"]
@@ -168,20 +168,20 @@ GIF 内存预算从 200MB 降至 40MB（`MAX_GIF_MEMORY_MB`）。暂停时释放
 
 ***
 
-## 附录 A：与 Lively Wallpaper 架构对比
+## 附录 A：技术架构选型
 
-| 维度    | Lively Wallpaper            | MirrorStar Wallpaper     | 改进说明            |
-| ----- | --------------------------- | ----------------------- | --------------- |
-| 语言    | C# (.NET)                   | Rust                    | 内存安全、零成本抽象、无 GC |
-| UI 框架 | WPF + MahApps.Metro         | Tauri (WebView2)        | 更轻量的 UI 方案      |
-| 进程监控  | DispatcherTimer 轮询 500ms    | SetWinEventHook 事件驱动    | CPU 占用从持续到近零    |
-| 壁纸类型  | 9 种                         | 4 种                     | 精简非核心类型         |
-| IPC   | CefSharp stdin/stdout       | 两套独立命名管道（mpv 原生 + wp-proc 自定义） | 分别针对不同子进程的通信需求  |
-| 配置    | JSON                        | TOML                    | 更好的可读性和手动编辑体验   |
-| 看门狗   | livelySubProcess（独立看门狗进程）  | 无独立看门狗进程（watchdog 已移除，依赖 OS 自动回收子进程） | 更简洁，无需额外进程     |
-| 暂停方式  | SuspendThread + VolumeMixer | 逻辑暂停 PauseSender + VolumeMixer | 逻辑暂停更安全，避免死锁    |
-| 日志    | NLog                        | tracing                 | Rust 生态标准方案     |
-| 二进制体积 | 需 .NET Runtime              | 单文件 < 10MB              | 无运行时依赖          |
+| 维度    | MirrorStar 方案              | 说明            |
+| ----- | --------------------------- | --------------- |
+| 语言    | Rust                    | 内存安全、零成本抽象、无 GC |
+| UI 框架 | Tauri (WebView2)        | 更轻量的 UI 方案      |
+| 进程监控  | SetWinEventHook 事件驱动    | CPU 占用从持续到近零    |
+| 壁纸类型  | 4 种                     | 精简非核心类型         |
+| IPC   | 两套独立命名管道（mpv 原生 + wp-proc 自定义） | 分别针对不同子进程的通信需求  |
+| 配置    | TOML                    | 更好的可读性和手动编辑体验   |
+| 看门狗   | 无独立看门狗进程（watchdog 已移除，依赖 OS 自动回收子进程） | 更简洁，无需额外进程     |
+| 暂停方式  | 逻辑暂停 PauseSender + VolumeMixer | 逻辑暂停更安全，避免死锁    |
+| 日志    | tracing                 | Rust 生态标准方案     |
+| 二进制体积 | 单文件 < 10MB              | 无运行时依赖          |
 
 ## 附录 B：关键 Windows API 参考
 
@@ -202,42 +202,41 @@ GIF 内存预算从 200MB 降至 40MB（`MAX_GIF_MEMORY_MB`）。暂停时释放
 
 ***
 
-## 附录 C：与 Lively Wallpaper 性能策略对比
+## 附录 C：关键性能策略
 
-| 维度 | MirrorStar | Lively |
-|----------|-----------|--------|
-| **全屏检测** | SetWinEventHook 事件驱动(0 CPU) + AtomicBool 去抖 | Timer 轮询(持续 CPU，500ms 间隔) |
-| **图片加载** | 超屏幕分辨率自动降采样 + 暂停释放像素 | 全分辨率加载 |
-| **GIF 内存** | 40MB 内存预算 + 暂停释放帧 + 速度控制 | 无限制 |
-| **GIF 渲染** | GDI 对象缓存 + 双缓冲 + WM_TIMER | WPF 动画框架 |
-| **WorkerW 检查** | 5min 间隔（Tokio 异步运行时） | 无 |
-| **缩略图生成** | image crate，320x180，JPEG 质量 85 | 无独立缩略图生成 |
-| **配置写入** | 原子写入(文件锁+临时文件+rename) + 300ms 防抖 | 双写备份 |
-| **进程暂停** | 逻辑暂停(PauseSender 快速通道绕过引擎锁) | SuspendThread(粗暴但有效) |
-| **原生壁纸 API** | SystemParametersInfoW + 注册表（零资源占用） | 无 |
-| **WebView2** | 独立子进程（按需启动，关闭即终止） | CefSharp 独立子进程（启动即加载） |
-| **COM 接口缓存** | 有（音量控制优化） | 无 |
+| 维度 | MirrorStar 策略 |
+|----------|-----------|
+| **全屏检测** | SetWinEventHook 事件驱动(0 CPU) + AtomicBool 去抖 |
+| **图片加载** | 超屏幕分辨率自动降采样 + 暂停释放像素 |
+| **GIF 内存** | 40MB 内存预算 + 暂停释放帧 + 速度控制 |
+| **GIF 渲染** | GDI 对象缓存 + 双缓冲 + WM_TIMER |
+| **WorkerW 检查** | 5min 间隔（Tokio 异步运行时） |
+| **缩略图生成** | image crate，320x180，JPEG 质量 85 |
+| **配置写入** | 原子写入(文件锁+临时文件+rename) + 300ms 防抖 |
+| **进程暂停** | 逻辑暂停(PauseSender 快速通道绕过引擎锁) |
+| **原生壁纸 API** | SystemParametersInfoW + 注册表（零资源占用） |
+| **WebView2** | 独立子进程（按需启动，关闭即终止） |
+| **COM 接口缓存** | 有（音量控制优化） |
 
-### 关键差异说明
+### 优化要点分析
 
-1. **CPU 优化**：MirrorStar 的全屏检测使用事件驱动 + AtomicBool 去抖，空闲时 CPU 占用接近 0%。Lively 使用定时器轮询（500ms 间隔），持续消耗 CPU。
+1. **CPU 优化**：全屏检测使用事件驱动 + AtomicBool 去抖，空闲时 CPU 占用接近 0%。
 
-2. **内存优化**：MirrorStar 对大图片和 GIF 做了降采样处理 + 40MB 内存预算 + 暂停释放帧/像素，显著减少内存占用。Lively 未做此类优化，大图片/GIF 可能占用大量内存。
+2. **内存优化**：对大图片和 GIF 做了降采样处理 + 40MB 内存预算 + 暂停释放帧/像素，显著减少内存占用。
 
-3. **原生壁纸 API**：MirrorStar 对静态图片使用 SystemParametersInfoW + 注册表设置，零资源占用（无窗口、无线程）。Lively 无此优化，所有壁纸都通过窗口嵌入。
+3. **原生壁纸 API**：对静态图片使用 SystemParametersInfoW + 注册表设置，零资源占用（无窗口、无线程）。
 
-4. **PauseSender 快速通道**：MirrorStar 的 PauseSender 绕过引擎互斥锁，直接发送暂停/恢复/音量命令，避免高优先级操作被阻塞。Lively 无此机制。
+4. **PauseSender 快速通道**：绕过引擎互斥锁，直接发送暂停/恢复/音量命令，避免高优先级操作被阻塞。
 
-5. **WebView2 按需子进程**：MirrorStar 的 WebView2 运行在独立子进程（mirrorstar-wp-proc）中，仅在设置 Web 壁纸时启动，关闭 Web 壁纸即终止子进程，释放全部内存。Lively 的 CefSharp 子进程启动即加载，常驻内存。
+5. **WebView2 按需子进程**：WebView2 运行在独立子进程（mirrorstar-wp-proc）中，仅在设置 Web 壁纸时启动，关闭 Web 壁纸即终止子进程，释放全部内存。
 
-6. **进程暂停安全性**：MirrorStar 使用逻辑暂停（PauseSender 快速通道），更安全但需要每种渲染器单独实现。Lively 使用 SuspendThread，简单粗暴但可能导致死锁。
+6. **进程暂停安全性**：使用逻辑暂停（PauseSender 快速通道），安全且需要每种渲染器单独实现，避免线程挂起导致的死锁风险。
 
 ***
 
 **相关文档：**
 
-- [架构概述](./01-架构概述-Architecture-Overview.md)
-- [系统架构](./02-系统架构-System-Architecture.md)
+- [架构概述与系统架构](./01-架构概述与系统架构-Architecture-Overview.md)
 - [模块设计](./03-模块设计-Module-Design.md)
 - [进程架构](./04-进程架构-Process-Architecture.md)
 - [依赖与数据流](./05-依赖与数据流-Dependency-and-Data-Flow.md)

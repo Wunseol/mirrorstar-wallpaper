@@ -1,6 +1,6 @@
 # wallpaper 模块优化文档
 
-> [← 返回索引](./README.md)
+> [← 返回文档索引](../index.md)
 
 > 本文档合并自：顶层 v4.0 wallpaper 模块审查文档 + v6.0 技术债审查（wallpaper 模块）文档。
 

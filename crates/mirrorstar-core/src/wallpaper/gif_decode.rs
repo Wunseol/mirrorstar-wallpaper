@@ -238,10 +238,7 @@ fn decode_gif_inner(
     let total_memory_bytes: usize = frames.iter().map(|f| f.pixels.len()).sum();
     let total_memory_mb = total_memory_bytes as f64 / (1024.0 * 1024.0);
     if let Some(center) = streaming_center {
-        let retained = frames
-            .iter()
-            .filter(|f| !f.pixels.is_empty())
-            .count();
+        let retained = frames.iter().filter(|f| !f.pixels.is_empty()).count();
         tracing::info!(
             frame_count = frames.len(),
             retained_pixel_frames = retained,
@@ -761,7 +758,11 @@ fn frame_delay_ms(delay: image::Delay) -> u32 {
     } else {
         100
     };
-    if delay_ms == 0 { 100 } else { delay_ms }
+    if delay_ms == 0 {
+        100
+    } else {
+        delay_ms
+    }
 }
 
 /// 处理单帧：解析延迟、按需降采样。像素保留 RGBA 字节序（GDI 经 BI_BITFIELDS
@@ -1702,7 +1703,10 @@ mod tests {
         assert!(!is_outside_streaming_window(1, 0), "帧 1 在窗口内");
         assert!(is_outside_streaming_window(2, 0), "帧 2 在窗口外");
         // center 靠近开头：saturating_sub 防止下溢
-        assert!(!is_outside_streaming_window(0, 1), "center=1 时帧 0 在窗口内");
+        assert!(
+            !is_outside_streaming_window(0, 1),
+            "center=1 时帧 0 在窗口内"
+        );
     }
 
     #[test]
@@ -1806,8 +1810,7 @@ mod tests {
         // (d): 窗口 [4,7) 内的帧像素应完全匹配
         for i in 4..7 {
             assert_eq!(
-                streamed[i].pixels,
-                full[i].pixels,
+                streamed[i].pixels, full[i].pixels,
                 "v18: 窗口内帧 {} 像素应与全量解码一致",
                 i
             );
@@ -1844,7 +1847,10 @@ mod tests {
         assert!(streamed[5].pixels.is_empty(), "帧 5 像素应已清空");
         assert_eq!(streamed[5].width, full[5].width, "帧 5 宽度元数据应保留");
         assert_eq!(streamed[5].height, full[5].height, "帧 5 高度元数据应保留");
-        assert_eq!(streamed[5].delay_ms, full[5].delay_ms, "帧 5 延迟元数据应保留");
+        assert_eq!(
+            streamed[5].delay_ms, full[5].delay_ms,
+            "帧 5 延迟元数据应保留"
+        );
     }
 
     #[test]
@@ -2011,14 +2017,30 @@ mod tests {
         let mut cursor = 0usize;
 
         // 请求 1：target=3, half=2 → window=[1,5]，cursor: 0→6
-        let r1 = prefetch_with_cursor(&path, screen_w, screen_h, &mut frames_iter, &mut cursor, 3, 2);
+        let r1 = prefetch_with_cursor(
+            &path,
+            screen_w,
+            screen_h,
+            &mut frames_iter,
+            &mut cursor,
+            3,
+            2,
+        );
         assert_eq!(r1.len(), 5, "请求 1 应返回 5 帧 [1,5]");
         assert_eq!(cursor, 6);
 
         // 请求 2：target=4, half=2 → window=[2,6]。
         // cursor=6 >= window_start=2，故帧 6 被处理；帧 2-5 已由请求 1 填充（cursor 跳过）。
         // 期望仅返回帧 6（delta），而非全部 [2,6]。
-        let r2 = prefetch_with_cursor(&path, screen_w, screen_h, &mut frames_iter, &mut cursor, 4, 2);
+        let r2 = prefetch_with_cursor(
+            &path,
+            screen_w,
+            screen_h,
+            &mut frames_iter,
+            &mut cursor,
+            4,
+            2,
+        );
         assert_eq!(
             r2.len(),
             1,
@@ -2037,13 +2059,29 @@ mod tests {
         let mut cursor = 0usize;
 
         // 请求 1：target=5, half=2 → window=[3,7]，cursor: 0→8
-        let r1 = prefetch_with_cursor(&path, screen_w, screen_h, &mut frames_iter, &mut cursor, 5, 2);
+        let r1 = prefetch_with_cursor(
+            &path,
+            screen_w,
+            screen_h,
+            &mut frames_iter,
+            &mut cursor,
+            5,
+            2,
+        );
         assert_eq!(r1.len(), 5);
         assert_eq!(cursor, 8);
 
         // 请求 2：target=7, half=2 → window=[5,9]。
         // cursor=8 在窗口 [5,9] 内，仅处理帧 8,9（帧 5-7 已由请求 1 填充）。
-        let r2 = prefetch_with_cursor(&path, screen_w, screen_h, &mut frames_iter, &mut cursor, 7, 2);
+        let r2 = prefetch_with_cursor(
+            &path,
+            screen_w,
+            screen_h,
+            &mut frames_iter,
+            &mut cursor,
+            7,
+            2,
+        );
         assert_eq!(r2.len(), 2, "请求 2 应仅返回 delta 帧 8,9");
         let indices: Vec<usize> = r2.iter().map(|(i, _)| *i).collect();
         assert_eq!(indices, vec![8, 9]);
@@ -2060,13 +2098,29 @@ mod tests {
         // 请求 1：target=8, half=2 → window=[6,10]（实际 [6,9]，GIF 只有 10 帧）。
         // cursor: 0→6（skip 0-5）→ 6,7,8,9 处理 → cursor=10，iter.next()=None，break。
         // 游标停在 10（break 前未 ++）。
-        let r1 = prefetch_with_cursor(&path, screen_w, screen_h, &mut frames_iter, &mut cursor, 8, 2);
+        let r1 = prefetch_with_cursor(
+            &path,
+            screen_w,
+            screen_h,
+            &mut frames_iter,
+            &mut cursor,
+            8,
+            2,
+        );
         assert_eq!(r1.len(), 4, "请求 1 应返回帧 6,7,8,9");
         assert!(cursor >= 10, "游标应到达或超过 10");
 
         // 请求 2：target=2, half=2 → window=[0,4]，window_end=4 < cursor=10 → 回绕。
         // 重新打开 GIF，cursor=0，解码 0..=4 = 5 帧。
-        let r2 = prefetch_with_cursor(&path, screen_w, screen_h, &mut frames_iter, &mut cursor, 2, 2);
+        let r2 = prefetch_with_cursor(
+            &path,
+            screen_w,
+            screen_h,
+            &mut frames_iter,
+            &mut cursor,
+            2,
+            2,
+        );
         assert_eq!(r2.len(), 5, "回绕后应返回帧 0,1,2,3,4");
         let indices: Vec<usize> = r2.iter().map(|(i, _)| *i).collect();
         assert_eq!(indices, vec![0, 1, 2, 3, 4]);
@@ -2099,8 +2153,15 @@ mod tests {
         let (screen_w, screen_h) = super::super::get_screen_size();
         let mut frames_iter: Option<image::Frames<'static>> = None;
         let mut cursor = 0usize;
-        let result =
-            prefetch_with_cursor(&path, screen_w, screen_h, &mut frames_iter, &mut cursor, 1, 2);
+        let result = prefetch_with_cursor(
+            &path,
+            screen_w,
+            screen_h,
+            &mut frames_iter,
+            &mut cursor,
+            1,
+            2,
+        );
         assert!(
             result.is_empty(),
             "v10-C: 全部帧超 8MB 阈值应被跳过，返回空"
@@ -2141,8 +2202,15 @@ mod tests {
         let (screen_w, screen_h) = super::super::get_screen_size();
         let mut frames_iter: Option<image::Frames<'static>> = None;
         let mut cursor = 0usize;
-        let result =
-            prefetch_with_cursor(path, screen_w, screen_h, &mut frames_iter, &mut cursor, 0, 2);
+        let result = prefetch_with_cursor(
+            path,
+            screen_w,
+            screen_h,
+            &mut frames_iter,
+            &mut cursor,
+            0,
+            2,
+        );
         assert!(result.is_empty(), "损坏的 GIF 应返回空 Vec");
     }
 
@@ -2153,8 +2221,15 @@ mod tests {
         let (screen_w, screen_h) = super::super::get_screen_size();
         let mut frames_iter: Option<image::Frames<'static>> = None;
         let mut cursor = 0usize;
-        let result =
-            prefetch_with_cursor(&path, screen_w, screen_h, &mut frames_iter, &mut cursor, 0, 2);
+        let result = prefetch_with_cursor(
+            &path,
+            screen_w,
+            screen_h,
+            &mut frames_iter,
+            &mut cursor,
+            0,
+            2,
+        );
         assert_eq!(result.len(), 3, "窗口 [0,2] 应返回 3 帧");
         let indices: Vec<usize> = result.iter().map(|(i, _)| *i).collect();
         assert_eq!(indices, vec![0, 1, 2]);
@@ -2169,8 +2244,15 @@ mod tests {
         let mut frames_iter: Option<image::Frames<'static>> = None;
         let mut cursor = 0usize;
         // target=3, half=2 → window=[1,5]，但帧 5 不存在
-        let result =
-            prefetch_with_cursor(&path, screen_w, screen_h, &mut frames_iter, &mut cursor, 3, 2);
+        let result = prefetch_with_cursor(
+            &path,
+            screen_w,
+            screen_h,
+            &mut frames_iter,
+            &mut cursor,
+            3,
+            2,
+        );
         assert_eq!(result.len(), 4, "应返回帧 1,2,3,4（帧 5 不存在）");
         let indices: Vec<usize> = result.iter().map(|(i, _)| *i).collect();
         assert_eq!(indices, vec![1, 2, 3, 4]);
@@ -2183,8 +2265,15 @@ mod tests {
         let (screen_w, screen_h) = super::super::get_screen_size();
         let mut frames_iter: Option<image::Frames<'static>> = None;
         let mut cursor = 0usize;
-        let result =
-            prefetch_with_cursor(&path, screen_w, screen_h, &mut frames_iter, &mut cursor, 5, 2);
+        let result = prefetch_with_cursor(
+            &path,
+            screen_w,
+            screen_h,
+            &mut frames_iter,
+            &mut cursor,
+            5,
+            2,
+        );
         // 帧 i 的 RGBA = [i,0,0,255]（GDI 经 BI_BITFIELDS 解释，无需转换），1×1 = 4 字节
         for (i, frame) in &result {
             assert_eq!(frame.pixels.len(), 4);
@@ -2233,7 +2322,12 @@ mod tests {
 
         // 请求 1：target=3，cursor: 0→4
         let f1 = decode_single_frame_with_cursor(
-            &path, screen_w, screen_h, &mut frames_iter, &mut cursor, 3,
+            &path,
+            screen_w,
+            screen_h,
+            &mut frames_iter,
+            &mut cursor,
+            3,
         )
         .expect("请求 1 应成功");
         assert_eq!(f1.pixels[0], 3, "请求 1 应返回帧 3");
@@ -2241,7 +2335,12 @@ mod tests {
 
         // 请求 2：target=4，cursor=4，仅解码 1 帧（delta）
         let f2 = decode_single_frame_with_cursor(
-            &path, screen_w, screen_h, &mut frames_iter, &mut cursor, 4,
+            &path,
+            screen_w,
+            screen_h,
+            &mut frames_iter,
+            &mut cursor,
+            4,
         )
         .expect("请求 2 应成功");
         assert_eq!(f2.pixels[0], 4, "请求 2 应返回帧 4");
@@ -2258,7 +2357,12 @@ mod tests {
 
         // 请求 1：target=8，cursor: 0→9
         let f1 = decode_single_frame_with_cursor(
-            &path, screen_w, screen_h, &mut frames_iter, &mut cursor, 8,
+            &path,
+            screen_w,
+            screen_h,
+            &mut frames_iter,
+            &mut cursor,
+            8,
         )
         .expect("请求 1 应成功");
         assert_eq!(f1.pixels[0], 8);
@@ -2266,7 +2370,12 @@ mod tests {
 
         // 请求 2：target=2 < cursor=9 → 回绕，重新打开，cursor=0，解码 0..=2
         let f2 = decode_single_frame_with_cursor(
-            &path, screen_w, screen_h, &mut frames_iter, &mut cursor, 2,
+            &path,
+            screen_w,
+            screen_h,
+            &mut frames_iter,
+            &mut cursor,
+            2,
         )
         .expect("请求 2 应成功");
         assert_eq!(f2.pixels[0], 2, "回绕后应返回帧 2");
@@ -2283,7 +2392,12 @@ mod tests {
 
         // 首次：target=0，cursor: 0→1（O(1)）
         let f0 = decode_single_frame_with_cursor(
-            &path, screen_w, screen_h, &mut frames_iter, &mut cursor, 0,
+            &path,
+            screen_w,
+            screen_h,
+            &mut frames_iter,
+            &mut cursor,
+            0,
         )
         .expect("帧 0 应成功");
         assert_eq!(f0.pixels[0], 0);
@@ -2292,7 +2406,12 @@ mod tests {
         // 逐帧推进 1→2→3→4，每次 O(1)
         for target in 1..=4 {
             let f = decode_single_frame_with_cursor(
-                &path, screen_w, screen_h, &mut frames_iter, &mut cursor, target,
+                &path,
+                screen_w,
+                screen_h,
+                &mut frames_iter,
+                &mut cursor,
+                target,
             )
             .expect("前向解码应成功");
             assert_eq!(f.pixels[0], target as u8, "帧 {} R 分量", target);
@@ -2310,7 +2429,12 @@ mod tests {
 
         // target=10 超出 5 帧总数
         let result = decode_single_frame_with_cursor(
-            &path, screen_w, screen_h, &mut frames_iter, &mut cursor, 10,
+            &path,
+            screen_w,
+            screen_h,
+            &mut frames_iter,
+            &mut cursor,
+            10,
         );
         assert!(result.is_none(), "超出范围的 target 应返回 None");
     }
@@ -2429,7 +2553,8 @@ mod tests {
         let mut s: Vec<u128> = (0..3)
             .map(|_| {
                 let t = std::time::Instant::now();
-                let _ = decode_gif_frame_range(path, start, end, DEFAULT_MAX_GIF_MEMORY_MB).unwrap();
+                let _ =
+                    decode_gif_frame_range(path, start, end, DEFAULT_MAX_GIF_MEMORY_MB).unwrap();
                 t.elapsed().as_micros()
             })
             .collect();
@@ -2454,10 +2579,8 @@ mod tests {
         println!("    帧合成 + 降采样成本 ∝ 帧像素数，与真实 GIF 一致。");
 
         // (宽, 高, 帧数, 标签)
-        let configs: &[(u32, u32, usize, &str)] = &[
-            (320, 240, 100, "320×240"),
-            (640, 480, 60, "640×480"),
-        ];
+        let configs: &[(u32, u32, usize, &str)] =
+            &[(320, 240, 100, "320×240"), (640, 480, 60, "640×480")];
         let mut per_frame: Vec<(f64, &str)> = Vec::new();
 
         for &(w, h, n_frames, label) in configs {
@@ -2496,13 +2619,19 @@ mod tests {
                 }
             }
             // 用最大 N 估算 per-frame 成本（固定开销已摊薄，最稳定）
-            let c = if max_n > 0 { max_ms / max_n as f64 } else { 0.0 };
+            let c = if max_n > 0 {
+                max_ms / max_n as f64
+            } else {
+                0.0
+            };
             per_frame.push((c, label));
 
             // decode_gif_frame_range 模拟预取窗口 [N-half, N+half]（half=STREAMING_WINDOW_HALF）
             // 仍从 0 解码到 end，故耗时 ∝ end（O(N)）。
             let half = STREAMING_WINDOW_HALF;
-            println!("[{label}, {n_frames} 帧]  decode_gif_frame_range(N-half, N+half)  (预取窗口):");
+            println!(
+                "[{label}, {n_frames} 帧]  decode_gif_frame_range(N-half, N+half)  (预取窗口):"
+            );
             for &n in &[n_frames / 2, n_frames - 1] {
                 let start = n.saturating_sub(half);
                 let end = (n + half).min(n_frames - 1);
@@ -2567,7 +2696,12 @@ mod tests {
                 let t = std::time::Instant::now();
                 for i in 0..n_frames {
                     let _ = decode_single_frame_with_cursor(
-                        path, screen_w, screen_h, &mut frames_iter, &mut cursor, i,
+                        path,
+                        screen_w,
+                        screen_h,
+                        &mut frames_iter,
+                        &mut cursor,
+                        i,
                     )
                     .unwrap();
                 }
@@ -2580,12 +2714,7 @@ mod tests {
 
     /// #1 prefetch 完整前向循环：复用 `(frames_iter, cursor)`，每次前向 O(1) delta
     /// （窗口滑动仅解码新进入的 1 帧）。总 O(N)。
-    fn time_full_loop_prefetch(
-        path: &str,
-        screen_w: u32,
-        screen_h: u32,
-        n_frames: usize,
-    ) -> f64 {
+    fn time_full_loop_prefetch(path: &str, screen_w: u32, screen_h: u32, n_frames: usize) -> f64 {
         let half = STREAMING_WINDOW_HALF;
         let mut s: Vec<u128> = (0..3)
             .map(|_| {
@@ -2594,7 +2723,13 @@ mod tests {
                 let t = std::time::Instant::now();
                 for i in 0..n_frames {
                     let _ = prefetch_with_cursor(
-                        path, screen_w, screen_h, &mut frames_iter, &mut cursor, i, half,
+                        path,
+                        screen_w,
+                        screen_h,
+                        &mut frames_iter,
+                        &mut cursor,
+                        i,
+                        half,
                     );
                 }
                 t.elapsed().as_micros()
@@ -2621,15 +2756,15 @@ mod tests {
         println!("    旧路径每次调用从 0 解码到 target → N 次调用 = O(N²)；");
         println!("    新路径持久化游标，前向仅解码 1 帧 delta → N 次调用 = O(N)。");
 
-        let configs: &[(u32, u32, usize, &str)] = &[
-            (320, 240, 100, "320×240"),
-            (640, 480, 60, "640×480"),
-        ];
+        let configs: &[(u32, u32, usize, &str)] =
+            &[(320, 240, 100, "320×240"), (640, 480, 60, "640×480")];
 
         for &(w, h, n_frames, label) in configs {
             // 生成与 bench_decode_o_n_growth 相同的多帧 GIF（7 色循环纯色帧）
             let dir = tempfile::tempdir().unwrap();
-            let gif_path = dir.path().join(format!("bench_cursor_{w}x{h}_{n_frames}f.gif"));
+            let gif_path = dir
+                .path()
+                .join(format!("bench_cursor_{w}x{h}_{n_frames}f.gif"));
             let file = std::fs::File::create(&gif_path).unwrap();
             let mut encoder = GifEncoder::new(file);
             for i in 0..n_frames {

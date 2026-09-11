@@ -297,7 +297,10 @@ mod tests {
         };
         std::fs::write(&store.path, toml::to_string(&state).unwrap()).unwrap();
         let loaded = store.load();
-        assert_eq!(loaded.version, PLAYBACK_SCHEMA_VERSION, "旧版本应回退重建（DR-32）");
+        assert_eq!(
+            loaded.version, PLAYBACK_SCHEMA_VERSION,
+            "旧版本应回退重建（DR-32）"
+        );
         assert!(loaded.units.is_empty());
         std::fs::remove_dir_all(&dir).ok();
     }

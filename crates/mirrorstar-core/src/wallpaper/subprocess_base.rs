@@ -458,8 +458,7 @@ mod tests {
 
     #[test]
     fn find_bundled_executable_dev_mode_finds_repo_root_mpv() {
-        let path =
-            SubprocessRendererBase::find_bundled_executable(Some("mpv"), "mpv.exe", "mpv");
+        let path = SubprocessRendererBase::find_bundled_executable(Some("mpv"), "mpv.exe", "mpv");
 
         // 通过 current_exe 的祖先回溯判断仓库根是否存在 mpv/mpv.exe
         let repo_has_mpv = std::env::current_exe()
@@ -475,7 +474,11 @@ mod tests {
 
         if repo_has_mpv {
             // 仓库根存在 mpv 时，应找到仓库根 mpv 而非回退到 PATH
-            assert_ne!(path, PathBuf::from("mpv.exe"), "应找到仓库根的 mpv，而非回退到 PATH");
+            assert_ne!(
+                path,
+                PathBuf::from("mpv.exe"),
+                "应找到仓库根的 mpv，而非回退到 PATH"
+            );
             assert_eq!(
                 path.file_name().and_then(|s| s.to_str()),
                 Some("mpv.exe"),

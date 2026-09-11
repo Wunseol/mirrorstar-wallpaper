@@ -67,7 +67,10 @@ fn log_file_header(file_path: &str) {
         }
     };
     if n == 0 {
-        tracing::warn!(path = file_path, "缩略图生成失败：源文件为空（头 8 字节为空）");
+        tracing::warn!(
+            path = file_path,
+            "缩略图生成失败：源文件为空（头 8 字节为空）"
+        );
         return;
     }
     let header_hex: String = buf[..n].iter().map(|b| format!("{:02x}", b)).collect();
@@ -309,14 +312,16 @@ impl DisplaySettingGuard {
     /// 4. 用户重试 set_wallpaper("A") → 获取 guard A 成功
     pub(crate) fn acquire(display_id: String) -> Result<Self, mirrorstar_core::MirrorStarError> {
         let mut set = DISPLAYS_SETTING.lock().map_err(|e| {
-            mirrorstar_core::MirrorStarError::LockPoisoned(format!("DISPLAYS_SETTING 锁中毒: {}", e))
+            mirrorstar_core::MirrorStarError::LockPoisoned(format!(
+                "DISPLAYS_SETTING 锁中毒: {}",
+                e
+            ))
         })?;
         // insert 返回 false 表示已存在，消除 contains 双重哈希查找。
         if !set.insert(display_id.clone()) {
-            return Err(mirrorstar_core::MirrorStarError::DesktopIntegration(format!(
-                "显示器 {} 正在切换壁纸，请稍后再试",
-                display_id
-            )));
+            return Err(mirrorstar_core::MirrorStarError::DesktopIntegration(
+                format!("显示器 {} 正在切换壁纸，请稍后再试", display_id),
+            ));
         }
         Ok(Self { display_id })
     }
@@ -683,7 +688,8 @@ pub async fn add_wallpaper(
                         // - DecodeFallback：内容损坏/格式非法（如 Invalid PNG signature），源文件存在，
                         //   回退以源文件路径作为缩略图并 emit wallpaper-updated（保留现有逻辑）。
                         // - Unrecoverable：其它不可恢复错误（源文件存在但打不开等），emit 失败弹窗。
-                        match classify_thumbnail_failure(&e, wallpaper_type_spawn, &file_path_clone) {
+                        match classify_thumbnail_failure(&e, wallpaper_type_spawn, &file_path_clone)
+                        {
                             ThumbnailFailureKind::SourceMissing => {
                                 tracing::warn!(
                                     path = %file_path_clone,
@@ -709,7 +715,8 @@ pub async fn add_wallpaper(
                                 // emit 完整 entry 供前端增量更新（功能上等同缩略图生成成功分支）
                                 match config_manager_clone.get_wallpaper(&id_clone) {
                                     Some(updated) => {
-                                        if let Err(e) = app_clone.emit("wallpaper-updated", updated) {
+                                        if let Err(e) = app_clone.emit("wallpaper-updated", updated)
+                                        {
                                             tracing::warn!(error = %e, "emit wallpaper-updated 失败：前端 UI 可能不刷新");
                                         }
                                     }
@@ -806,7 +813,11 @@ pub async fn remove_wallpaper(
             }
             // 删除对应缩略图（若有），同样先做 data_dir 边界校验防越界删除。
             // 缩略图按含 uuid 的源路径 hash 命名，逐 id 删除安全，不会误删其他壁纸。
-            if !entry.thumbnail.is_empty() && validate_path_within_data_dir(&entry.thumbnail).await.is_ok() {
+            if !entry.thumbnail.is_empty()
+                && validate_path_within_data_dir(&entry.thumbnail)
+                    .await
+                    .is_ok()
+            {
                 if let Err(e) = tokio::fs::remove_file(&entry.thumbnail).await {
                     tracing::warn!(error = %e, path = %entry.thumbnail, "删除缩略图失败（配置已移除）");
                 }
@@ -819,7 +830,9 @@ pub async fn remove_wallpaper(
                 if let Err(e) = tokio::fs::remove_dir(&id_dir).await {
                     match e.kind() {
                         std::io::ErrorKind::NotFound | std::io::ErrorKind::DirectoryNotEmpty => {}
-                        _ => tracing::warn!(error = %e, path = %id_dir.display(), "删除壁纸目录失败"),
+                        _ => {
+                            tracing::warn!(error = %e, path = %id_dir.display(), "删除壁纸目录失败")
+                        }
                     }
                 }
             }
@@ -841,7 +854,8 @@ pub async fn set_wallpaper(
 ) -> Result<(), mirrorstar_core::MirrorStarError> {
     // 使用 get_wallpaper 按 id 查找，避免全量克隆 Vec<WallpaperEntry>
     // v16-C-003: 壁纸不存在时不暴露内部 id，提示用户刷新列表（条目可能已被移除）
-    let entry = state.config_manager
+    let entry = state
+        .config_manager
         .get_wallpaper(&wallpaper_id)
         .ok_or_else(|| {
             mirrorstar_core::MirrorStarError::DesktopIntegration(
@@ -886,7 +900,9 @@ pub async fn set_wallpaper(
             Ok::<(), mirrorstar_core::MirrorStarError>(())
         })
         .await
-        .map_err(|e| mirrorstar_core::MirrorStarError::TaskJoin(format!("任务 join 失败: {}", e)))?;
+        .map_err(|e| {
+            mirrorstar_core::MirrorStarError::TaskJoin(format!("任务 join 失败: {}", e))
+        })?;
         result?;
     } else {
         // WorkerW 壁纸：3 阶段模式，减少锁持有时间
@@ -2412,8 +2428,11 @@ mod tests {
         let dir = tempfile::TempDir::new().expect("创建临时目录失败");
         let src = dir.path().join("corrupted.png");
         // 非 PNG 魔数内容（文件存在但不可解码）
-        std::fs::write(&src, [0x00u8, 0x00, 0x00, 0x0c, 0x4a, 0x00, 0x00, 0x00, 0x6d])
-            .expect("写入损坏 PNG 失败");
+        std::fs::write(
+            &src,
+            [0x00u8, 0x00, 0x00, 0x0c, 0x4a, 0x00, 0x00, 0x00, 0x6d],
+        )
+        .expect("写入损坏 PNG 失败");
         let src_str = src.to_string_lossy().to_string();
 
         let kind = classify_thumbnail_failure(

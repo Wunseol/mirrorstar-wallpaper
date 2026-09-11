@@ -1,4 +1,4 @@
-import { defineConfig } from "vite";
+import { defineConfig } from "vitest/config";
 
 // 当前 build.minify 使用 terser（非默认 esbuild），目的为启用
 // terserOptions.compress.pure_funcs = ["console.log"]，仅移除 console.log 而保留
@@ -49,6 +49,27 @@ export default defineConfig({
         manualChunks: {
           vendor: ["@tauri-apps/api"],
         },
+      },
+    },
+  },
+  // Vitest 测试配置（原 vitest.config.ts 并入，Vitest 默认读取 vite.config.ts 的 test 字段）
+  test: {
+    environment: "jsdom",
+    globals: true,
+    include: ["src/**/*.test.ts"],
+    coverage: {
+      provider: "v8",
+      reporter: ["text", "html"],
+      include: ["src/**/*.ts"],
+      // types.ts 为纯类型声明无运行时逻辑；mod.ts 为 barrel re-export，均无测试价值
+      exclude: ["src/**/*.test.ts", "src/**/*.d.ts", "src/scripts/types.ts", "src/scripts/ui/mod.ts"],
+      thresholds: {
+        lines: 70,
+        // 显式声明 branches 阈值与 statements/lines 对齐（由 60 提升至 70）
+        branches: 70,
+        functions: 70,
+        // 补充 statements 阈值，与 lines 对齐，保持四项阈值完整
+        statements: 70,
       },
     },
   },

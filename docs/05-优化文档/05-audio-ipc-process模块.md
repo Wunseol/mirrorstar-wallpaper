@@ -1,6 +1,6 @@
 # audio / ipc / process 模块优化文档
 
-> [← 返回索引](./README.md)
+> [← 返回文档索引](../index.md)
 
 ## 模块概览 / 现状与文件清单
 

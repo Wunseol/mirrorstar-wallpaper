@@ -58,6 +58,44 @@ jobs:
       - name: Cache cargo
         uses: Swatinem/rust-cache@v2
 
+      - name: Build wp-proc resource
+        run: cargo build -p mirrorstar-wp-proc --release
+
+      # 提供 mpv 运行时（打包 src-tauri 前）：tauri_build::try_build 编译期校验 `../mpv/mpv.exe`，
+      # 且 mpv/ 在 .gitignore（~123MB 超入库限制）。固定 release + SHA256 双保险下载，仅解出 mpv.exe。
+      # mpv/license 已随源码入库。锁定版本 20260903 / SHA256 见 checks.yml 统一说明。
+      - name: Provision mpv runtime
+        shell: pwsh
+        run: |
+          $mpvUrl    = "https://github.com/shinchiro/mpv-winbuild-cmake/releases/download/20260903/mpv-x86_64-v3-20260903-git-69e63f425a.7z"
+          $mpvSha256 = "8786587181584f49e79217913043c5969beaae1ef202d6b6d4bc9ee708fdc75e"
+          $target    = "mpv\mpv.exe"
+          if (Test-Path $target) {
+            Write-Host "mpv.exe already present, skipping download (cached/ahead-of-checkout)"
+            exit 0
+          }
+          $archive  = Join-Path $env:RUNNER_TEMP "mpv-x86_64-v3-20260903.7z"
+          $extract  = Join-Path $env:RUNNER_TEMP "mpv-extract"
+          Write-Host "Downloading pinned mpv (20260903) ..."
+          Invoke-WebRequest -Uri $mpvUrl -OutFile $archive
+          $hash = (Get-FileHash $archive -Algorithm SHA256).Hash.ToLower()
+          if ($hash -ne $mpvSha256) {
+            throw "mpv SHA256 mismatch: expected $mpvSha256, got $hash"
+          }
+          $sevenZip = @("C:\Program Files\7-Zip\7z.exe", "C:\Program Files (x86)\7-Zip\7z.exe") |
+            Where-Object { Test-Path $_ } | Select-Object -First 1
+          if (-not $sevenZip) {
+            $cmd = Get-Command 7z.exe -ErrorAction SilentlyContinue
+            if ($cmd) { $sevenZip = $cmd.Source }
+          }
+          if (-not $sevenZip) { throw "7-Zip (7z.exe) not found on runner" }
+          New-Item -ItemType Directory -Force (Split-Path $target) | Out-Null
+          & $sevenZip x -y "-o$extract" $archive mpv.exe | Out-Null
+          $exe = Join-Path $extract "mpv.exe"
+          if (-not (Test-Path $exe)) { throw "mpv.exe was not extracted from archive" }
+          Copy-Item $exe $target
+          Write-Host "mpv.exe provisioned: $((Get-Item $target).Length) bytes"
+
       - name: Install frontend dependencies
         run: npm ci
 

@@ -26,7 +26,7 @@ use crate::MirrorStarError;
 /// 原 MAX_PATH(260) 已被 D02 Medium 修复扩大至此值，以支持超长路径。
 const UNICODE_STRING_MAX_CHARS: usize = 32767;
 
-/// Progman 触发 WorkerW 创建的窗口消息（参考 Lively Wallpaper 实现）
+/// Progman 触发 WorkerW 创建的窗口消息
 ///
 /// 发送此消息给 Progman 窗口会触发其创建 WorkerW 层，用于嵌入壁纸窗口。
 const WM_SPAWN_WORK: u32 = 0x052C;
@@ -151,7 +151,7 @@ pub fn find_workerw_no_retry() -> Result<(HWND, HWND), MirrorStarError> {
         }
 
         // Step 3: SendMessageTimeoutW(progman_hwnd, WM_SPAWN_WORK, ...) to trigger WorkerW creation
-        // 注意：Lively 不检查返回值，因为即使返回 0，WorkerW 也可能已经创建
+        // 注意：不检查返回值，因为即使返回 0，WorkerW 也可能已经创建
         // 此消息幂等：若 WorkerW 已存在，Progman 不会重复创建
         // 不关心返回值，传 None 避免 dead store（D09）
         //
@@ -290,7 +290,7 @@ unsafe extern "system" fn find_workerw_callback(hwnd: HWND, lparam: LPARAM) -> B
 }
 
 /// 备用 EnumWindows callback: 查找所有 WorkerW 窗口，返回没有 SHELLDLL_DefView 子窗口的那个
-/// 参考 Lively 的方法：找到包含 SHELLDLL_DefView 的 WorkerW，然后取其兄弟 WorkerW
+/// 找到包含 SHELLDLL_DefView 的 WorkerW，然后取其兄弟 WorkerW
 unsafe extern "system" fn find_workerw_fallback_callback(hwnd: HWND, lparam: LPARAM) -> BOOL {
     let mut class_name_buf = [0u16; 256];
     let name_len = GetClassNameW(hwnd, &mut class_name_buf);

@@ -27,10 +27,12 @@
 
 | 方案 | 优势 | 劣势 | 结论 |
 |------|------|------|------|
-| **WPF** (Lively 的选择) | 成熟稳定，XAML 数据绑定 | 需要 .NET Framework，体积大，样式定制复杂 | ❌ 运行时依赖过重 |
+| **WPF** | 成熟稳定，XAML 数据绑定 | 需要 .NET Framework，体积大，样式定制复杂 | ❌ 运行时依赖过重 |
 | **egui** | 纯 Rust，即时模式 | 不适合复杂 UI，无 CSS 样式 | ❌ 不适合富 UI |
 | **WinUI3** | 微软官方，Fluent Design | 需要 Windows App SDK，Rust 绑定不成熟 | ❌ 依赖过重 |
 | **Tauri v2** ✅ | 系统 WebView2，Rust 后端，Web UI 灵活 | 需要 WebView2 Runtime（Win10/11 已预装） | ✅ 最佳平衡 |
+
+在**避免引入重型 UI 框架**的前提下，Tauri v2 利用系统预装的 WebView2 Runtime 与 Rust 后端，在**体积、性能与安全性**上取得最佳平衡，成为本项目的首选方案。
 
 ### 前端方案
 

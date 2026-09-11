@@ -193,10 +193,7 @@ impl GifRenderData {
                 true
             }
             None => {
-                tracing::warn!(
-                    frame = current,
-                    "#2: 按需重新解码帧失败，保留空像素"
-                );
+                tracing::warn!(frame = current, "#2: 按需重新解码帧失败，保留空像素");
                 false
             }
         }

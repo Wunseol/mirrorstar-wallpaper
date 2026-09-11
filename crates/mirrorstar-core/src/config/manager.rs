@@ -353,21 +353,20 @@ fn is_cargo_build_artifact_dir(dir: &std::path::Path) -> bool {
         return false;
     }
     // 向上找一段名为 `target` 的祖先目录（跳过自身）。
-    dir.ancestors()
-        .skip(1)
-        .any(|anc| anc.file_name().map(|s| s.eq_ignore_ascii_case("target")).unwrap_or(false))
+    dir.ancestors().skip(1).any(|anc| {
+        anc.file_name()
+            .map(|s| s.eq_ignore_ascii_case("target"))
+            .unwrap_or(false)
+    })
 }
 
 /// 获取数据根：显式设置优先，否则懒解析并缓存。
 pub fn data_root() -> std::path::PathBuf {
-    DATA_ROOT
-        .get()
-        .cloned()
-        .unwrap_or_else(|| {
-            let root = resolve_data_root();
-            let _ = DATA_ROOT.set(root.clone());
-            root
-        })
+    DATA_ROOT.get().cloned().unwrap_or_else(|| {
+        let root = resolve_data_root();
+        let _ = DATA_ROOT.set(root.clone());
+        root
+    })
 }
 
 impl ConfigManager {
@@ -694,7 +693,10 @@ impl ConfigManager {
                 .wallpaper_library
                 .write()
                 .unwrap_or_else(|e| e.into_inner());
-            lib.pools.iter().position(|p| p.id == id).map(|i| lib.pools.remove(i))
+            lib.pools
+                .iter()
+                .position(|p| p.id == id)
+                .map(|i| lib.pools.remove(i))
         };
         if removed.is_some() {
             self.mark_library_dirty();
@@ -1456,17 +1458,31 @@ mod tests {
     #[test]
     fn cargo_build_artifact_dir_detection() {
         // 携带 `target/<debug|release>` 的构建产物目录应被识别。
-        assert!(is_cargo_build_artifact_dir(Path::new(r"C:\Dev\foo\target\debug")));
-        assert!(is_cargo_build_artifact_dir(Path::new("C:/Dev/foo/target/release")));
-        assert!(is_cargo_build_artifact_dir(Path::new(r"C:\Dev\foo\target\x86_64-pc-windows-msvc\debug")));
+        assert!(is_cargo_build_artifact_dir(Path::new(
+            r"C:\Dev\foo\target\debug"
+        )));
+        assert!(is_cargo_build_artifact_dir(Path::new(
+            "C:/Dev/foo/target/release"
+        )));
+        assert!(is_cargo_build_artifact_dir(Path::new(
+            r"C:\Dev\foo\target\x86_64-pc-windows-msvc\debug"
+        )));
 
         // 测试二进制目录（`target/<profile>/deps/`）不应命中。
-        assert!(!is_cargo_build_artifact_dir(Path::new(r"C:\Dev\foo\target\debug\deps")));
+        assert!(!is_cargo_build_artifact_dir(Path::new(
+            r"C:\Dev\foo\target\debug\deps"
+        )));
         // 普通安装目录不应命中（生产便携行为不变）。
-        assert!(!is_cargo_build_artifact_dir(Path::new(r"C:\Program Files\MirrorStar")));
-        assert!(!is_cargo_build_artifact_dir(Path::new(r"C:\Dev\foo\target")));
+        assert!(!is_cargo_build_artifact_dir(Path::new(
+            r"C:\Program Files\MirrorStar"
+        )));
+        assert!(!is_cargo_build_artifact_dir(Path::new(
+            r"C:\Dev\foo\target"
+        )));
         // 非 debug/release 且带 target 祖先也不命中。
-        assert!(!is_cargo_build_artifact_dir(Path::new(r"C:\Dev\foo\target\build")));
+        assert!(!is_cargo_build_artifact_dir(Path::new(
+            r"C:\Dev\foo\target\build"
+        )));
     }
 
     // ── WallpaperEntry 序列化 ────────────────────────────────────────────────
@@ -1641,7 +1657,10 @@ added_at = "1"
         // None → "全部"
         assert!(resolve_pool(&lib, None).is_none());
         // 显式存在的池 → Some
-        assert_eq!(resolve_pool(&lib, Some("p1")).map(|p| p.id.as_str()), Some("p1"));
+        assert_eq!(
+            resolve_pool(&lib, Some("p1")).map(|p| p.id.as_str()),
+            Some("p1")
+        );
         // 指向已删/不存在的池 → None（回退"全部"）
         assert!(resolve_pool(&lib, Some("deleted")).is_none());
     }
@@ -1676,8 +1695,11 @@ added_at = "1"
         };
         cm.add_wallpaper(e1).unwrap();
         cm.add_wallpaper(e2).unwrap();
-        cm.create_pool(None, vec!["w1".to_string(), "w2".to_string(), "w1".to_string()])
-            .expect("create pool");
+        cm.create_pool(
+            None,
+            vec!["w1".to_string(), "w2".to_string(), "w1".to_string()],
+        )
+        .expect("create pool");
 
         // 池创建时成员已去重
         let before = cm.list_pools();
@@ -1721,7 +1743,11 @@ added_at = "1"
             .expect("create pool");
 
         let updated = cm
-            .update_pool(&pool.id, Some("新名字"), Some(vec!["b".to_string(), "a".to_string(), "b".to_string()]))
+            .update_pool(
+                &pool.id,
+                Some("新名字"),
+                Some(vec!["b".to_string(), "a".to_string(), "b".to_string()]),
+            )
             .expect("update pool")
             .unwrap();
         assert_eq!(updated.name, "新名字");
@@ -1731,7 +1757,10 @@ added_at = "1"
             "update_pool 应就地去重（DR-24）"
         );
         // 更新不存在的池 → None
-        assert!(cm.update_pool("no-such-pool", Some("x"), None).unwrap().is_none());
+        assert!(cm
+            .update_pool("no-such-pool", Some("x"), None)
+            .unwrap()
+            .is_none());
     }
 
     // ── DisplayInfo 序列化 ───────────────────────────────────────────────────
@@ -2630,12 +2659,18 @@ balanced_keep_frames = 0
         let config_path = dir.join("config.toml");
         let library_path = dir.join("wallpapers.toml");
         assert!(!config_path.exists(), "前置：全新目录不应有 config.toml");
-        assert!(!library_path.exists(), "前置：全新目录不应有 wallpapers.toml");
+        assert!(
+            !library_path.exists(),
+            "前置：全新目录不应有 wallpapers.toml"
+        );
 
         let _cm = ConfigManager::new_in_dir(dir.clone()).expect("构造应成功");
 
         assert!(config_path.exists(), "Bug-01：首次构造应落盘 config.toml");
-        assert!(library_path.exists(), "Bug-01：首次构造应落盘 wallpapers.toml");
+        assert!(
+            library_path.exists(),
+            "Bug-01：首次构造应落盘 wallpapers.toml"
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }

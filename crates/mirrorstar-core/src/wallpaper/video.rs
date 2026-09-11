@@ -262,7 +262,10 @@ pub fn video_first_frame_ready(status: &serde_json::Value) -> bool {
         .and_then(|v| v.as_i64())
         .map(|w| w > 0)
         .unwrap_or(false);
-    let idle_ok = matches!(status.get("idle-active").and_then(|v| v.as_str()), Some("no"));
+    let idle_ok = matches!(
+        status.get("idle-active").and_then(|v| v.as_str()),
+        Some("no")
+    );
     width_ok && idle_ok
 }
 
@@ -787,13 +790,19 @@ mod tests {
     fn video_first_frame_ready_pure_branches() {
         use serde_json::json;
         // 未 loadfile / 空闲：width=0 或缺失 → 未就绪
-        assert!(!video_first_frame_ready(&json!({"width": 0, "idle-active": "yes"})));
+        assert!(!video_first_frame_ready(
+            &json!({"width": 0, "idle-active": "yes"})
+        ));
         assert!(!video_first_frame_ready(&json!({"idle-active": "no"})));
         assert!(!video_first_frame_ready(&json!({})));
         // 就绪：width>0 且 idle-active=no
-        assert!(video_first_frame_ready(&json!({"width": 1920, "idle-active": "no"})));
+        assert!(video_first_frame_ready(
+            &json!({"width": 1920, "idle-active": "no"})
+        ));
         // width>0 但仍在空闲 → 未就绪
-        assert!(!video_first_frame_ready(&json!({"width": 1920, "idle-active": "yes"})));
+        assert!(!video_first_frame_ready(
+            &json!({"width": 1920, "idle-active": "yes"})
+        ));
         // 属性查询失败（error 对象）→ 未就绪，不应误判
         assert!(!video_first_frame_ready(&json!({
             "width": {"error": "property not found"},

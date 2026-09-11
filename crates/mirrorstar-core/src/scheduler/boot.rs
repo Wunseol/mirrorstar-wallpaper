@@ -89,9 +89,9 @@ mod tests {
         for (enabled, on_boot, unit_enabled, pool) in [
             (false, false, false, 0),
             (false, true, true, 5),
-            (true, false, true, 5),  // on_boot=false
-            (true, true, false, 5),  // unit_enabled=false
-            (true, true, true, 1),   // 池 < 2（DR-14 不轮换）
+            (true, false, true, 5), // on_boot=false
+            (true, true, false, 5), // unit_enabled=false
+            (true, true, true, 1),  // 池 < 2（DR-14 不轮换）
         ] {
             match resolve_boot(true, Some("cur"), false, enabled, on_boot, unit_enabled, pool) {
                 BootDecision::Restore(id) => assert_eq!(id, "cur"),
@@ -104,7 +104,15 @@ mod tests {
     fn boot_web_current_advances_when_gate_open_else_restore() {
         // P1-3 / DR-18：current=Web + 推进门控全开 → Advance（采样跳 Web 取池内下一张）。
         for (enabled, on_boot, unit_enabled, pool) in [(true, true, true, 5)] {
-            match resolve_boot(true, Some("web"), true, enabled, on_boot, unit_enabled, pool) {
+            match resolve_boot(
+                true,
+                Some("web"),
+                true,
+                enabled,
+                on_boot,
+                unit_enabled,
+                pool,
+            ) {
                 BootDecision::Advance => {}
                 other => panic!("Web+门控全开应 Advance，实际 {other:?}"),
             }
@@ -116,7 +124,15 @@ mod tests {
             (true, true, true, 1),
             (true, false, true, 5),
         ] {
-            match resolve_boot(true, Some("web"), true, enabled, on_boot, unit_enabled, pool) {
+            match resolve_boot(
+                true,
+                Some("web"),
+                true,
+                enabled,
+                on_boot,
+                unit_enabled,
+                pool,
+            ) {
                 BootDecision::Restore(id) => assert_eq!(id, "web"),
                 other => panic!("门控未全开应 Restore(web)，实际 {other:?}"),
             }
@@ -145,7 +161,9 @@ mod tests {
         for (enabled, unit_enabled, pool) in [(false, true, 3), (true, false, 3), (true, true, 0)] {
             match resolve_boot(false, None, false, enabled, true, unit_enabled, pool) {
                 BootDecision::None => {}
-                other => panic!("应 None，实际 {other:?}（enabled={enabled} unit={unit_enabled} pool={pool}）"),
+                other => panic!(
+                    "应 None，实际 {other:?}（enabled={enabled} unit={unit_enabled} pool={pool}）"
+                ),
             }
         }
     }

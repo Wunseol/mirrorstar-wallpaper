@@ -118,7 +118,9 @@ fn video_wallpaper_fullpath_diagnostic() {
     // Step 5: terminate
     println!("== Step 5: terminate ==");
     let _ = renderer.terminate();
-    println!("诊断完成（请检查 mpv-*.log 是否含 Failed to create Texture2D / shaderc internal error）");
+    println!(
+        "诊断完成（请检查 mpv-*.log 是否含 Failed to create Texture2D / shaderc internal error）"
+    );
 
     unsafe { CoUninitialize() }
 }

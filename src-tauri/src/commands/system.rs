@@ -105,7 +105,12 @@ pub async fn open_file_dialog(
         .add_filter("所有文件", &["*"])
         .add_filter("图片文件", &["jpg", "jpeg", "png", "bmp", "webp"])
         .add_filter("GIF 动画", &["gif"])
-        .add_filter("视频文件", &["mp4", "avi", "mkv", "mov", "webm", "flv", "wmv", "m4v", "mpg", "mpeg", "ts"])
+        .add_filter(
+            "视频文件",
+            &[
+                "mp4", "avi", "mkv", "mov", "webm", "flv", "wmv", "m4v", "mpg", "mpeg", "ts",
+            ],
+        )
         .pick_file(move |file_path| {
             // 对话框关闭后回调。若超时已触发，receiver 已 drop，send 返回 Err，安全忽略。
             let _ = tx.send(file_path);

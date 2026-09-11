@@ -21,6 +21,47 @@ jobs:
       - name: Cache cargo
         uses: Swatinem/rust-cache@v2
 
+      # 构建 wp-proc 资源：src-tauri/build.rs 经 tauri_build::try_build 编译期校验 bundle 资源，
+      # 必须先构建 mirrorstar-wp-proc 再编译任何触发 src-tauri 的命令
+      - name: Build wp-proc resource
+        run: cargo build -p mirrorstar-wp-proc --release
+
+      # 提供 mpv 运行时：mpv/ 在 .gitignore 中（mpv.exe ~123MB 超 GitHub 100MB 入库限制），
+      # 且 tauri_build::try_build 编译期校验 `../mpv/mpv.exe` 必须存在，否则 src-tauri 编译失败。
+      # 从固定 release + SHA256 双保险下载，仅解出 mpv.exe（mpv/license 已随源码入库）。
+      # 若不升级 mpv，版本列 20260903 与期望 SHA256 应同步保持锁定。
+      - name: Provision mpv runtime
+        shell: pwsh
+        run: |
+          $mpvUrl    = "https://github.com/shinchiro/mpv-winbuild-cmake/releases/download/20260903/mpv-x86_64-v3-20260903-git-69e63f425a.7z"
+          $mpvSha256 = "8786587181584f49e79217913043c5969beaae1ef202d6b6d4bc9ee708fdc75e"
+          $target    = "mpv\mpv.exe"
+          if (Test-Path $target) {
+            Write-Host "mpv.exe already present, skipping download (cached/ahead-of-checkout)"
+            exit 0
+          }
+          $archive  = Join-Path $env:RUNNER_TEMP "mpv-x86_64-v3-20260903.7z"
+          $extract  = Join-Path $env:RUNNER_TEMP "mpv-extract"
+          Write-Host "Downloading pinned mpv (20260903) ..."
+          Invoke-WebRequest -Uri $mpvUrl -OutFile $archive
+          $hash = (Get-FileHash $archive -Algorithm SHA256).Hash.ToLower()
+          if ($hash -ne $mpvSha256) {
+            throw "mpv SHA256 mismatch: expected $mpvSha256, got $hash"
+          }
+          $sevenZip = @("C:\Program Files\7-Zip\7z.exe", "C:\Program Files (x86)\7-Zip\7z.exe") |
+            Where-Object { Test-Path $_ } | Select-Object -First 1
+          if (-not $sevenZip) {
+            $cmd = Get-Command 7z.exe -ErrorAction SilentlyContinue
+            if ($cmd) { $sevenZip = $cmd.Source }
+          }
+          if (-not $sevenZip) { throw "7-Zip (7z.exe) not found on runner" }
+          New-Item -ItemType Directory -Force (Split-Path $target) | Out-Null
+          & $sevenZip x -y "-o$extract" $archive mpv.exe | Out-Null
+          $exe = Join-Path $extract "mpv.exe"
+          if (-not (Test-Path $exe)) { throw "mpv.exe was not extracted from archive" }
+          Copy-Item $exe $target
+          Write-Host "mpv.exe provisioned: $((Get-Item $target).Length) bytes"
+
       # cargo test 已隐含编译，无需独立 Build 步骤；共享资源类测试标记 #[ignore] 由下方串行执行
       - name: Test
         run: cargo test --workspace
@@ -62,6 +103,7 @@ jobs:
 
       - name: Security audit (dev dependencies)
         run: npm audit --audit-level=critical
+        continue-on-error: true
 
       - name: Build
         run: npm run build

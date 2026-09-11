@@ -1,4 +1,4 @@
-[← 返回文档索引](../../README.md) > [架构设计](./01-架构概述-Architecture-Overview.md) > 错误处理
+[← 返回文档索引](../../README.md) > [架构设计](./01-架构概述与系统架构-Architecture-Overview.md) > 错误处理
 
 # MirrorStar Wallpaper（镜星壁纸）架构设计 — 错误处理策略
 
@@ -125,8 +125,7 @@ flowchart TD
 
 **相关文档：**
 
-- [架构概述](./01-架构概述-Architecture-Overview.md)
-- [系统架构](./02-系统架构-System-Architecture.md)
+- [架构概述与系统架构](./01-架构概述与系统架构-Architecture-Overview.md)
 - [模块设计](./03-模块设计-Module-Design.md)
 - [进程架构](./04-进程架构-Process-Architecture.md)
 - [依赖与数据流](./05-依赖与数据流-Dependency-and-Data-Flow.md)

@@ -135,7 +135,10 @@ impl MpvIpcClient {
     ///
     /// 保留同步路径以读取 mpv 返回的属性值；超时缩短为 2s（默认 5s 的一半），
     /// 因为 get_property 的调用方（如状态查询）通常期望快速响应。
-    pub fn get_property(&mut self, name: &str) -> Result<serde_json::Value, crate::MirrorStarError> {
+    pub fn get_property(
+        &mut self,
+        name: &str,
+    ) -> Result<serde_json::Value, crate::MirrorStarError> {
         self.send_command_with_timeout(&["get_property", name], Duration::from_secs(2))
             .map(|r| r.data.unwrap_or(serde_json::Value::Null))
     }

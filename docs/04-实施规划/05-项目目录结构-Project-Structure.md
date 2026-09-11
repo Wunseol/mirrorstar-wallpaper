@@ -39,9 +39,7 @@ mirrorstar-wallpaper/
 ├── rust-toolchain.toml             # 固定 Rust 工具链（stable / MSRV 1.80）
 ├── rustfmt.toml                    # rustfmt 配置
 ├── package.json                    # 前端工程（Vite / Vitest / TS / ESLint / Prettier）
-├── pnpm-lock.yaml / pnpm-workspace.yaml  # 遗留文件（项目改为 npm）
-├── vite.config.ts                  # Vite 打包配置
-├── vitest.config.ts                # Vitest 测试配置
+├── vite.config.ts                  # Vite 构建 + Vitest 测试配置
 ├── tsconfig.json                   # TypeScript 配置
 └── eslint.config.js                # ESLint 配置
 ```
@@ -191,7 +189,6 @@ Tauri 应用层（Rust）：
 - [实施规划总览](01-实施规划总览-Implementation-Overview.md)
 - [开发阶段划分](03-开发阶段划分-Development-Phases.md)
 - [质量保障](06-质量保障-Quality-Assurance.md)
-- [甘特图](04-甘特图-Gantt-Chart.md)
-- [架构概述（02）](../02-架构设计/01-架构概述-Architecture-Overview.md)
+- [架构概述与系统架构（02）](../02-架构设计/01-架构概述与系统架构-Architecture-Overview.md)
 - [模块设计（02）](../02-架构设计/03-模块设计-Module-Design.md)
 - [进程架构（02）](../02-架构设计/04-进程架构-Process-Architecture.md)

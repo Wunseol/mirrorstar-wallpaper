@@ -901,9 +901,7 @@ unsafe fn handle_frames_loaded(
 
             // v17 性能埋点：解码耗时 + 帧内存估算 + 进程内存
             // decode_ms 含「派生线程 → 解码 → PostMessageW → 消息循环处理」总延迟
-            let decode_ms = decode_start
-                .map(|s| s.elapsed().as_millis())
-                .unwrap_or(0);
+            let decode_ms = decode_start.map(|s| s.elapsed().as_millis()).unwrap_or(0);
             let frame_mem_mb = render.estimate_memory_bytes() as f64 / (1024.0 * 1024.0);
             let rss_mb = crate::perf::process_rss_mb();
             let private_mb = crate::perf::process_private_mb();
@@ -2076,7 +2074,11 @@ mod tests {
     fn v17_proactive_prefetch_triggers_when_next_empty() {
         // current=5, frame_count=10, next=6 为空, 无预取进行中 → Some(6)
         let center = proactive_prefetch_center(5, 10, true, false);
-        assert_eq!(center, Some(6), "下一帧为空时应以 next=6 为中心触发主动预取");
+        assert_eq!(
+            center,
+            Some(6),
+            "下一帧为空时应以 next=6 为中心触发主动预取"
+        );
     }
 
     /// v17: 下一帧有像素时不触发主动预取（窗口内无需提前解码）

@@ -1062,7 +1062,10 @@ impl WallpaperEngine {
                 desktop.is_child_of_workerw(hwnd)
             };
             if !parent_ok {
-                tracing::warn!(display_id, "原子交换：commit 前校验失败（新窗父窗口已非当前 WorkerW），弃置新窗");
+                tracing::warn!(
+                    display_id,
+                    "原子交换：commit 前校验失败（新窗父窗口已非当前 WorkerW），弃置新窗"
+                );
                 let _ = new_renderer.terminate();
                 return Err(MirrorStarError::DesktopIntegration(
                     "原子交换 commit 前校验失败：新窗父窗口已非当前 WorkerW".to_string(),
@@ -1431,13 +1434,7 @@ pub fn create_and_play_renderer(
     scaling_mode: ScalingMode,
     config: &RendererConfig,
 ) -> Result<Box<dyn WallpaperRenderer>, MirrorStarError> {
-    construct_renderer(
-        source,
-        wallpaper_type,
-        scaling_mode,
-        config,
-        true,
-    )
+    construct_renderer(source, wallpaper_type, scaling_mode, config, true)
 }
 
 /// 依据壁纸来源与类型派生渲染器唯一 id（DR-33 同目标短路用，纯函数）
@@ -1468,8 +1465,13 @@ pub fn build_new_renderer(
         tracing::info!("原子交换：新图与旧图相同，短路跳过 swap");
         return Ok(BuildOutcome::Skip);
     }
-    let renderer =
-        construct_renderer(source, wallpaper_type, scaling_mode, &pending.config, pending.clear_native)?;
+    let renderer = construct_renderer(
+        source,
+        wallpaper_type,
+        scaling_mode,
+        &pending.config,
+        pending.clear_native,
+    )?;
     Ok(BuildOutcome::Ready(renderer))
 }
 
@@ -1609,7 +1611,10 @@ mod tests {
         assert_ne!(renderer_id(&src_a, vid_a), renderer_id(&src_b, vid_a));
         // Url 来源也稳定
         let url = WallpaperSource::Url("https://x/x.mp4".to_string());
-        assert_eq!(renderer_id(&url, WallpaperType::Web), renderer_id(&url, WallpaperType::Web));
+        assert_eq!(
+            renderer_id(&url, WallpaperType::Web),
+            renderer_id(&url, WallpaperType::Web)
+        );
     }
 
     // ── 测试辅助 ──────────────────────────────────────────────────────────
@@ -2935,17 +2940,30 @@ mod tests {
         // 阶段 A（锁内 embed + after_embed）：新窗未登记、旧窗仍在 map。
         let (new, new_shared) = MockRenderer::new();
         let new = eng.embed_atomic_into(Box::new(new), "d1").unwrap();
-        assert!(eng.wallpapers.contains_key("d1"), "A 阶段后旧壁纸仍应在 map 占位（P1-5）");
-        assert!(!old_shared.lock().unwrap().terminated, "A 阶段不应 terminate 旧窗");
+        assert!(
+            eng.wallpapers.contains_key("d1"),
+            "A 阶段后旧壁纸仍应在 map 占位（P1-5）"
+        );
+        assert!(
+            !old_shared.lock().unwrap().terminated,
+            "A 阶段不应 terminate 旧窗"
+        );
 
         // 阶段 C（锁内换槽）：一次换槽 → 新登记、旧 terminate。
         assert_eq!(
-            eng.commit_atomic_swap(new, "d1", &src, WallpaperType::Video).unwrap(),
+            eng.commit_atomic_swap(new, "d1", &src, WallpaperType::Video)
+                .unwrap(),
             SwapOutcome::Committed
         );
         assert!(eng.wallpapers.contains_key("d1"), "换槽后新窗应在 map");
-        assert!(old_shared.lock().unwrap().terminated, "C 阶段应 terminate 旧窗");
-        assert!(!new_shared.lock().unwrap().terminated, "新窗不应被 terminate");
+        assert!(
+            old_shared.lock().unwrap().terminated,
+            "C 阶段应 terminate 旧窗"
+        );
+        assert!(
+            !new_shared.lock().unwrap().terminated,
+            "新窗不应被 terminate"
+        );
         // 换槽后 wallpaper_sources 已更新为新来源/类型。
         assert_eq!(
             eng.wallpaper_sources.get("d1").map(|(_, t)| *t),
@@ -2980,11 +2998,15 @@ mod tests {
         let (new, new_shared) = MockRenderer::new();
         let new = eng.embed_atomic_into(Box::new(new), "d1").unwrap();
         assert_eq!(
-            eng.commit_atomic_swap(new, "d1", &src, WallpaperType::Gif).unwrap(),
+            eng.commit_atomic_swap(new, "d1", &src, WallpaperType::Gif)
+                .unwrap(),
             SwapOutcome::Committed
         );
         assert!(eng.wallpapers.contains_key("d1"));
         assert!(old_shared.lock().unwrap().terminated, "旧窗应 terminate");
-        assert!(!new_shared.lock().unwrap().terminated, "新窗不应被 terminate");
+        assert!(
+            !new_shared.lock().unwrap().terminated,
+            "新窗不应被 terminate"
+        );
     }
 }

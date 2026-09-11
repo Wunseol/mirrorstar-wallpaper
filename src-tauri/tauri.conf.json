@@ -20,7 +20,7 @@
     "targets": ["nsis"],
     "resources": {
       "../mpv/mpv.exe": "mpv/mpv.exe",
-      "../mpv/license.txt": "mpv/license.txt",
+      "../mpv/license": "mpv/license",
       "../target/release/mirrorstar-wp-proc.exe": "mirrorstar-wp-proc.exe"
     },
     "icon": [

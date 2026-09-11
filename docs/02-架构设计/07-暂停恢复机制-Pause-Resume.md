@@ -1,4 +1,4 @@
-[← 返回文档索引](../../README.md) > [架构设计](./01-架构概述-Architecture-Overview.md) > 暂停恢复机制
+[← 返回文档索引](../../README.md) > [架构设计](./01-架构概述与系统架构-Architecture-Overview.md) > 暂停恢复机制
 
 # MirrorStar Wallpaper（镜星壁纸）架构设计 — 暂停/恢复机制详细设计
 
@@ -380,7 +380,7 @@ impl ImageRenderer {
 
 MirrorStar 使用**逻辑暂停**（PauseSender 快速通道），**不使用** `SuspendThread`/`ResumeThread`。
 
-`SuspendThread` 是 Lively Wallpaper 的方案——通过挂起外部进程的所有线程实现暂停。这是一种不安全的操作，可能导致死锁（如果线程持有锁时被挂起）。MirrorStar 不采用此方案。
+`SuspendThread` 通过挂起外部进程的所有线程实现暂停，这是一种不安全且可能造成风险的操作——若线程在持有锁时被挂起，可能导致死锁。MirrorStar 主动放弃该方案，改为在各渲染器内实现协作式的逻辑暂停。
 
 MirrorStar 的暂停通过以下方式实现：
 
@@ -392,7 +392,7 @@ MirrorStar 的暂停通过以下方式实现：
 | 图片（WorkerW） | PauseSender → 渲染线程停止 | 主进程内线程，释放像素数据 |
 | 图片（Native） | 空操作（no-op） | 系统直接渲染，无需控制 |
 
-> **关键区别**：Lively 使用 `SuspendThread`/`ResumeThread` 挂起进程线程（可能导致死锁），MirrorStar 使用逻辑暂停（PauseSender 快速通道绕过引擎互斥锁，直接发送暂停/恢复命令），更安全且响应更快。
+> **关键区别**：MirrorStar 采用逻辑暂停（PauseSender 快速通道绕过引擎互斥锁，直接发送暂停/恢复命令），而非线程挂起方式，因此更安全且响应更快。
 
 ### 9.7 暂停/恢复完整流程
 
@@ -443,8 +443,7 @@ sequenceDiagram
 
 **相关文档：**
 
-- [架构概述](./01-架构概述-Architecture-Overview.md)
-- [系统架构](./02-系统架构-System-Architecture.md)
+- [架构概述与系统架构](./01-架构概述与系统架构-Architecture-Overview.md)
 - [模块设计](./03-模块设计-Module-Design.md)
 - [进程架构](./04-进程架构-Process-Architecture.md)
 - [依赖与数据流](./05-依赖与数据流-Dependency-and-Data-Flow.md)

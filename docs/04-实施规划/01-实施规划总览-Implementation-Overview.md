@@ -102,7 +102,7 @@ graph LR
 
 > 以下为可选改进项（非当前阻塞项），按价值高低排序，立项时按需实施：
 
-1. **精细鼠标交互**：参考 Lively `RawInputDX`，实现 RawInput 全局鼠标捕获 + `PostMessage` 转发，解决交互模式下桌面图标不可点击问题（当前 `set_interaction_mode` 已实现交互开关，但桌面图标点击交互尚未支持）
+1. **精细鼠标交互**：实现 RawInput 全局鼠标捕获 + `PostMessage` 转发，解决交互模式下桌面图标不可点击问题（当前 `set_interaction_mode` 已实现交互开关，但桌面图标点击交互尚未支持）
 2. **应用规则系统**：实现 pause / ignore / kill 规则，支持按窗口标题/进程规则处置
 3. **多显示器感知暂停**：仅暂停全屏显示器上的壁纸（当前全屏检测为全局暂停）
 4. **Win7 兼容回退**：`Progman` 直接嵌入的回退方案
@@ -113,4 +113,4 @@ graph LR
 
 ***
 
-**相关章节：** [开发阶段划分](./03-开发阶段划分-Development-Phases.md) | [项目目录结构](./05-项目目录结构-Project-Structure.md) | [甘特图](./04-甘特图-Gantt-Chart.md) | [质量保障](./06-质量保障-Quality-Assurance.md)
+**相关章节：** [开发阶段划分](./03-开发阶段划分-Development-Phases.md) | [项目目录结构](./05-项目目录结构-Project-Structure.md) | [质量保障](./06-质量保障-Quality-Assurance.md)

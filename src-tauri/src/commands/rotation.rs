@@ -25,9 +25,7 @@ use crate::state::AppState;
 // ── 轮换配置 ────────────────────────────────────────────────────────────────
 
 #[tauri::command]
-pub fn get_rotation_config(
-    state: State<'_, AppState>,
-) -> Result<RotationConfig, MirrorStarError> {
+pub fn get_rotation_config(state: State<'_, AppState>) -> Result<RotationConfig, MirrorStarError> {
     Ok(state.config_manager.get_config().rotation)
 }
 
@@ -93,7 +91,9 @@ pub fn update_pool(
     name: Option<String>,
     member_ids: Option<Vec<String>>,
 ) -> Result<(), MirrorStarError> {
-    state.config_manager.update_pool(&id, name.as_deref(), member_ids)?;
+    state
+        .config_manager
+        .update_pool(&id, name.as_deref(), member_ids)?;
     state.scheduler.wake.notify_waiters();
     Ok(())
 }
@@ -145,9 +145,7 @@ pub struct UnitStateDto {
 /// 后端已绑定/开启的配置（fix-rotation-scheduler Task 6 / P2）。纯内存读，无需
 /// 超时包装；锁内浅拷贝后返回。
 #[tauri::command]
-pub fn get_unit_states(
-    state: State<'_, AppState>,
-) -> Result<Vec<UnitStateDto>, MirrorStarError> {
+pub fn get_unit_states(state: State<'_, AppState>) -> Result<Vec<UnitStateDto>, MirrorStarError> {
     let play = state
         .scheduler
         .playback
@@ -218,7 +216,9 @@ fn validate_unit_key(state: &AppState, key: &Option<String>) -> Result<String, M
             if let Some(k) = key.as_deref() {
                 if !k.is_empty() && k != ALL_UNIT_KEY {
                     return Err(MirrorStarError::InvalidArgument {
-                        reason: format!("此编排下不允许设置单元: {k}（仅支持全局单元 {ALL_UNIT_KEY}）"),
+                        reason: format!(
+                            "此编排下不允许设置单元: {k}（仅支持全局单元 {ALL_UNIT_KEY}）"
+                        ),
                     });
                 }
             }

@@ -157,7 +157,9 @@ fn write_wallpaper_style(style: &str, tile: &str) -> Result<(), crate::MirrorSta
     let hkcu = RegKey::predef(HKEY_CURRENT_USER);
     let desktop = hkcu
         .open_subkey_with_flags("Control Panel\\Desktop", KEY_SET_VALUE)
-        .map_err(|e| crate::MirrorStarError::DesktopIntegration(format!("打开注册表失败: {}", e)))?;
+        .map_err(|e| {
+            crate::MirrorStarError::DesktopIntegration(format!("打开注册表失败: {}", e))
+        })?;
 
     desktop.set_value("WallPaperStyle", &style).map_err(|e| {
         crate::MirrorStarError::DesktopIntegration(format!("写入 WallPaperStyle 失败: {}", e))

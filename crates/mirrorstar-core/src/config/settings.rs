@@ -562,10 +562,7 @@ mod tests {
         assert!(config.general.minimize_to_tray);
         assert!((config.audio.volume - 0.8).abs() < f32::EPSILON);
         assert!(!config.audio.muted);
-        assert_eq!(
-            config.pause.fullscreen_action,
-            FullscreenAction::Terminate
-        );
+        assert_eq!(config.pause.fullscreen_action, FullscreenAction::Terminate);
         assert!(!config.pause.pause_on_battery);
         assert_eq!(config.display.arrangement, Arrangement::PerMonitor);
         assert!(config.video.hwdec);

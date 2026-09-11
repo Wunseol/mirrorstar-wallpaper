@@ -321,8 +321,15 @@ fn panic_hook_timestamp() -> String {
     let mp = (5 * doy + 2) / 153;
     let d = doy - (153 * mp + 2) / 5 + 1;
     let m = if mp < 10 { mp + 3 } else { mp - 9 };
-    let y = if m <= 2 { yoe + era * 400 + 1 } else { yoe + era * 400 };
-    format!("{:04}-{:02}-{:02} {:02}:{:02}:{:02}.{:03}", y, m, d, hh, mm, ss, millis)
+    let y = if m <= 2 {
+        yoe + era * 400 + 1
+    } else {
+        yoe + era * 400
+    };
+    format!(
+        "{:04}-{:02}-{:02} {:02}:{:02}:{:02}.{:03}",
+        y, m, d, hh, mm, ss, millis
+    )
 }
 
 /// 将 panic 信息追加写入 crash.log 并同步记录到 tracing 日志。
@@ -334,7 +341,10 @@ fn panic_hook_timestamp() -> String {
 #[allow(clippy::incompatible_msrv)]
 fn trace_panic_info(info: &std::panic::PanicHookInfo<'_>) {
     // 线程名（与消息循环 / 监控线程协调查错；主线程未命名时为默认名）
-    let thread_name = std::thread::current().name().unwrap_or("unnamed").to_string();
+    let thread_name = std::thread::current()
+        .name()
+        .unwrap_or("unnamed")
+        .to_string();
 
     // panic payload 一般为 &'static str / String，另有兜底标记
     let payload = if let Some(s) = info.payload().downcast_ref::<&'static str>() {
@@ -365,7 +375,11 @@ fn trace_panic_info(info: &std::panic::PanicHookInfo<'_>) {
         tracing::error!(error = %e, "panic hook：创建数据根目录失败，无法写 crash.log");
     }
     let path = root.join("crash.log");
-    match std::fs::OpenOptions::new().create(true).append(true).open(&path) {
+    match std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+    {
         Ok(mut file) => {
             use std::io::Write;
             // writeln! 返回 Result，丢弃错误；hook 内不可 panic
@@ -419,7 +433,8 @@ impl Drop for HandleGuard {
 /// 枚举系统进程并逐个终止（不含当前进程）。失败仅记录日志，不致命。
 fn cleanup_stale_child_processes() {
     use windows::Win32::System::Diagnostics::ToolHelp::{
-        CreateToolhelp32Snapshot, Process32FirstW, Process32NextW, PROCESSENTRY32W, TH32CS_SNAPPROCESS,
+        CreateToolhelp32Snapshot, Process32FirstW, Process32NextW, PROCESSENTRY32W,
+        TH32CS_SNAPPROCESS,
     };
     use windows::Win32::System::Threading::{
         GetCurrentProcessId, OpenProcess, TerminateProcess, PROCESS_TERMINATE,
@@ -1369,6 +1384,9 @@ mod tests {
         // 运行时 panic 时由 std 提供合法 HookInfo，此处仅确保格式函数健壮性。
         let ts = panic_hook_timestamp();
         assert!(!ts.contains('\n'), "时间戳不应含换行");
-        assert!(ts.trim().len() == 23, "时间戳应为 19 + 1 空格 + 3 毫秒 = 23 字符: {ts}");
+        assert!(
+            ts.trim().len() == 23,
+            "时间戳应为 19 + 1 空格 + 3 毫秒 = 23 字符: {ts}"
+        );
     }
 }

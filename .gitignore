@@ -9,6 +9,8 @@
 # Rust 构建产物（cargo build 输出，包含 deps / incremental / .fingerprint 等）
 # workspace 根 target/ 统一收纳所有 crate 的构建产物
 /target/
+# CI 验证用的临时 target 目录（CARGO_TARGET_DIR 指向自建目录时产生，勿入库）
+.ci-verify-target/
 # rustfmt 备份文件（仅 nightly rustfmt 在格式化失败时生成）
 **/*.rs.bk
 
@@ -68,7 +70,11 @@ __tmp_patch_*.ps1
 
 # Binaries（外部二进制依赖，体积大且版本/平台特定）
 # mpv 播放器（视频壁纸渲染依赖，按 README 指引单独下载解压）
-mpv/
+# 例外：mpv/license 为项目自写的小型定制许可文本（~19KB，稳定），需跟随源码入库，
+# CI 全新 checkout 才有该资源（tauri.conf.json resources 引用它）；mpv.exe（~123MB）仍忽略，
+# 由 CI 的 provisioning 步骤按固定 release + SHA256 下载（详见 .github/workflows/checks.yml）
+mpv/*
+!mpv/license
 
 # Reference projects（第三方参考源码，仅本地保留用于对照实现）
 # 不属于本仓库构建，应通过 external link 或 git submodule 跟踪

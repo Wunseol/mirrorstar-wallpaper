@@ -77,33 +77,35 @@ graph TB
 
 ***
 
-## 2. 与 Lively Wallpaper 技术栈对比
+## 2. 技术方案概览
 
-| 维度 | Lively Wallpaper | MirrorStar Wallpaper |
-|------|-----------------|-------------------|
-| **语言** | C# (.NET Framework 4.7.2) | Rust (stable, 1.80) |
-| **UI 框架** | WPF + MahApps.Metro | Tauri v2 + WebView2 |
-| **视频播放** | MediaFoundation / DirectShow / mpv | mpv.exe 子进程 |
-| **GIF 播放** | XamlAnimatedGif / DirectShow | image crate + GDI 双缓冲 |
-| **网页渲染** | CefSharp (Chromium) | WebView2 (Chromium, wp-proc 子进程) |
-| **配置格式** | JSON (Newtonsoft.Json) | TOML (serde + toml) |
-| **日志** | NLog | tracing |
-| **进程监控** | DispatcherTimer 轮询 | SetWinEventHook 事件驱动 |
-| **IPC** | stdin/stdout | Windows 命名管道（两套协议） |
-| **音频控制** | Core Audio COM | WASAPI (windows-rs Core Audio) |
-| **系统托盘** | NotifyIcon (WinForms) | Tauri 2 tray-icon feature |
-| **运行时依赖** | .NET Framework 4.7.2 | 无（静态链接） |
-| **GC 暂停** | 有 | 无 |
+MirrorStar 的技术选型围绕「零运行时依赖、事件驱动、轻量渲染、双向 IPC」展开，各模块实现如下：
 
-> **看门狗说明**：Lively 使用看门狗进程监控壁纸子进程。MirrorStar 无看门狗，主进程崩溃时依赖作业对象与操作系统清理子进程（mpv.exe / mirrorstar-wp-proc.exe），不引入额外监控进程。
+| 维度 | 实现 |
+|------|------|
+| **语言** | Rust (stable, 1.80) |
+| **UI 框架** | Tauri v2 + WebView2 |
+| **视频播放** | mpv.exe 子进程 |
+| **GIF 播放** | image crate + GDI 双缓冲 |
+| **网页渲染** | WebView2 (Chromium, wp-proc 子进程) |
+| **配置格式** | TOML (serde + toml) |
+| **日志** | tracing |
+| **进程监控** | SetWinEventHook 事件驱动 |
+| **IPC** | Windows 命名管道（两套协议） |
+| **音频控制** | WASAPI (windows-rs Core Audio) |
+| **系统托盘** | Tauri 2 tray-icon feature |
+| **运行时依赖** | 无（静态链接） |
+| **GC 暂停** | 无 |
+
+> **进程清理说明**：MirrorStar 不引入常驻监控进程，主进程崩溃时依赖作业对象（Job Objects）与操作系统自动清理子进程（mpv.exe / mirrorstar-wp-proc.exe），在保证健壮性的同时避免额外常驻开销。
 
 ### 关键优势总结
 
 1. **零运行时依赖**：无需 .NET Framework，无需安装任何运行时
 2. **低内存占用**：Rust 无 GC，壁纸播放更流畅；静态图片走 Native 路径零资源
-3. **事件驱动**：`SetWinEventHook` 替代轮询，全屏检测更及时
-4. **双向 IPC**：命名管道替代 stdin/stdout，通信更可靠
-5. **轻量网页渲染**：WebView2 替代 CefSharp，无需捆绑 ~200MB CEF
+3. **事件驱动**：`SetWinEventHook` 事件驱动通知，全屏检测更及时
+4. **双向 IPC**：命名管道提供可靠的双向通信
+5. **轻量网页渲染**：WebView2 取自系统预装，无需捆绑 ~200MB CEF
 
 ***
 
@@ -114,7 +116,7 @@ graph TB
 | 风险 | 说明 | 缓解措施 |
 |------|------|----------|
 | **可执行文件缺失** | mpv.exe 需捆绑或位于 PATH | `find_mpv()` 优先查找捆绑资源，回退 PATH；未找到返回错误 |
-| **许可证** | mpv 使用 GPL-2.0 | mpv.exe 作为独立外部进程调用（非链接），不影响主应用许可证 |
+| **许可证** | mpv 使用 GPL-2.0 | 项目自身已采用 GPLv2+（GPL-2.0-or-later），与 mpv 的 GPL-2.0+ 完全兼容，许可证风险消除 |
 | **版本兼容** | mpv IPC 协议可能变更 | 锁定兼容版本随应用更新；使用 mpv 稳定属性接口 |
 
 ### WebView2 Runtime

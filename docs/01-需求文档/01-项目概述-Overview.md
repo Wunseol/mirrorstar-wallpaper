@@ -18,7 +18,7 @@
 
 ### 1.1 项目背景
 
-Windows 平台上的动态壁纸软件已有多种实现，其中 Lively Wallpaper 是最受欢迎的开源方案之一。然而，Lively Wallpaper 基于 C# WPF 开发，依赖 .NET 运行时，存在以下问题：
+Windows 平台上的动态壁纸软件已有多种实现，但现有主流方案多基于 C# WPF 开发、依赖运行时，普遍存在以下问题：
 
 - **内存占用高**：即使壁纸暂停，主进程仍占用 50MB+ 内存
 - **运行时依赖**：需要安装 .NET Runtime，增加了用户部署成本
@@ -27,7 +27,7 @@ Windows 平台上的动态壁纸软件已有多种实现，其中 Lively Wallpap
 
 ### 1.2 项目定义
 
-MirrorStar Wallpaper（镜星壁纸）是一款基于 Rust + Tauri v2 开发的轻量级、高性能 Windows 动态壁纸应用程序。项目使用 Tauri v2 作为应用框架（系统 WebView 渲染前端 UI，Rust 处理后端逻辑），核心壁纸引擎采用纯 Rust + Win32 API 实现（无 GUI 框架依赖）。项目以 Lively Wallpaper 为参考实现，保留其核心功能，去除非必要特性，利用 Rust 语言的内存安全和零成本抽象特性，实现极致的轻量化与高性能。
+MirrorStar Wallpaper（镜星壁纸）是一款基于 Rust + Tauri v2 开发的轻量级、高性能 Windows 动态壁纸应用程序。项目使用 Tauri v2 作为应用框架（系统 WebView 渲染前端 UI，Rust 处理后端逻辑），核心壁纸引擎采用纯 Rust + Win32 API 实现（无 GUI 框架依赖）。项目保留动态壁纸的核心功能，去除非必要特性，利用 Rust 语言的内存安全和零成本抽象特性，实现极致的轻量化与高性能。
 
 ### 1.3 目标用户
 
@@ -54,7 +54,7 @@ MirrorStar Wallpaper（镜星壁纸）是一款基于 Rust + Tauri v2 开发的�
 
 | 目标 | 指标 | 说明 | 实测 |
 |------|------|------|------|
-| 轻量 | 主进程暂停态 < 20MB 内存 | 远低于 Lively Wallpaper 的 50MB+ | ⚠️ Debug 实测 22.03/22.17MB（略超，Release 待复测） |
+| 轻量 | 主进程暂停态 < 20MB 内存 | 远低于常见方案的 50MB+ 水平 | ⚠️ Debug 实测 22.03/22.17MB（略超，Release 待复测） |
 | 高性能 | 暂停态 CPU 占用 0% | 无后台轮询，事件驱动架构 | ✅ 0%（事件驱动 + PauseSender 快速通道） |
 | 高性能 | 视频壁纸播放 CPU < 5% | 利用硬件解码 | 待测量（mpv --hwdec=auto） |
 | 原生安全 | Rust 编写，无 GC | 零成本抽象，无运行时开销 | ✅ 纯 Rust，无 GC |

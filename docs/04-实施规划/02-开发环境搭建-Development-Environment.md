@@ -21,7 +21,7 @@
 | **Node.js** | 20 LTS（CI 使用 Node 20） | Tauri 前端构建（Vite） | `winget install OpenJS.NodeJS.LTS` |
 | **Git** | latest | 版本控制 | `winget install Git.Git` |
 
-> **包管理器**：仓库使用 **npm**（存在 `package-lock.json`）。CI（`.github/workflows/checks.yml`）使用 `npm ci`。仓库根还保留 `pnpm-lock.yaml` / `pnpm-workspace.yaml`（遗留文件，不参与构建，可忽略）。
+> **包管理器**：仓库使用 **npm**（存在 `package-lock.json`）。CI（`.github/workflows/checks.yml`）使用 `npm ci`。
 
 ### Rust 工具链
 

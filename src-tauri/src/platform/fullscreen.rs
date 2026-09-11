@@ -3,7 +3,7 @@ use std::sync::atomic::Ordering;
 use std::sync::Arc;
 
 use crate::state::{
-    hide_main_window_on_fullscreen, resume_all_fast_blocking, restore_main_window_after_fullscreen,
+    hide_main_window_on_fullscreen, restore_main_window_after_fullscreen, resume_all_fast_blocking,
     try_pause_all_fast, try_terminate_all_fast, SendWinEventHook, FULLSCREEN_MONITOR_RUNNING,
     FULLSCREEN_MONITOR_THREAD, FULLSCREEN_MONITOR_THREAD_ID, FULLSCREEN_WAS, SHARED_CONFIG,
     SHARED_ENGINE, WIN_EVENT_HOOK,
@@ -221,7 +221,8 @@ unsafe extern "system" fn foreground_event_callback(
             }
             Transition::DowngradeToMaximized => {
                 tracing::info!("级别降级 TrueFullscreen→Maximized，壁纸保持终止不恢复");
-                *FULLSCREEN_LEVEL.lock().unwrap_or_else(|e| e.into_inner()) = FullscreenLevel::Maximized;
+                *FULLSCREEN_LEVEL.lock().unwrap_or_else(|e| e.into_inner()) =
+                    FullscreenLevel::Maximized;
                 update_last_fullscreen_hwnd(FullscreenLevel::Maximized);
             }
             Transition::Exit => {
@@ -294,7 +295,11 @@ pub(crate) fn start_fullscreen_monitor(
         }
         // 4. 停止旧周期复查线程（循环检查 RUNNING 标志，join 在 2s 内完成）
         FULLSCREEN_REVIEW_RUNNING.store(false, Ordering::SeqCst);
-        if let Some(handle) = FULLSCREEN_REVIEW_THREAD.lock().ok().and_then(|mut t| t.take()) {
+        if let Some(handle) = FULLSCREEN_REVIEW_THREAD
+            .lock()
+            .ok()
+            .and_then(|mut t| t.take())
+        {
             let _ = handle.join();
         }
     }
@@ -509,7 +514,8 @@ fn foreground_fullscreen_level() -> FullscreenLevel {
             return FullscreenLevel::TrueFullscreen;
         }
         // IsZoomed 或 ≥95% → 最大化
-        if IsZoomed(foreground).as_bool() || is_rect_covering_95_percent(&window_rect, &monitor_rect)
+        if IsZoomed(foreground).as_bool()
+            || is_rect_covering_95_percent(&window_rect, &monitor_rect)
         {
             return FullscreenLevel::Maximized;
         }
@@ -731,7 +737,7 @@ fn is_rect_covering_monitor(
         && window_rect.bottom >= monitor_rect.bottom
 }
 
-/// 判断窗口矩形宽高是否均 ≥ 显示器矩形的 95%（参考 Lively IsZoomedCustom）
+/// 判断窗口矩形宽高是否均 ≥ 显示器矩形的 95%（全屏判定）
 fn is_rect_covering_95_percent(
     window_rect: &windows::Win32::Foundation::RECT,
     monitor_rect: &windows::Win32::Foundation::RECT,
@@ -1159,11 +1165,21 @@ mod tests {
     #[test]
     fn test_compute_transition_none_was_false_noop() {
         assert_eq!(
-            compute_transition(FullscreenLevel::None, FullscreenLevel::None, false, FullscreenAction::None),
+            compute_transition(
+                FullscreenLevel::None,
+                FullscreenLevel::None,
+                false,
+                FullscreenAction::None
+            ),
             Transition::NoOp
         );
         assert_eq!(
-            compute_transition(FullscreenLevel::None, FullscreenLevel::Maximized, false, FullscreenAction::Terminate),
+            compute_transition(
+                FullscreenLevel::None,
+                FullscreenLevel::Maximized,
+                false,
+                FullscreenAction::Terminate
+            ),
             Transition::NoOp
         );
     }
@@ -1172,11 +1188,21 @@ mod tests {
     fn test_compute_transition_none_was_true_exit() {
         // 之前已处置且当前非全屏 → 退出恢复
         assert_eq!(
-            compute_transition(FullscreenLevel::None, FullscreenLevel::TrueFullscreen, true, FullscreenAction::Terminate),
+            compute_transition(
+                FullscreenLevel::None,
+                FullscreenLevel::TrueFullscreen,
+                true,
+                FullscreenAction::Terminate
+            ),
             Transition::Exit
         );
         assert_eq!(
-            compute_transition(FullscreenLevel::None, FullscreenLevel::Maximized, true, FullscreenAction::Pause),
+            compute_transition(
+                FullscreenLevel::None,
+                FullscreenLevel::Maximized,
+                true,
+                FullscreenAction::Pause
+            ),
             Transition::Exit
         );
     }
@@ -1185,11 +1211,21 @@ mod tests {
     fn test_compute_transition_maximized_same_level_noop() {
         // 同级别（Maximized→Maximized）：仅更新 HWND
         assert_eq!(
-            compute_transition(FullscreenLevel::Maximized, FullscreenLevel::Maximized, true, FullscreenAction::Terminate),
+            compute_transition(
+                FullscreenLevel::Maximized,
+                FullscreenLevel::Maximized,
+                true,
+                FullscreenAction::Terminate
+            ),
             Transition::NoOp
         );
         assert_eq!(
-            compute_transition(FullscreenLevel::Maximized, FullscreenLevel::Maximized, false, FullscreenAction::Pause),
+            compute_transition(
+                FullscreenLevel::Maximized,
+                FullscreenLevel::Maximized,
+                false,
+                FullscreenAction::Pause
+            ),
             Transition::NoOp
         );
     }
@@ -1212,7 +1248,12 @@ mod tests {
     fn test_compute_transition_maximized_pause_with_terminate_action() {
         // 最大化永远只暂停：即使配置为 terminate 也暂停
         assert_eq!(
-            compute_transition(FullscreenLevel::Maximized, FullscreenLevel::None, false, FullscreenAction::Terminate),
+            compute_transition(
+                FullscreenLevel::Maximized,
+                FullscreenLevel::None,
+                false,
+                FullscreenAction::Terminate
+            ),
             Transition::Pause
         );
     }
@@ -1220,7 +1261,12 @@ mod tests {
     #[test]
     fn test_compute_transition_maximized_pause_with_pause_action() {
         assert_eq!(
-            compute_transition(FullscreenLevel::Maximized, FullscreenLevel::None, false, FullscreenAction::Pause),
+            compute_transition(
+                FullscreenLevel::Maximized,
+                FullscreenLevel::None,
+                false,
+                FullscreenAction::Pause
+            ),
             Transition::Pause
         );
     }
@@ -1228,7 +1274,12 @@ mod tests {
     #[test]
     fn test_compute_transition_maximized_noop_with_none_action() {
         assert_eq!(
-            compute_transition(FullscreenLevel::Maximized, FullscreenLevel::None, false, FullscreenAction::None),
+            compute_transition(
+                FullscreenLevel::Maximized,
+                FullscreenLevel::None,
+                false,
+                FullscreenAction::None
+            ),
             Transition::NoOp
         );
     }
@@ -1237,11 +1288,21 @@ mod tests {
     fn test_compute_transition_true_fullscreen_same_level_noop() {
         // 同级别（TrueFullscreen→TrueFullscreen）：仅更新 HWND
         assert_eq!(
-            compute_transition(FullscreenLevel::TrueFullscreen, FullscreenLevel::TrueFullscreen, true, FullscreenAction::Terminate),
+            compute_transition(
+                FullscreenLevel::TrueFullscreen,
+                FullscreenLevel::TrueFullscreen,
+                true,
+                FullscreenAction::Terminate
+            ),
             Transition::NoOp
         );
         assert_eq!(
-            compute_transition(FullscreenLevel::TrueFullscreen, FullscreenLevel::TrueFullscreen, false, FullscreenAction::Pause),
+            compute_transition(
+                FullscreenLevel::TrueFullscreen,
+                FullscreenLevel::TrueFullscreen,
+                false,
+                FullscreenAction::Pause
+            ),
             Transition::NoOp
         );
     }
@@ -1249,7 +1310,12 @@ mod tests {
     #[test]
     fn test_compute_transition_true_fullscreen_terminate() {
         assert_eq!(
-            compute_transition(FullscreenLevel::TrueFullscreen, FullscreenLevel::None, false, FullscreenAction::Terminate),
+            compute_transition(
+                FullscreenLevel::TrueFullscreen,
+                FullscreenLevel::None,
+                false,
+                FullscreenAction::Terminate
+            ),
             Transition::Terminate
         );
     }
@@ -1258,7 +1324,12 @@ mod tests {
     fn test_compute_transition_true_fullscreen_upgrade_terminates() {
         // 升级 Maximized→TrueFullscreen：终止
         assert_eq!(
-            compute_transition(FullscreenLevel::TrueFullscreen, FullscreenLevel::Maximized, true, FullscreenAction::Terminate),
+            compute_transition(
+                FullscreenLevel::TrueFullscreen,
+                FullscreenLevel::Maximized,
+                true,
+                FullscreenAction::Terminate
+            ),
             Transition::Terminate
         );
     }
@@ -1266,7 +1337,12 @@ mod tests {
     #[test]
     fn test_compute_transition_true_fullscreen_pause() {
         assert_eq!(
-            compute_transition(FullscreenLevel::TrueFullscreen, FullscreenLevel::None, false, FullscreenAction::Pause),
+            compute_transition(
+                FullscreenLevel::TrueFullscreen,
+                FullscreenLevel::None,
+                false,
+                FullscreenAction::Pause
+            ),
             Transition::Pause
         );
     }
@@ -1274,7 +1350,12 @@ mod tests {
     #[test]
     fn test_compute_transition_true_fullscreen_noop_with_none_action() {
         assert_eq!(
-            compute_transition(FullscreenLevel::TrueFullscreen, FullscreenLevel::None, false, FullscreenAction::None),
+            compute_transition(
+                FullscreenLevel::TrueFullscreen,
+                FullscreenLevel::None,
+                false,
+                FullscreenAction::None
+            ),
             Transition::NoOp
         );
     }
@@ -1302,10 +1383,7 @@ mod tests {
             flag.swap(true, Ordering::SeqCst),
             "进行中再次调用应返回 true（去重，跳过本次触发）"
         );
-        assert!(
-            flag.load(Ordering::Acquire),
-            "去重期间标志应保持 true"
-        );
+        assert!(flag.load(Ordering::Acquire), "去重期间标志应保持 true");
 
         // 3. 线程结束复位：store(false) → 可再次触发
         flag.store(false, Ordering::Release);

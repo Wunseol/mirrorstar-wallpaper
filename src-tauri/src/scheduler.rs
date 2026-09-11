@@ -44,17 +44,17 @@ use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use crate::commands::wallpaper::DisplaySettingGuard;
 use mirrorstar_core::config::{PlaybackState, PlaybackStore, Unit};
 use mirrorstar_core::scheduler::{
     filter_candidates, invalidate_sampler, resolve_boot, sample_next, BootDecision, PoolEntry,
     SamplerState,
 };
 use mirrorstar_core::{
-    build_new_renderer, wait_new_ready, AppConfig, Arrangement, AtomicSwapPrepare,
-    BuildOutcome, ConfigManager, DesktopIntegrator, MirrorStarError, ScalingMode, SwapOutcome,
-    WallpaperEngine, WallpaperRenderer, WallpaperSource, WallpaperType, ATOMIC_SWAP_READY_TIMEOUT,
+    build_new_renderer, wait_new_ready, AppConfig, Arrangement, AtomicSwapPrepare, BuildOutcome,
+    ConfigManager, DesktopIntegrator, MirrorStarError, ScalingMode, SwapOutcome, WallpaperEngine,
+    WallpaperRenderer, WallpaperSource, WallpaperType, ATOMIC_SWAP_READY_TIMEOUT,
 };
-use crate::commands::wallpaper::DisplaySettingGuard;
 use tauri::Emitter;
 use tokio::sync::mpsc::{self, UnboundedReceiver, UnboundedSender};
 use tokio::sync::Notify;
@@ -142,7 +142,9 @@ impl SchedulerHandle {
     ) -> Result<(), MirrorStarError> {
         if let Some(pid) = &pool_id {
             if self.config_manager.get_pool(pid).is_none() {
-                return Err(MirrorStarError::InvalidArgument { reason: format!("池不存在: {pid}") });
+                return Err(MirrorStarError::InvalidArgument {
+                    reason: format!("池不存在: {pid}"),
+                });
             }
         }
         {
@@ -278,7 +280,11 @@ fn pool_count(cm: &ConfigManager, active_pool: Option<&str>) -> usize {
 
 // ── 主循环 ──────────────────────────────────────────────────────────────────
 
-async fn run_loop(handle: Arc<SchedulerHandle>, app: tauri::AppHandle, mut manual_rx: UnboundedReceiver<Option<String>>) {
+async fn run_loop(
+    handle: Arc<SchedulerHandle>,
+    app: tauri::AppHandle,
+    mut manual_rx: UnboundedReceiver<Option<String>>,
+) {
     // 启动阶段：读配置 + 对账 + 对齐单元 + 开机解析一次（设计 §16）。
     let cfg = handle.config_manager.get_config();
     let mut layout = Layout::new();
@@ -430,7 +436,11 @@ fn resolve_migration(
 
 /// 按当前编排枚举显示器建立 / 对齐单元映射；清理引用已删壁纸 / 已删池的条目并回退；
 /// 编排切换时按 DR-22 迁移主屏 / `all` 单元状态到目标单元。
-fn reconcile_and_align(handle: &SchedulerHandle, arrangement: Arrangement, layout: &mut Layout) -> bool {
+fn reconcile_and_align(
+    handle: &SchedulerHandle,
+    arrangement: Arrangement,
+    layout: &mut Layout,
+) -> bool {
     // DR-22 迁移需在上次映射被覆盖前快照"来源"侧状态。
     let mut changed = false;
     let prev_arrangement = layout.arrangement;
@@ -487,8 +497,13 @@ fn reconcile_and_align(handle: &SchedulerHandle, arrangement: Arrangement, layou
 
     // DR-22：编排切换时迁移主屏 / all 单元状态到目标单元，避免 current 丢失导致
     // 开机从池重选而非延续。source → dst 迁移 current / active_pool / order_cursor / enabled。
-    let migration =
-        resolve_migration(prev_arrangement, arrangement, prev_primary.as_deref(), layout.primary.as_deref(), had_all_unit);
+    let migration = resolve_migration(
+        prev_arrangement,
+        arrangement,
+        prev_primary.as_deref(),
+        layout.primary.as_deref(),
+        had_all_unit,
+    );
     if let Some((src_key, dst_key)) = migration {
         if src_key != dst_key {
             changed = true;
@@ -522,7 +537,11 @@ fn reconcile_and_align(handle: &SchedulerHandle, arrangement: Arrangement, layou
     // current / active_pool / order_cursor / bag_remaining 一致性：剔除引用已删
     // 壁纸 / 已删池的条目（DR-34 / DR-35）。
     for u in play.units.values_mut() {
-        if scrub_unit_refs(u, |id| cm.get_wallpaper(id).is_some(), |pid| cm.get_pool(pid).is_some()) {
+        if scrub_unit_refs(
+            u,
+            |id| cm.get_wallpaper(id).is_some(),
+            |pid| cm.get_pool(pid).is_some(),
+        ) {
             changed = true;
         }
     }
@@ -544,7 +563,10 @@ fn scrub_unit_refs(
     pool_live: impl Fn(&str) -> bool,
 ) -> bool {
     let mut changed = false;
-    if let (Some(id), true) = (unit.current_wallpaper_id.as_deref(), unit.current_wallpaper_id.is_some()) {
+    if let (Some(id), true) = (
+        unit.current_wallpaper_id.as_deref(),
+        unit.current_wallpaper_id.is_some(),
+    ) {
         if !wallpaper_live(id) {
             unit.current_wallpaper_id = None;
             changed = true;
@@ -620,7 +642,13 @@ async fn apply_boot(handle: &SchedulerHandle, layout: &Layout, app: &tauri::AppH
             cfg.rotation.enabled,
             cfg.rotation.on_boot,
             unit.enabled,
-            if pool_ge_two { 2 } else if pool_ge_one { 1 } else { 0 },
+            if pool_ge_two {
+                2
+            } else if pool_ge_one {
+                1
+            } else {
+                0
+            },
         );
 
         match decision {
@@ -817,20 +845,18 @@ async fn apply_to_display(
                         eng.embed_atomic_into(renderer, display_id)?
                     };
                     // 阶段 B（锁外，不持引擎锁）：首帧就绪（视频等待加载）。
-                    let ready =
-                        tokio::task::spawn_blocking(move || -> (
-                            Result<(), MirrorStarError>,
-                            Box<dyn WallpaperRenderer>,
-                        ) {
+                    let ready = tokio::task::spawn_blocking(
+                        move || -> (Result<(), MirrorStarError>, Box<dyn WallpaperRenderer>) {
                             let result = wait_new_ready(
                                 &mut renderer,
                                 ATOMIC_SWAP_READY_TIMEOUT,
                                 Duration::from_millis(100),
                             );
                             (result, renderer)
-                        })
-                        .await
-                        .map_err(|e| MirrorStarError::TaskJoin(format!("任务 join 失败: {e}")))?;
+                        },
+                    )
+                    .await
+                    .map_err(|e| MirrorStarError::TaskJoin(format!("任务 join 失败: {e}")))?;
                     let (ready_result, mut renderer) = ready;
                     if let Err(e) = ready_result {
                         let _ = renderer.terminate();
@@ -838,7 +864,12 @@ async fn apply_to_display(
                     }
                     // 阶段 C（锁内）：一次换槽 old→new + 补发暂停（DR-20）+ terminate 旧。
                     let mut eng = engine.lock().await;
-                    match eng.commit_atomic_swap(renderer, display_id, &commit_source, wallpaper_type)? {
+                    match eng.commit_atomic_swap(
+                        renderer,
+                        display_id,
+                        &commit_source,
+                        wallpaper_type,
+                    )? {
                         SwapOutcome::Committed => Ok(ApplyOutcome::Swapped),
                     }
                 }
@@ -885,7 +916,10 @@ fn unit_is_rotatable(handle: &SchedulerHandle, _layout: &Layout, key: &str) -> b
 }
 
 fn has_rotatable_unit(handle: &SchedulerHandle, layout: &Layout) -> bool {
-    layout.unit_keys().into_iter().any(|k| unit_is_rotatable(handle, layout, &k))
+    layout
+        .unit_keys()
+        .into_iter()
+        .any(|k| unit_is_rotatable(handle, layout, &k))
 }
 
 fn emit_rotated(app: &tauri::AppHandle, key: &str, wallpaper_id: &str) {
@@ -906,11 +940,7 @@ mod tests {
 
     /// 构造布局：PerMonitor 时 keys 即各显示器单元（primary 指向其中一个）；
     /// AllSame / Span 时以 ALL_UNIT_KEY 承载全部，primary 仅作默认值。
-    fn layout_with(
-        arrangement: Arrangement,
-        keys: &[&str],
-        primary: Option<&str>,
-    ) -> Layout {
+    fn layout_with(arrangement: Arrangement, keys: &[&str], primary: Option<&str>) -> Layout {
         let mut l = Layout::new();
         l.arrangement = arrangement;
         for k in keys {
@@ -927,7 +957,10 @@ mod tests {
     fn target_all_same_always_returns_all_when_unit_exists() {
         let l = layout_with(Arrangement::AllSame, &[ALL_UNIT_KEY], None);
         // AllSame 下无论 key 为何均回退全局单元
-        assert_eq!(resolve_target_key(&l, Some("any".to_string())).as_deref(), Some(ALL_UNIT_KEY));
+        assert_eq!(
+            resolve_target_key(&l, Some("any".to_string())).as_deref(),
+            Some(ALL_UNIT_KEY)
+        );
         assert_eq!(resolve_target_key(&l, None).as_deref(), Some(ALL_UNIT_KEY));
     }
 
@@ -947,7 +980,10 @@ mod tests {
     #[test]
     fn target_per_monitor_uses_explicit_key() {
         let l = layout_with(Arrangement::PerMonitor, &["a", "b"], Some("a"));
-        assert_eq!(resolve_target_key(&l, Some("b".to_string())).as_deref(), Some("b"));
+        assert_eq!(
+            resolve_target_key(&l, Some("b".to_string())).as_deref(),
+            Some("b")
+        );
     }
 
     #[test]
@@ -962,7 +998,13 @@ mod tests {
     fn migration_all_same_to_per_monitor_moves_to_primary() {
         // all → 主屏单元
         assert_eq!(
-            resolve_migration(Arrangement::AllSame, Arrangement::PerMonitor, Some("m1"), Some("m1"), true),
+            resolve_migration(
+                Arrangement::AllSame,
+                Arrangement::PerMonitor,
+                Some("m1"),
+                Some("m1"),
+                true
+            ),
             Some((ALL_UNIT_KEY.to_string(), "m1".to_string()))
         );
     }
@@ -971,7 +1013,13 @@ mod tests {
     fn migration_all_same_to_per_monitor_no_primary_no_move() {
         // had_all_unit 为 false → 无迁移
         assert_eq!(
-            resolve_migration(Arrangement::AllSame, Arrangement::PerMonitor, Some("m1"), Some("m1"), false),
+            resolve_migration(
+                Arrangement::AllSame,
+                Arrangement::PerMonitor,
+                Some("m1"),
+                Some("m1"),
+                false
+            ),
             None
         );
     }
@@ -980,7 +1028,13 @@ mod tests {
     fn migration_per_monitor_to_all_same_moves_to_all() {
         // 主屏 → all
         assert_eq!(
-            resolve_migration(Arrangement::PerMonitor, Arrangement::Span, Some("m2"), None, false),
+            resolve_migration(
+                Arrangement::PerMonitor,
+                Arrangement::Span,
+                Some("m2"),
+                None,
+                false
+            ),
             Some(("m2".to_string(), ALL_UNIT_KEY.to_string()))
         );
     }
@@ -989,7 +1043,13 @@ mod tests {
     fn migration_primary_change_within_per_monitor() {
         // 主屏由 m1 变为 m2 → 迁移 m1→m2
         assert_eq!(
-            resolve_migration(Arrangement::PerMonitor, Arrangement::PerMonitor, Some("m1"), Some("m2"), false),
+            resolve_migration(
+                Arrangement::PerMonitor,
+                Arrangement::PerMonitor,
+                Some("m1"),
+                Some("m2"),
+                false
+            ),
             Some(("m1".to_string(), "m2".to_string()))
         );
     }
@@ -997,11 +1057,23 @@ mod tests {
     #[test]
     fn migration_same_primary_no_move() {
         assert_eq!(
-            resolve_migration(Arrangement::PerMonitor, Arrangement::PerMonitor, Some("m1"), Some("m1"), false),
+            resolve_migration(
+                Arrangement::PerMonitor,
+                Arrangement::PerMonitor,
+                Some("m1"),
+                Some("m1"),
+                false
+            ),
             None
         );
         assert_eq!(
-            resolve_migration(Arrangement::PerMonitor, Arrangement::PerMonitor, None, None, false),
+            resolve_migration(
+                Arrangement::PerMonitor,
+                Arrangement::PerMonitor,
+                None,
+                None,
+                false
+            ),
             None
         );
     }
@@ -1010,7 +1082,13 @@ mod tests {
     fn migration_span_to_span_never_moves() {
         // 同形态（Span → Span）无迁移
         assert_eq!(
-            resolve_migration(Arrangement::Span, Arrangement::Span, Some("m1"), Some("m1"), true),
+            resolve_migration(
+                Arrangement::Span,
+                Arrangement::Span,
+                Some("m1"),
+                Some("m1"),
+                true
+            ),
             None
         );
     }
@@ -1145,8 +1223,14 @@ mod tests {
             let mut play = handle.playback.lock().unwrap();
             play.units.get_mut("b").unwrap().enabled = false;
         }
-        assert!(!unit_is_rotatable(&handle, &layout, "b"), "被关闭单元不应参与轮换");
-        assert!(unit_is_rotatable(&handle, &layout, "a"), "其它开启单元仍应参与");
+        assert!(
+            !unit_is_rotatable(&handle, &layout, "b"),
+            "被关闭单元不应参与轮换"
+        );
+        assert!(
+            unit_is_rotatable(&handle, &layout, "a"),
+            "其它开启单元仍应参与"
+        );
         assert!(has_rotatable_unit(&handle, &layout));
 
         // 全关 → 皆不参与，全局不再可触发。

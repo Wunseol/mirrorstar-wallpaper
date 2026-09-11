@@ -1,4 +1,4 @@
-[← 返回文档索引](../../README.md) > [架构设计](./01-架构概述-Architecture-Overview.md) > 进程架构
+[← 返回文档索引](../../README.md) > [架构设计](./01-架构概述与系统架构-Architecture-Overview.md) > 进程架构
 
 # MirrorStar Wallpaper（镜星壁纸）架构设计 — 进程架构
 
@@ -9,7 +9,7 @@
 | 更新日期 | 2026-08-29                |
 | 文档状态 | 已实现（基于最新代码审计）        |
 
-> 基于真实代码审计 + 混合架构实现 + Lively 对比
+> 基于真实代码审计 + 混合架构实现
 
 ## 1. 进程模型
 
@@ -265,108 +265,17 @@ MirrorStar 使用**两套完全独立**的 IPC 协议，分别对应两种子进
 
 **嵌入流程**：HWND 获取后，主进程的 `DesktopIntegrator` 执行 WorkerW 嵌入（`SetParent` + `SetWindowPos(HWND_BOTTOM)` + `ShowWindow`），与 mpv 窗口嵌入逻辑一致。
 
----
-
-## 3. Lively 进程模型对比
-
-### MirrorStar 进程模型（混合架构：主进程 + 按需 Web 子进程）
-
-```
-┌──────────────────────────────────────────────────────────┐
-│              mirrorstar-wallpaper.exe（主进程）             │
-│  ┌──────────┐ ┌──────────┐ ┌──────────┐ ┌────────────┐  │
-│  │ Tauri    │ │ 图片线程  │ │ GIF 线程  │ │ 视频线程   │  │
-│  │ 主线程   │ │ (GetMsg) │ │ (Timer)  │ │ (mpv IPC) │  │
-│  └──────────┘ └──────────┘ └──────────┘ └────────────┘  │
-│  ┌──────────┐ ┌──────────┐ ┌──────────────────────────┐  │
-│  │ 全屏检测 │ │ 配置监视 │ │ WebRenderer (代理层)     │  │
-│  │ (Hook)   │ │ (notify) │ │  ├ ProcessManager       │  │
-│  └──────────┘ └──────────┘ │  └ WpProcIpcClient       │  │
-│                              └──────────────────────────┘  │
-└──────────────────────────────────────────────────────────┘
-       │                              │
-       │ CreateProcessW               │ CreateProcessW + 命名管道 IPC
-       ▼                              ▼
-┌─────────────────┐         ┌──────────────────────────┐
-│   mpv.exe       │         │ mirrorstar-wp-proc.exe    │
-│   (视频壁纸)    │         │ (Web 壁纸子进程)          │
-│   按需启动      │         │  ┌────────────────────┐  │
-└─────────────────┘         │  │ WebView2 环境      │  │
-                            │  │  └ 窗口 + 消息循环  │  │
-                            │  └────────────────────┘  │
-                            └──────────────────────────┘
-                               ↑ 仅 Web 壁纸时启动
-                               ↑ 关闭 Web 壁纸时终止
-```
-
-**特点：**
-- Image/Gif 渲染器在主进程专用线程中运行（GDI + 双缓冲）
-- Video 渲染器通过 ProcessManager 启动 mpv.exe 子进程（按需）
-- **Web 渲染器已重构为代理层**：通过 ProcessManager 启动 mirrorstar-wp-proc.exe 子进程（按需），通过 WpProcIpcClient 命名管道通信
-- HWND 通过 FindWindowW + PID 验证获取后，主进程执行 WorkerW 嵌入（与 mpv 窗口嵌入逻辑一致）
-- 线程间通过 mpsc 通道 + PostMessageW 通信
-- 全屏检测使用 SetWinEventHook 事件驱动
-- PauseSender 快速通道绕过引擎互斥锁
-- watchdog crate 已在阶段2移除（不再需要独立看门狗进程）
-
-**内存优化：**
-- 无 Web 壁纸时：零子进程开销（仅主进程 + 可选的 mpv）
-- WebView2 运行时仅加载在子进程中，主进程不加载 webview2-com
-- 子进程在 Web 壁纸关闭时立即终止，释放全部内存
-
-### Lively 进程模型
-
-```
-┌─────────────────────────────────────────────────┐
-│              livelywpf.exe（主进程）              │
-│  ┌──────────┐ ┌──────────┐ ┌──────────────────┐ │
-│  │ WPF      │ │ 定时器   │ │ CefSharp stdout  │ │
-│  │ UI 线程  │ │ (轮询)   │ │ 消息处理         │ │
-│  └──────────┘ └──────────┘ └──────────────────┘ │
-└─────────────────────────────────────────────────┘
-    │                    │                │
-    │ SetParent()        │ WaitForExit()  │ stdin/stdout
-    ▼                    ▼                ▼
-┌────────┐  ┌────────────────┐  ┌─────────────────┐
-│WPF窗口 │  │livelySubProcess│  │LivelyCefSharp   │
-│(内嵌)  │  │(看门狗进程)    │  │(CefSharp子进程) │
-└────────┘  └────────────────┘  └─────────────────┘
-    │
-    │ SetParent() + SuspendThread/ResumeThread
-    ▼
-┌────────────────┐
-│ 外部进程        │  ← Unity/Godot/mpv 等
-│ (mpv/Unity等)  │
-└────────────────┘
-```
-
-**特点：**
-- 所有壁纸窗口都是 WPF Window（内嵌在主进程）或外部进程
-- CefSharp 运行在独立子进程，通过 stdin/stdout 通信
-- livelySubProcess 看门狗进程监控主进程，崩溃时清理资源
-- 外部进程通过 SuspendThread/ResumeThread 暂停/恢复
-
-### 对比总结
-
-| 维度 | MirrorStar | Lively |
-|------|-----------|--------|
-| 壁纸渲染位置 | 主进程专用线程（Image/Gif/Video）+ 独立子进程（Web） | 主进程 WPF 窗口 + 外部进程 |
-| 子进程数量 | 0-2（mpv + wp-proc，均按需启动） | 2+（CefSharp + 看门狗 + 外部程序） |
-| 崩溃隔离 | Web 壁纸崩溃隔离（子进程），Image/Gif/Video 在主进程 | 子进程崩溃不影响主进程 + 看门狗进程 |
-| 起进程监控 | 退出监听（spawn_proc_exit_monitor）+ OS 自动回收，无独立看门狗进程（watchdog crate 已在阶段2移除） | 有（livelySubProcess 完整实现） |
-| 暂停机制 | 逻辑暂停（PauseSender 快速通道） | 线程挂起（SuspendThread） |
-| 内存优化 | 无 Web 壁纸时零子进程开销，WebView2 仅按需加载 | CefSharp 启动即加载 |
-
-**关键差异：**
-- MirrorStar 采用混合进程架构——Image/Gif/Video 渲染器在主进程专用线程中运行，仅 Web 壁纸通过独立子进程（mirrorstar-wp-proc）渲染，按需启动。Video 壁纸也启动 mpv 子进程（按需）。watchdog crate 已在阶段2移除（不再需要独立看门狗进程）。
-- Lively 使用 `SuspendThread/ResumeThread` 挂起外部进程的所有线程来实现暂停，这是一种粗暴但有效的方式。MirrorStar 则通过 PauseSender 快速通道绕过引擎互斥锁，直接发送暂停/恢复/音量命令，实现优雅暂停。
-- MirrorStar 的混合架构在内存占用上更优：无 Web 壁纸时仅主进程运行（+ 可选的 mpv），而 Lively 的 CefSharp 子进程启动即加载。
+**进程模型要点总结：**
+- **混合进程架构**：Image/Gif/Video 渲染器在主进程专用线程中运行，仅 Web 壁纸（及外部 Video 的 mpv）通过独立子进程渲染，均按需启动
+- **崩溃隔离**：Web 壁纸经 mirrorstar-wp-proc 子进程渲染，崩溃不影响主进程
+- **起进程监控**：通过 `spawn_proc_exit_monitor` 监听子进程退出 + 操作系统自动回收，无需独立看门狗进程（watchdog crate 已在阶段2移除）
+- **逻辑暂停**：通过 PauseSender 快速通道绕过引擎互斥锁，直接发送暂停/恢复/音量命令，实现安全优雅的暂停
+- **内存优化**：无 Web 壁纸时零子进程开销，WebView2 运行时仅按需加载，关闭 Web 壁纸即终止子进程释放全部内存
 
 ---
 
 **相关文档：**
-- [架构概述](./01-架构概述-Architecture-Overview.md)
-- [系统架构](./02-系统架构-System-Architecture.md)
+- [架构概述与系统架构](./01-架构概述与系统架构-Architecture-Overview.md)
 - [模块设计](./03-模块设计-Module-Design.md)
 - [依赖与数据流](./05-依赖与数据流-Dependency-and-Data-Flow.md)
 - [桌面集成](./06-桌面集成-Desktop-Integration.md)

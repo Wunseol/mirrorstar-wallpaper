@@ -7,7 +7,7 @@ import globals from "globals";
 // 规则适度放宽以避免大量改动现有代码
 export default tseslint.config(
   {
-    ignores: ["src-tauri/**", "node_modules/**", "dist/**", "lively-reference/**"],
+    ignores: ["src-tauri/**", "node_modules/**", "dist/**"],
   },
   js.configs.recommended,
   ...tseslint.configs.recommended,

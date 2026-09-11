@@ -132,7 +132,9 @@ fn sample_shuffle_bag(
     let valid_ids: std::collections::HashSet<&str> =
         candidates.iter().map(|c| c.id.as_str()).collect();
     // C1：剔除袋内已不在候选中的残留 id（已删 / 缺文件）。
-    state.bag_remaining.retain(|id| valid_ids.contains(id.as_str()));
+    state
+        .bag_remaining
+        .retain(|id| valid_ids.contains(id.as_str()));
     if state.bag_remaining.is_empty() {
         // 重新成袋，剔除 Web（DR-18）。
         state.bag_remaining = candidates
@@ -203,10 +205,11 @@ fn seed_from_system() -> u64 {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_nanos() as u64)
         .unwrap_or(0x9E3779B97F4A7C15);
-    elapsed ^ std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0)
+    elapsed
+        ^ std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0)
 }
 
 thread_local! {
@@ -281,7 +284,11 @@ mod tests {
         };
         let next = sample_next_inner(Order::Sequential, &candidates, &mut state, &mut |_| 0);
         assert_eq!(next.as_deref(), Some("b"), "a 之后应取 b");
-        assert_eq!(state.order_cursor.as_deref(), Some("b"), "抽中 id 应设为新游标");
+        assert_eq!(
+            state.order_cursor.as_deref(),
+            Some("b"),
+            "抽中 id 应设为新游标"
+        );
     }
 
     #[test]
@@ -435,7 +442,10 @@ mod tests {
             );
         }
         let empty: Vec<PoolEntry> = vec![];
-        assert_eq!(sample_next_inner(Order::ShuffleBag, &empty, &mut state, &mut rng), None);
+        assert_eq!(
+            sample_next_inner(Order::ShuffleBag, &empty, &mut state, &mut rng),
+            None
+        );
     }
 
     // ── invalidate_sampler（DR-23）─────────────────────────────────────
@@ -449,7 +459,11 @@ mod tests {
         // 给出 current_id：清袋、保留游标锚点
         invalidate_sampler(&mut state, Some("x"));
         assert!(state.bag_remaining.is_empty(), "袋应清空重建");
-        assert_eq!(state.order_cursor.as_deref(), Some("x"), "游标应保留 current_id");
+        assert_eq!(
+            state.order_cursor.as_deref(),
+            Some("x"),
+            "游标应保留 current_id"
+        );
         // 无 current_id：游标置 None
         invalidate_sampler(&mut state, None);
         assert!(state.order_cursor.is_none());
