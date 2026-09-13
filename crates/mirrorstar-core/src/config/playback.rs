@@ -46,9 +46,14 @@ pub struct Unit {
     /// 洗牌袋剩余量（DR-18，袋空重洗）
     #[serde(default)]
     pub bag_remaining: Vec<String>,
-    /// 单元是否启用
-    #[serde(default)]
+    /// 单元是否启用（缺失字段回退 true，保证旧/精简配置加载后默认全开）
+    #[serde(default = "default_enabled_true")]
     pub enabled: bool,
+}
+
+/// `enabled` 字段缺失时的默认值：true（默认全开，与 [`PlaybackState::ensure_unit`] 一致）。
+fn default_enabled_true() -> bool {
+    true
 }
 
 impl Default for PlaybackState {
@@ -69,7 +74,7 @@ impl PlaybackState {
             active_pool: None,
             order_cursor: None,
             bag_remaining: Vec::new(),
-            enabled: false,
+            enabled: true,
         })
     }
 }
@@ -240,7 +245,8 @@ mod tests {
         assert_eq!(unit.key, "global");
         assert!(unit.current_wallpaper_id.is_none());
         assert!(unit.active_pool.is_none());
-        assert!(!unit.enabled);
+        // 新建单元默认全开（DR：默认全开体验）
+        assert!(unit.enabled);
     }
 
     #[test]
@@ -265,6 +271,33 @@ mod tests {
         assert_eq!(u.bag_remaining, vec!["w3".to_string(), "w1".to_string()]);
         assert!(u.enabled);
 
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn missing_enabled_field_defaults_to_true() {
+        let (store, dir) = temp_store();
+        // 构造不含 enabled 字段的旧/精简 playback.toml（省略该字段即可，同 `enabled=false` 被省略）
+        let content = r#"
+version = 1
+
+[units.m0]
+key = "m0"
+current_wallpaper_id = "w1"
+active_pool = "p1"
+"#;
+        std::fs::write(&store.path, content).unwrap();
+        let loaded = store.load();
+        assert_eq!(loaded.version, PLAYBACK_SCHEMA_VERSION);
+        assert_eq!(loaded.units.len(), 1);
+        let u = &loaded.units["m0"];
+        // 缺失 enabled 字段应回退为 true（默认全开），而非 serde 默认的 false
+        assert!(u.enabled, "缺失 enabled 字段应回退 true");
+        // 加载后既有单元不被 ensure_unit 重置 enabled（只 or_insert 新建）
+        let mut s = loaded.clone();
+        let reused = s.ensure_unit("m0".to_string());
+        assert!(reused.enabled, "既有单元不应被 ensure_unit 重置 enabled");
+        assert_eq!(s.units.len(), 1, "既有 key 不应重复建单元");
         std::fs::remove_dir_all(&dir).ok();
     }
 

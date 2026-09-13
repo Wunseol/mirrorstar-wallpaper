@@ -62,10 +62,8 @@ import type { DisplayInfo, Pool, RotationConfig, WallpaperEntry } from "../types
 import {
   createPoolFromInput,
   dedupeMembers,
-  getPoolList,
   isOrder,
   loadPools,
-  orderLabel,
   patchRotation,
   poolNamesForWallpaper,
   reorderMembers,
@@ -181,18 +179,6 @@ describe("isOrder", () => {
     expect(isOrder("random")).toBe(false);
     expect(isOrder("")).toBe(false);
     expect(isOrder("Sequential")).toBe(false);
-  });
-});
-
-describe("orderLabel", () => {
-  it("映射顺序循环 / 洗牌袋 / 纯随机", () => {
-    expect(orderLabel("sequential")).toBe("顺序循环");
-    expect(orderLabel("shuffle_bag")).toBe("洗牌袋");
-    expect(orderLabel("pseudo_random")).toBe("纯随机");
-  });
-
-  it("未知值原样返回（防御性）", () => {
-    expect(orderLabel("unknown" as never)).toBe("unknown");
   });
 });
 
@@ -480,6 +466,24 @@ describe("renderUnitConfig", () => {
     expect(setRotationEnabled).toHaveBeenCalledWith("d1", true);
   });
 
+  it("set_rotation_enabled 失败时回滚 checkbox 并提示错误（与 main.ts 全局开关一致）", async () => {
+    vi.mocked(listPools).mockResolvedValue(samplePools());
+    vi.mocked(setRotationEnabled).mockRejectedValue(new Error("ipc failure"));
+    await loadPools();
+    await renderUnitConfig();
+
+    const checkbox = container.querySelector("input.unit-rotation-enabled") as HTMLInputElement;
+    checkbox.checked = true;
+    checkbox.dispatchEvent(new Event("change"));
+    await vi.waitFor(() => {
+      expect(showStatus).toHaveBeenCalledWith(expect.stringContaining("设置单元"), "error");
+    });
+
+    // 失败后应回滚到切换前的未勾选状态，保持 UI 与后端一致
+    expect(checkbox.checked).toBe(false);
+    expect(log.error).toHaveBeenCalled();
+  });
+
   it("set_active_pool 失败时展示错误提示", async () => {
     vi.mocked(listPools).mockResolvedValue(samplePools());
     vi.mocked(setActivePool).mockRejectedValue(new Error("ipc failure"));
@@ -577,9 +581,8 @@ describe("loadPools", () => {
     const cards = container.querySelectorAll(".rotation-pool");
     expect(cards).toHaveLength(1);
     expect(cards[0]!.getAttribute("data-pool-id")).toBe("p1");
-    // 同步 state 与缓存
+    // 同步 state
     expect(appState.pools).toBe(pools);
-    expect(getPoolList()).toBe(pools);
     // 派发事件由 main.ts 监听 → 刷新壁纸列表
     expect(eventSpy).toHaveBeenCalledTimes(1);
 

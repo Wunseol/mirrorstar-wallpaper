@@ -19,7 +19,6 @@ export {
   debounce,
   extractFileName,
   showStatus,
-  isSupportedFile,
 } from "./utils";
 export {
   isOrder,
@@ -28,4 +27,5 @@ export {
   setupNextWallpaperButton,
   loadPools,
   renderUnitConfig,
+  getEnabledUnitLabels,
 } from "./rotation";

@@ -3,7 +3,7 @@ use std::path::PathBuf;
 use windows::Win32::Foundation::{DuplicateHandle, DUPLICATE_SAME_ACCESS, HANDLE, HWND};
 use windows::Win32::System::Threading::GetCurrentProcess;
 use windows::Win32::UI::WindowsAndMessaging::{
-    FindWindowExW, FindWindowW, GetWindowThreadProcessId,
+    FindWindowExW, FindWindowW, GetWindowThreadProcessId, SetPropW,
 };
 
 use crate::process::manager::{JobObjectGuard, ProcessManager};
@@ -67,6 +67,13 @@ pub(crate) const WP_PROC_CONNECT_RETRIES: u32 = 160;
 /// Wave v9-C：从 200ms 降至 50ms，配合 `WP_PROC_CONNECT_RETRIES = 160` 保持
 /// 8s 总超时不变（160 × 50ms = 8s），降低管道就绪后到下次检测的等待延迟。
 pub(crate) const WP_PROC_CONNECT_INTERVAL_MS: u64 = 50;
+
+/// 子进程渲染器窗口识别的窗口属性名
+///
+/// `set_hwnd` 通过 `SetPropW` 在本应用 mpv/wp-proc 渲染器窗口上打此标记，
+/// src-tauri 全屏检测用 `GetPropW` 查询该属性识别自家壁纸窗口。
+/// 属性与窗口同生共死——窗口销毁时属性自动消失，无 PID 复用竞态、O(1) 查询。
+const WALLPAPER_WINDOW_PROP: windows::core::PCWSTR = windows::core::w!("MirrorStarWallpaper");
 
 /// 子进程渲染器公共基类，封装 `VideoRenderer` 和 `WebRenderer` 的共同模式：
 /// - `ProcessManager` 管理子进程生命周期
@@ -205,6 +212,17 @@ impl SubprocessRendererBase {
     /// 设置窗口句柄
     pub fn set_hwnd(&mut self, hwnd: Option<HWND>) {
         self.hwnd = hwnd;
+        // 用 SetPropW 在本应用 mpv/wp-proc 渲染器窗口上打标记（值 1 仅作非空标记，
+        // GetProp 只判断非 null），供 src-tauri 全屏检测识别自家壁纸窗口。属性与窗口
+        // 同生共死——窗口销毁时自动消失，无 PID 复用竞态。set_hwnd 可能被子类反复
+        // 调用，SetPropW 幂等可重复打。hwnd 为 None 时无需处理。
+        if let Some(hwh) = hwnd {
+            // SAFETY: SetPropW 仅向 hwh 关联一个整型标记属性，hwh 由 Window 查找流程
+            // 校验有效（非空、非 invalid）。字符串常量以 NUL 结尾，PCWSTR 读取有效。
+            unsafe {
+                let _ = SetPropW(hwh, WALLPAPER_WINDOW_PROP, HANDLE(1 as *mut core::ffi::c_void));
+            }
+        }
     }
 
     /// 获取管道名称

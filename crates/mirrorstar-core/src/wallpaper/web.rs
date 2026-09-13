@@ -199,6 +199,10 @@ impl WallpaperRenderer for WebRenderer {
         self.base.hwnd()
     }
 
+    fn process_pid(&self) -> Option<u32> {
+        self.base.process_pid()
+    }
+
     fn state(&self) -> WallpaperState {
         self.base.state()
     }

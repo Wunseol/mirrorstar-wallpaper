@@ -17,7 +17,8 @@ pub use config::ConfigManager;
 pub use desktop::DesktopIntegrator;
 pub use wallpaper::manager::{
     build_new_renderer, renderer_id, wait_new_ready, AtomicSwapPending, AtomicSwapPrepare,
-    BuildOutcome, SwapOutcome, WallpaperEngine, WallpaperMode, ATOMIC_SWAP_READY_TIMEOUT,
+    BuildOutcome, SwapOutcome, WallpaperEngine, WallpaperMode, ATOMIC_SWAP_IN_PROGRESS,
+    ATOMIC_SWAP_READY_TIMEOUT,
 };
 pub use wallpaper::{
     GifMemoryStrategy, PauseCommand, PauseReason, PauseSender, ScalingMode, WallpaperRenderer,

@@ -674,6 +674,10 @@ pub trait WallpaperRenderer: Send {
     fn terminate(&mut self) -> Result<(), crate::MirrorStarError>;
     /// 获取壁纸窗口句柄
     fn hwnd(&self) -> Option<HWND>;
+    /// 获取渲染器子进程 PID（图片/GIF 等无子进程渲染器返回 `None`，默认实现）
+    fn process_pid(&self) -> Option<u32> {
+        None
+    }
     /// 获取当前壁纸状态
     fn state(&self) -> WallpaperState;
     /// 设置播放速度（0.25~4.0，仅视频壁纸有效，默认 no-op）

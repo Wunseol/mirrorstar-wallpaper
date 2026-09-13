@@ -13,7 +13,7 @@ use tauri::{Emitter, Manager};
 
 use commands::*;
 use platform::{start_explorer_restart_monitor, start_fullscreen_monitor, start_workerw_check};
-use state::{create_or_show_main_window, perform_shutdown_blocking, AppState};
+use state::{create_or_show_main_window, perform_shutdown_blocking, record_main_window_destroyed, AppState};
 
 // ST-017: 重新导出 ST-007 提取的纯函数，供集成测试直接调用
 // （避免测试通过 format!() 字符串匹配模拟命令层逻辑）
@@ -1206,7 +1206,10 @@ pub fn run() {
             //   Hook/COM 释放，避免 mpv 孤立与资源泄漏。
             if let tauri::RunEvent::ExitRequested { code, api, .. } = event {
                 if code.is_none() {
-                    // 主窗口关闭：阻止退出，保持托盘运行，不执行退出清理
+                    // 主窗口关闭：阻止退出，保持托盘运行，不执行退出清理。
+                    // 记录"主窗口最近销毁"时间戳，用于阻断销毁瞬间托盘事件重入
+                    // 导致的窗口自动重现（DR 防抖，见 state.rs 冷却逻辑）。
+                    record_main_window_destroyed();
                     api.prevent_exit();
                 } else if let Some(state) = app_handle.try_state::<AppState>() {
                     perform_shutdown_blocking(

@@ -1,7 +1,10 @@
 use crate::scheduler::SchedulerHandle;
-use mirrorstar_core::{ConfigManager, DesktopIntegrator, PauseReason, WallpaperEngine};
-use std::sync::atomic::{AtomicBool, Ordering};
+use mirrorstar_core::{
+    ATOMIC_SWAP_IN_PROGRESS, ConfigManager, DesktopIntegrator, PauseReason, WallpaperEngine,
+};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
+use std::time::{SystemTime, UNIX_EPOCH};
 use tauri::{AppHandle, Manager, WebviewUrl, WebviewWindowBuilder};
 
 /// 应用状态
@@ -186,6 +189,49 @@ pub(crate) static SHARED_APP_HANDLE: OnceLock<AppHandle> = OnceLock::new();
 /// 接受瞬时内存占用，避免销毁聚焦 WebView2 窗口触发 wry 空指针崩溃。
 /// 此标志记录"需在退出全屏后恢复"。`swap(false)` 消费标志，避免重复恢复。
 pub(crate) static FULLSCREEN_MAIN_WINDOW_HIDDEN: AtomicBool = AtomicBool::new(false);
+
+/// 最近一次主窗口销毁的 Unix 毫秒时间戳（0 = 从未销毁）。
+///
+/// 主窗口采用"关闭即销毁以释放 WebView2 内存"的策略（v8.0），窗口销毁会触发
+/// WebView2 子进程退出 + 托盘区域重绘，可能在关闭后的极短窗口内再次派发
+/// `TrayIconEvent::Click(Up)`，导致 `create_or_show_main_window` 重入 build 路径
+/// 重建窗口（表现为"关窗后窗口自动重现"）。此时间戳用于阻断该同批次重入。
+///
+/// 注意：该记录仅用于**竞态防抖**，不改变"用户主动点击托盘可打开窗口"的语义——
+/// 冷却窗口极短，用户主动操作总是晚于关闭瞬间，不受影响。
+pub(crate) static MAIN_WINDOW_LAST_DESTROYED: AtomicU64 = AtomicU64::new(0);
+
+/// 主窗口关闭后拒绝"托盘重入重建"的冷却窗口。销毁瞬间的系统重绘/事件重入
+/// 通常在几百毫秒内完成，取 1.5s 作为安全边界。
+const MAIN_WINDOW_REOPEN_COOLDOWN_MS: u64 = 1500;
+
+/// 获取当前 Unix 毫秒时间戳（时钟异常时按 0 处理）。
+fn now_unix_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+/// 记录主窗口刚被销毁（须在主窗口关闭导致的 `ExitRequested(code=None)` 路径调用）。
+///
+/// 供 `create_or_show_main_window` 判断是否处于销毁后冷却窗口，阻断托盘重入重建。
+pub(crate) fn record_main_window_destroyed() {
+    MAIN_WINDOW_LAST_DESTROYED.store(now_unix_ms(), Ordering::SeqCst);
+}
+
+/// 是否处于"最近一次主窗口销毁后的冷却窗口"内。
+///
+/// 若为 true，则 `create_or_show_main_window` 应忽略本次重建请求（判定为
+/// 销毁瞬间的托盘事件重入），避免窗口自动重现。用户主动操作必然晚于关闭瞬间，
+/// 故不会被误拦。
+fn within_reopen_cooldown() -> bool {
+    let last = MAIN_WINDOW_LAST_DESTROYED.load(Ordering::SeqCst);
+    if last == 0 {
+        return false;
+    }
+    now_unix_ms().saturating_sub(last) < MAIN_WINDOW_REOPEN_COOLDOWN_MS
+}
 
 /// 全局状态用于 Win32 回调（回调需要函数指针，无法使用闭包）
 /// 全屏检测和电源监控共享同一个 wallpaper_engine Arc
@@ -440,6 +486,15 @@ pub(crate) fn try_resume_all_fast(reason: PauseReason) -> Option<Vec<String>> {
     Some(failed)
 }
 
+/// 原子交换进行中？（只读查询，Task 4.3 互斥决策判定条件）
+///
+/// 仅读取全局 `ATOMIC_SWAP_IN_PROGRESS` 标志，供全屏终止/恢复的跳过分支使用。
+/// 置位/复位由调度器侧 `AtomicSwapInProgressGuard`（RAII，scheduler.rs）负责。
+/// 抽成纯函数便于单测直接验证跳过决策，无需触碰 SHARED_ENGINE 全局。
+pub(crate) fn atomic_swap_in_progress() -> bool {
+    ATOMIC_SWAP_IN_PROGRESS.load(Ordering::SeqCst)
+}
+
 /// 阻塞式恢复所有壁纸（供后台恢复线程使用，Task 7.1/7.2）
 ///
 /// 与 [`try_resume_all_fast`] 的区别：后者运行于 Win32 回调上下文，必须用
@@ -455,6 +510,12 @@ pub(crate) fn try_resume_all_fast(reason: PauseReason) -> Option<Vec<String>> {
 /// - `Some(failed)`：已调用 `resume_all_fast`，`failed` 为失败的 display_id 列表
 ///   （空表示全部成功）。调用方据此决定是否更新 FULLSCREEN_WAS。
 pub(crate) fn resume_all_fast_blocking(reason: PauseReason) -> Option<Vec<String>> {
+    // Task 4.3：原子交换进行中时跳过全屏恢复（语义同 try_terminate_all_fast）。
+    // 返回 None 使调用方保留 FULLSCREEN_WAS，由周期复查线程在交换结束后重试恢复。
+    if atomic_swap_in_progress() {
+        tracing::warn!(reason = ?reason, "原子交换进行中，跳过 resume_all_fast_blocking（周期复查线程会重试）");
+        return None;
+    }
     let engine = SHARED_ENGINE.get()?;
     // blocking_lock：后台线程，可安全阻塞等待（tokio Mutex 无 poison，仅阻塞）。
     // 与 Win32 回调路径的 try_lock 不同，此处允许等待 engine 锁释放
@@ -472,6 +533,14 @@ pub(crate) fn resume_all_fast_blocking(reason: PauseReason) -> Option<Vec<String
 /// - `None`：`SHARED_ENGINE` 未设置或锁忙，调用方应跳过本次事件，不更新状态标志
 /// - `Some(failed)`：已调用 `terminate_all_fast`，`failed` 为失败的 display_id 列表
 pub(crate) fn try_terminate_all_fast(reason: PauseReason) -> Option<Vec<String>> {
+    // Task 4.3：原子交换进行中时跳过全屏终止。原子交换阶段 A→C 期间 WorkerW
+    // 正在被新窗嵌入/换槽，此时终止会重建 WorkerW 导致 commit 前校验失败
+    // （"新窗父窗口已非当前 WorkerW"）与首帧等待超时。返回 None 与"锁忙跳过"语义
+    // 一致：调用方不更新状态，事件会重复触发。
+    if atomic_swap_in_progress() {
+        tracing::warn!(reason = ?reason, "原子交换进行中，跳过 terminate_all_fast（事件会重复触发）");
+        return None;
+    }
     let engine = SHARED_ENGINE.get()?;
     let mut engine = match engine.try_lock() {
         Ok(e) => e,
@@ -792,6 +861,13 @@ pub(crate) fn create_or_show_main_window(app: &tauri::AppHandle) {
             tracing::warn!(error = %e, "聚焦主窗口失败");
         }
     } else {
+        // 销毁后冷却防抖：窗口刚被关闭销毁时，系统托盘区域重绘可能引发
+        // TrayIconEvent::Click 重入，走此 build 路径重建窗口（表现为"关窗后窗口
+        // 自动重现"）。若距最近销毁仍在冷却窗口内，判定为同批次重入并忽略。
+        if within_reopen_cooldown() {
+            tracing::info!("主窗口刚于销毁冷却窗口内，忽略托盘非主动重入，避免窗口自动重现");
+            return;
+        }
         match WebviewWindowBuilder::new(app, "main", WebviewUrl::App("index.html".into()))
             .title("镜星壁纸")
             .inner_size(900.0, 600.0)

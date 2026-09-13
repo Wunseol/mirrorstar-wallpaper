@@ -41,11 +41,6 @@ export function isOrder(v: string): v is Order {
   return (ORDERS as readonly string[]).includes(v);
 }
 
-/** 取 Order 的中文标签；未知值原样返回（防御性） */
-export function orderLabel(order: Order): string {
-  return ORDER_LABELS[order] ?? order;
-}
-
 // ── 纯函数：池名映射（10.4）────────────────────────────────────────────────────
 
 /**
@@ -123,11 +118,6 @@ export function unitKeysForArrangement(
 let poolList: Pool[] = [];
 let currentArrangement: Arrangement = "per_monitor";
 let currentDisplays: DisplayInfo[] = [];
-
-/** 供测试 / 其它模块读取当前池缓存 */
-export function getPoolList(): Pool[] {
-  return poolList;
-}
 
 /**
  * 同步池缓存到模块与 appState（供壁纸卡片标注池名 & 单元配置下拉复用），
@@ -271,11 +261,22 @@ function renderUnitItem(
   // 回填后端真实开关态（state 缺省 → 关）
   checkbox.checked = state?.enabled ?? false;
   checkbox.addEventListener("change", () => {
-    runGuard(setRotationEnabled(key, checkbox.checked), `设置单元 ${label} 轮换开关失败`);
+    const isEnabled = checkbox.checked;
+    const prev = !isEnabled;
+    setRotationEnabled(key, isEnabled)
+      .then(() => {
+        showStatus(`${label} 轮换已${isEnabled ? "开启" : "关闭"}`, "success");
+      })
+      .catch((e) => {
+        log.error(`设置单元 ${label} 轮换开关失败`, e);
+        checkbox.checked = prev; // 回滚到切换前状态，保持 UI 与后端一致
+        showStatus(`设置单元 ${label} 轮换开关失败`, "error");
+      });
   });
   const cbLabel = document.createElement("label");
   cbLabel.appendChild(checkbox);
-  cbLabel.append("单元轮换开关");
+  // 标题已展示屏幕名，这里紧跟“轮换开关”即可明确是哪个屏幕的开关
+  cbLabel.append("轮换开关");
   enabledRow.appendChild(cbLabel);
   item.appendChild(enabledRow);
 
@@ -288,6 +289,21 @@ function runGuard(promise: Promise<unknown>, errorMsg: string): void {
     log.error(errorMsg, e);
     showStatus(errorMsg, "error");
   });
+}
+
+/**
+ * 读取当前编排下所有「已启用」单元的屏幕标签列表，供全局开关开启时提示生效屏幕。
+ * 依据后端真实单元状态过滤（enabled==true），默认全开模型下通常为全部单元。
+ */
+export async function getEnabledUnitLabels(): Promise<string[]> {
+  const [config, displays, states] = await Promise.all([
+    getRotationConfig(),
+    getDisplays(),
+    getUnitStates(),
+  ]);
+  const units = unitKeysForArrangement(config.arrangement, displays);
+  const enabledKeys = new Set(states.filter((s) => s.enabled).map((s) => s.key));
+  return units.filter((u) => enabledKeys.has(u.key)).map((u) => u.label);
 }
 
 // ── 10.2 池编辑器：CRUD + 成员拖拽排序 ─────────────────────────────────────────

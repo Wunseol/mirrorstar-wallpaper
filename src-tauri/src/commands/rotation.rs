@@ -36,31 +36,10 @@ pub fn update_rotation_config(
 ) -> Result<(), MirrorStarError> {
     // 合并进完整 AppConfig（其余字段保持不变）后走既有 update_config 校验 + 落盘。
     let mut full = state.config_manager.get_config();
-    let old_enabled = full.rotation.enabled;
-    let new_enabled = config.enabled;
     full.rotation = config;
     state.config_manager.update_config(full)?;
 
-    // 全局 `rotation.enabled` 由 false→true：按当前编排联动启用对应布局单元，
-    // 否则仅开全局开关不会轮换（调度器判定定时可触发取决于单元的 enabled，见
-    // scheduler 的 unit_is_rotatable）。此后用户仍可单独关闭某单元，保持到下次再开。
-    if !old_enabled && new_enabled {
-        let arrangement = state.config_manager.get_config().rotation.arrangement;
-        let keys: Vec<String> = match arrangement {
-            Arrangement::PerMonitor => {
-                let displays = {
-                    let desktop = state.desktop.lock().unwrap_or_else(|e| e.into_inner());
-                    desktop.enumerate_displays()
-                };
-                displays.into_iter().map(|d| d.id).collect()
-            }
-            Arrangement::AllSame | Arrangement::Span => vec![ALL_UNIT_KEY.to_string()],
-        };
-        state.scheduler.enable_layout_units(&keys);
-    }
-
-    // 编排 / 间隔 / 开关等变化 → 唤醒调度器重算 deadline（DR-23）。
-    // enable_layout_units 内部已唤醒一次；此处再唤醒一次幂等无害，保持既有行为。
+    // 唤醒调度器重算 deadline（DR-23）。
     state.scheduler.wake.notify_waiters();
     Ok(())
 }

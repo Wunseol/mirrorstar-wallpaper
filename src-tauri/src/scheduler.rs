@@ -38,9 +38,10 @@
 //! 同屏并发。Native 图片 / 无现有壁纸回退现有 `set_wallpaper` 同步便利路径（先关后设，
 //! DR-33 注）。失败保持旧壁纸、游标已推进跳过（DR-19）。
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::future::Future;
 use std::pin::Pin;
+use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -53,7 +54,8 @@ use mirrorstar_core::scheduler::{
 use mirrorstar_core::{
     build_new_renderer, wait_new_ready, AppConfig, Arrangement, AtomicSwapPrepare, BuildOutcome,
     ConfigManager, DesktopIntegrator, MirrorStarError, ScalingMode, SwapOutcome, WallpaperEngine,
-    WallpaperRenderer, WallpaperSource, WallpaperType, ATOMIC_SWAP_READY_TIMEOUT,
+    WallpaperRenderer, WallpaperSource, WallpaperType, ATOMIC_SWAP_IN_PROGRESS,
+    ATOMIC_SWAP_READY_TIMEOUT,
 };
 use tauri::Emitter;
 use tokio::sync::mpsc::{self, UnboundedReceiver, UnboundedSender};
@@ -62,6 +64,27 @@ use tokio::sync::Notify;
 /// 全局 / 全体调度单元 key（`AllSame` / `Span` 编排下的唯一单元；亦作为"全局开关"
 /// 的 key，设计 §14）。
 pub const ALL_UNIT_KEY: &str = "all";
+
+/// 原子交换进行中守卫（RAII，Task 4.1/4.2）
+///
+/// 构造时置位 `ATOMIC_SWAP_IN_PROGRESS`，Drop 时复位。在 `apply_to_display` 的
+/// 原子交换路径（阶段 A 嵌入 → B 首帧就绪 → C commit）创建，确保：
+/// - 全屏终止/恢复检测到标志时跳过本次（state.rs 见 try_terminate_all_fast /
+///   resume_all_fast_blocking），避免交换期间重建 WorkerW / 冷启动 mpv
+/// - 任何错误路径（wait_new_ready 失败 / commit 校验失败）退出作用域时自动复位，
+///   不会残留 true 卡死后续全屏处置
+struct AtomicSwapInProgressGuard;
+impl AtomicSwapInProgressGuard {
+    fn new() -> Self {
+        ATOMIC_SWAP_IN_PROGRESS.store(true, Ordering::SeqCst);
+        Self
+    }
+}
+impl Drop for AtomicSwapInProgressGuard {
+    fn drop(&mut self) {
+        ATOMIC_SWAP_IN_PROGRESS.store(false, Ordering::SeqCst);
+    }
+}
 
 /// `wallpaper-rotated` 事件负载（DR-30）。
 #[derive(serde::Serialize, Clone)]
@@ -168,21 +191,6 @@ impl SchedulerHandle {
         self.wake.notify_waiters();
     }
 
-    /// 按当前编排批量启用布局单元（全局 `rotation.enabled` 由 false→true 时联动）。
-    ///
-    /// 复用 `ensure_unit`（单元不存在则新建后启用）的语义，但一次持锁遍历所有 key，
-    /// 统一 `flush_playback()` 一次并 `wake.notify_waiters()` 一次，避免为每个单元
-    /// 重复落盘 + 唤醒。此后用户仍可经 [`set_unit_enabled`](Self::set_unit_enabled)
-    /// 单独关闭某单元，该关闭保持到下次全局再开启为止。
-    pub fn enable_layout_units(&self, keys: &[String]) {
-        {
-            let mut play = self.playback.lock().unwrap_or_else(|e| e.into_inner());
-            set_layout_units_enabled(&mut play, keys);
-        }
-        self.flush_playback();
-        self.wake.notify_waiters();
-    }
-
     // ── playback 防抖落盘（DR-29 简化：轮换/开机低频，直接原子写，PS1） ────────
 
     pub(crate) fn flush_playback(&self) {
@@ -196,8 +204,10 @@ impl SchedulerHandle {
     }
 }
 
-/// 无副作用地批量置位布局单元的 `enabled`（供 [`SchedulerHandle::enable_layout_units`]
-/// 与测试复用）。单元不存在则经 `ensure_unit` 新建后启用；不落盘、不唤醒。
+/// 无副作用地批量置位布局单元的 `enabled`（供测试复用；生产路径不再使用——单元默认
+/// 全开，用户按需经 `SchedulerHandle::set_unit_enabled` 单独开关是唯一控制通道）。
+/// 单元不存在则经 `ensure_unit` 新建后启用；不落盘、不唤醒。
+#[cfg(test)]
 fn set_layout_units_enabled(play: &mut PlaybackState, keys: &[String]) {
     for key in keys {
         play.ensure_unit(key.clone()).enabled = true;
@@ -483,11 +493,12 @@ fn reconcile_and_align(
         }
     }
 
-    // 对齐到已建 / 新建单元，并对孤儿单元归档；清理已删池 / 已删壁纸引用（DR-34）。
+    // 对齐到已建 / 新建单元。孤儿单元（已拔屏 / 编排不再覆盖）不做任何降级、直接保留，
+    // 回归"默认全开"模型（它们不在 layout.unit_keys，天然不参与轮换迭代）；清理已删池 /
+    // 已删壁纸引用（DR-34）。
     let mut play = handle.playback.lock().unwrap_or_else(|e| e.into_inner());
     let cm = &handle.config_manager;
-    let current_keys: HashSet<String> = layout.unit_displays.keys().cloned().collect();
-    let live_keys: Vec<String> = current_keys.iter().cloned().collect();
+    let live_keys: Vec<String> = layout.unit_displays.keys().cloned().collect();
     for k in live_keys {
         if !play.units.contains_key(&k) {
             changed = true;
@@ -519,21 +530,6 @@ fn reconcile_and_align(
         }
     }
 
-    // 孤儿 key（显示器已拔下 / 编排切换不再覆盖的单元）降级为非启用、保留状态备恢复。
-    let orphan: Vec<String> = play
-        .units
-        .keys()
-        .filter(|k| !current_keys.contains(*k))
-        .cloned()
-        .collect();
-    for k in orphan {
-        if let Some(u) = play.units.get_mut(&k) {
-            if u.enabled {
-                u.enabled = false;
-                changed = true;
-            }
-        }
-    }
     // current / active_pool / order_cursor / bag_remaining 一致性：剔除引用已删
     // 壁纸 / 已删池的条目（DR-34 / DR-35）。
     for u in play.units.values_mut() {
@@ -839,6 +835,10 @@ async fn apply_to_display(
                     Ok(ApplyOutcome::Skipped)
                 }
                 Ok(BuildOutcome::Ready(renderer)) => {
+                    // Task 4.2：阶段 A→C 全程置"原子交换进行中"标志，全屏终止/恢复
+                    // 检测到该标志时跳过本次（见 state.rs），防止交换期间重建 WorkerW
+                    // 导致 commit 前校验失败。守卫 Drop 时（含所有错误路径）自动复位。
+                    let _swap_guard = AtomicSwapInProgressGuard::new();
                     // 阶段 A（锁内）：嵌入 + after_embed（loadfile）。旧壁纸保持占位。
                     let mut renderer = {
                         let mut eng = engine.lock().await;
@@ -1151,7 +1151,35 @@ mod tests {
         assert_eq!(unit.bag_remaining, vec!["alive".to_string()]);
     }
 
-    // ── enable_layout_units（全局 rotation.enabled false→true 联动）────────────
+    // ── reconcile_and_align：孤儿单元保留（默认全开模型）────────────────────────
+
+    /// 孤儿单元（已拔屏 / 编排切换不再覆盖）不应被 reconcile 降级 `enabled`，须原样保留。
+    ///
+    /// `reconcile_and_align` 会基于枚举到的真实显示器重建 `layout.unit_displays`，无法在
+    /// 单测中注入"仅含 key_A"的布局；故选用两个绝不可能等于 Windows 显示器 id（形如
+    /// `\\.\DISPLAY1`）的 key `a` / `b`——它们在当前编排下恒为孤儿，从而与测试机显示器
+    /// 数量解耦，稳定断言"孤儿不被降级"。
+    #[test]
+    fn reconcile_keeps_orphan_unit_enabled() {
+        let (handle, _dir) = handle_with_two_wallpapers();
+        // 隔离测试状态：清空数据根残留，仅预置 a / b 两个孤儿单元且全开（默认全开模型）。
+        let mut play = handle.playback.lock().unwrap();
+        play.units.clear();
+        play.ensure_unit("a".to_string()).enabled = true;
+        play.ensure_unit("b".to_string()).enabled = true;
+        drop(play);
+
+        let mut layout = Layout::new();
+        reconcile_and_align(&handle, Arrangement::PerMonitor, &mut layout);
+
+        let play = handle.playback.lock().unwrap();
+        assert!(play.units.contains_key("a"), "孤儿单元 a 应保留");
+        assert!(play.units["a"].enabled, "孤儿单元 a 不应被降级");
+        assert!(play.units.contains_key("b"), "孤儿单元 b 应保留");
+        assert!(play.units["b"].enabled, "孤儿单元 b 不应被降级");
+    }
+
+    // ── set_layout_units_enabled（测试辅助：批量置位布局单元 enabled）──────────
 
     /// 构造含两张真实图片壁纸的调度句柄（供 has_rotatable_unit / unit_is_rotatable
     /// 集成断言）。返回的 TempDir 保持文件存活至测试结束。
@@ -1190,7 +1218,8 @@ mod tests {
     #[test]
     fn set_layout_units_enabled_enables_all_keys() {
         let mut state = PlaybackState::default();
-        state.ensure_unit("b".to_string()); // 预置一个关闭单元
+        // 显式预置一个关闭单元（新单元默认全开，需显式关闭以测试"重新启用"路径）。
+        state.ensure_unit("b".to_string()).enabled = false;
         assert!(!state.units["b"].enabled);
         // 布局启用：不存在的新建启用、已存在关闭的重新启用（无副作用：不落盘/不唤醒）。
         set_layout_units_enabled(&mut state, &["a".to_string(), "b".to_string()]);
@@ -1241,5 +1270,78 @@ mod tests {
         assert!(!has_rotatable_unit(&handle, &layout));
         assert!(!unit_is_rotatable(&handle, &layout, "a"));
         assert!(!unit_is_rotatable(&handle, &layout, "b"));
+    }
+
+    // ── Task 4.3：原子交换互斥标志（ATOMIC_SWAP_IN_PROGRESS）测试 ─────────────
+
+    /// 串行化读写全局 `ATOMIC_SWAP_IN_PROGRESS` 的测试。
+    ///
+    /// 该标志是进程级全局静态量，cargo test 默认多线程并行执行；若多个测试同时
+    /// 置位/复位会互相干扰。所有操作该标志的测试必须先获取此锁，保证同一时刻
+    /// 只有一个测试读写全局标志。guard 的 RAII Drop 在测试结束（含 panic）时自动
+    /// 复位，与锁配合确保不污染后续测试。
+    static ATOMIC_SWAP_TEST_LOCK: Mutex<()> = Mutex::new(());
+
+    /// 测试 a：`AtomicSwapInProgressGuard` 置位/复位。
+    ///
+    /// guard 存活期间 `atomic_swap_in_progress()`（state.rs 的只读查询函数）为 true；
+    /// guard drop 后为 false。
+    #[test]
+    fn test_atomic_swap_guard_sets_and_resets_flag() {
+        let _lock = ATOMIC_SWAP_TEST_LOCK.lock().unwrap();
+        // 进入时标志应为 false（上一测试经 guard Drop 复位；并行场景由锁串行化保证）。
+        assert!(
+            !crate::state::atomic_swap_in_progress(),
+            "进入测试时全局标志应为 false"
+        );
+        {
+            let _guard = AtomicSwapInProgressGuard::new();
+            assert!(
+                crate::state::atomic_swap_in_progress(),
+                "guard 存活期间标志应为 true"
+            );
+        }
+        assert!(
+            !crate::state::atomic_swap_in_progress(),
+            "guard drop 后标志应复位为 false"
+        );
+    }
+
+    /// 测试 a（panic 路径）：guard 的 Drop 保证 panic 展开时同样自动复位，
+    /// 不残留 true 卡死后续全屏处置。
+    #[test]
+    fn test_atomic_swap_guard_resets_flag_on_panic() {
+        let _lock = ATOMIC_SWAP_TEST_LOCK.lock().unwrap();
+        let result = std::panic::catch_unwind(|| {
+            let _guard = AtomicSwapInProgressGuard::new();
+            assert!(crate::state::atomic_swap_in_progress());
+            panic!("模拟原子交换路径中途 panic");
+        });
+        assert!(result.is_err(), "闭包应因模拟 panic 返回 Err");
+        assert!(
+            !crate::state::atomic_swap_in_progress(),
+            "guard Drop 应保证 panic 展开后自动复位"
+        );
+    }
+
+    /// 测试 b：跳过决策判定条件。
+    ///
+    /// state.rs 的 `try_terminate_all_fast` / `resume_all_fast_blocking` 在
+    /// `atomic_swap_in_progress()` 为 true 时跳过本次全屏终止/恢复并 warn 返回 None
+    /// （与"锁忙跳过"语义一致，调用方不更新状态，事件会重复触发）。本测试验证该
+    /// 判定条件的置位/复位行为：guard 存活期间为 true（跳过分支命中），drop 后为
+    /// false（跳过分支不命中）。两函数本体因 SHARED_ENGINE 全局未设置（非测试
+    /// 环境）无法直接调用，跳过分支的判定条件即 `atomic_swap_in_progress()` 的返回值。
+    #[test]
+    fn test_atomic_swap_flag_skip_decision() {
+        let _lock = ATOMIC_SWAP_TEST_LOCK.lock().unwrap();
+        // 未置位：跳过分支不命中，继续走正常路径。
+        assert!(!crate::state::atomic_swap_in_progress());
+        let guard = AtomicSwapInProgressGuard::new();
+        // 置位期间：跳过分支命中（两函数检测到 true 时 warn 并返回 None）。
+        assert!(crate::state::atomic_swap_in_progress());
+        drop(guard);
+        // 复位后：跳过分支不再命中。
+        assert!(!crate::state::atomic_swap_in_progress());
     }
 }

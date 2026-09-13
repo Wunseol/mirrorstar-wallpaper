@@ -1,5 +1,5 @@
 use mirrorstar_core::{ConfigManager, FullscreenAction, PauseReason, WallpaperEngine};
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use crate::state::{
@@ -132,6 +132,26 @@ static FULLSCREEN_REVIEW_THREAD: std::sync::Mutex<Option<std::thread::JoinHandle
 static RESUME_IN_PROGRESS: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
+/// 终止防抖冷却时长：Terminate 后 1s 内抑制重复终止（Task 3.2）
+const TERMINATE_COOLDOWN: std::time::Duration = std::time::Duration::from_millis(1000);
+/// 恢复防抖冷却时长：Terminate 后 0.5s 内延迟恢复（Task 3.3）
+const RESUME_COOLDOWN: std::time::Duration = std::time::Duration::from_millis(500);
+/// 最近一次全屏终止的时间戳（进程级，供冷却判定）
+static LAST_TERMINATE_TS: std::sync::Mutex<Option<std::time::Instant>> =
+    std::sync::Mutex::new(None);
+
+/// 终止代数（进程级单调递增计数器，供异步恢复线程比对"是否过期"）
+///
+/// 竞态根因：Terminate T1 后恢复线程慢跑（2-6s 冷启动 mpv），期间用户进入新真全屏
+/// T2，T2 再次 Terminate（置 FULLSCREEN_WAS=true、hide_main_window），但 T1 的恢复
+/// 线程结束时仍无条件置 FULLSCREEN_WAS=false 并 restore 主窗口，把壁纸/主窗口恢复到
+/// T2 的全屏游戏之上。`RESUME_IN_PROGRESS` 只防并发恢复，不防"恢复被更新的终止推翻"。
+///
+/// 修复：每次**成功终止**（置 FULLSCREEN_WAS=true）时递增此代数。恢复线程在 spawn 时
+/// 捕获当前代数，结束后若发现代数已变化（期间又有新终止发生），则放弃本次恢复（保持
+/// FULLSCREEN_WAS=true、不 restore 主窗口），从而防止过期恢复覆盖后续新终止。
+static TERMINATION_GENERATION: AtomicU64 = AtomicU64::new(0);
+
 /// SetWinEventHook 的前台窗口切换回调函数
 ///
 /// 当前台窗口切换时触发，检测是否为全屏应用并暂停/恢复壁纸。
@@ -201,11 +221,22 @@ unsafe extern "system" fn foreground_event_callback(
                 // None → 锁忙，不更新状态（事件会重复触发）
             }
             Transition::Terminate => {
+                // Task 3.2：终止冷却期内跳过重复终止（安全网，打断高频死循环）
+                if !should_allow_terminate() {
+                    tracing::warn!("检测到真全屏应用，但处于终止冷却期内，跳过本次终止（防抖）");
+                    return;
+                }
+                // Task 5.1：记录前台窗口上下文，便于真机验证识别/排除逻辑
+                log_terminate_context();
                 let failed = try_terminate_all_fast(PauseReason::FULLSCREEN);
+                record_terminate_time();
                 if let Some(failed) = failed {
                     if failed.is_empty() {
                         tracing::info!("检测到真全屏应用，终止壁纸释放内存");
                         FULLSCREEN_WAS.store(true, Ordering::Release);
+                        // 递增终止代数：标记本次成功终止，使之前 spawn 的恢复线程
+                        // 判定"过期"，放弃恢复，防止旧恢复覆盖后续新终止（防竞态）
+                        increment_termination_generation();
                         *FULLSCREEN_LEVEL.lock().unwrap_or_else(|e| e.into_inner()) = level;
                         update_last_fullscreen_hwnd(level);
                         hide_main_window_on_fullscreen();
@@ -218,6 +249,7 @@ unsafe extern "system" fn foreground_event_callback(
                         *FULLSCREEN_LEVEL.lock().unwrap_or_else(|e| e.into_inner()) = level;
                     }
                 }
+                // None → 锁忙，不更新状态（事件会重复触发）
             }
             Transition::DowngradeToMaximized => {
                 tracing::info!("级别降级 TrueFullscreen→Maximized，壁纸保持终止不恢复");
@@ -231,6 +263,11 @@ unsafe extern "system" fn foreground_event_callback(
                     tracing::info!("前台切换但原全屏窗口仍覆盖显示器（临时覆盖层），跳过壁纸恢复");
                     return;
                 }
+                // Task 3.3 / 5.2：恢复冷却期内不立即恢复，由周期复查线程兜底
+                if in_resume_cooldown() {
+                    tracing::warn!("退出全屏，但处于恢复冷却期内，延迟恢复（由周期复查线程兜底重试）");
+                    return;
+                }
                 tracing::info!("退出全屏，恢复壁纸");
                 resume_from_fullscreen_exit();
                 *FULLSCREEN_LEVEL.lock().unwrap_or_else(|e| e.into_inner()) = FullscreenLevel::None;
@@ -241,6 +278,36 @@ unsafe extern "system" fn foreground_event_callback(
     // catch_unwind 返回 Err(_)：回调内部发生 panic，已被捕获，防止穿越 FFI 硬崩溃
     if result.is_err() {
         tracing::error!("全屏回调 panic 已被捕获，防止穿越 FFI 硬崩溃");
+    }
+}
+
+/// Task 5.1：记录前台窗口上下文，便于真机验证自家窗口识别/排除逻辑
+///
+/// 在 Terminate 分支执行时记录前台窗口的 hwnd / 标题 / 类名 / 父窗口 / 进程 PID。
+fn log_terminate_context() {
+    use windows::Win32::UI::WindowsAndMessaging::{
+        GetClassNameW, GetForegroundWindow, GetParent, GetWindowTextW, GetWindowThreadProcessId,
+    };
+    unsafe {
+        let fg = GetForegroundWindow();
+        if fg.is_invalid() {
+            return;
+        }
+        let mut title = [0u16; TITLE_BUF_LEN];
+        let tlen = GetWindowTextW(fg, &mut title);
+        let mut class = [0u16; TITLE_BUF_LEN];
+        let clen = GetClassNameW(fg, &mut class);
+        let mut pid: u32 = 0;
+        let _ = GetWindowThreadProcessId(fg, Some(&mut pid));
+        let parent = GetParent(fg);
+        tracing::info!(
+            hwnd = ?fg,
+            title = %String::from_utf16_lossy(&title[..tlen as usize]),
+            class = %String::from_utf16_lossy(&class[..clen as usize]),
+            parent = ?parent,
+            pid,
+            "全屏终止上下文：前台窗口信息"
+        );
     }
 }
 
@@ -447,6 +514,17 @@ fn spawn_fullscreen_review_thread() {
 /// 若未来需要按子串匹配长标题，应改用 `Vec<u16>` 动态分配并按返回长度重新分配。
 const TITLE_BUF_LEN: usize = 256;
 
+/// 自家壁纸渲染器窗口标识（mpv 经 `--title=MirrorStarVideo` 固定标题）
+const OWN_WALLPAPER_TITLE: &str = "MirrorStarVideo";
+/// 自家壁纸渲染器窗口类名（mpv 编译时固定 `MPV_WINDOW_CLASS_NAME = "mpv"`）
+const OWN_WALLPAPER_CLASS: &str = "mpv";
+
+/// 自家壁纸渲染器窗口的 SetPropW 窗口属性名（与 subprocess_base 打标记处一致）
+///
+/// `set_hwnd` 用 `SetPropW` 在本应用 mpv/wp-proc 窗口上打此标记，属性与窗口同生共死，
+/// 无 PID 复用竞态；全屏检测用 `GetPropW` 查询命中即豁免。
+const WALLPAPER_WINDOW_PROP: windows::core::PCWSTR = windows::core::w!("MirrorStarWallpaper");
+
 /// 检测前台窗口的全屏级别（None / Maximized / TrueFullscreen）
 ///
 /// 骨架沿用原 `is_foreground_fullscreen`：自身窗口标题精确匹配排除、系统桌面组件
@@ -459,7 +537,7 @@ fn foreground_fullscreen_level() -> FullscreenLevel {
         GetMonitorInfoW, MonitorFromWindow, MONITORINFO, MONITOR_DEFAULTTONEAREST,
     };
     use windows::Win32::UI::WindowsAndMessaging::{
-        GetClassNameW, GetForegroundWindow, GetWindowRect, GetWindowTextW, IsZoomed,
+        GetClassNameW, GetForegroundWindow, GetPropW, GetWindowRect, GetWindowTextW, IsZoomed,
     };
 
     unsafe {
@@ -472,25 +550,43 @@ fn foreground_fullscreen_level() -> FullscreenLevel {
         // ST-012: 改用精确匹配而非 contains，避免误排除任何标题含 "MirrorStar" 子串的第三方窗口。
         // 自身 Tauri 窗口标题为 "镜星壁纸"（WebviewWindowBuilder::title 在 state.rs L417 设置）；
         // "MirrorStar Wallpaper" 用于版本号 UI 显示与英文环境兼容。
+        // title_str 提升到块外供后续自家壁纸窗口识别复用；GetWindowTextW 失败/空标题时为空串
+        // （is_self_window_title("") 恒为 false，与原 if title_len > 0 分支语义一致）。
         let mut title = [0u16; TITLE_BUF_LEN];
         let title_len = GetWindowTextW(foreground, &mut title);
-        if title_len > 0 {
-            let title_str = String::from_utf16_lossy(&title[..title_len as usize]);
-            if is_self_window_title(&title_str) {
-                return FullscreenLevel::None;
-            }
+        let title_str = if title_len > 0 {
+            String::from_utf16_lossy(&title[..title_len as usize])
+        } else {
+            String::new()
+        };
+        if is_self_window_title(&title_str) {
+            return FullscreenLevel::None;
         }
 
         // 排除桌面/壁纸层/任务栏窗口：
         // SetForegroundWindow(progman) 会使 Progman 成为前台窗口，其标题为空、矩形覆盖全屏，
         // 被误判为全屏应用。通过类名排除 Progman/WorkerW/Shell_TrayWnd 等系统桌面组件。
+        // class_str 同样提升到块外供自家壁纸窗口识别复用（is_system_window_class("") 恒为 false）。
         let mut class_name = [0u16; TITLE_BUF_LEN];
         let class_len = GetClassNameW(foreground, &mut class_name);
-        if class_len > 0 {
-            let class_str = String::from_utf16_lossy(&class_name[..class_len as usize]);
-            if is_system_window_class(&class_str) {
-                return FullscreenLevel::None;
-            }
+        let class_str = if class_len > 0 {
+            String::from_utf16_lossy(&class_name[..class_len as usize])
+        } else {
+            String::new()
+        };
+        if is_system_window_class(&class_str) {
+            return FullscreenLevel::None;
+        }
+
+        // 排除自家壁纸渲染器窗口（mpv：标题 MirrorStarVideo / 类名 mpv）。
+        // 主识别靠 `set_hwnd` 时 SetPropW 打的窗口属性标记（与窗口同生共死、无 PID 复用
+        // 竞态），对窗口句柄 GetPropW 命中即豁免；未命中再用标题/类名纯字符串兜底
+        // （双保险，见 is_own_wallpaper_window）。
+        // SAFETY: GetPropW 只读查询 foreground 的窗口属性；WALLPAPER_WINDOW_PROP 常量以
+        // NUL 结尾，PCWSTR 读取有效。foreground 已校验非 invalid（且已位于外层 unsafe 块内）。
+        let has_prop_mark = !GetPropW(foreground, WALLPAPER_WINDOW_PROP).0.is_null();
+        if has_prop_mark || is_own_wallpaper_window(&title_str, &class_str) {
+            return FullscreenLevel::None;
         }
 
         // 获取窗口矩形
@@ -545,6 +641,74 @@ fn should_intercept_resume(recorded_level: FullscreenLevel) -> bool {
         FullscreenLevel::Maximized | FullscreenLevel::None => false,
         FullscreenLevel::TrueFullscreen => true,
     }
+}
+
+/// 终止冷却决策（纯函数，Task 3.4）：距上次终止未达冷却时长 → 不允许再次终止
+fn should_allow_terminate_after(
+    last: Option<std::time::Instant>,
+    now: std::time::Instant,
+    cooldown: std::time::Duration,
+) -> bool {
+    match last {
+        None => true,
+        Some(t) => now.duration_since(t) >= cooldown,
+    }
+}
+
+/// 恢复冷却判定（纯函数）：距上次终止未达冷却时长 → 应延迟恢复
+fn in_resume_cooldown_after(
+    last: Option<std::time::Instant>,
+    now: std::time::Instant,
+    cooldown: std::time::Duration,
+) -> bool {
+    match last {
+        None => false,
+        Some(t) => now.duration_since(t) < cooldown,
+    }
+}
+
+/// 生产包装：是否允许本次终止
+fn should_allow_terminate() -> bool {
+    let now = std::time::Instant::now();
+    let last = LAST_TERMINATE_TS.lock().ok().and_then(|g| *g);
+    should_allow_terminate_after(last, now, TERMINATE_COOLDOWN)
+}
+
+/// 生产包装：是否处于恢复冷却期
+fn in_resume_cooldown() -> bool {
+    let now = std::time::Instant::now();
+    let last = LAST_TERMINATE_TS.lock().ok().and_then(|g| *g);
+    in_resume_cooldown_after(last, now, RESUME_COOLDOWN)
+}
+
+/// 记录本次终止时间戳（终止处置执行时调用）
+fn record_terminate_time() {
+    if let Ok(mut g) = LAST_TERMINATE_TS.lock() {
+        *g = Some(std::time::Instant::now());
+    }
+}
+
+/// 递增终止代数并返回新值（仅在**成功终止**且置 FULLSCREEN_WAS=true 时调用）
+///
+/// `fetch_add(1) + 1` 保证单调递增（即使 fetch_add 返回旧值溢出，新值仍大于旧值）。
+/// 递增后，任何在递增之前 spawn 的恢复线程都会因代数变化而判定"过期"，放弃本次恢复，
+/// 从而防止旧恢复覆盖新的终止状态。
+fn increment_termination_generation() -> u64 {
+    TERMINATION_GENERATION.fetch_add(1, Ordering::SeqCst) + 1
+}
+
+/// 读取当前终止代数（供恢复线程 spawn 前捕获，用于比对恢复是否过期）
+fn current_termination_generation() -> u64 {
+    TERMINATION_GENERATION.load(Ordering::SeqCst)
+}
+
+/// 判定一次"恢复"能否继续（纯函数，供恢复线程与测试复用）
+///
+/// 仅当恢复线程 spawn 时捕获的代数 `spawned_at_gen` 与当前代数 `current_gen` 相同，
+/// 才允许本次恢复继续（写 FULLSCREEN_WAS=false / 重建主窗口）。一旦期间发生了新的
+/// 成功终止（代数已递增），本次恢复已"过期"，应放弃，避免壁纸/主窗口覆盖到新全屏之上。
+fn resume_generation_can_proceed(spawned_at_gen: u64, current_gen: u64) -> bool {
+    spawned_at_gen == current_gen
 }
 
 /// 判断最近记录的全屏窗口是否仍覆盖其所在显示器（仅 TrueFullscreen 级别拦截）
@@ -650,7 +814,24 @@ fn clear_last_fullscreen_hwnd() {
 /// - 成功 → 清 `FULLSCREEN_WAS` / `LAST_FULLSCREEN` / 重建主窗口
 /// - 失败 → 保留 `FULLSCREEN_WAS=true`，由周期复查线程（2s 间隔）自动重试
 /// - 通过 `RESUME_IN_PROGRESS` 标志去重，防止事件回调与复查线程并发重复恢复
+///
+/// # 终止代数比对（Task 2：防恢复覆盖更新终止）
+///
+/// Terminate T1 后恢复线程慢跑期间，用户可能进入新真全屏 T2（再次 Terminate）。
+/// 恢复线程在 spawn **之前**捕获当时的终止代数 `gen_at_spawn`；线程内恢复成功
+/// （failed 为空）后，**先比对代数**：若 `current_termination_generation() !=
+/// gen_at_spawn`，说明期间又发生了新的成功终止，本次恢复已"过期"，应放弃——
+/// 保持 `FULLSCREEN_WAS=true`、不 restore 主窗口（主窗口已在 T2 hide 状态），
+/// 仅打 warn 日志，防止过期恢复把壁纸/主窗口恢复到 T2 全屏游戏之上。
 fn resume_from_fullscreen_exit() {
+    // Task 3.3：终止后恢复冷却期内不立即恢复。Exit 事件分支与周期复查线程共用本入口，
+    // 冷却期内直接返回，保留 FULLSCREEN_WAS=true，由周期复查线程（2s 间隔）在冷却结束后
+    // 兜底恢复。
+    if in_resume_cooldown() {
+        tracing::warn!("恢复冷却期内（终止后 {}ms），延迟恢复，由周期复查线程兜底", RESUME_COOLDOWN.as_millis());
+        return;
+    }
+
     // 去重：已有后台恢复线程在进行中则跳过（事件回调退出分支与周期复查线程
     // 可能并发触发）。swap(true) 原子地取得"执行权"：
     // - 返回 true → 已有线程在跑，本次调用直接返回
@@ -660,10 +841,13 @@ fn resume_from_fullscreen_exit() {
         return;
     }
 
+    // spawn 后台恢复线程之前捕获当前终止代数，move 进闭包用于比对恢复是否过期
+    let gen_at_spawn = current_termination_generation();
+
     // spawn 后台线程执行恢复，避免阻塞 Win32 回调线程（Task 7.2）
     let spawn_result = std::thread::Builder::new()
         .name("mirrorstar-fullscreen-resume".to_string())
-        .spawn(|| {
+        .spawn(move || {
             // 阻塞式恢复：等待 engine 锁 + play() 冷启动 mpv（2-6s）在此线程完成
             let failed = match resume_all_fast_blocking(PauseReason::FULLSCREEN) {
                 Some(f) => f,
@@ -676,7 +860,19 @@ fn resume_from_fullscreen_exit() {
                 }
             };
             if failed.is_empty() {
-                // C-008：仅当全部成功才更新 FULLSCREEN_WAS
+                // 终止代数比对：若恢复线程慢跑期间又有新的成功终止发生，则本次
+                // 恢复已"过期"，放弃——保持 FULLSCREEN_WAS=true、不 restore 主窗口，
+                // 防止过期恢复覆盖后续新终止的全屏状态（Task 2）。
+                if !resume_generation_can_proceed(gen_at_spawn, current_termination_generation()) {
+                    tracing::warn!(
+                        spawned_at_gen = gen_at_spawn,
+                        current_gen = current_termination_generation(),
+                        "恢复线程慢跑期间发生新的全屏终止，放弃本次过期恢复（保持 FULLSCREEN_WAS=true）"
+                    );
+                    RESUME_IN_PROGRESS.store(false, Ordering::Release);
+                    return;
+                }
+                // C-008：仅当全部成功且代数未变化才更新 FULLSCREEN_WAS
                 FULLSCREEN_WAS.store(false, Ordering::Release);
                 clear_last_fullscreen_hwnd();
                 // 若此前销毁了主窗口则重建
@@ -720,6 +916,21 @@ fn is_self_window_title(title: &str) -> bool {
 /// - Shell_TrayWnd：任务栏
 fn is_system_window_class(class: &str) -> bool {
     class == "Progman" || class == "WorkerW" || class == "Shell_TrayWnd"
+}
+
+/// 判断窗口标题/类名是否为自家壁纸渲染器窗口标识（纯函数，字符串兜底）
+///
+/// 标题 `MirrorStarVideo`（`OWN_WALLPAPER_TITLE`）**且**类名 `mpv`（`OWN_WALLPAPER_CLASS`）
+/// **同时命中**才判为自家壁纸窗口。作为 `SetPropW` 窗口属性标记（主识别，与窗口同生共死）
+/// 之外的纯字符串兜底：当标记因窗口在 `set_hwnd` 打标前即被前台检测命中时，仍能靠此识别。
+///
+/// 采用 AND 而非 OR：`mpv` 是通用播放器类名、`MirrorStarVideo` 是普通字符串，任一单一条件
+/// 命中都可能与第三方窗口撞车（第三方 mpv 播放器全屏时类名同为 `mpv`）。双条件同时命中才
+/// 豁免可避免误豁免第三方窗口（其全屏本应触发壁纸暂停）。自家 mpv 窗口标题与类名均由本应用
+/// 启动参数固定（`--title=MirrorStarVideo`、类名 `mpv`），双条件恒满足。
+/// 返回 true 时全屏检测应返回 `FullscreenLevel::None`（不做任何处置）。
+fn is_own_wallpaper_window(title: &str, class: &str) -> bool {
+    title == OWN_WALLPAPER_TITLE && class == OWN_WALLPAPER_CLASS
 }
 
 /// 判断窗口矩形是否覆盖整个显示器矩形（即窗口为全屏）
@@ -1412,5 +1623,146 @@ mod tests {
             !flag.load(Ordering::Acquire),
             "spawn 失败后标志应复位为 false，否则后续恢复永不触发"
         );
+    }
+
+    // ── is_own_wallpaper_window: 自家壁纸渲染器窗口识别（Task 1.2） ────────
+
+    #[test]
+    fn test_is_own_wallpaper_window_own_window() {
+        // 自家 mpv 窗口：标题 MirrorStarVideo + 类名 mpv 同时命中 → true
+        assert!(is_own_wallpaper_window("MirrorStarVideo", "mpv"));
+    }
+
+    #[test]
+    fn test_is_own_wallpaper_window_own_partial_match_not_own() {
+        // 仅标题命中（类名不同）→ 不豁免（AND 语义，避免误豁免第三方）
+        assert!(!is_own_wallpaper_window("MirrorStarVideo", "SomeClass"));
+        // 仅类名命中（标题不同/为空）→ 不豁免（第三方 mpv 播放器类名同为 mpv，不能豁免）
+        assert!(!is_own_wallpaper_window("", "mpv"));
+        assert!(!is_own_wallpaper_window("Third Party Title", "mpv"));
+    }
+
+    #[test]
+    fn test_is_own_wallpaper_window_third_party() {
+        // 第三方应用无关标题且无关类名 → 不豁免
+        assert!(!is_own_wallpaper_window("Third Party App", "NotMpv"));
+        assert!(!is_own_wallpaper_window("Some Other Window", "OtherClass"));
+        assert!(!is_own_wallpaper_window("", ""));
+        // 第三方窗口标题恰为 MirrorStarVideo 但非 mpv 类名 → 不豁免
+        assert!(!is_own_wallpaper_window("MirrorStarVideo", "NotMpv"));
+    }
+
+    // ── 终止代数（Task 2）：increment / current 单调递增与读取 ────────────────────
+    //
+    // `TERMINATION_GENERATION` 是进程级全局静态量，测试通过"读到旧值→递增→断言新值
+    // 更大"的相对方式验证单调递增，不依赖其具体数值（避免与其他测试的执行次序耦合）。
+    // 递增操作只在本测试中发生，不影响其他测试（其余测试不读取代数）。
+
+    #[test]
+    fn test_termination_generation_increments_monotonically() {
+        // 连续两次递增：每次返回的新值都应严格大于前一次
+        let before = current_termination_generation();
+        let g1 = increment_termination_generation();
+        assert!(g1 > before, "第一次递增后新值应大于旧值");
+        let g2 = increment_termination_generation();
+        assert!(g2 > g1, "第二次递增后新值应大于第一次");
+    }
+
+    #[test]
+    fn test_termination_generation_current_reads_latest() {
+        // 递增后 current 应读取到返回的最新值
+        let latest = increment_termination_generation();
+        assert_eq!(
+            current_termination_generation(),
+            latest,
+            "current_termination_generation 应返回最近一次递增后的值"
+        );
+    }
+
+    #[test]
+    fn test_resume_generation_can_proceed_same_gen_allows() {
+        // 恢复线程 spawn 捕获的代数与当前相同 → 允许恢复继续
+        assert!(resume_generation_can_proceed(5, 5));
+        assert!(resume_generation_can_proceed(0, 0));
+    }
+
+    #[test]
+    fn test_resume_generation_can_proceed_stale_gen_blocked() {
+        // 期间发生了新的成功终止（当前代数已递增）→ 本次恢复过期，应放弃
+        assert!(!resume_generation_can_proceed(3, 4));
+        assert!(!resume_generation_can_proceed(0, 100));
+        assert!(!resume_generation_can_proceed(u64::MAX - 1, u64::MAX));
+    }
+
+    // ── 冷却纯函数（Task 3.4）：should_allow_terminate_after / in_resume_cooldown_after ──
+
+    #[test]
+    fn test_should_allow_terminate_after_no_last_allows() {
+        // 无上次终止记录 → 允许终止
+        let now = std::time::Instant::now();
+        assert!(should_allow_terminate_after(
+            None,
+            now,
+            std::time::Duration::from_secs(1)
+        ));
+    }
+
+    #[test]
+    fn test_should_allow_terminate_after_within_cooldown_denies() {
+        // 距上次终止 500ms（<1s）→ 不允许
+        let now = std::time::Instant::now();
+        let last = now - std::time::Duration::from_millis(500);
+        assert!(!should_allow_terminate_after(
+            Some(last),
+            now,
+            std::time::Duration::from_secs(1)
+        ));
+    }
+
+    #[test]
+    fn test_should_allow_terminate_after_past_cooldown_allows() {
+        // 距上次终止 1100ms（>1s）→ 允许
+        let now = std::time::Instant::now();
+        let last = now - std::time::Duration::from_millis(1100);
+        assert!(should_allow_terminate_after(
+            Some(last),
+            now,
+            std::time::Duration::from_secs(1)
+        ));
+    }
+
+    #[test]
+    fn test_in_resume_cooldown_after_within_cooldown_true() {
+        // 距上次终止 300ms（<0.5s）→ 处于恢复冷却期
+        let now = std::time::Instant::now();
+        let last = now - std::time::Duration::from_millis(300);
+        assert!(in_resume_cooldown_after(
+            Some(last),
+            now,
+            std::time::Duration::from_millis(500)
+        ));
+    }
+
+    #[test]
+    fn test_in_resume_cooldown_after_past_cooldown_false() {
+        // 距上次终止 600ms（>0.5s）→ 不在恢复冷却期
+        let now = std::time::Instant::now();
+        let last = now - std::time::Duration::from_millis(600);
+        assert!(!in_resume_cooldown_after(
+            Some(last),
+            now,
+            std::time::Duration::from_millis(500)
+        ));
+    }
+
+    #[test]
+    fn test_in_resume_cooldown_after_none_false() {
+        // 无上次终止记录 → 不在恢复冷却期
+        let now = std::time::Instant::now();
+        assert!(!in_resume_cooldown_after(
+            None,
+            now,
+            std::time::Duration::from_millis(500)
+        ));
     }
 }

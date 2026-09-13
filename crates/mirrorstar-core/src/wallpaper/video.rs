@@ -152,6 +152,13 @@ impl VideoRenderer {
             "--no-terminal".to_string(),
             "--keep-open=no".to_string(),
             "--force-window=yes".to_string(),
+            // 根因 F：mpv 窗口创建时不抢占前台焦点（mpv ≥0.40 支持，当前 0.41 满足）。
+            // 轮换/全屏恢复冷启动 mpv 时，其满屏窗口（1920x1080）嵌入 WorkerW 前会作为
+            // 顶层窗口短暂浮动；默认 focus-on 会让窗口抢占前台，触发
+            // EVENT_SYSTEM_FOREGROUND → 全屏检测误判为"真全屏应用" → 终止壁纸 →
+            // 恢复 → 重建 mpv → 再误判 的死循环（主窗口闪屏）。设为 never 后浮动期不再
+            // 抢占前台，从源头消除该事件触发。
+            "--focus-on=never".to_string(),
             format!("--input-ipc-server={}", ipc_path),
             // v10-A：缓存与解码队列限制（详见函数开头注释）
             "--cache=no".to_string(),
@@ -462,6 +469,10 @@ impl WallpaperRenderer for VideoRenderer {
 
     fn hwnd(&self) -> Option<HWND> {
         self.base.hwnd()
+    }
+
+    fn process_pid(&self) -> Option<u32> {
+        self.base.process_pid()
     }
 
     fn state(&self) -> WallpaperState {

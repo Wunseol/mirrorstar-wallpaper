@@ -45,6 +45,7 @@ import {
   setupNextWallpaperButton,
   setupPoolCreate,
   setupPreviewModal,
+  getEnabledUnitLabels,
   showStatus,
   updateWallpaperCard,
 } from "./ui/mod";
@@ -371,10 +372,18 @@ export async function init() {
       const prev = !rotationEnabledCheckbox.checked;
       try {
         await patchRotation({ enabled: rotationEnabledCheckbox.checked });
-        showStatus(
-          rotationEnabledCheckbox.checked ? "壁纸轮换已开启" : "壁纸轮换已关闭",
-          "success",
-        );
+        if (rotationEnabledCheckbox.checked) {
+          // 开启时信息性提示生效屏幕（非确认框）
+          const labels = await getEnabledUnitLabels();
+          showStatus(
+            labels.length > 0
+              ? `定时轮换已开启，生效屏幕：${labels.join("、")}`
+              : "定时轮换已开启（暂无生效屏幕）",
+            "success",
+          );
+        } else {
+          showStatus("壁纸轮换已关闭", "success");
+        }
       } catch (e) {
         log.error("更新轮换开关失败:", e);
         showStatus("更新轮换开关失败", "error");

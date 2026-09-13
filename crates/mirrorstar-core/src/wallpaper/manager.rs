@@ -92,6 +92,16 @@ pub struct SetWallpaperPending {
 /// 原子交换的最大首帧就绪等待超时（视频 mpv 冷启动 + loadfile 渲染，锁外等待）
 pub const ATOMIC_SWAP_READY_TIMEOUT: Duration = Duration::from_secs(8);
 
+/// 原子交换进行中标志（全局静态）
+///
+/// 原子交换阶段 A→C（`embed_atomic_into` 嵌入新窗 → `commit_atomic_swap` 换槽）
+/// 期间置位，src-tauri 全屏终止/恢复检测到该标志时跳过本次操作（事件会重复触发，
+/// 可容忍偶发跳过）。防止全屏处置在原子交换期间重建 WorkerW / 冷启动 mpv，导致
+/// commit 前校验失败（"新窗父窗口已非当前 WorkerW"）或新窗首帧等待超时。
+/// 置位/复位由 src-tauri 调度器（`src-tauri/src/scheduler.rs`）的 RAII 守卫负责。
+pub static ATOMIC_SWAP_IN_PROGRESS: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
 /// 原子交换准备结果（阶段 1 `prepare_atomic_swap` 的返回值）
 pub enum AtomicSwapPrepare {
     /// 可进行原子交换：新渲染器就绪后可一键换槽，旧壁纸全程占位

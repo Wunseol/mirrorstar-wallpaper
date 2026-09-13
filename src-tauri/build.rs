@@ -21,8 +21,47 @@
 //! - 失败时 panic 导致整个 build 失败（fail-fast，避免生成错误的应用二进制）
 //!
 //! 详见 https://v2.tauri.app/develop/configuration-files/build-script/
+//!
+//! 必须在本脚本调用 `tauri_build::try_build()` **之前**先产出外设进程
+//! `mirrorstar-wp-proc.exe`：`tauri.conf.json` 的 `bundle.resources` 硬编码引用了
+//! `../target/release/mirrorstar-wp-proc.exe`，构建期需要它已存在（debug 与 release、
+//! `cargo build` 与 `tauri build` 均适用）。若不主动产出，干净环境下 Cargo 与 wp-proc
+//! 并行编译可能让主 crate 的构建脚本先运行而报 “resource path doesn't exist”。
+//! 注意：Cargo 对 build-dependency 只编译 lib、不会产出 `[[bin]]`，故必须显式构建。
+
+use std::env;
+use std::path::PathBuf;
+use std::process::Command;
 
 fn main() {
+    // 1) 显式构建 wp-proc。使用独立 CARGO_TARGET_DIR，避免内层 cargo 与当前外层
+    //    build 争用同一 target 目录的全局锁而彼此 deadlock。
+    let manifest_dir = PathBuf::from(env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR"));
+    let workspace_root = manifest_dir.join("..");
+    let cargo = env::var("CARGO").unwrap_or_else(|_| "cargo".into());
+    let isolated_target = env::temp_dir().join("mirrorstar-wp-proc-cargo-target");
+    let status = Command::new(&cargo)
+        .current_dir(&workspace_root)
+        .env("CARGO_TARGET_DIR", &isolated_target)
+        .args(["build", "-p", "mirrorstar-wp-proc", "--release"])
+        .status()
+        .expect("failed to launch cargo build for mirrorstar-wp-proc");
+    assert!(status.success(), "cargo build -p mirrorstar-wp-proc --release failed");
+
+    // 2) 把 exe 落入资源路径声明的位置，供 try_build() 读取。
+    let built_exe = isolated_target.join("release").join("mirrorstar-wp-proc.exe");
+    let dest_dir = workspace_root.join("target").join("release");
+    let dest_exe = dest_dir.join("mirrorstar-wp-proc.exe");
+    std::fs::create_dir_all(&dest_dir).expect("create target/release");
+    std::fs::copy(&built_exe, &dest_exe).expect("copy mirrorstar-wp-proc.exe to target/release");
+
+    // 3) wp-proc 源码变化时，本脚本需重跑，以便 try_build() 重新复制最新 exe。
+    println!(
+        "cargo:rerun-if-changed={}",
+        workspace_root.join("crates/mirrorstar-wp-proc/src").display()
+    );
+
+    // 4) 执行 Tauri 构建期工作（会读取上述资源）。
     let windows_attrs =
         tauri_build::WindowsAttributes::new().app_manifest(include_str!("manifest.xml"));
     let attrs = tauri_build::Attributes::new().windows_attributes(windows_attrs);
