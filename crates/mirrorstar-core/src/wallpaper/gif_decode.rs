@@ -773,11 +773,15 @@ fn process_gif_frame(frame: image::Frame, screen_w: u32, screen_h: u32) -> GifFr
     let img = frame.into_buffer();
     let (width, height) = img.dimensions();
 
-    // 如果帧尺寸超过屏幕分辨率，降采样到屏幕尺寸以减少内存占用。
-    // 像素保留 image crate 输出的 RGBA 字节序，GDI 端用 BI_BITFIELDS 解释。
+    // 如果帧尺寸超过屏幕分辨率，等比降采样到屏幕范围内以减少内存占用。
+    // scale = min(screen_w/width, screen_h/height)，保持帧宽高比不变，
+    // 避免 thumbnail 非等比压扁导致动态 GIF 壁纸变形。目标尺寸 round 取整且至少 1×1。
     let (final_width, final_height, pixels) = if width > screen_w || height > screen_h {
+        let scale = (screen_w as f64 / width as f64).min(screen_h as f64 / height as f64);
+        let dw = ((width as f64 * scale).round() as u32).max(1);
+        let dh = ((height as f64 * scale).round() as u32).max(1);
         let thumb =
-            image::imageops::thumbnail(&image::DynamicImage::ImageRgba8(img), screen_w, screen_h);
+            image::imageops::thumbnail(&image::DynamicImage::ImageRgba8(img), dw, dh);
         let (tw, th) = thumb.dimensions();
         (tw, th, thumb.into_raw())
     } else {
@@ -795,11 +799,7 @@ fn process_gif_frame(frame: image::Frame, screen_w: u32, screen_h: u32) -> GifFr
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Mutex;
-
-    /// v10-C: 序列化使用 `set_screen_size_for_test` 的测试，避免并行运行时
-    /// 全局屏幕尺寸缓存互相干扰（一个测试 invalidate 时另一个测试正在读取）。
-    static SCREEN_SIZE_TEST_MUTEX: Mutex<()> = Mutex::new(());
+    use super::super::SCREEN_SIZE_TEST_MUTEX;
 
     /// 最小有效 GIF（1x1 像素，GIF89a，含 2 色全局颜色表）
     const MINIMAL_GIF: &[u8] = &[
@@ -1985,6 +1985,7 @@ mod tests {
     /// #1: 首次预取——frames_iter=None 触发 need_open，从 0 解码到 window_end。
     #[test]
     fn test_prefetch_with_cursor_first_call_opens_gif() {
+        let _guard = SCREEN_SIZE_TEST_MUTEX.lock().unwrap();
         let (_dir, path) = make_indexed_gif(10);
         let (screen_w, screen_h) = super::super::get_screen_size();
         let mut frames_iter: Option<image::Frames<'static>> = None;
@@ -2011,6 +2012,7 @@ mod tests {
     /// #1: 前向前进——游标已在窗口起点之后，仅解码 delta 帧（O(half) 而非 O(N)）。
     #[test]
     fn test_prefetch_with_cursor_forward_advance_only_decodes_delta() {
+        let _guard = SCREEN_SIZE_TEST_MUTEX.lock().unwrap();
         let (_dir, path) = make_indexed_gif(10);
         let (screen_w, screen_h) = super::super::get_screen_size();
         let mut frames_iter: Option<image::Frames<'static>> = None;
@@ -2053,6 +2055,7 @@ mod tests {
     /// #1: 窗口重叠跳过——连续两次预取窗口部分重叠，第二次不重解码已覆盖帧。
     #[test]
     fn test_prefetch_with_cursor_overlapping_window_skips_already_decoded() {
+        let _guard = SCREEN_SIZE_TEST_MUTEX.lock().unwrap();
         let (_dir, path) = make_indexed_gif(20);
         let (screen_w, screen_h) = super::super::get_screen_size();
         let mut frames_iter: Option<image::Frames<'static>> = None;
@@ -2090,6 +2093,7 @@ mod tests {
     /// #1: 回绕——window_end < cursor 触发重新打开 GIF，cursor 重置为 0。
     #[test]
     fn test_prefetch_with_cursor_rewind_reopens_gif() {
+        let _guard = SCREEN_SIZE_TEST_MUTEX.lock().unwrap();
         let (_dir, path) = make_indexed_gif(10);
         let (screen_w, screen_h) = super::super::get_screen_size();
         let mut frames_iter: Option<image::Frames<'static>> = None;
@@ -2173,6 +2177,7 @@ mod tests {
     /// #1: 错误路径——文件不存在时 open_gif_frames 返回 Err，预取返回空 Vec。
     #[test]
     fn test_prefetch_with_cursor_nonexistent_file_returns_empty() {
+        let _guard = SCREEN_SIZE_TEST_MUTEX.lock().unwrap();
         let (screen_w, screen_h) = super::super::get_screen_size();
         let mut frames_iter: Option<image::Frames<'static>> = None;
         let mut cursor = 0usize;
@@ -2193,6 +2198,7 @@ mod tests {
     /// #1: 损坏的 GIF——open_gif_frames 解码初始化失败，返回空 Vec。
     #[test]
     fn test_prefetch_with_cursor_corrupted_gif_returns_empty() {
+        let _guard = SCREEN_SIZE_TEST_MUTEX.lock().unwrap();
         let corrupted = &MINIMAL_GIF[..10];
         let dir = tempfile::tempdir().unwrap();
         let gif_path = dir.path().join("corrupted.gif");
@@ -2217,6 +2223,7 @@ mod tests {
     /// #1: target=0 + half=2 → window=[0,2]，无 skip，全收集。
     #[test]
     fn test_prefetch_with_cursor_window_at_start() {
+        let _guard = SCREEN_SIZE_TEST_MUTEX.lock().unwrap();
         let (_dir, path) = make_indexed_gif(10);
         let (screen_w, screen_h) = super::super::get_screen_size();
         let mut frames_iter: Option<image::Frames<'static>> = None;
@@ -2239,6 +2246,7 @@ mod tests {
     /// #1: target+half 超出总帧数时优雅降级——返回实际存在的帧。
     #[test]
     fn test_prefetch_with_cursor_window_beyond_end_degrades_gracefully() {
+        let _guard = SCREEN_SIZE_TEST_MUTEX.lock().unwrap();
         let (_dir, path) = make_indexed_gif(5); // 仅 5 帧（索引 0-4）
         let (screen_w, screen_h) = super::super::get_screen_size();
         let mut frames_iter: Option<image::Frames<'static>> = None;
@@ -2261,6 +2269,7 @@ mod tests {
     /// #1: 像素值正确性——验证 RGBA 保持与帧索引匹配。
     #[test]
     fn test_prefetch_with_cursor_pixel_values_correct() {
+        let _guard = SCREEN_SIZE_TEST_MUTEX.lock().unwrap();
         let (_dir, path) = make_indexed_gif(10);
         let (screen_w, screen_h) = super::super::get_screen_size();
         let mut frames_iter: Option<image::Frames<'static>> = None;
@@ -2289,6 +2298,7 @@ mod tests {
     /// #2: 首次调用——frames_iter=None 触发 need_open，从 0 解码到 target。
     #[test]
     fn test_decode_single_frame_with_cursor_first_call_opens_gif() {
+        let _guard = SCREEN_SIZE_TEST_MUTEX.lock().unwrap();
         let (_dir, path) = make_indexed_gif(10);
         let (screen_w, screen_h) = super::super::get_screen_size();
         let mut frames_iter: Option<image::Frames<'static>> = None;
@@ -2315,6 +2325,7 @@ mod tests {
     /// #2: 前向前进——cursor ≈ target，仅解码 1 帧 delta（O(1) 而非 O(target)）。
     #[test]
     fn test_decode_single_frame_with_cursor_forward_advance_only_decodes_delta() {
+        let _guard = SCREEN_SIZE_TEST_MUTEX.lock().unwrap();
         let (_dir, path) = make_indexed_gif(10);
         let (screen_w, screen_h) = super::super::get_screen_size();
         let mut frames_iter: Option<image::Frames<'static>> = None;
@@ -2350,6 +2361,7 @@ mod tests {
     /// #2: 回绕——target < cursor 触发重新打开 GIF，cursor 重置为 0。
     #[test]
     fn test_decode_single_frame_with_cursor_rewind_reopens_gif() {
+        let _guard = SCREEN_SIZE_TEST_MUTEX.lock().unwrap();
         let (_dir, path) = make_indexed_gif(10);
         let (screen_w, screen_h) = super::super::get_screen_size();
         let mut frames_iter: Option<image::Frames<'static>> = None;
@@ -2385,6 +2397,7 @@ mod tests {
     /// #2: 连续前向解码多个帧——模拟 WM_TIMER 逐帧推进，每次 O(1)。
     #[test]
     fn test_decode_single_frame_with_cursor_sequential_forward() {
+        let _guard = SCREEN_SIZE_TEST_MUTEX.lock().unwrap();
         let (_dir, path) = make_indexed_gif(10);
         let (screen_w, screen_h) = super::super::get_screen_size();
         let mut frames_iter: Option<image::Frames<'static>> = None;
@@ -2422,6 +2435,7 @@ mod tests {
     /// #2: target 超出总帧数返回 None（迭代器耗尽）。
     #[test]
     fn test_decode_single_frame_with_cursor_target_beyond_end() {
+        let _guard = SCREEN_SIZE_TEST_MUTEX.lock().unwrap();
         let (_dir, path) = make_indexed_gif(5);
         let (screen_w, screen_h) = super::super::get_screen_size();
         let mut frames_iter: Option<image::Frames<'static>> = None;
@@ -2442,6 +2456,7 @@ mod tests {
     /// #2: 不存在的文件返回 None。
     #[test]
     fn test_decode_single_frame_with_cursor_nonexistent_file() {
+        let _guard = SCREEN_SIZE_TEST_MUTEX.lock().unwrap();
         let (screen_w, screen_h) = super::super::get_screen_size();
         let mut frames_iter: Option<image::Frames<'static>> = None;
         let mut cursor = 0usize;
@@ -2461,6 +2476,7 @@ mod tests {
     /// #2: 像素值正确性——RGBA 保持与帧索引匹配（与 prefetch 测试一致）。
     #[test]
     fn test_decode_single_frame_with_cursor_pixel_values_correct() {
+        let _guard = SCREEN_SIZE_TEST_MUTEX.lock().unwrap();
         let (_dir, path) = make_indexed_gif(10);
         let (screen_w, screen_h) = super::super::get_screen_size();
         let mut frames_iter: Option<image::Frames<'static>> = None;
@@ -2820,5 +2836,72 @@ mod tests {
         println!("      (d) 降 half 主要省内存而对 CPU 影响极小。");
 
         super::super::invalidate_screen_size_cache();
+    }
+
+    // ========== spec: fix-aspect-preserving-downsample（等比降采样测试） ==========
+    //
+    // process_gif_frame(frame, screen_w, screen_h) 的 screen_w/screen_h 为显式参数，
+    // 测试完全确定，无需修改全局屏幕尺寸，故不使用 SCREEN_SIZE_TEST_MUTEX。
+
+    #[test]
+    fn test_process_gif_frame_downsample_wide_frame_keeps_aspect_ratio() {
+        // A: 宽幅帧 2560×1080 + 屏幕 1920×1080。
+        // scale = min(1920/2560, 1080/1080) = 0.75 → dw = 1920, dh = 810。
+        let img = image::RgbaImage::from_pixel(2560, 1080, image::Rgba([0, 0, 0, 255]));
+        let frame = image::Frame::new(img);
+        let result = process_gif_frame(frame, 1920, 1080);
+
+        // 期望值精确断言
+        assert_eq!(result.width, 1920, "宽幅帧应等比降采样到宽 1920");
+        assert_eq!(result.height, 810, "宽幅帧应等比降采样到高 810");
+        // 不超屏幕
+        assert!(result.width <= 1920, "宽度不应超过屏幕宽 1920");
+        assert!(result.height <= 1080, "高度不应超过屏幕高 1080");
+        // 宽高比保持（2560/1080 ≈ 2.3704，容差 0.02）
+        let aspect = result.width as f64 / result.height as f64;
+        let expected = 2560.0 / 1080.0;
+        assert!(
+            (aspect - expected).abs() <= 0.02,
+            "宽高比应保持，实际 {aspect:.4}，期望 {expected:.4}"
+        );
+        // 像素长度 = 1920×810×4
+        assert_eq!(result.pixels.len(), (1920 * 810 * 4) as usize);
+    }
+
+    #[test]
+    fn test_process_gif_frame_downsample_portrait_frame_keeps_aspect_ratio() {
+        // B: 竖幅帧 1080×1920 + 屏幕 1920×1080。
+        // scale = min(1920/1080, 1080/1920) = 0.5625
+        // → dw = round(1080*0.5625) = round(607.5) = 608, dh = round(1920*0.5625) = 1080。
+        let img = image::RgbaImage::from_pixel(1080, 1920, image::Rgba([0, 0, 0, 255]));
+        let frame = image::Frame::new(img);
+        let result = process_gif_frame(frame, 1920, 1080);
+
+        // 不超屏幕
+        assert!(result.width <= 1920, "宽度不应超过屏幕宽 1920");
+        assert!(result.height <= 1080, "高度不应超过屏幕高 1080");
+        // 宽高比保持（1080/1920 = 0.5625，容差 0.02）
+        let aspect = result.width as f64 / result.height as f64;
+        let expected = 1080.0 / 1920.0;
+        assert!(
+            (aspect - expected).abs() <= 0.02,
+            "宽高比应保持，实际 {aspect:.4}，期望 {expected:.4}"
+        );
+    }
+
+    #[test]
+    fn test_process_gif_frame_small_frame_not_downsampled() {
+        // C: 小帧 100×50 + 屏幕 1920×1080，未超屏幕 → 原样保留，不降采样。
+        let img = image::RgbaImage::from_pixel(100, 50, image::Rgba([0, 0, 0, 255]));
+        let frame = image::Frame::new(img);
+        let result = process_gif_frame(frame, 1920, 1080);
+
+        assert_eq!(result.width, 100, "小帧宽度应原样保留");
+        assert_eq!(result.height, 50, "小帧高度应原样保留");
+        assert_eq!(
+            result.pixels.len(),
+            100 * 50 * 4,
+            "小帧像素长度应为 100×50×4"
+        );
     }
 }

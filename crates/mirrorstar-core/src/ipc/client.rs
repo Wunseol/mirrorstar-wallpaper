@@ -21,7 +21,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use windows::Win32::Foundation::HANDLE;
-use windows::Win32::System::Pipes::PeekNamedPipe;
+use windows::Win32::System::Pipes::{PeekNamedPipe, WaitNamedPipeW};
 
 use crate::MirrorStarError;
 
@@ -169,49 +169,159 @@ impl<T> Drop for NamedPipeClient<T> {
 
 /// 连接到命名管道（客户端）
 ///
-/// 重试最多 `retry_count` 次，每次间隔 `retry_interval_ms` 毫秒。
+/// 在 `retry_count * retry_interval_ms` 毫秒的总预算内等待并连接命名管道，
 /// 返回带缓冲的读写端（写入端基于原始句柄，读取端基于克隆句柄）。
 ///
-/// I05 阻塞提示：本方法使用 `std::thread::sleep` 进行重试等待，会阻塞当前线程
-/// 最长 `retry_count * retry_interval_ms` 毫秒。在 async 上下文（如 tokio runtime）
-/// 中调用时，必须通过 `tokio::task::spawn_blocking` 包裹，避免阻塞 tokio worker
-/// 线程导致整个 runtime 卡顿。当前调用方（`NamedPipeClient::connect`）已遵循此约定，
-/// 顶层均在 `spawn_blocking` 闭包中调用。
+/// 实现为组合式等待：管道**不存在**（服务端未就绪）时 `WaitNamedPipeW` 立即返回
+/// `ERROR_FILE_NOT_FOUND`，代码走 `std::thread::sleep(RETRY_SLEEP_MS)`（20ms）短暂休眠后
+/// 继续循环，即低开销轮询（每轮仅记录 `tracing::debug!`，不产生 WARN 风暴）；管道已存在
+/// 但无空闲实例时由 `WaitNamedPipeW` 内核级等待，直至出现可用实例或剩余预算用尽
+/// （`ERROR_SEM_TIMEOUT`）。两条路径等待期间均只记录 `tracing::debug!` 级日志，仅当总预算
+/// 用尽时记录一条 `tracing::warn!`。管道就绪后的 `OpenOptions::open` 若仍失败（实例被其他
+/// 客户端竞态抢走），说明并发争用，短暂休眠后继续循环等待。
+///
+/// I05 阻塞提示：本方法通过 `WaitNamedPipeW` 等待 + 少量 `std::thread::sleep`，阻塞当前线程
+/// 最长约 `retry_count * retry_interval_ms` 毫秒。在 async 上下文（如 tokio runtime）中调用时，
+/// 必须通过 `tokio::task::spawn_blocking` 包裹，避免阻塞 tokio worker 线程导致整个 runtime
+/// 卡顿。当前调用方（`NamedPipeClient::connect`）已遵循此约定，顶层均在 `spawn_blocking`
+/// 闭包中调用。
 ///
 /// # Blocking
 ///
-/// 本方法使用 `std::thread::sleep` 阻塞当前线程，最长阻塞 `retry_count * retry_interval_ms` 毫秒。
+/// 本方法阻塞当前线程，最长阻塞约 `retry_count * retry_interval_ms` 毫秒。
 /// 在 async 上下文中调用时必须通过 `tokio::task::spawn_blocking` 包裹。
 pub(crate) fn connect_named_pipe(
     pipe_path: &str,
     retry_count: u32,
     retry_interval_ms: u64,
 ) -> Result<(BufWriter<std::fs::File>, BufReader<std::fs::File>), MirrorStarError> {
-    let mut attempts = 0u32;
-    loop {
-        match std::fs::OpenOptions::new()
-            .read(true)
-            .write(true)
-            .open(pipe_path)
-        {
-            Ok(file) => {
-                let reader_file = file.try_clone().map_err(|e| {
-                    MirrorStarError::IpcError(format!("克隆管道文件句柄失败: {}", e))
-                })?;
-                return Ok((BufWriter::new(file), BufReader::new(reader_file)));
-            }
-            Err(e) => {
-                attempts += 1;
-                if attempts > retry_count {
-                    return Err(MirrorStarError::IpcError(format!(
-                        "连接命名管道失败 (已重试 {} 次): {} (path={})",
-                        retry_count, e, pipe_path
-                    )));
+    #[cfg(windows)]
+    {
+        use windows::Win32::Foundation::{ERROR_FILE_NOT_FOUND, ERROR_SEM_TIMEOUT};
+
+        // 总等待预算 = retry_count * retry_interval_ms；任一为 0 时退化为默认 2000ms，
+        // 避免除以零 / 零预算导致立即失败（保持旧行为语义的宽松等价）。
+        const DEFAULT_BUDGET_MS: u64 = 2000;
+        // 单次 open 竞态失败 / FILE_NOT_FOUND 时的短暂休眠，避免忙等烧 CPU。
+        const RETRY_SLEEP_MS: u64 = 20;
+
+        let budget_ms = retry_count
+            .saturating_mul_32_times(retry_interval_ms)
+            .unwrap_or(DEFAULT_BUDGET_MS);
+
+        let deadline = std::time::Instant::now() + Duration::from_millis(budget_ms);
+        // 记录最后一次错误，用于预算用尽后的单条 WARN。循环每条 continue/break 路径都会赋值。
+        let mut last_error;
+
+        let path_wide: Vec<u16> = pipe_path
+            .encode_utf16()
+            .chain(std::iter::once(0))
+            .collect();
+
+        loop {
+            // 剩余毫秒（至少 1ms，避免 WaitNamedPipeW(0) 使用系统默认/无限等待语义
+            // 以及超时后仍以 0 阻塞）。剩余用尽则跳出循环。
+            let remaining_ms = deadline
+                .saturating_duration_since(std::time::Instant::now())
+                .as_millis();
+            let remaining_ms = std::cmp::max(remaining_ms, 1) as u32;
+
+            let path = windows::core::PCWSTR(path_wide.as_ptr());
+            let available = unsafe { WaitNamedPipeW(path, remaining_ms) }.as_bool();
+
+            if available {
+                // 管道已有可用实例，尝试真正连接。
+                match std::fs::OpenOptions::new()
+                    .read(true)
+                    .write(true)
+                    .open(pipe_path)
+                {
+                    Ok(file) => {
+                        let reader_file = file.try_clone().map_err(|e| {
+                            MirrorStarError::IpcError(format!("克隆管道文件句柄失败: {}", e))
+                        })?;
+                        tracing::debug!(pipe_path, "命名管道连接成功");
+                        return Ok((BufWriter::new(file), BufReader::new(reader_file)));
+                    }
+                    Err(e) => {
+                        // 实例被其他客户端竞态抢走，记录 error、短暂休眠后继续等待。
+                        last_error = Some(e);
+                        tracing::debug!(
+                            pipe_path,
+                            error = %last_error.as_ref().unwrap(),
+                            "命名管道实例已被其他客户端占用，重新等待"
+                        );
+                    }
                 }
-                tracing::warn!(attempts, error = %e, "命名管道未就绪，等待重试");
-                std::thread::sleep(Duration::from_millis(retry_interval_ms));
+            } else {
+                // WaitNamedPipeW 失败，判断错误码决定是否还有继续等待的价值。
+                let e = std::io::Error::last_os_error();
+                let code = e.raw_os_error().unwrap_or(0);
+                last_error = Some(e);
+                if code == ERROR_FILE_NOT_FOUND.0 as i32 {
+                    // 管道尚未创建（服务端未就绪），WaitNamedPipeW 立即返回，继续等待。
+                    tracing::debug!(pipe_path, error_code = code, "命名管道尚未创建，等待服务端就绪");
+                } else {
+                    // ERROR_SEM_TIMEOUT 表示预算用尽（有管道但超时内无空闲实例）；其他错误为真实失败。
+                    // 两种情形均无需继续循环。
+                    let is_sem_timeout = code == ERROR_SEM_TIMEOUT.0 as i32;
+                    tracing::debug!(
+                        pipe_path,
+                        error_code = code,
+                        is_sem_timeout,
+                        "命名管道等待失败，停止重试"
+                    );
+                    break;
+                }
+            }
+
+            // 预算耗尽，退出循环（在循环底部统一判断，确保即使最后一次 ERROR_FILENAME_NOT_FOUND 也能退出）。
+            if std::time::Instant::now() >= deadline {
+                break;
+            }
+            if !available {
+                std::thread::sleep(Duration::from_millis(RETRY_SLEEP_MS));
             }
         }
+
+        let err_detail = last_error
+            .map(|e| format!("{}", e))
+            .unwrap_or_else(|| "未知错误".to_string());
+        tracing::warn!(
+            pipe_path,
+            timeout_budget_ms = budget_ms,
+            error = %err_detail,
+            "连接命名管道超时失败"
+        );
+        Err(MirrorStarError::IpcError(format!(
+            "连接命名管道失败 (等待 {}ms 超时): {} (path={})",
+            budget_ms, err_detail, pipe_path
+        )))
+    }
+
+    #[cfg(not(windows))]
+    {
+        // 非 Windows 平台：命名管道仅存在于 Windows，提供一个合理的 Err 桩。
+        let _ = (retry_count, retry_interval_ms);
+        Err(MirrorStarError::IpcError(format!(
+            "命名管道仅支持 Windows (path={})",
+            pipe_path
+        )))
+    }
+}
+
+/// u32 × u64 的饱和乘法辅助，返回 Option<u64>：溢出或任一因子为 0 时返回 None。
+/// 用于将 `retry_count` 与 `retry_interval_ms` 转为总预算毫秒数。
+trait SaturatingMul32Times {
+    fn saturating_mul_32_times(self, ms: u64) -> Option<u64>;
+}
+
+impl SaturatingMul32Times for u32 {
+    fn saturating_mul_32_times(self, ms: u64) -> Option<u64> {
+        if self == 0 || ms == 0 {
+            return None;
+        }
+        (self as u64).checked_mul(ms)
     }
 }
 

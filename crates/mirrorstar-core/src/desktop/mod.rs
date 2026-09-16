@@ -64,7 +64,7 @@ use windows::Win32::Graphics::Gdi::{
 };
 use windows::Win32::UI::HiDpi::{GetDpiForMonitor, MDT_EFFECTIVE_DPI};
 use windows::Win32::UI::WindowsAndMessaging::{
-    GetParent, IsWindow, SetParent, ShowWindow, MONITORINFOF_PRIMARY, SW_HIDE,
+    GetAncestor, GA_PARENT, IsWindow, SetParent, ShowWindow, MONITORINFOF_PRIMARY, SW_HIDE,
 };
 
 use crate::config::settings::Arrangement;
@@ -132,6 +132,7 @@ impl DesktopIntegrator {
     /// 仅保存原始壁纸，不查找 WorkerW。WorkerW 将在首次需要时懒加载。
     pub fn new() -> Self {
         let original_wallpaper = worker_w::get_system_wallpaper();
+
         tracing::info!(original = ?original_wallpaper, "已保存原始系统壁纸");
 
         Self {
@@ -413,11 +414,17 @@ impl DesktopIntegrator {
 
     /// 校验 `hwnd` 的父窗口是否为当前 WorkerW（DR-40 原子交换 commit 前校验）
     ///
+    /// 必须用 `GetAncestor(GA_PARENT)` 而非 `GetParent`：mpv 等壁纸子进程窗口
+    /// 为弹出式窗口（无 `WS_CHILD` 样式），`SetParent` 重定父后内部父链已指向
+    /// WorkerW（`EnumChildWindows` 可枚举到），但 `GetParent` 对无 `WS_CHILD`
+    /// 的窗口返回的是**拥有者**（此处为 NULL），导致已正确嵌入的窗口误判为
+    /// 校验失败，轮换永不提交（且旧壁纸被误杀）。
+    ///
     /// 若 WorkerW 已失效或 `hwnd` 已无效（父窗口被回收/桌面重建），返回 `false`，
     /// 调用方应放弃原子交换并 terminate 新窗。
     pub fn is_child_of_workerw(&self, hwnd: HWND) -> bool {
         self.workerw_hwnd
-            .map(|w| unsafe { GetParent(hwnd) == Ok(w) && IsWindow(hwnd).as_bool() })
+            .map(|w| unsafe { GetAncestor(hwnd, GA_PARENT) == w && IsWindow(hwnd).as_bool() })
             .unwrap_or(false)
     }
 

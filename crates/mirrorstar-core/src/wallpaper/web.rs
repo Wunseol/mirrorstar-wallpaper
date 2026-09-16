@@ -168,6 +168,13 @@ impl WallpaperRenderer for WebRenderer {
     }
 
     fn terminate(&mut self) -> Result<(), crate::MirrorStarError> {
+        // 0. 先置终止状态（先于进程退出）——同步 base.state 与 shared_state，
+        //    避免退出监听线程在进程退出时读到旧状态误报"异常退出"（同 video.rs）。
+        self.base.set_state(WallpaperState::Terminated);
+        if let Some(sender) = &self.base.pause_sender {
+            sender.set_state(WallpaperState::Terminated);
+        }
+
         // 1. 通过 IPC 请求子进程退出
         {
             let mut ipc = self.ipc.lock().unwrap_or_else(|e| e.into_inner());
@@ -190,7 +197,7 @@ impl WallpaperRenderer for WebRenderer {
             *ipc = None;
         }
         self.base.set_hwnd(None);
-        self.base.set_state(WallpaperState::Terminated);
+
         tracing::info!("网页壁纸已终止");
         Ok(())
     }

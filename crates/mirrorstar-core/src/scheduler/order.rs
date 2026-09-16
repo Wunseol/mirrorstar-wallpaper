@@ -55,19 +55,22 @@ pub fn filter_candidates(entries: Vec<&PoolEntry>) -> Vec<PoolEntry> {
 ///
 /// 语义：抽中 id 后推进 `state`（顺序更新 `order_cursor`；洗牌袋更新
 /// `bag_remaining`），返回抽中 id。候选池 < 2 返回 `None`（DR-14）。
+/// 调用方传入当前壁纸 id（`current_id`）；候选池 ≥ 2 时结果保证 ≠ 当前，
+/// 候选池 < 2 返回 `None`（DR-14）。
 pub fn sample_next(
     order: Order,
     candidates: &[PoolEntry],
     state: &mut SamplerState,
+    current_id: Option<&str>,
 ) -> Option<String> {
     if matches!(order, Order::Sequential) {
         // 顺序算法不依赖随机数，传一个占位闭包即可（不会调用）。
-        return sample_next_inner(order, candidates, state, &mut |_| 0);
+        return sample_next_inner(order, candidates, state, current_id, &mut |_| 0);
     }
     // 洗牌袋 / 纯随机：用内置 PRNG。
     let seed = PRNG_SEED.with(|c| c.get());
     let mut rng = Lcg::new(seed);
-    let result = sample_next_inner(order, candidates, state, &mut |bound| {
+    let result = sample_next_inner(order, candidates, state, current_id, &mut |bound| {
         (rng.next_u64() % bound as u64) as usize
     });
     PRNG_SEED.with(|c| c.set(rng.0));
@@ -81,12 +84,13 @@ fn sample_next_inner(
     order: Order,
     candidates: &[PoolEntry],
     state: &mut SamplerState,
+    current_id: Option<&str>,
     rng: &mut dyn FnMut(usize) -> usize,
 ) -> Option<String> {
     match order {
-        Order::Sequential => sample_sequential(candidates, state),
-        Order::ShuffleBag => sample_shuffle_bag(candidates, state, rng),
-        Order::PseudoRandom => sample_pseudo_random(candidates, rng),
+        Order::Sequential => sample_sequential(candidates, state, current_id),
+        Order::ShuffleBag => sample_shuffle_bag(candidates, state, current_id, rng),
+        Order::PseudoRandom => sample_pseudo_random(candidates, current_id, rng),
     }
 }
 
@@ -95,11 +99,16 @@ fn sample_next_inner(
 /// - 游标存在且其 id 在候选中：取其**下一个**候选（结束绕回第一个）。
 /// - 游标指向的 id 已不在候选（被删 / 被过滤）：**前跳**到第一个有效候选（C2）。
 /// - 无游标：取第一个候选。抽中 id 设为新游标。
-fn sample_sequential(candidates: &[PoolEntry], state: &mut SamplerState) -> Option<String> {
+/// - 抽中当前壁纸则取下一个（绕回）；池 ≥2（入口已保证）时下一个必存在且 != 当前。
+fn sample_sequential(
+    candidates: &[PoolEntry],
+    state: &mut SamplerState,
+    current_id: Option<&str>,
+) -> Option<String> {
     if candidates.len() < 2 {
         return None;
     }
-    let drawn = match state.order_cursor.as_deref() {
+    let mut drawn = match state.order_cursor.as_deref() {
         Some(cursor) => {
             if let Some(idx) = candidates.iter().position(|c| c.id == cursor) {
                 // 取下一个，结束绕回第一个（顺序循环）
@@ -112,6 +121,13 @@ fn sample_sequential(candidates: &[PoolEntry], state: &mut SamplerState) -> Opti
         }
         None => candidates[0].id.clone(),
     };
+    // 排除当前：抽中当前壁纸则取下一个（绕回）。池 ≥2（入口已保证），
+    // 下一个必存在且 != current。
+    if Some(drawn.as_str()) == current_id {
+        if let Some(idx) = candidates.iter().position(|c| c.id == drawn) {
+            drawn = candidates[(idx + 1) % candidates.len()].id.clone();
+        }
+    }
     state.order_cursor = Some(drawn.clone());
     Some(drawn)
 }
@@ -121,9 +137,11 @@ fn sample_sequential(candidates: &[PoolEntry], state: &mut SamplerState) -> Opti
 /// - 袋空基于候选重新打乱成袋（初始化即剔除 Web，DR-18）。
 /// - 抽中一个移出袋；袋内不重复，袋空重洗（C4）。
 /// - 袋内残留的已删 / 缺频件在抽取前剔除（C1，对应当前候选快照）。
+/// - 抽中当前壁纸则重抽；池 ≥2（入口已保证）时袋内必有替代。
 fn sample_shuffle_bag(
     candidates: &[PoolEntry],
     state: &mut SamplerState,
+    current_id: Option<&str>,
     rng: &mut dyn FnMut(usize) -> usize,
 ) -> Option<String> {
     if candidates.len() < 2 {
@@ -135,33 +153,53 @@ fn sample_shuffle_bag(
     state
         .bag_remaining
         .retain(|id| valid_ids.contains(id.as_str()));
-    if state.bag_remaining.is_empty() {
-        // 重新成袋，剔除 Web（DR-18）。
-        state.bag_remaining = candidates
-            .iter()
-            .filter(|e| e.ty != WallpaperType::Web)
-            .map(|e| e.id.clone())
-            .collect();
-        shuffle_mut(&mut state.bag_remaining, rng);
+    // 抽中当前则重抽：袋内剩余非空直接从剩余抽；袋空则下次循环重洗成袋。
+    // 池 ≥2 保证存在替代（DR-14 已拦截池 <2）。
+    loop {
+        if state.bag_remaining.is_empty() {
+            // 重新成袋，剔除 Web（DR-18）。
+            state.bag_remaining = candidates
+                .iter()
+                .filter(|e| e.ty != WallpaperType::Web)
+                .map(|e| e.id.clone())
+                .collect();
+            shuffle_mut(&mut state.bag_remaining, rng);
+            // 防御：剔除 Web 后袋仍为空（如调用方误传未过滤候选）→ 返回 None，
+            // 避免 rng(0) 除零 / remove(0) 越界 panic。合法路径袋 ≥2 不触发。
+            if state.bag_remaining.is_empty() {
+                return None;
+            }
+        }
+        let idx = rng(state.bag_remaining.len());
+        let drawn = state.bag_remaining.remove(idx);
+        if Some(drawn.as_str()) == current_id {
+            continue;
+        }
+        return Some(drawn);
     }
-    // 防御：剔除 Web 后袋仍为空（如调用方误传未过滤候选）→ 返回 None，
-    // 避免 `rng(0)` 除零 / `remove(0)` 越界 panic。合法路径袋 ≥2 不触发。
-    if state.bag_remaining.is_empty() {
-        return None;
-    }
-    let idx = rng(state.bag_remaining.len());
-    Some(state.bag_remaining.remove(idx))
 }
 
-/// 纯随机（DR-4 / C3）：每次独立抽取，可能连续同张。
+/// 纯随机（DR-4 / C3）：每次独立抽取，可能连续同张；排除当前壁纸（池 ≥2）。
 fn sample_pseudo_random(
     candidates: &[PoolEntry],
+    current_id: Option<&str>,
     rng: &mut dyn FnMut(usize) -> usize,
 ) -> Option<String> {
     if candidates.len() < 2 {
         return None;
     }
-    let idx = rng(candidates.len());
+    // 池 ≥2：排除当前索引后从其余候选中抽取（DR-4 / C3 随机性不变）。
+    let cur_pos = current_id.and_then(|c| candidates.iter().position(|e| e.id == c));
+    let idx = match cur_pos {
+        Some(p) => {
+            let mut i = rng(candidates.len() - 1);
+            if i >= p {
+                i += 1;
+            }
+            i
+        }
+        None => rng(candidates.len()),
+    };
     Some(candidates[idx].id.clone())
 }
 
@@ -282,7 +320,7 @@ mod tests {
             order_cursor: Some("a".into()),
             ..SamplerState::default()
         };
-        let next = sample_next_inner(Order::Sequential, &candidates, &mut state, &mut |_| 0);
+        let next = sample_next_inner(Order::Sequential, &candidates, &mut state, None, &mut |_| 0);
         assert_eq!(next.as_deref(), Some("b"), "a 之后应取 b");
         assert_eq!(
             state.order_cursor.as_deref(),
@@ -299,7 +337,7 @@ mod tests {
             order_cursor: Some("z".into()),
             ..SamplerState::default()
         };
-        let next = sample_next_inner(Order::Sequential, &candidates, &mut state, &mut |_| 0);
+        let next = sample_next_inner(Order::Sequential, &candidates, &mut state, None, &mut |_| 0);
         assert_eq!(next.as_deref(), Some("a"));
     }
 
@@ -311,7 +349,7 @@ mod tests {
             order_cursor: Some("d".into()),
             ..SamplerState::default()
         };
-        let next = sample_next_inner(Order::Sequential, &candidates, &mut state, &mut |_| 0);
+        let next = sample_next_inner(Order::Sequential, &candidates, &mut state, None, &mut |_| 0);
         assert_eq!(next.as_deref(), Some("a"));
     }
 
@@ -319,7 +357,7 @@ mod tests {
     fn sequential_no_cursor_starts_at_first() {
         let candidates = seq_candidates();
         let mut state = SamplerState::default();
-        let next = sample_next_inner(Order::Sequential, &candidates, &mut state, &mut |_| 0);
+        let next = sample_next_inner(Order::Sequential, &candidates, &mut state, None, &mut |_| 0);
         assert_eq!(next.as_deref(), Some("a"));
     }
 
@@ -338,13 +376,13 @@ mod tests {
 
         let mut drawn = Vec::new();
         for _ in 0..candidates.len() {
-            let d = sample_next_inner(Order::ShuffleBag, &candidates, &mut state, &mut rng)
+            let d = sample_next_inner(Order::ShuffleBag, &candidates, &mut state, None, &mut rng)
                 .expect("袋内应有候选");
             assert!(!drawn.contains(&d), "袋内不应重复，重复={d}");
             drawn.push(d);
         }
         // 袋空 → 第四次调用应重洗（C4），仍返回合法候选
-        let d4 = sample_next_inner(Order::ShuffleBag, &candidates, &mut state, &mut rng)
+        let d4 = sample_next_inner(Order::ShuffleBag, &candidates, &mut state, None, &mut rng)
             .expect("袋空应重洗");
         assert!(["a", "b", "c"].contains(&d4.as_str()));
     }
@@ -360,7 +398,7 @@ mod tests {
         let mut state = SamplerState::default();
         let mut rng = |_n: usize| 0usize;
         for _ in 0..8 {
-            let d = sample_next_inner(Order::ShuffleBag, &candidates, &mut state, &mut rng)
+            let d = sample_next_inner(Order::ShuffleBag, &candidates, &mut state, None, &mut rng)
                 .expect("至少 2 个有效候选");
             assert_ne!(d, "web", "洗牌袋不应抽出 Web");
         }
@@ -378,7 +416,7 @@ mod tests {
         // 注入确定性 rng：若防御缺失，`rng(0)` 会除零 panic（此处因返回 None 不会被调用）。
         let mut rng = |_n: usize| 0usize;
         assert_eq!(
-            sample_next_inner(Order::ShuffleBag, &candidates, &mut state, &mut rng),
+            sample_next_inner(Order::ShuffleBag, &candidates, &mut state, None, &mut rng),
             None,
             "全 Web 未过滤候选应返回 None 而非 panic"
         );
@@ -395,13 +433,13 @@ mod tests {
         let mut state = SamplerState::default();
         let mut rng = |_n: usize| 0usize;
         // 首抽填充袋子
-        let _ = sample_next_inner(Order::ShuffleBag, &candidates, &mut state, &mut rng);
+        let _ = sample_next_inner(Order::ShuffleBag, &candidates, &mut state, None, &mut rng);
 
         // 模拟 "a" 被删除：候选快照移除 a（剩 b,c，仍 ≥2 可采样）
         let shrunk: Vec<PoolEntry> = candidates.into_iter().filter(|c| c.id != "a").collect();
         assert_eq!(shrunk.len(), 2);
         for _ in 0..6 {
-            let d = sample_next_inner(Order::ShuffleBag, &shrunk, &mut state, &mut rng)
+            let d = sample_next_inner(Order::ShuffleBag, &shrunk, &mut state, None, &mut rng)
                 .expect("剩 2 个候选应能采样");
             assert_ne!(d, "a", "已删条目不应再被抽出");
         }
@@ -418,8 +456,8 @@ mod tests {
         ];
         let mut state = SamplerState::default();
         let mut rng = |_n: usize| 0usize;
-        let d1 = sample_next_inner(Order::PseudoRandom, &candidates, &mut state, &mut rng);
-        let d2 = sample_next_inner(Order::PseudoRandom, &candidates, &mut state, &mut rng);
+        let d1 = sample_next_inner(Order::PseudoRandom, &candidates, &mut state, None, &mut rng);
+        let d2 = sample_next_inner(Order::PseudoRandom, &candidates, &mut state, None, &mut rng);
         assert_eq!(d1, Some("a".to_string()));
         assert_eq!(d2, Some("a".to_string()));
         // 纯随机不推进任何游标 / 袋
@@ -436,16 +474,88 @@ mod tests {
         let mut rng = |_n: usize| 0usize;
         for order in [Order::Sequential, Order::ShuffleBag, Order::PseudoRandom] {
             assert_eq!(
-                sample_next_inner(order, &one, &mut state, &mut rng),
+                sample_next_inner(order, &one, &mut state, None, &mut rng),
                 None,
                 "{order:?} 候选 < 2 应返回 None（DR-14）"
             );
         }
         let empty: Vec<PoolEntry> = vec![];
         assert_eq!(
-            sample_next_inner(Order::ShuffleBag, &empty, &mut state, &mut rng),
+            sample_next_inner(Order::ShuffleBag, &empty, &mut state, None, &mut rng),
             None
         );
+    }
+
+    // ── 排除当前壁纸（跨袋重洗不得抽中 current_id）───────────────────────
+
+    #[test]
+    fn shuffle_bag_two_pool_never_returns_current() {
+        // 候选 [a,b]、袋预置 [a,b]（避免 shuffle 依赖）、当前 a：
+        // rng 第一次返回 0 抽中 a（→ 排除重抽），第二次返回 0 从剩余 ["b"] 抽到 b。
+        let candidates = vec![
+            entry("a", WallpaperType::Image),
+            entry("b", WallpaperType::Image),
+        ];
+        let mut state = SamplerState {
+            bag_remaining: vec!["a".into(), "b".into()],
+            ..SamplerState::default()
+        };
+        let mut rng = |_n: usize| 0usize;
+        let result = sample_next_inner(Order::ShuffleBag, &candidates, &mut state, Some("a"), &mut rng);
+        assert_eq!(result.as_deref(), Some("b"), "2 张池抽中当前应重抽到另一张");
+    }
+
+    #[test]
+    fn shuffle_bag_refill_excludes_current() {
+        // 候选 [a,b]、袋为空（触发重洗成袋）、当前 a：
+        // 计数 rng 恒返回 0；无论 shuffle 后抽取结果如何，排除 a 后必为 b。
+        let candidates = vec![
+            entry("a", WallpaperType::Image),
+            entry("b", WallpaperType::Image),
+        ];
+        let mut state = SamplerState::default();
+        let mut rng = |_n: usize| 0usize;
+        let result = sample_next_inner(Order::ShuffleBag, &candidates, &mut state, Some("a"), &mut rng);
+        assert!(result.is_some(), "袋重洗后应能采样");
+        assert_ne!(
+            result.as_deref(),
+            Some("a"),
+            "重洗后也不得抽中当前壁纸"
+        );
+        assert_eq!(result.as_deref(), Some("b"));
+    }
+
+    #[test]
+    fn pseudo_random_excludes_current() {
+        // 候选 [a,b,c]、当前 a：rng 返回 0（本想抽 a）→ 应映射到跳过 a 后的 b。
+        let candidates = vec![
+            entry("a", WallpaperType::Image),
+            entry("b", WallpaperType::Image),
+            entry("c", WallpaperType::Image),
+        ];
+        let mut state = SamplerState::default();
+        let mut rng = |_n: usize| 0usize;
+        let result =
+            sample_next_inner(Order::PseudoRandom, &candidates, &mut state, Some("a"), &mut rng);
+        assert_eq!(result.as_deref(), Some("b"), "纯随机应跳过当前索引");
+    }
+
+    #[test]
+    fn sequential_skips_current() {
+        // 游标 a、当前 b：顺序算法游标下一个是 b → 应跳过 b 取 c。
+        let candidates = vec![
+            entry("a", WallpaperType::Image),
+            entry("b", WallpaperType::Image),
+            entry("c", WallpaperType::Image),
+        ];
+        let mut state = SamplerState {
+            order_cursor: Some("a".into()),
+            ..SamplerState::default()
+        };
+        let result =
+            sample_next_inner(Order::Sequential, &candidates, &mut state, Some("b"), &mut |_| 0);
+        assert_eq!(result.as_deref(), Some("c"), "顺序算法应跳过当前壁纸");
+        assert_eq!(state.order_cursor.as_deref(), Some("c"));
     }
 
     // ── invalidate_sampler（DR-23）─────────────────────────────────────

@@ -27,12 +27,15 @@ use super::gdi_cache::GdiCache;
 /// 收敛收益低于回归风险。
 const WM_WALLPAPER_COMMAND: u32 = WM_USER + 1;
 
-/// v11.0 内存优化：降采样目标尺寸上限（QHD 2560×1440）
+/// v15.0（clarity-first-upscale）：清晰度优先——降采样目标尺寸上限（8K 7680×4320）
 ///
-/// 4K/8K 屏幕下，降采样到屏幕分辨率仍会保留过多像素（4K ~33MB，8K ~133MB）。
-/// 此上限将目标尺寸限制为 2560×1440（~15MB），视觉差异不明显但大幅降低内存。
-/// 1080p 屏幕（1920×1080）低于此上限，不受影响。
-const MAX_DOWNSAMPLE_DIMENSION: u32 = 2560;
+/// 与 v11.0 强制降到 QHD 2560 不同，本版本改为屏幕 1:1 保留原始像素：
+/// 1080p/2K/4K/8K 屏（≤7680）均按屏幕分辨率保留，仅在图片超过 8K 时兜底截断，
+/// 避免 8K 屏上的超大图（>8K）保留过多像素（8K ~133MB 为可接受上限）。
+const MAX_WALLPAPER_DIMENSION: u32 = 7680;
+
+/// 升采样倍率上限（>2x 升采样无意义且浪费计算，超过则保持原尺寸）
+const MAX_UPSCALE_FACTOR: f64 = 2.0;
 
 /// Commands sent from the main thread to the wallpaper thread
 ///
@@ -359,10 +362,21 @@ impl WallpaperRenderer for ImageRenderer {
 
 // ── Wallpaper Thread ─────────────────────────────────────────────────────────
 
-/// 加载图片并降采样到屏幕分辨率
+/// 该缩放模式是否允许小图升采样（Fill/Fit/Stretch 升采样，Center/Tile 保持原尺寸）
+fn is_upscale_mode(mode: ScalingMode) -> bool {
+    matches!(mode, ScalingMode::Fill | ScalingMode::Fit | ScalingMode::Stretch)
+}
+
+/// 加载图片并按清晰度优先策略缩放到屏幕分辨率
 ///
-/// 解码图片后，如果图片尺寸大于屏幕分辨率，则使用 thumbnail 算法降采样，
-/// 显著减少内存占用和渲染开销。像素保留 RGBA 字节序（GDI 经 BI_BITFIELDS 解释）。
+/// 解码图片后：
+/// - 图片任一维度超过目标尺寸（屏幕分辨率与 8K 上限的较小者）时，
+///   用 Lanczos3 等比降采样，显著减少内存占用和渲染开销；
+/// - 小图（两维均小于目标）在 Fill/Fit/Stretch 模式下用 Lanczos3 升采样到
+///   屏幕分辨率并做 unsharp 锐化（Center/Tile 保持原始尺寸，维护 Win10
+///   "居中/平铺=原始尺寸"语义）。
+///
+/// 像素保留 RGBA 字节序（GDI 经 BI_BITFIELDS 解释）。
 fn load_and_downsample_image(
     image_path: &str,
     scaling_mode: ScalingMode,
@@ -387,22 +401,64 @@ fn load_and_downsample_image(
     // v5.0 W-PERF-003: 使用缓存避免每次 Resume 都调用 GetSystemMetrics
     let (screen_w, screen_h) = super::get_screen_size();
 
-    // v11.0：降采样目标尺寸上限为 MAX_DOWNSAMPLE_DIMENSION，避免 4K/8K 屏保留过多像素
-    let target_w = screen_w.min(MAX_DOWNSAMPLE_DIMENSION);
-    let target_h = screen_h.min(MAX_DOWNSAMPLE_DIMENSION);
+    // v15.0（clarity-first-upscale）：目标尺寸 = min(屏幕分辨率, 8K 上限)，
+    // 屏幕 1:1 保留像素，仅对 >8K 的超大图兜底截断
+    let target_w = screen_w.min(MAX_WALLPAPER_DIMENSION);
+    let target_h = screen_h.min(MAX_WALLPAPER_DIMENSION);
 
-    // 如果图片大于目标尺寸，降采样以节省内存
+    // Fill/Fit/Stretch 模式允许小图升采样到屏幕分辨率；Center/Tile 保持原始尺寸
+    // （维护 Win10"居中/平铺=原始尺寸"语义）
+    let should_upscale = is_upscale_mode(scaling_mode);
+
+    // 等比缩放：scale = min(target_w/orig_w, target_h/orig_h)，目标尺寸按原始比例
+    // round 取整且至少 1×1，避免非等比压扁导致图片变形（填充/适应模式下可见）。
+    // 三分支：
+    // 1) 降采样：仅当任一维度超限（scale < 1.0）时触发，Lanczos3 高质量；
+    // 2) 升采样：小图放大到屏幕分辨率，Lanczos3 + unsharp 锐化补偿放大模糊；
+    // 3) 其余（原始尺寸已足够 / Center/Tile / 单维恰好相等）保持原图。
+    // 有意设计：该降采样分支对所有排列模式生效，Center/Tile 模式下大图也会被降到
+    // min(屏幕, 8K)，以控制内存占用——这也是与 Win10"居中=原始尺寸"语义偏差的原因所在；
+    // Center/Tile 仅对小图保持原始尺寸、不做升采样（见上方 should_upscale 说明）。
     let processed_img = if orig_w > target_w || orig_h > target_h {
+        let scale = (target_w as f64 / orig_w as f64).min(target_h as f64 / orig_h as f64);
+        let dw = ((orig_w as f64 * scale).round() as u32).max(1);
+        let dh = ((orig_h as f64 * scale).round() as u32).max(1);
         tracing::info!(
             orig_w,
             orig_h,
             target_w,
             target_h,
-            screen_w,
-            screen_h,
-            "图片大于目标尺寸，降采样中"
+            scale,
+            "图片大于目标尺寸，等比降采样中"
         );
-        image::DynamicImage::ImageRgba8(image::imageops::thumbnail(&img, target_w, target_h))
+        img.resize(dw, dh, image::imageops::FilterType::Lanczos3)
+    } else if should_upscale && orig_w < target_w && orig_h < target_h {
+        let scale = (target_w as f64 / orig_w as f64).min(target_h as f64 / orig_h as f64);
+        if scale > MAX_UPSCALE_FACTOR {
+            // 放大比例过大（>2x），无意义升采样且浪费计算，保持原尺寸。
+            // 注意：Fill/Fit/Stretch 下即使超过上限保持原尺寸，Draw 阶段
+            // （StretchBlt 铺满）仍会拉伸小图显示，仅省去预升采样计算，
+            // 不消除极小题最终被拉伸的现实；Center/Tile 走保持原尺寸路径不受此影响。
+            img
+        } else {
+            let dw = ((orig_w as f64 * scale).round() as u32).max(1);
+            let dh = ((orig_h as f64 * scale).round() as u32).max(1);
+            tracing::info!(
+                orig_w,
+                orig_h,
+                target_w,
+                target_h,
+                scale,
+                "小图升采样至屏幕分辨率（Lanczos3 + unsharp 锐化）"
+            );
+            let upscaled = img.resize(dw, dh, image::imageops::FilterType::Lanczos3);
+            // unsharp 锐化：sigma 与升采样倍率相关（1.5 * scale），threshold 2 防噪声放大
+            image::DynamicImage::ImageRgba8(image::imageops::unsharpen(
+                &upscaled.to_rgba8(),
+                1.5 * scale as f32,
+                2,
+            ))
+        }
     } else {
         img
     };
@@ -553,13 +609,18 @@ fn wallpaper_thread(
                         let data_ptr =
                             GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut ImageWindowData;
                         if !data_ptr.is_null() {
+                            // 记录切换前的模式，用于判断是否跨"升采样/原尺寸"类别
+                            let prev_mode = (*data_ptr).render.scaling_mode;
                             (*data_ptr).render.scaling_mode = mode;
                             // v8.0: 清空 image_bitmap 缓存，下次 WM_PAINT 走"首次绘制"路径重新生成
                             if let Some(ref mut cache) = (*data_ptr).gdi_cache {
                                 cache.release_image_bitmap();
                             }
-                            // 若 pixels 已释放（首次绘制后），从文件重新解码供下次首次绘制使用
-                            if (*data_ptr).render.pixels.is_none() {
+                            // 跨缩放类别切换（升采样 ↔ 原尺寸）时 img_w/img_h 会改变，
+                            // 或 pixels 已释放（首次绘制后）时，需从文件重新解码刷新图片。
+                            let mode_category_changed =
+                                is_upscale_mode(prev_mode) != is_upscale_mode(mode);
+                            if mode_category_changed || (*data_ptr).render.pixels.is_none() {
                                 let path = (*data_ptr).render.image_path.clone();
                                 let mode = (*data_ptr).render.scaling_mode;
                                 match load_and_downsample_image(&path, mode) {
@@ -779,6 +840,7 @@ unsafe extern "system" fn wallpaper_wnd_proc(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use super::super::SCREEN_SIZE_TEST_MUTEX;
 
     #[test]
     fn test_load_valid_small_image() {
@@ -792,11 +854,12 @@ mod tests {
         img.save(&img_path).unwrap();
         let path = img_path.to_str().unwrap();
 
-        let data = load_and_downsample_image(path, ScalingMode::Fill).expect("有效图片应加载成功");
+        // v15.0（clarity-first-upscale）：Center 模式保持原始尺寸，避免小图被升采样
+        let data = load_and_downsample_image(path, ScalingMode::Center).expect("有效图片应加载成功");
         assert_eq!(data.img_w, 10);
         assert_eq!(data.img_h, 10);
         assert_eq!(data.pixels.as_ref().unwrap().len(), 10 * 10 * 4);
-        assert_eq!(data.scaling_mode, ScalingMode::Fill);
+        assert_eq!(data.scaling_mode, ScalingMode::Center);
         assert_eq!(data.image_path, path);
         assert!(!data.paused);
     }
@@ -812,6 +875,7 @@ mod tests {
 
     #[test]
     fn test_load_downsamples_large_image() {
+        let _guard = SCREEN_SIZE_TEST_MUTEX.lock().unwrap();
         // 查询屏幕分辨率（与函数内部逻辑一致，使用缓存版本）
         let (screen_w, screen_h) = crate::wallpaper::get_screen_size();
 
@@ -830,9 +894,9 @@ mod tests {
 
         let data = load_and_downsample_image(path, ScalingMode::Fit).expect("大图片应加载成功");
 
-        // 降采样后尺寸不应超过目标尺寸（屏幕分辨率与 MAX_DOWNSAMPLE_DIMENSION 的较小者）
-        let max_w = screen_w.min(MAX_DOWNSAMPLE_DIMENSION);
-        let max_h = screen_h.min(MAX_DOWNSAMPLE_DIMENSION);
+        // 降采样后尺寸不应超过目标尺寸（屏幕分辨率与 MAX_WALLPAPER_DIMENSION 的较小者）
+        let max_w = screen_w.min(MAX_WALLPAPER_DIMENSION);
+        let max_h = screen_h.min(MAX_WALLPAPER_DIMENSION);
         assert!(
             data.img_w <= max_w,
             "降采样后宽度 {} 应 <= 目标宽度 {}",
@@ -861,36 +925,383 @@ mod tests {
         );
     }
 
-    /// v11.0：验证屏幕分辨率超过 MAX_DOWNSAMPLE_DIMENSION 时降采样上限生效。
+    /// v15.0（clarity-first-upscale）：验证目标尺寸上限 = 8K 的数学关系。
     ///
-    /// 由于 `get_screen_size` 返回真实屏幕分辨率（无法在测试中修改），
-    /// 此测试通过验证 `MAX_DOWNSAMPLE_DIMENSION` 常量值与降采样逻辑的数学关系来验证：
-    /// 若 screen_w > MAX_DOWNSAMPLE_DIMENSION，则 target_w = MAX_DOWNSAMPLE_DIMENSION。
+    /// 与实现共用公式：target = min(screen, MAX_WALLPAPER_DIMENSION)。
+    /// 4K/8K 屏不触发上限（屏幕 1:1 保留，清晰度优先），仅 >8K 屏被兜底截断。
     #[test]
-    fn test_downsample_caps_at_max_dimension() {
-        // 验证常量值为 2560（QHD）
+    fn test_wallpaper_dimension_cap_is_8k() {
+        // 验证常量值为 7680（8K）
         assert_eq!(
-            MAX_DOWNSAMPLE_DIMENSION, 2560,
-            "v11.0: MAX_DOWNSAMPLE_DIMENSION 应为 2560（QHD）"
+            MAX_WALLPAPER_DIMENSION, 7680,
+            "v15.0: MAX_WALLPAPER_DIMENSION 应为 7680（8K 上限）"
         );
 
-        // 模拟 4K 屏幕：target_w = min(3840, 2560) = 2560
+        // 模拟 4K 屏幕：target_w = min(3840, 7680) = 3840（不触发上限，1:1 保留）
         let screen_w_4k = 3840u32;
-        let target_w_4k = screen_w_4k.min(MAX_DOWNSAMPLE_DIMENSION);
-        assert_eq!(target_w_4k, 2560, "4K 屏幕降采样目标宽度应为 2560");
+        let target_w_4k = screen_w_4k.min(MAX_WALLPAPER_DIMENSION);
+        assert_eq!(target_w_4k, 3840, "4K 屏幕目标宽度应为 3840（1:1 保留）");
 
-        // 模拟 8K 屏幕：target_w = min(7680, 2560) = 2560
+        // 模拟 8K 屏幕：target_w = min(7680, 7680) = 7680（恰等于上限）
         let screen_w_8k = 7680u32;
-        let target_w_8k = screen_w_8k.min(MAX_DOWNSAMPLE_DIMENSION);
-        assert_eq!(target_w_8k, 2560, "8K 屏幕降采样目标宽度应为 2560");
+        let target_w_8k = screen_w_8k.min(MAX_WALLPAPER_DIMENSION);
+        assert_eq!(target_w_8k, 7680, "8K 屏幕目标宽度应为 7680（恰等于上限）");
 
-        // 模拟 1080p 屏幕：target_w = min(1920, 2560) = 1920（不触发上限）
+        // 模拟 10K 屏幕：target_w = min(10240, 7680) = 7680（触发上限截断）
+        let screen_w_10k = 10240u32;
+        let target_w_10k = screen_w_10k.min(MAX_WALLPAPER_DIMENSION);
+        assert_eq!(target_w_10k, 7680, "10K 屏幕目标宽度应被截断为 7680");
+
+        // 模拟 1080p 屏幕：target_w = min(1920, 7680) = 1920（低于上限，不受影响）
         let screen_w_1080p = 1920u32;
-        let target_w_1080p = screen_w_1080p.min(MAX_DOWNSAMPLE_DIMENSION);
+        let target_w_1080p = screen_w_1080p.min(MAX_WALLPAPER_DIMENSION);
         assert_eq!(
             target_w_1080p, 1920,
-            "1080p 屏幕降采样目标宽度应为 1920（低于上限，不受影响）"
+            "1080p 屏幕目标宽度应为 1920（低于上限，不受影响）"
         );
+    }
+
+    /// 验证宽幅大图（宽高比大于屏幕）降采样后保持宽高比。
+    ///
+    /// 不使用 `set_screen_size_for_test` 修改全局状态（会与其它文件并行测试互相干扰），
+    /// 改为读取运行时屏幕尺寸，并用与实现相同的公式计算期望值。
+    #[test]
+    fn test_downsample_keeps_aspect_ratio_wide() {
+        let _guard = SCREEN_SIZE_TEST_MUTEX.lock().unwrap();
+        // 读取运行时屏幕尺寸
+        let (screen_w, screen_h) = crate::wallpaper::get_screen_size();
+        let target_w = screen_w.min(MAX_WALLPAPER_DIMENSION);
+        let target_h = screen_h.min(MAX_WALLPAPER_DIMENSION);
+
+        // 构造宽幅大图（宽高比大于屏幕）
+        let orig_w = target_w + 1000;
+        let orig_h = (target_h + 1000) / 2;
+        let img = image::DynamicImage::ImageRgba8(image::RgbaImage::from_pixel(
+            orig_w,
+            orig_h,
+            image::Rgba([0, 0, 255, 255]),
+        ));
+        let dir = tempfile::tempdir().unwrap();
+        let img_path = dir.path().join("wide_large.png");
+        img.save(&img_path).unwrap();
+        let path = img_path.to_str().unwrap();
+
+        let data = load_and_downsample_image(path, ScalingMode::Fill).expect("宽幅大图应加载成功");
+
+        // 降采样不超上限
+        assert!(
+            data.img_w <= target_w,
+            "降采样后宽度 {} 应 <= 目标宽度 {}",
+            data.img_w,
+            target_w
+        );
+
+        // 宽高比保持（与原始比例误差 < 0.02）
+        let orig_ratio = orig_h as f64 / orig_w as f64;
+        let out_ratio = data.img_h as f64 / data.img_w as f64;
+        assert!(
+            (out_ratio - orig_ratio).abs() < 0.02,
+            "宽高比应保持：原始比例 {}，输出比例 {}",
+            orig_ratio,
+            out_ratio
+        );
+
+        // 与公式期望值一致
+        let scale = (target_w as f64 / orig_w as f64).min(target_h as f64 / orig_h as f64);
+        let exp_w = ((orig_w as f64 * scale).round() as u32).max(1);
+        let exp_h = ((orig_h as f64 * scale).round() as u32).max(1);
+        assert_eq!(
+            data.img_w, exp_w,
+            "宽度应与公式期望值一致：实际 {}，期望 {}",
+            data.img_w, exp_w
+        );
+        assert_eq!(
+            data.img_h, exp_h,
+            "高度应与公式期望值一致：实际 {}，期望 {}",
+            data.img_h, exp_h
+        );
+    }
+
+    /// 验证竖幅大图（宽高比大于屏幕）降采样后保持宽高比。
+    #[test]
+    fn test_downsample_keeps_aspect_ratio_tall() {
+        let _guard = SCREEN_SIZE_TEST_MUTEX.lock().unwrap();
+        // 读取运行时屏幕尺寸
+        let (screen_w, screen_h) = crate::wallpaper::get_screen_size();
+        let target_w = screen_w.min(MAX_WALLPAPER_DIMENSION);
+        let target_h = screen_h.min(MAX_WALLPAPER_DIMENSION);
+
+        // 构造竖幅大图（宽高比大于屏幕）
+        let orig_w = (target_w + 1000) / 2;
+        let orig_h = target_h + 1000;
+        let img = image::DynamicImage::ImageRgba8(image::RgbaImage::from_pixel(
+            orig_w,
+            orig_h,
+            image::Rgba([0, 0, 255, 255]),
+        ));
+        let dir = tempfile::tempdir().unwrap();
+        let img_path = dir.path().join("tall_large.png");
+        img.save(&img_path).unwrap();
+        let path = img_path.to_str().unwrap();
+
+        let data = load_and_downsample_image(path, ScalingMode::Fill).expect("竖幅大图应加载成功");
+
+        // 降采样不超上限
+        assert!(
+            data.img_h <= target_h,
+            "降采样后高度 {} 应 <= 目标高度 {}",
+            data.img_h,
+            target_h
+        );
+
+        // 宽高比保持（与原始比例误差 < 0.02）
+        let orig_ratio = orig_h as f64 / orig_w as f64;
+        let out_ratio = data.img_h as f64 / data.img_w as f64;
+        assert!(
+            (out_ratio - orig_ratio).abs() < 0.02,
+            "宽高比应保持：原始比例 {}，输出比例 {}",
+            orig_ratio,
+            out_ratio
+        );
+
+        // 与公式期望值一致
+        let scale = (target_w as f64 / orig_w as f64).min(target_h as f64 / orig_h as f64);
+        let exp_w = ((orig_w as f64 * scale).round() as u32).max(1);
+        let exp_h = ((orig_h as f64 * scale).round() as u32).max(1);
+        assert_eq!(
+            data.img_w, exp_w,
+            "宽度应与公式期望值一致：实际 {}，期望 {}",
+            data.img_w, exp_w
+        );
+        assert_eq!(
+            data.img_h, exp_h,
+            "高度应与公式期望值一致：实际 {}，期望 {}",
+            data.img_h, exp_h
+        );
+    }
+
+    // ========== v15.0 清晰度优先（clarity-first-upscale）测试 ==========
+
+    /// 生成指定尺寸纯色图并保存为临时 PNG，返回 `(路径, TempDir)`。
+    /// 调用方必须持有返回的 `TempDir`（drop 即删除文件），故不能只返回路径。
+    fn save_test_image(w: u32, h: u32, color: [u8; 4], name: &str) -> (String, tempfile::TempDir) {
+        let dir = tempfile::tempdir().unwrap();
+        let img_path = dir.path().join(name);
+        image::DynamicImage::ImageRgba8(image::RgbaImage::from_pixel(
+            w,
+            h,
+            image::Rgba(color),
+        ))
+        .save(&img_path)
+        .unwrap();
+        (img_path.to_str().unwrap().to_string(), dir)
+    }
+
+    /// 生成指定尺寸渐变图（非平坦，确保 unsharp 锐化可检测）并保存为临时 PNG。
+    fn save_gradient_image(w: u32, h: u32, name: &str) -> (String, tempfile::TempDir) {
+        let buf = image::RgbaImage::from_fn(w, h, |x, y| {
+            let v = ((x * 255 / w) + (y * 255 / h)) as u8;
+            image::Rgba([v, 255 - v, (x * 7) as u8, 255])
+        });
+        let dir = tempfile::tempdir().unwrap();
+        let img_path = dir.path().join(name);
+        image::DynamicImage::ImageRgba8(buf)
+            .save(&img_path)
+            .unwrap();
+        (img_path.to_str().unwrap().to_string(), dir)
+    }
+
+    /// 4K 图 + 4K 屏：不降采样，保持 3840×2160（清晰度优先，屏幕 1:1 保留）。
+    #[test]
+    fn test_4k_image_on_4k_screen_no_downsample() {
+        let _guard = SCREEN_SIZE_TEST_MUTEX.lock().unwrap();
+        super::super::set_screen_size_for_test(3840, 2160);
+
+        let (path, _dir) = save_test_image(3840, 2160, [255, 0, 0, 255], "4k.png");
+        let data = load_and_downsample_image(&path, ScalingMode::Fill)
+            .expect("4K 图在 4K 屏上应加载成功");
+        assert_eq!(data.img_w, 3840, "4K 图 + 4K 屏不应降采样，宽度应为 3840");
+        assert_eq!(data.img_h, 2160, "4K 图 + 4K 屏不应降采样，高度应为 2160");
+
+        super::super::invalidate_screen_size_cache();
+    }
+
+    /// 4K 图 + 1080p 屏：等比降采样到 1920×1080。
+    #[test]
+    fn test_4k_image_on_1080p_screen_downsampled() {
+        let _guard = SCREEN_SIZE_TEST_MUTEX.lock().unwrap();
+        super::super::set_screen_size_for_test(1920, 1080);
+
+        let (path, _dir) = save_test_image(3840, 2160, [255, 0, 0, 255], "4k.png");
+        let data = load_and_downsample_image(&path, ScalingMode::Fill)
+            .expect("4K 图在 1080p 屏上应加载成功");
+        assert_eq!(data.img_w, 1920, "4K 图 + 1080p 屏应降采样到宽 1920");
+        assert_eq!(data.img_h, 1080, "4K 图 + 1080p 屏应降采样到高 1080");
+
+        super::super::invalidate_screen_size_cache();
+    }
+
+    /// 8K 图 + 4K 屏：等比降采样到 3840×2160。
+    #[test]
+    fn test_8k_image_on_4k_screen_downsampled() {
+        let _guard = SCREEN_SIZE_TEST_MUTEX.lock().unwrap();
+        super::super::set_screen_size_for_test(3840, 2160);
+
+        let (path, _dir) = save_test_image(7680, 4320, [0, 255, 0, 255], "8k.png");
+        let data = load_and_downsample_image(&path, ScalingMode::Fill)
+            .expect("8K 图在 4K 屏上应加载成功");
+        assert_eq!(data.img_w, 3840, "8K 图 + 4K 屏应降采样到宽 3840");
+        assert_eq!(data.img_h, 2160, "8K 图 + 4K 屏应降采样到高 2160");
+
+        super::super::invalidate_screen_size_cache();
+    }
+
+    /// 8K 图 + 8K 屏：目标尺寸恰等于上限，不降采样，保持 7680×4320。
+    #[test]
+    fn test_8k_image_on_8k_screen_kept() {
+        let _guard = SCREEN_SIZE_TEST_MUTEX.lock().unwrap();
+        super::super::set_screen_size_for_test(7680, 4320);
+
+        let (path, _dir) = save_test_image(7680, 4320, [0, 255, 0, 255], "8k.png");
+        let data = load_and_downsample_image(&path, ScalingMode::Fill)
+            .expect("8K 图在 8K 屏上应加载成功");
+        assert_eq!(data.img_w, 7680, "8K 图 + 8K 屏不应降采样，宽度应为 7680");
+        assert_eq!(data.img_h, 4320, "8K 图 + 8K 屏不应降采样，高度应为 4320");
+
+        super::super::invalidate_screen_size_cache();
+    }
+
+    /// 12000×3375 全景 + 8K 屏：等比降采样到宽 7680（高 = round(3375*7680/12000) = 2160）。
+    #[test]
+    fn test_panorama_12000x3375_downsampled_to_7680w_on_8k_screen() {
+        let _guard = SCREEN_SIZE_TEST_MUTEX.lock().unwrap();
+        super::super::set_screen_size_for_test(7680, 4320);
+
+        let (path, _dir) = save_test_image(12000, 3375, [0, 0, 255, 255], "pano.png");
+        let data = load_and_downsample_image(&path, ScalingMode::Fill)
+            .expect("12000×3375 全景图应加载成功");
+        assert_eq!(data.img_w, 7680, "全景图降采样后宽度应为 7680（上限）");
+        assert_eq!(data.img_h, 2160, "全景图降采样后高度应为 2160（等比 round）");
+
+        super::super::invalidate_screen_size_cache();
+    }
+
+    /// 1080p 小图 + 4K 屏 + Fill：升采样到 3840×2160，
+    /// 且输出像素与"未锐化的 Lanczos3 原始放大"不同，证明 unsharp 锐化生效。
+    #[test]
+    fn test_small_image_upscaled_and_sharpened_on_4k_screen() {
+        let _guard = SCREEN_SIZE_TEST_MUTEX.lock().unwrap();
+        super::super::set_screen_size_for_test(3840, 2160);
+
+        let (path, _dir) = save_gradient_image(1920, 1080, "small_gradient.png");
+        let data = load_and_downsample_image(&path, ScalingMode::Fill)
+            .expect("1080p 小图在 4K 屏上应加载成功");
+        assert_eq!(data.img_w, 3840, "Fill 模式小图应升采样到宽 3840");
+        assert_eq!(data.img_h, 2160, "Fill 模式小图应升采样到高 2160");
+
+        // 与未锐化的原始 Lanczos3 放大结果比较，证明锐化确实改变了像素
+        let orig_img = image::ImageReader::open(&path)
+            .unwrap()
+            .with_guessed_format()
+            .unwrap()
+            .decode()
+            .unwrap();
+        let expected = orig_img
+            .resize(3840, 2160, image::imageops::FilterType::Lanczos3)
+            .to_rgba8()
+            .into_raw();
+        assert_ne!(
+            data.pixels.as_ref().unwrap(),
+            &expected,
+            "升采样后应经 unsharp 锐化，与未锐化放大结果不同"
+        );
+
+        super::super::invalidate_screen_size_cache();
+    }
+
+    /// 1080p 小图 + 4K 屏 + Center / Tile：保持原始 1920×1080
+    /// （维护 Win10"居中/平铺=原始尺寸"语义，不升采样）。
+    #[test]
+    fn test_small_image_kept_original_size_center_and_tile() {
+        let _guard = SCREEN_SIZE_TEST_MUTEX.lock().unwrap();
+        super::super::set_screen_size_for_test(3840, 2160);
+
+        let (path, _dir) = save_gradient_image(1920, 1080, "small_gradient.png");
+        for mode in [ScalingMode::Center, ScalingMode::Tile] {
+            let data = load_and_downsample_image(&path, mode)
+                .expect("Center/Tile 模式小图应加载成功");
+            assert_eq!(data.img_w, 1920, "{:?} 模式应保持原始宽度 1920", mode);
+            assert_eq!(data.img_h, 1080, "{:?} 模式应保持原始高度 1080", mode);
+        }
+
+        super::super::invalidate_screen_size_cache();
+    }
+
+    /// 极小图（10×10）+ Fill：放大比例远超 2x，跳过升采样、保持原尺寸。
+    ///
+    /// get_screen_size() 是真实屏幕分辨率（最低也≥800×600），10×10 的 scale 必然 >2.0，
+    /// 断言稳定返回原始 10×10。
+    #[test]
+    fn test_load_tiny_image_fill_keeps_original() {
+        let _guard = SCREEN_SIZE_TEST_MUTEX.lock().unwrap();
+
+        let (path, _dir) = save_gradient_image(10, 10, "tiny_gradient.png");
+        let data = load_and_downsample_image(&path, ScalingMode::Fill)
+            .expect("10×10 极小图在 Fill 模式下应加载成功");
+        assert_eq!(data.img_w, 10, "极小图放大比例 >2x 应跳过升采样，保持原宽 10");
+        assert_eq!(data.img_h, 10, "极小图放大比例 >2x 应跳过升采样，保持原高 10");
+
+        super::super::invalidate_screen_size_cache();
+    }
+
+    /// 渐变图（1400×900）在 2560×1440（2K）屏 + Fill 下升采样到 2240×1440，
+    /// scale = min(2560/1400, 1440/900) = 1.6 ≤ MAX_UPSCALE_FACTOR，验证升采样分支
+    /// （Lanczos3 + unsharp）真正执行而非保持原尺寸。
+    #[test]
+    fn test_upscale_within_2x_applies_lanczos_and_unsharp() {
+        let _guard = SCREEN_SIZE_TEST_MUTEX.lock().unwrap();
+        // 在锁内设置确定性 2K 屏幕，保证 scale 可预期（不依赖真实屏幕分辨率）
+        super::super::set_screen_size_for_test(2560, 1440);
+
+        // 渐变图（非平坦，确保可断言空间变化）
+        let (path, _dir) = save_gradient_image(1400, 900, "upscale_2k_gradient.png");
+        let data = load_and_downsample_image(&path, ScalingMode::Fill)
+            .expect("1400×900 渐变图在 2K 屏上应加载成功");
+
+        // scale = min(2560/1400, 1440/900) = 1.6；dw = round(1400*1.6)=2240，dh = round(900*1.6)=1440
+        // 升采样分支真正执行（而非保持原尺寸），故应放大到 2240×1440
+        assert_eq!(data.img_w, 2240, "Fill 升采样后宽度应为 2240（scale=1.6）");
+        assert_eq!(data.img_h, 1440, "Fill 升采样后高度应为 1440（scale=1.6）");
+        // 输出尺寸应大于原始小图
+        assert!(data.img_w > 1400 && data.img_h > 900, "升采样后应大于原图 1400×900");
+
+        // 像素应为 RGBA 格式（每像素 4 字节）
+        let pixels = data.pixels.as_ref().unwrap();
+        assert_eq!(
+            pixels.len(),
+            (data.img_w * data.img_h * 4) as usize,
+            "像素长度应符合 img_w*img_h*4"
+        );
+
+        // 对渐变图升采样后像素应仍有空间变化而非单色：抽样断言非全部像素相同
+        let first = pixels[0];
+        assert!(
+            pixels.iter().any(|&p| p != first),
+            "升采样后渐变图应有空间变化，不应全部像素相同"
+        );
+
+        // 恢复屏幕尺寸缓存，避免影响其它测试
+        super::super::invalidate_screen_size_cache();
+    }
+
+    /// 验证 is_upscale_mode：Fill/Fit/Stretch 返回 true，Center/Tile 返回 false。
+    #[test]
+    fn test_is_upscale_mode() {
+        assert!(is_upscale_mode(ScalingMode::Fill), "Fill 应允许升采样");
+        assert!(is_upscale_mode(ScalingMode::Fit), "Fit 应允许升采样");
+        assert!(is_upscale_mode(ScalingMode::Stretch), "Stretch 应允许升采样");
+        assert!(!is_upscale_mode(ScalingMode::Center), "Center 应保持原尺寸");
+        assert!(!is_upscale_mode(ScalingMode::Tile), "Tile 应保持原尺寸");
     }
 
     // ========== W-003 修复测试：Resume 失败状态回滚 ==========

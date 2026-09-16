@@ -308,7 +308,8 @@ pub fn init_data_root(dir: std::path::PathBuf) {
 }
 
 /// 解析数据根：环境变量 `MIRRORSTAR_DATA_ROOT`（dev 便利）→ `current_exe().parent()`
-/// （= 安装目录）→ 回退 `%APPDATA%/mirrorstar` → `.`
+/// （始终使用，生产为安装目录，dev 为 `target/<debug|release>/`）→ 回退到
+/// `%APPDATA%/mirrorstar`。
 pub fn resolve_data_root() -> std::path::PathBuf {
     if let Some(dir) = std::env::var_os("MIRRORSTAR_DATA_ROOT") {
         let p = std::path::PathBuf::from(dir);
@@ -320,44 +321,11 @@ pub fn resolve_data_root() -> std::path::PathBuf {
         .ok()
         .and_then(|exe| exe.parent().map(|p| p.to_path_buf()))
     {
-        // 便携数据根的"exe 所在目录"语义仅对真正部署/安装的可执行文件有意义。
-        // cargo 构建产物目录（`<...>/target/<debug|release>/`）属于构建残留：把用户数据
-        // （config/wallpapers/playback/logs/缩略图/WebView2 缓存）落入其中会随
-        // `cargo clean` 或工作区清理随构建产物一起被删除，且与文档/测试期望的
-        // `%APPDATA%\mirrorstar` 相矛盾。识别到此类构建产物目录时不采用 exe 目录，
-        // 而是回退到 `%APPDATA%\mirrorstar`（dev/CI 环境发现修复）。
-        if !is_cargo_build_artifact_dir(&exe_dir) {
-            return exe_dir;
-        }
+        return exe_dir;
     }
     dirs::data_dir()
         .map(|d| d.join("mirrorstar"))
         .unwrap_or_else(|| std::path::PathBuf::from("."))
-}
-
-/// 判断 `dir` 是否为 cargo 构建产物目录（存在 `target/` 祖先，且自身名为
-/// `debug` 或 `release`；目标三元组目录如 `target/x86_64-pc-windows-msvc/debug/`
-/// 由 `target/` 祖先扫描覆盖）。
-///
-/// 测试二进制位于 `target/<profile>/deps/`（自身名为 `deps`），生产安装于任意
-/// 目录，二者均不匹配，因此测试与生产行为不受影响。
-fn is_cargo_build_artifact_dir(dir: &std::path::Path) -> bool {
-    let is_profile_level = dir
-        .file_name()
-        .map(|s| {
-            let n = s.to_string_lossy().to_ascii_lowercase();
-            n == "debug" || n == "release"
-        })
-        .unwrap_or(false);
-    if !is_profile_level {
-        return false;
-    }
-    // 向上找一段名为 `target` 的祖先目录（跳过自身）。
-    dir.ancestors().skip(1).any(|anc| {
-        anc.file_name()
-            .map(|s| s.eq_ignore_ascii_case("target"))
-            .unwrap_or(false)
-    })
 }
 
 /// 获取数据根：显式设置优先，否则懒解析并缓存。
@@ -1452,38 +1420,6 @@ pub(crate) mod test_support {
 mod tests {
     use super::test_support::make_temp_config_manager;
     use super::*;
-
-    // ── 数据根构建产物目录识别（环境发现修复） ─────────────────────────────
-
-    #[test]
-    fn cargo_build_artifact_dir_detection() {
-        // 携带 `target/<debug|release>` 的构建产物目录应被识别。
-        assert!(is_cargo_build_artifact_dir(Path::new(
-            r"C:\Dev\foo\target\debug"
-        )));
-        assert!(is_cargo_build_artifact_dir(Path::new(
-            "C:/Dev/foo/target/release"
-        )));
-        assert!(is_cargo_build_artifact_dir(Path::new(
-            r"C:\Dev\foo\target\x86_64-pc-windows-msvc\debug"
-        )));
-
-        // 测试二进制目录（`target/<profile>/deps/`）不应命中。
-        assert!(!is_cargo_build_artifact_dir(Path::new(
-            r"C:\Dev\foo\target\debug\deps"
-        )));
-        // 普通安装目录不应命中（生产便携行为不变）。
-        assert!(!is_cargo_build_artifact_dir(Path::new(
-            r"C:\Program Files\MirrorStar"
-        )));
-        assert!(!is_cargo_build_artifact_dir(Path::new(
-            r"C:\Dev\foo\target"
-        )));
-        // 非 debug/release 且带 target 祖先也不命中。
-        assert!(!is_cargo_build_artifact_dir(Path::new(
-            r"C:\Dev\foo\target\build"
-        )));
-    }
 
     // ── WallpaperEntry 序列化 ────────────────────────────────────────────────
 

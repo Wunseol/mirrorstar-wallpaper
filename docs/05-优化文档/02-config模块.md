@@ -37,6 +37,25 @@ config 模块是 mirrorstar-core 的配置与壁纸库管理中枢，聚合五�
 
 测试盲区见第 5 节。
 
+### 1.4 数据根目录（便携 / 数据存放位置）
+
+config 模块采用**便携数据根**设计：所有用户数据都被集中收集到"数据根"目录下，包括 `config.toml`、`wallpapers.toml`、`wallpapers\`（壁纸资源）、`thumbnails\`（缩略图）、`logs`（日志）与 `webview2-cache`（WebView2 缓存）。数据根由 `resolve_data_root()` 解析并通过 `OnceLock`（`DATA_ROOT`）缓存，应用启动时也可由 `init_data_root()` 显式指定。
+
+解析优先级：
+
+1. 环境变量 `MIRRORSTAR_DATA_ROOT`（dev 便利手段，可强制指定数据根）；
+2. `current_exe().parent()`（即 exe 所在目录），**始终采用**；
+3. 仅当无法取得 exe 路径时才回退 `%APPDATA%\mirrorstar`（最后兜底 `.`）。
+
+第 2 步对生产与 dev 一视同仁：生产 / 安装版的 exe 位于安装目录，数据即落在安装目录（完全便携）；dev `cargo run` 的 exe 位于 `target\<debug|release>\`，数据随之落在 `target\<profile>` 下。旧版本曾通过 `is_cargo_build_artifact_dir()` 检测 cargo 构建产物目录并强制回退到 `%APPDATA%\mirrorstar`，该检测与 dev 回退逻辑已被删除。
+
+| 运行方式 | 数据根 | 是否位于 `target\` |
+|---|---|---|
+| 生产 / 安装版 | 安装目录（exe 所在目录）——完全便携 | 否 |
+| dev `cargo run` | `target\<debug|release>\`（exe 所在目录） | 是 |
+
+**设计意图**：① 便携版将用户数据放在安装目录，删除安装目录即完成全量清理；② dev 构建的数据落在 `target\` 下，会随 `cargo clean` 连同构建产物一并删除，从而丢弃开发期数据——这一行为是维护者**刻意接受**的权衡（dev 数据视为可再生的临时产物，无需长期保留），并非便携性缺陷。
+
 ## 2. v4.0 审查发现（18 项）与修复状态
 
 > 来源：`.trae/specs/comprehensive-project-review-and-doc-restructure-2026-07-15/findings/01-config.md`

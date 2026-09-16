@@ -1043,8 +1043,9 @@ impl WallpaperEngine {
     /// 与阶段 B（引擎锁外 `wait_new_ready`：首帧就绪）。
     ///
     /// 执行步骤（换槽临界区）：
-    /// 1. 在换槽临界区才 `self.wallpapers.remove(display_id)` 取旧（P1-5：A/B 阶段旧窗始终在 map）
-    /// 2. DR-40 commit 前校验：新窗父窗口仍为当前 WorkerW，否则放弃 commit（terminate 新窗）
+    /// 1. DR-40 commit 前校验：新窗父窗口仍为当前 WorkerW，否则放弃 commit（terminate 新窗）。
+    ///    校验先于换槽，校验失败时旧壁纸仍在 map 未动，无需回滚，也不会因 Drop 误杀旧壁纸
+    /// 2. 校验通过后才 `self.wallpapers.remove(display_id)` 取旧（P1-5：A/B 阶段旧窗始终在 map）
     /// 3. 一次换槽（复用 `register_renderer_maps`，不先关旧）
     /// 4. 按当前全局 `PauseReason` 位图对新渲染器补发暂停（DR-20）
     /// 5. terminate 旧渲染器（失败则强毁旧 hwnd 兜底）
@@ -1058,12 +1059,9 @@ impl WallpaperEngine {
         source: &WallpaperSource,
         wallpaper_type: WallpaperType,
     ) -> Result<SwapOutcome, MirrorStarError> {
-        // 换槽临界区：此刻才把旧窗从 map 取出（P1-5）。A/B 阶段旧窗始终在 map 占位。
-        let old_renderer = self.wallpapers.remove(display_id);
-        let old_hwnd = old_renderer.as_ref().and_then(|r| r.hwnd());
-
         // DR-40 commit 前校验：新窗父窗口仍为当前 WorkerW，否则放弃 commit（terminate 新窗）。
-        // 旧窗仍在 map（未动），无需重嵌回滚。
+        // 校验必须先于换槽：若先 remove 旧窗，校验失败路径上 old_renderer 随函数返回被 Drop，
+        // Drop 会终止旧壁纸进程（VideoRenderer::drop），导致屏幕空白且轮换永不提交。
         if let Some(hwnd) = new_renderer.hwnd() {
             let parent_ok = {
                 let desktop = self.desktop.lock().map_err(|e| {
@@ -1082,6 +1080,10 @@ impl WallpaperEngine {
                 ));
             }
         }
+
+        // 换槽临界区：校验通过后才从 map 取出旧窗（P1-5）。A/B 阶段旧窗始终在 map 占位。
+        let old_renderer = self.wallpapers.remove(display_id);
+        let old_hwnd = old_renderer.as_ref().and_then(|r| r.hwnd());
 
         // 一次换槽（复用注册逻辑，不先关旧）
         self.register_renderer_maps(new_renderer, display_id, source, wallpaper_type);
@@ -1488,7 +1490,7 @@ pub fn build_new_renderer(
 /// 阶段 3（锁外）：等待新渲染器首帧就绪（DR-33 步骤 wait_new_ready）。
 ///
 /// - 视频：复用 [`VideoRenderer::poll_first_frame_ready`]（trait 覆写，内部轮询
-///   mpv 至 `width>0 且 idle-active=no`）；每 `poll_interval` 查询一次。
+///   mpv 至 `width>0 且 idle-active=false`）；每 `poll_interval` 查询一次。
 /// - 图片 / GIF / 网页：trait 默认实现立即返回就绪，一次查询即返回。
 ///
 /// 失败或超时返回 `Err`（旧壁纸照常显示，零回滚），由调用方 `terminate` 新渲染器。

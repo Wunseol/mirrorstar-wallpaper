@@ -40,7 +40,7 @@
             <label for="arrangement-select">排列模式</label>
             <select id="arrangement-select">
               <option value="per_monitor">每屏独立</option>
-              <option value="all_same">全体员工同图</option>
+              <option value="all_same">每屏同图</option>
               <option value="span">跨屏合并</option>
             </select>
           </div>
@@ -50,8 +50,8 @@
               <option value="fill">填充</option>
               <option value="fit">适应</option>
               <option value="stretch">拉伸</option>
+              <option value="tile">平铺</option>
               <option value="center">居中</option>
-              <option value="original">原始</option>
             </select>
           </div>
           <div class="settings-group">
@@ -112,10 +112,10 @@
               <label for="rotation-arrangement-select">轮换编排</label>
               <select id="rotation-arrangement-select">
                 <option value="per_monitor">每屏独立</option>
-                <option value="all_same">全体员工同图</option>
+                <option value="all_same">每屏同图</option>
                 <option value="span">跨屏合并</option>
               </select>
-              <p class="settings-hint">决定调度单元：每屏一个（per_monitor）或全局一个（all_same/span）</p>
+              <p class="settings-hint">决定调度单元：每屏独立（per_monitor）或全局一个（每屏同图 all_same / 跨屏合并 span）</p>
             </div>
           </div>
           <div class="settings-group">

@@ -96,6 +96,15 @@ pub(crate) fn set_screen_size_for_test(w: u32, h: u32) {
     *guard = Some((w, h));
 }
 
+/// v14（测试稳定性修复）：操作全局 `SCREEN_SIZE` 缓存的所有测试共用同一把互斥锁。
+///
+/// 此前 image.rs 与 gif_decode.rs 各自声明独立的局部 `SCREEN_SIZE_TEST_MUTEX`，
+/// 两者互不互斥，且部分读真实屏幕的测试不加锁，导致并行运行测试时一个测试
+/// `set_screen_size_for_test` 写入的假分辨率被另一个测试的 `get_screen_size` 读到，
+/// 产生偶发断言失败。统一为单例并让读写方都持锁可彻底消除该竞态。
+#[cfg(test)]
+pub(crate) static SCREEN_SIZE_TEST_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 /// RAII 包装器：独占拥有一个 Win32 进程句柄，Drop 时调用 `CloseHandle`。
 ///
 /// W-001 修复：`WebRenderer::create_pause_sender` 通过 `duplicate_process_handle`
@@ -301,8 +310,8 @@ pub enum ScalingMode {
     Fill,
     Fit,
     Stretch,
+    Tile,
     Center,
-    Original,
 }
 
 /// GIF 内存管理策略
@@ -715,7 +724,7 @@ pub trait WallpaperRenderer: Send {
     ///
     /// - **图片 / GIF / 网页**：无"嵌入后首帧延迟"，默认实现直接返回 `true`。
     /// - **视频（mpv）**：`after_embed` 通过 IPC `loadfile` 加载文件（fire-and-forget，
-    ///   不保证首帧已渲染），须覆写本方法轮询 mpv 至 `width>0 且 idle-active=no`
+    ///   不保证首帧已渲染），须覆写本方法轮询 mpv 至 `width>0 且 idle-active=false`
     ///   才返回 `true`，确保 terminate 旧时新窗已显示首帧、瞬时无黑屏。
     ///
     /// 返回 `Err` 表示无法确认就绪状态（如 mpv IPC 中断），调用方应超时/失败终止
@@ -784,12 +793,14 @@ pub fn calculate_scaling(
             (draw_x, draw_y, draw_w, draw_h)
         }
         ScalingMode::Stretch => (0, 0, win_w as i32, win_h as i32),
+        // 平铺模式：返回"基准瓦片"矩形（原始尺寸、原点对齐），
+        // 实际铺满屏幕的网格循环在 gdi_base.rs 的绘制函数中实现。
+        ScalingMode::Tile => (0, 0, img_w as i32, img_h as i32),
         ScalingMode::Center => {
             let draw_x = (win_w as i32 - img_w as i32) / 2;
             let draw_y = (win_h as i32 - img_h as i32) / 2;
             (draw_x, draw_y, img_w as i32, img_h as i32)
         }
-        ScalingMode::Original => (0, 0, img_w as i32, img_h as i32),
     }
 }
 
@@ -798,7 +809,7 @@ pub fn calculate_scaling(
 /// 当绘制矩形 `[draw_x, draw_x+draw_w) × [draw_y, draw_y+draw_h)` 完全覆盖
 /// 客户区 `[0, client_w) × [0, client_h)` 时返回 `true`。此时 StretchDIBits/
 /// StretchBlt 会覆写全部客户区像素，前置的 FillRect 黑底被完全覆盖，可跳过
-/// 以省一次全屏 GDI 填充。Fill/Stretch 覆盖模式返回 `true`；Fit/Center/Original
+/// 以省一次全屏 GDI 填充。Fill/Stretch 覆盖模式返回 `true`；Fit/Center/Tile
 /// 等留黑边模式（绘制矩形小于客户区）返回 `false`，仍需 FillRect 填充 letterbox。
 pub(crate) fn draw_rect_covers_full(
     draw_x: i32,
@@ -910,11 +921,11 @@ mod tests {
     }
 
     #[test]
-    fn original_any_image() {
-        let (x, y, w, h) = calculate_scaling(800, 600, 1920, 1080, ScalingMode::Original);
+    fn tile_any_image() {
+        let (x, y, w, h) = calculate_scaling(800, 600, 1920, 1080, ScalingMode::Tile);
         assert_eq!((x, y, w, h), (0, 0, 800, 600));
 
-        let (x, y, w, h) = calculate_scaling(2560, 1440, 1920, 1080, ScalingMode::Original);
+        let (x, y, w, h) = calculate_scaling(2560, 1440, 1920, 1080, ScalingMode::Tile);
         assert_eq!((x, y, w, h), (0, 0, 2560, 1440));
     }
 
@@ -987,8 +998,8 @@ mod tests {
             ScalingMode::Fill,
             ScalingMode::Fit,
             ScalingMode::Stretch,
+            ScalingMode::Tile,
             ScalingMode::Center,
-            ScalingMode::Original,
         ];
         for variant in variants {
             let json = serde_json::to_string(&variant).unwrap();
@@ -1008,8 +1019,8 @@ mod tests {
             ("\"fill\"", ScalingMode::Fill),
             ("\"fit\"", ScalingMode::Fit),
             ("\"stretch\"", ScalingMode::Stretch),
+            ("\"tile\"", ScalingMode::Tile),
             ("\"center\"", ScalingMode::Center),
-            ("\"original\"", ScalingMode::Original),
         ] {
             let decoded: ScalingMode = serde_json::from_str(json).unwrap();
             assert_eq!(serde_json::to_string(&expected).unwrap(), json);

@@ -111,6 +111,10 @@ pub enum MirrorStarError {
     /// WebView2 异步操作超时（W-006: 替代无限阻塞的 wait_for_async_operation）
     #[error("WebView2 操作超时: {0}")]
     WebView2Timeout(String),
+
+    /// 未找到指定进程的音频会话（可能为静音视频，或会话尚未注册）
+    #[error("未找到进程 {pid} 的音频会话")]
+    AudioSessionNotFound { pid: u32 },
 }
 
 impl serde::Serialize for MirrorStarError {
@@ -141,6 +145,7 @@ impl serde::Serialize for MirrorStarError {
             MirrorStarError::InvalidUrl { .. } => "InvalidUrl",
             MirrorStarError::InvalidArgument { .. } => "InvalidArgument",
             MirrorStarError::WebView2Timeout(_) => "WebView2Timeout",
+            MirrorStarError::AudioSessionNotFound { .. } => "AudioSessionNotFound",
         };
         let mut state = serializer.serialize_struct("MirrorStarError", 2)?;
         state.serialize_field("code", code)?;

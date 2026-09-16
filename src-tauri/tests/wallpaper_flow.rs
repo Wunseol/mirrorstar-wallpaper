@@ -275,7 +275,7 @@ fn test_set_scaling_mode_workerw() {
         ScalingMode::Fill,
         ScalingMode::Stretch,
         ScalingMode::Center,
-        ScalingMode::Original,
+        ScalingMode::Tile,
     ] {
         let result = engine.set_scaling_mode(&display_id, mode);
         assert!(result.is_ok(), "set_scaling_mode {:?} 应成功", mode);
@@ -444,8 +444,8 @@ fn test_set_scaling_mode_invalid_string_mapping() {
     assert_eq!(parse_scaling_mode("stretch").unwrap(), ScalingMode::Stretch);
     assert_eq!(parse_scaling_mode("center").unwrap(), ScalingMode::Center);
     assert_eq!(
-        parse_scaling_mode("original").unwrap(),
-        ScalingMode::Original
+        parse_scaling_mode("tile").unwrap(),
+        ScalingMode::Tile
     );
 
     // 非法字符串 → InvalidArgument 错误（ST-004: 参数校验错误改用 InvalidArgument 变体）

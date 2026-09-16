@@ -68,6 +68,19 @@ pub(crate) const WP_PROC_CONNECT_RETRIES: u32 = 160;
 /// 8s 总超时不变（160 × 50ms = 8s），降低管道就绪后到下次检测的等待延迟。
 pub(crate) const WP_PROC_CONNECT_INTERVAL_MS: u64 = 50;
 
+/// 初始音量设置重试次数（等待 mpv/wp-proc 音频会话注册）
+///
+/// mpv 启动后 WASAPI 音频会话异步注册，`play()` 后立即调用
+/// `set_process_volume` 会命中"未找到进程 X 的音频会话"。
+///
+/// 从 20 降为 5：静音视频（无音轨）已由 Task 2 的音轨探测在调用
+/// `set_process_volume` 前剔除，此循环仅服务"有音轨但会话尚未注册"的短暂等待。
+/// 且 `with_session` 已对"未找到会话"静默处理（不刷新、不重试、不刷屏），
+/// 故此循环只在最终失败时打一条 WARN。5 × 150ms ≈ 0.75s。
+pub(crate) const AUDIO_VOLUME_RETRIES: u32 = 5;
+/// 初始音量设置重试间隔（毫秒）
+pub(crate) const AUDIO_VOLUME_RETRY_INTERVAL_MS: u64 = 150;
+
 /// 子进程渲染器窗口识别的窗口属性名
 ///
 /// `set_hwnd` 通过 `SetPropW` 在本应用 mpv/wp-proc 渲染器窗口上打此标记，

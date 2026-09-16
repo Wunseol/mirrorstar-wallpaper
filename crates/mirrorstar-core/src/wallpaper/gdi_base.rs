@@ -384,7 +384,7 @@ pub unsafe fn paint_with_double_buffer(
         // #6: 仅当绘制矩形未完全覆盖客户区（存在黑边）或无像素可绘时才填充黑色背景。
         // Fill/Stretch 等覆盖模式下绘制矩形完全覆盖客户区，StretchDIBits 会覆写全部像素，
         // 此前 FillRect 的全屏黑底会被完全覆盖 → 跳过以省一次全屏 GDI 填充。
-        // Fit/Center/Original 等留黑边模式仍需 FillRect 填充 letterbox 区域。
+        // Fit/Center/Tile 等留黑边模式仍需 FillRect 填充 letterbox 区域。
         let will_draw = img_w > 0 && img_h > 0 && !pixels.is_empty();
         let covers_full = will_draw
             && super::draw_rect_covers_full(draw_x, draw_y, draw_w, draw_h, client_w, client_h);
@@ -404,7 +404,39 @@ pub unsafe fn paint_with_double_buffer(
             // BI_BITFIELDS + RGB 掩码：GDI 直接解释 RGBA 字节序，无需 BGRA swap
             let bmi = BitmapInfoBitfields::new(img_w as i32, img_h as i32);
 
-            if StretchDIBits(
+            if scaling_mode == ScalingMode::Tile {
+                // 平铺模式：按 img_w×img_h 网格把图片重复绘制铺满客户区（不缩放、原点对齐）
+                let img_w_i32 = img_w as i32;
+                let img_h_i32 = img_h as i32;
+                let mut ty = 0i32;
+                while ty < client_h {
+                    let mut tx = 0i32;
+                    while tx < client_w {
+                        if StretchDIBits(
+                            cache.mem_dc(),
+                            tx,
+                            ty,
+                            img_w_i32,
+                            img_h_i32,
+                            0,
+                            0,
+                            img_w_i32,
+                            img_h_i32,
+                            Some(pixels.as_ptr() as *const _),
+                            &bmi as *const BitmapInfoBitfields as *const BITMAPINFO,
+                            DIB_RGB_COLORS,
+                            SRCCOPY,
+                        ) == 0
+                        {
+                            tracing::error!(
+                                "StretchDIBits 失败：图片绘制到内存 DC 失败（可能黑屏）"
+                            );
+                        }
+                        tx += img_w_i32;
+                    }
+                    ty += img_h_i32;
+                }
+            } else if StretchDIBits(
                 cache.mem_dc(),
                 draw_x,
                 draw_y,
@@ -537,7 +569,38 @@ pub unsafe fn paint_image_with_double_buffer(
                 let old_obj = SelectObject(src_dc, image_bitmap);
                 // HALFTONE 模式已由 mem_dc 的 SetStretchBltMode 设置（GdiCache::new 中），
                 // StretchBlt 使用目标 DC 的拉伸模式
-                if !StretchBlt(
+                if scaling_mode == ScalingMode::Tile {
+                    // 平铺模式：按 img_w×img_h 网格把图片重复绘制铺满客户区（不缩放、原点对齐）
+                    let img_w_i32 = img_w as i32;
+                    let img_h_i32 = img_h as i32;
+                    let mut ty = 0i32;
+                    while ty < client_h {
+                        let mut tx = 0i32;
+                        while tx < client_w {
+                            if !StretchBlt(
+                                cache.mem_dc(),
+                                tx,
+                                ty,
+                                img_w_i32,
+                                img_h_i32,
+                                src_dc,
+                                0,
+                                0,
+                                img_w_i32,
+                                img_h_i32,
+                                SRCCOPY,
+                            )
+                            .as_bool()
+                            {
+                                tracing::error!(
+                                    "StretchBlt 失败：图片绘制到内存 DC 失败（可能黑屏）"
+                                );
+                            }
+                            tx += img_w_i32;
+                        }
+                        ty += img_h_i32;
+                    }
+                } else if !StretchBlt(
                     cache.mem_dc(),
                     draw_x,
                     draw_y,

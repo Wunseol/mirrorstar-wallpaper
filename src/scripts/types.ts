@@ -34,11 +34,11 @@
 export type WallpaperState = "Initializing" | "Playing" | "Paused" | "Terminated";
 
 /// 缩放模式，与后端 Rust ScalingMode 枚举的 serde 序列化格式一致（lowercase）
-export type ScalingMode = "fill" | "fit" | "stretch" | "center" | "original";
+export type ScalingMode = "fill" | "fit" | "stretch" | "tile" | "center";
 
 /// 显示器排列模式（三值编排，DR-2 / 设计 §4.4），与后端 Rust Arrangement
 /// 枚举的 serde 序列化格式一致（snake_case）。
-/// 注意：`all_same`（全体员工同图）为新增变体，旧前端类型缺失须补齐。
+/// 注意：`all_same`（每屏同图）为新增变体，旧前端类型缺失须补齐。
 export type Arrangement = "per_monitor" | "all_same" | "span";
 
 /// 采样算法（DR-4，设计 §7），与后端 Rust Order 枚举 serde 序列化格式一致（snake_case）。

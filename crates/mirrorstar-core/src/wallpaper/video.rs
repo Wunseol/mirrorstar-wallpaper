@@ -26,6 +26,221 @@ fn should_invoke_wasapi(com_initialized: bool, pid: Option<u32>, has_volume_cont
     com_initialized && pid.is_some() && has_volume_control
 }
 
+/// 音轨探测结果（Task 2：消除 WASAPI 音量控制警报风暴）
+///
+/// 在调用 WASAPI 音量控制前探测视频是否有音轨，静音视频（无音轨）直接跳过
+/// WASAPI，从根上消除"未找到音频会话"被误判为设备错误导致的刷新/重试/刷屏。
+enum ProbeOutcome {
+    /// 有音轨（或探测查询失败、不确定时保守视为有音轨）：执行音量重试循环
+    HasAudio,
+    /// 确认无音轨（静音视频）：跳过 WASAPI，不打 WARN
+    Silent,
+    /// mpv 未在等待预算内进入播放（探测时序不确定）：回退为单次静默 WASAPI 尝试
+    TimedOut,
+}
+
+/// 判断 mpv `idle-active` 属性值是否为"空闲（idle）"。
+///
+/// 兼容两种形式：JSON 布尔（true=idle）与字符串（"yes"=idle，历史数据/单元测试；
+/// "no"=播放中=非 idle）。取不到有效值（其他字符串 / 缺失 / error 对象）时返回
+/// true（保守视为 idle，继续轮询等待，避免在 loadfile 生效前误判为播放中）。
+fn is_mpv_idle_active(value: &serde_json::Value) -> bool {
+    match value.as_bool() {
+        Some(b) => b,
+        None => match value.as_str() {
+            Some("yes") => true,
+            Some("no") => false,
+            // 取不到有效值：保守视为 idle，继续轮询等待。
+            _ => true,
+        },
+    }
+}
+
+/// 静音视频探测：等待 mpv 进入播放后查询 `track-list` 判断是否有 audio 音轨。
+///
+/// **时序背景**：mpv 以 `--idle=yes` 启动（不加载任何文件），视频文件由
+/// `after_embed()` 在窗口嵌入后通过 IPC `loadfile` 加载。后台音频线程在
+/// `play()` 末尾 spawn，运行时刻很可能**早于** loadfile，此时 mpv 仍处于 idle、
+/// `track-list` 为空。若直接查询音轨会误判为静音而漏掉有音轨视频的音量。
+///
+/// 故先轮询 `idle-active` 等待 mpv 真正开始播放，再查询 `track-list`：
+/// - 返回 `false`（正在播放）→ 停止轮询，进入音轨查询
+/// - 返回 `true` 或查询错误 → 继续轮询（每轮短暂持有 IPC 锁后释放再 sleep，
+///   避免长时间占用 mutex 阻塞主线程的 after_embed loadfile）
+/// - 超时仍 idle → 回退 [`ProbeOutcome::TimedOut`]，保证不因探测时序引入回归
+fn probe_audio_track(ipc: &Arc<std::sync::Mutex<Option<MpvIpcClient>>>) -> ProbeOutcome {
+    // 等待预算：与音量重试窗口同量级（约 3s），覆盖 loadfile 生效与解码初始化延迟。
+    const AUDIO_PROBE_TIMEOUT_MS: u64 = 3000;
+    // 每轮轮询间隔（缩短探测期间占用的 IPC 锁时间）。
+    const PROBE_POLL_MS: u64 = 150;
+
+    let start = std::time::Instant::now();
+    let mut playing = false;
+    loop {
+        // 短暂持有 IPC 锁查询 idle-active，随后释放再 sleep。
+        let idle = {
+            let mut guard = ipc.lock().unwrap_or_else(|e| e.into_inner());
+            match guard.as_mut() {
+                Some(client) => match client.get_property("idle-active") {
+                    // idle=true：仍在等待文件加载；idle=false：正在播放。
+                    Ok(v) => is_mpv_idle_active(&v),
+                    // 查询失败：视为仍 idle，继续轮询等待。
+                    Err(_) => true,
+                },
+                // IPC 未连接：继续轮询。
+                None => true,
+            }
+        };
+        if !idle {
+            playing = true;
+            break;
+        }
+        if start.elapsed().as_millis() >= AUDIO_PROBE_TIMEOUT_MS as u128 {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(PROBE_POLL_MS));
+    }
+
+    if !playing {
+        // 超时仍未进入播放 → 时序无法确认，回退为单次静默 WASAPI 尝试。
+        return ProbeOutcome::TimedOut;
+    }
+
+    // 进入播放后查询音轨：track-list 为 track 对象数组，若存在任意 type=="audio"
+    // 的 track 则判定有音轨。
+    let has_audio = {
+        let mut guard = ipc.lock().unwrap_or_else(|e| e.into_inner());
+        match guard.as_mut() {
+            Some(client) => match client.get_property("track-list") {
+                Ok(v) => match v.as_array() {
+                    Some(tracks) => tracks
+                        .iter()
+                        .any(|t| t.get("type").and_then(|ty| ty.as_str()) == Some("audio")),
+                    // 解析失败：不确定，保守视为有音轨。
+                    None => true,
+                },
+                // 查询失败：不确定，保守视为有音轨。
+                Err(_) => true,
+            },
+            // IPC 未连接：不确定，保守视为有音轨。
+            None => true,
+        }
+    };
+
+    if has_audio {
+        ProbeOutcome::HasAudio
+    } else {
+        ProbeOutcome::Silent
+    }
+}
+
+/// 计算视频解码队列上限：单帧字节 = 宽×高×1.5（YUV420 8bit）。
+/// 仅当单帧超 16MB（4K 以上）时才需要放大队列，否则保持 16MB 内存优先默认。
+fn vd_queue_max_bytes(video_w: u64, video_h: u64) -> u64 {
+    let frame_bytes = video_w.saturating_mul(video_h).saturating_mul(3) / 2;
+    (16 * 1024 * 1024).max(frame_bytes.saturating_mul(3))
+}
+
+/// 解析 mpv `video-params/w` / `video-params/h` 属性值。
+///
+/// mpv JSON IPC 的 `get_property` 对这两个子属性以字符串返回（如 `"1920"`）。
+/// 非字符串或解析失败（含非数字、负数、溢出）返回 `None`，调用方跳过队列调优。
+fn parse_dimension(value: &serde_json::Value) -> Option<u64> {
+    value.as_str()?.parse::<u64>().ok()
+}
+
+/// 视频探测结果，用于调用方决定是否需要在 video-params 未就绪时有界重试。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum VideoProbeResult {
+    /// 已取得决定性结果（分辨率就绪并走完调优/保持逻辑），无需重试。
+    Done,
+    /// video-params 尚未就绪（查询 Err 或解析失败），调用方可短暂重试。
+    Retry,
+}
+
+/// v15.0（audit-edge-clarity-followups）：video-params 未就绪时，解码队列探测/调优的有界重试次数与间隔。
+/// 与既有 `AUDIO_VOLUME_RETRIES` / `AUDIO_VOLUME_RETRY_INTERVAL_MS` 保持一致节奏。
+const VIDEO_PROBE_RETRIES: u32 = 5;
+const VIDEO_PROBE_RETRY_INTERVAL_MS: u64 = 150;
+
+/// 视频尺寸探测与解码队列调优（clarity-first-upscale，Task 2）。
+///
+/// 在 mpv 进入播放后（与 [`probe_audio_track`] 同批调用）读取真实分辨率
+/// `video-params/w`、`video-params/h`：单帧字节（宽×高×1.5，YUV420 8bit）
+/// 超 16MB（即 4K 以上）时，将解码队列上限从启动参数默认的 16MB 放大为
+/// [`vd_queue_max_bytes`]，避免高分辨率视频因队列过小频繁丢弃/重建解码帧。
+/// 未超阈值（1080p 等）或解析失败时保持 16MB 内存优先默认，不做改动。
+///
+/// 任何失败（查询失败 / 解析失败 / set_property 失败）均仅记录日志，
+/// 不改变整体成功/失败语义、不阻塞播放。
+fn probe_video_size_and_tune_queue(
+    ipc: &Arc<std::sync::Mutex<Option<MpvIpcClient>>>,
+) -> VideoProbeResult {
+    // 单帧超 16MB（4K 以上）才需要放大队列的判定基准（与 vd_queue_max_bytes 的
+    // 16MB 内存优先下限一致）。
+    const FRAME_BYTES_THRESHOLD: u64 = 16 * 1024 * 1024;
+
+    let mut guard = ipc.lock().unwrap_or_else(|e| e.into_inner());
+    let Some(client) = guard.as_mut() else {
+        // IPC 未连接：跳过调参（短时间不会连上，重试无意义）。
+        return VideoProbeResult::Done;
+    };
+
+    // 读取宽/高，任一查询失败或解析失败即视为 video-params 尚未就绪（可重试）。
+    let video_w = match client.get_property("video-params/w") {
+        Ok(v) => match parse_dimension(&v) {
+            Some(w) => w,
+            None => {
+                tracing::debug!(value = ?v, "video-params/w 解析失败，跳过解码队列调优");
+                return VideoProbeResult::Retry;
+            }
+        },
+        Err(e) => {
+            tracing::debug!(error = %e, "video-params/w 查询失败，跳过解码队列调优");
+            return VideoProbeResult::Retry;
+        }
+    };
+    let video_h = match client.get_property("video-params/h") {
+        Ok(v) => match parse_dimension(&v) {
+            Some(h) => h,
+            None => {
+                tracing::debug!(value = ?v, "video-params/h 解析失败，跳过解码队列调优");
+                return VideoProbeResult::Retry;
+            }
+        },
+        Err(e) => {
+            tracing::debug!(error = %e, "video-params/h 查询失败，跳过解码队列调优");
+            return VideoProbeResult::Retry;
+        }
+    };
+
+    // 单帧字节 = 宽×高×1.5（YUV420 8bit）。未超 16MB 时保持内存优先默认。
+    let frame_bytes = video_w.saturating_mul(video_h).saturating_mul(3) / 2;
+    if frame_bytes <= FRAME_BYTES_THRESHOLD {
+        tracing::debug!(
+            video_w,
+            video_h,
+            frame_bytes,
+            "分辨率未超 4K，解码队列保持 16MB 默认"
+        );
+        return VideoProbeResult::Done;
+    }
+
+    let queue_bytes = vd_queue_max_bytes(video_w, video_h);
+    tracing::info!(
+        video_w,
+        video_h,
+        frame_bytes,
+        queue_bytes,
+        "4K 以上视频：放大解码队列上限"
+    );
+    if let Err(e) = client.set_property("vd-queue-max-bytes", &queue_bytes.to_string()) {
+        // set_property 失败仅告警，不阻塞播放。
+        tracing::warn!(error = %e, queue_bytes, "设置 vd-queue-max-bytes 失败");
+    }
+    VideoProbeResult::Done
+}
+
 /// 视频音频状态，合并为单一 Mutex 以避免嵌套锁
 struct VideoAudioState {
     /// 静音前的音量（用于恢复）；Some 表示当前已静音
@@ -143,6 +358,11 @@ impl VideoRenderer {
             "--loop-file".to_string(),
             "--hwdec=auto".to_string(),
             "--vo=gpu".to_string(),
+            // clarity-first-upscale（Task 2）：基础升采样滤镜（lanczos sharp 变体）。
+            // 壁纸视频（常见 1080p）放大到 4K 屏时使用高质量升采样，边缘更锐利。
+            // 该参数作为 --scale 全局默认；Fill/Fit/Stretch 的适配行为仍由下方
+            // panscan/keepaspect 控制，互不冲突。
+            "--scale=ewa_lanczossharp".to_string(),
             "--input-vo-keyboard=no".to_string(),
             "--no-osc".to_string(),
             "--no-osd-bar".to_string(),
@@ -188,8 +408,12 @@ impl VideoRenderer {
 
         // 根据缩放模式设置视频缩放参数
         match self.base.scaling_mode {
+            // 填充：等比放大铺满窗口并裁切溢出部分，与静态图片的 Fill 行为一致。
+            // mpv 默认 panscan=0.0（不裁切，保留黑边，等同"适应"），必须显式
+            // --panscan=1.0 才能消除黑边填满窗口（等比，不变形）。
             ScalingMode::Fill => {
                 args.push("--video-unscaled=no".to_string());
+                args.push("--panscan=1.0".to_string());
             }
             ScalingMode::Fit => {
                 args.push("--video-unscaled=no".to_string());
@@ -199,7 +423,12 @@ impl VideoRenderer {
                 args.push("--video-unscaled=no".to_string());
                 args.push("--keepaspect=no".to_string());
             }
-            ScalingMode::Center | ScalingMode::Original => {
+            ScalingMode::Center => {
+                args.push("--video-unscaled=yes".to_string());
+            }
+            // 已知限制：mpv 无原生平铺能力，Tile 模式回退为"原始尺寸居中"行为
+            // （与 Center 相同），不崩溃即可；如后续 mpv 支持平铺再增强。
+            ScalingMode::Tile => {
                 args.push("--video-unscaled=yes".to_string());
             }
         }
@@ -218,7 +447,7 @@ impl VideoRenderer {
     /// 任一属性查询失败时在该字段记录错误信息而不中断整体查询。
     ///
     /// 诊断判定：
-    /// - `idle-active = "no"` 且 `time-pos` 持续增长 → 视频已 loadfile 且正在播放
+    /// - `idle-active = false`（JSON 布尔，播放中）且 `time-pos` 持续增长 → 视频已 loadfile 且正在播放
     /// - `width`/`height` > 0 → 视频纹理已成功创建（无黑屏）
     pub fn diagnostic_playback_status(
         &mut self,
@@ -259,7 +488,12 @@ impl VideoRenderer {
 ///
 /// 解析 [`VideoRenderer::diagnostic_playback_status`] 返回的 JSON：
 /// - `width` > 0：视频解码完成、纹理已创建（无黑屏）
-/// - `idle-active` == "no"：mpv 已 `loadfile` 且正在解码（非空闲）
+/// - `idle-active` == `false`：mpv 已 `loadfile` 且正在解码（非空闲）
+///
+/// 注意：mpv JSON IPC 将 flag 属性序列化为 **JSON 布尔**——`idle-active` 空闲时为
+/// `true`、播放中为 `false`，而非字符串 `"yes"`/`"no"`（曾误按字符串 `"no"` 解析，
+/// 导致播放中的就绪判断永远不成立、原子交换 8s 超时）。此处兼容布尔与字符串两种
+/// 形式。
 ///
 /// 任一属性查询失败（字段为 `{"error": ...}` 对象）或取不到有效值时返回 `false`，
 /// 由调用方继续轮询直至超时，而不会误判为就绪。
@@ -269,10 +503,14 @@ pub fn video_first_frame_ready(status: &serde_json::Value) -> bool {
         .and_then(|v| v.as_i64())
         .map(|w| w > 0)
         .unwrap_or(false);
-    let idle_ok = matches!(
-        status.get("idle-active").and_then(|v| v.as_str()),
-        Some("no")
-    );
+    // 布尔：false = 播放中（非空闲）；字符串：兼容 "no"（历史数据 / 单元测试）。
+    let idle_ok = match status.get("idle-active").and_then(|v| v.as_bool()) {
+        Some(playing) => !playing,
+        None => matches!(
+            status.get("idle-active").and_then(|v| v.as_str()),
+            Some("no")
+        ),
+    };
     width_ok && idle_ok
 }
 
@@ -350,6 +588,7 @@ impl WallpaperRenderer for VideoRenderer {
         // WASAPI 在后台线程初始化 COM（MTA）后执行音量设置。失败仅 warn 不影响主流程。
         if let (Some(pid), Some(vc)) = (self.base.process_pid(), self.volume_control.as_ref()) {
             let vc = vc.clone();
+            let ipc_for_audio = self.ipc.clone();
             let volume = self.volume;
             let muted = self.muted;
             let pid_for_audio = pid;
@@ -367,13 +606,90 @@ impl WallpaperRenderer for VideoRenderer {
                         return;
                     }
 
-                    let vc = vc.lock().unwrap_or_else(|e| e.into_inner());
-                    if let Err(e) = vc.set_process_volume(pid_for_audio, volume) {
-                        tracing::warn!(error = ?e, "set_process_volume 失败（后台线程）");
+                    // 消警报风暴（Task 2）：在真正设置音量前探测音轨。
+                    // 静音视频（无音轨）直接跳过 WASAPI，避免"未找到音频会话"被
+                    // 误判为设备错误驱动 refresh_session_manager 重建 + 刷屏。
+                    // ipc 另克隆一份供探测使用（与主流程自持的 ipc 相同 Arc）。
+                    let outcome = probe_audio_track(&ipc_for_audio);
+                    // clarity-first-upscale（Task 2）：视频尺寸探测与解码队列调优。
+                    // 与音轨探测同批执行（此时 mpv 已进入播放），4K 以上视频放大
+                    // vd-queue-max-bytes 避免解码队列过小频繁丢帧/重建；失败仅记录
+                    // 日志、不阻塞播放，也不影响下方音量逻辑。
+                    // v15.0（audit-edge-clarity-followups）：video-params 未就绪时有界重试，
+                    // 避免 4K 解码队列调优被一次性静默跳过。已就绪（Done）首调即退出、不引入
+                    // 延迟；仅未就绪（Retry）才短暂 sleep 重试，达到上限后以 WARN 日志收尾，
+                    // 不阻塞同线程后续音量逻辑。
+                    let mut probe_outcome = VideoProbeResult::Done;
+                    for attempt in 0..VIDEO_PROBE_RETRIES {
+                        probe_outcome = probe_video_size_and_tune_queue(&ipc_for_audio);
+                        if probe_outcome == VideoProbeResult::Done {
+                            break;
+                        }
+                        if attempt + 1 < VIDEO_PROBE_RETRIES {
+                            std::thread::sleep(std::time::Duration::from_millis(
+                                VIDEO_PROBE_RETRY_INTERVAL_MS,
+                            ));
+                        }
                     }
-                    if muted {
-                        if let Err(e) = vc.set_process_mute(pid_for_audio, true) {
-                            tracing::warn!(error = ?e, "set_process_mute 失败（后台线程）");
+                    if probe_outcome == VideoProbeResult::Retry {
+                        tracing::warn!("video-params 多次重试仍未就绪，跳过解码队列调优（不影响播放）");
+                    }
+                    match outcome {
+                        ProbeOutcome::HasAudio => {
+                            // 有音轨（或探测不确定时保守视为有音轨）：执行音量重试循环。
+                            // 循环内无逐次日志，仅结束失败时打一条 WARN。
+                            let vc = vc.lock().unwrap_or_else(|e| e.into_inner());
+                            let mut volume_ok = false;
+                            let mut last_err = None;
+                            for _ in 0..super::subprocess_base::AUDIO_VOLUME_RETRIES {
+                                match vc.set_process_volume(pid_for_audio, volume) {
+                                    Ok(()) => {
+                                        volume_ok = true;
+                                        break;
+                                    }
+                                    Err(e) => {
+                                        last_err = Some(e);
+                                        std::thread::sleep(std::time::Duration::from_millis(
+                                            super::subprocess_base::AUDIO_VOLUME_RETRY_INTERVAL_MS,
+                                        ));
+                                    }
+                                }
+                            }
+                            if let Some(e) = last_err {
+                                tracing::warn!(error = ?e, "set_process_volume 失败（后台线程，重试窗口内音频会话未就绪）");
+                            }
+                            if muted && volume_ok {
+                                if let Err(e) = vc.set_process_mute(pid_for_audio, true) {
+                                    tracing::warn!(error = ?e, "set_process_mute 失败（后台线程）");
+                                }
+                            }
+                        }
+                        ProbeOutcome::Silent => {
+                            // 确认无音轨（静音视频）：直接跳过 WASAPI，不打 WARN。
+                            tracing::debug!(pid = pid_for_audio, "视频无音轨，跳过 WASAPI 音量设置");
+                        }
+                        ProbeOutcome::TimedOut => {
+                            // mpv 未在等待预算内进入播放：回退为单次静默 WASAPI 尝试，
+                            // 仅 debug 级日志，保证不因探测时序引入功能回归。
+                            let vc = vc.lock().unwrap_or_else(|e| e.into_inner());
+                            match vc.set_process_volume(pid_for_audio, volume) {
+                                Ok(()) => {
+                                    if muted {
+                                        if let Err(e) = vc.set_process_mute(pid_for_audio, true) {
+                                            tracing::debug!(
+                                                error = ?e,
+                                                "探测超时回退：set_process_mute 失败（单次尝试）"
+                                            );
+                                        }
+                                    }
+                                }
+                                Err(e) => {
+                                    tracing::debug!(
+                                        error = ?e,
+                                        "探测超时回退：单次 set_process_volume 失败（仅 debug）"
+                                    );
+                                }
+                            }
                         }
                     }
 
@@ -439,6 +755,16 @@ impl WallpaperRenderer for VideoRenderer {
     }
 
     fn terminate(&mut self) -> Result<(), crate::MirrorStarError> {
+        // 0. 先置终止状态（先于进程退出）——同步 base.state 与 shared_state：
+        //    退出监听线程读取 shared_state（create_pause_sender 内
+        //    spawn_proc_exit_monitor 回调），若进程退出时仍为 Playing/Paused，
+        //    会误报"mpv 子进程异常退出"并触发多余状态变更事件。先置位可彻底
+        //    关闭该竞态；子进程真正崩溃（state != Terminated）时原异常路径不变。
+        self.base.set_state(WallpaperState::Terminated);
+        if let Some(sender) = &self.base.pause_sender {
+            sender.set_state(WallpaperState::Terminated);
+        }
+
         // 1. 通过 IPC 请求 mpv 退出
         {
             let mut ipc = self.ipc.lock().unwrap_or_else(|e| e.into_inner());
@@ -461,7 +787,6 @@ impl WallpaperRenderer for VideoRenderer {
             *ipc = None;
         }
         self.base.set_hwnd(None);
-        self.base.set_state(WallpaperState::Terminated);
 
         tracing::info!("视频壁纸已终止");
         Ok(())
@@ -549,7 +874,7 @@ impl WallpaperRenderer for VideoRenderer {
         }
     }
 
-    /// 原子交换就绪判断（DR-33）：轮询 mpv 至 `width>0 且 idle-active=no`
+    /// 原子交换就绪判断（DR-33）：轮询 mpv 至 `width>0 且 idle-active=false`
     /// 才认为首帧已渲染，避免 terminate 旧壁纸时新窗未显示首帧导致黑屏。
     fn poll_first_frame_ready(&mut self) -> Result<bool, crate::MirrorStarError> {
         let status = self.diagnostic_playback_status()?;
@@ -641,7 +966,12 @@ impl WallpaperRenderer for VideoRenderer {
                                 if let (Some(p), Some(vc)) = (pid, volume_control.as_ref()) {
                                     let vc = vc.lock().unwrap_or_else(|e| e.into_inner());
                                     if let Err(e) = vc.set_process_volume(p, volume) {
-                                        tracing::warn!(error = ?e, "SetVolume set_process_volume 失败");
+                                        if matches!(e, crate::MirrorStarError::AudioSessionNotFound { .. }) {
+                                            // 静音视频无音频会话：属预期情形，降级为 debug，避免拖动音量滑块时刷屏
+                                            tracing::debug!(error = ?e, "SetVolume set_process_volume：静音视频无音频会话，跳过");
+                                        } else {
+                                            tracing::warn!(error = ?e, "SetVolume set_process_volume 失败");
+                                        }
                                     }
                                 }
                             } else if !com_initialized {
@@ -673,7 +1003,12 @@ impl WallpaperRenderer for VideoRenderer {
                                 if let (Some(p), Some(vc)) = (pid, volume_control.as_ref()) {
                                     let vc = vc.lock().unwrap_or_else(|e| e.into_inner());
                                     if let Err(e) = vc.set_process_volume(p, target_volume) {
-                                        tracing::warn!(error = ?e, "ToggleMute set_process_volume 失败");
+                                        if matches!(e, crate::MirrorStarError::AudioSessionNotFound { .. }) {
+                                            // 静音视频无音频会话：属预期情形，降级为 debug，避免静音切换时刷屏
+                                            tracing::debug!(error = ?e, "ToggleMute set_process_volume：静音视频无音频会话，跳过");
+                                        } else {
+                                            tracing::warn!(error = ?e, "ToggleMute set_process_volume 失败");
+                                        }
                                     }
                                 }
                             } else if !com_initialized {
@@ -775,6 +1110,11 @@ impl Drop for VideoRenderer {
                 }
                 *ipc = None;
             }
+            // 与 terminate() 一致：先同步 shared_state 为 Terminated，
+            // 避免 drop 强杀子进程时退出监听线程读到旧状态误报异常退出。
+            if let Some(sender) = &self.base.pause_sender {
+                sender.set_state(WallpaperState::Terminated);
+            }
             if let Err(e) = self.base.process.stop_immediate() {
                 tracing::warn!(error = %e, "VideoRenderer drop 时 stop_immediate 失败");
             }
@@ -802,15 +1142,22 @@ mod tests {
         use serde_json::json;
         // 未 loadfile / 空闲：width=0 或缺失 → 未就绪
         assert!(!video_first_frame_ready(
-            &json!({"width": 0, "idle-active": "yes"})
+            &json!({"width": 0, "idle-active": true})
         ));
-        assert!(!video_first_frame_ready(&json!({"idle-active": "no"})));
+        assert!(!video_first_frame_ready(&json!({"idle-active": false})));
         assert!(!video_first_frame_ready(&json!({})));
-        // 就绪：width>0 且 idle-active=no
+        // 就绪：width>0 且 idle-active=false（mpv JSON IPC：布尔 false = 播放中）
+        assert!(video_first_frame_ready(
+            &json!({"width": 1920, "idle-active": false})
+        ));
+        // 就绪：字符串 "no" 兼容形式
         assert!(video_first_frame_ready(
             &json!({"width": 1920, "idle-active": "no"})
         ));
-        // width>0 但仍在空闲 → 未就绪
+        // width>0 但仍在空闲（布尔 true / 字符串 "yes"）→ 未就绪
+        assert!(!video_first_frame_ready(
+            &json!({"width": 1920, "idle-active": true})
+        ));
         assert!(!video_first_frame_ready(
             &json!({"width": 1920, "idle-active": "yes"})
         ));
@@ -819,6 +1166,26 @@ mod tests {
             "width": {"error": "property not found"},
             "idle-active": {"error": "property not found"}
         })));
+    }
+
+    // ========== is_mpv_idle_active 纯函数测试（Task 2：idle-active 解析稳健性） ==========
+
+    #[test]
+    fn is_mpv_idle_active_pure_branches() {
+        use serde_json::json;
+        // JSON 布尔：true = idle
+        assert!(is_mpv_idle_active(&json!(true)));
+        // JSON 布尔：false = 播放中（非 idle）
+        assert!(!is_mpv_idle_active(&json!(false)));
+        // 字符串 "yes"（历史数据 / 单元测试）→ idle
+        assert!(is_mpv_idle_active(&json!("yes")));
+        // 字符串 "no" → 播放中（非 idle）
+        assert!(!is_mpv_idle_active(&json!("no")));
+        // 其他字符串 / 缺失（Null）/ error 对象 / 数字：取不到有效值，保守视为 idle
+        assert!(is_mpv_idle_active(&json!("other")));
+        assert!(is_mpv_idle_active(&serde_json::Value::Null));
+        assert!(is_mpv_idle_active(&json!({"error": "property not found"})));
+        assert!(is_mpv_idle_active(&json!(1)));
     }
 
     // ========== Common args tests ==========
@@ -851,6 +1218,9 @@ mod tests {
         assert!(args.contains(&"--cache=no".to_string()));
         assert!(args.contains(&"--vd-queue-max-bytes=16777216".to_string()));
         assert!(args.contains(&"--ad-queue-max-bytes=4194304".to_string()));
+        // clarity-first-upscale（Task 2）：基础升采样滤镜（lanczos sharp 变体），
+        // 1080p 视频放大到 4K 屏时高质量升采样、边缘更锐利
+        assert!(args.contains(&"--scale=ewa_lanczossharp".to_string()));
         // v11.0：demuxer 后退缓冲清零 + 禁用时间维度缓存参数
         assert!(args.contains(&"--demuxer-max-back-bytes=0".to_string()));
         assert!(args.contains(&"--cache-secs=0".to_string()));
@@ -901,6 +1271,12 @@ mod tests {
             !args.iter().any(|a| a == "--panscan=0.0"),
             "Fill mode should NOT contain --panscan=0.0"
         );
+        // mpv 语义：panscan=0.0（默认）不裁切、保留黑边（等同"适应"）；
+        // --panscan=1.0 才消除黑边等比填满窗口并裁切溢出，与静态图片 Fill 一致。
+        assert!(
+            args.iter().any(|a| a == "--panscan=1.0"),
+            "Fill mode should contain --panscan=1.0"
+        );
     }
 
     #[test]
@@ -945,14 +1321,62 @@ mod tests {
     }
 
     #[test]
-    fn build_mpv_args_original_mode() {
-        let renderer = create_renderer(ScalingMode::Original);
+    fn build_mpv_args_tile_mode() {
+        let renderer = create_renderer(ScalingMode::Tile);
         let args = renderer.build_mpv_args();
 
         assert!(
             args.iter().any(|a| a == "--video-unscaled=yes"),
-            "Original mode should contain --video-unscaled=yes"
+            "Tile mode should contain --video-unscaled=yes (fallback)"
         );
+    }
+
+    // ========== clarity-first-upscale：vd_queue_max_bytes 解码队列调优测试 ==========
+
+    #[test]
+    fn vd_queue_max_bytes_keeps_16mb_for_1080p() {
+        // 1080p：单帧 = 1920×1080×1.5 = 3,110,400B（≈3MB）< 16MB，
+        // 未超阈值 → 保持 16MB 内存优先默认。
+        assert_eq!(vd_queue_max_bytes(1920, 1080), 16 * 1024 * 1024);
+    }
+
+    #[test]
+    fn vd_queue_max_bytes_scales_for_4k() {
+        // 4K：单帧 = 3840×2160×1.5 = 12,441,600B（≈12.4MB）> 16MB →
+        // max(16MB, 12,441,600×3 = 37,324,800B≈37.3MB) = 37,324,800B（≈38MB）。
+        assert_eq!(vd_queue_max_bytes(3840, 2160), 37_324_800);
+    }
+
+    #[test]
+    fn vd_queue_max_bytes_scales_for_8k() {
+        // 8K：单帧 = 7680×4320×1.5 = 49,766,400B（≈49.8MB）> 16MB →
+        // max(16MB, 49,766,400×3 = 149,299,200B≈149.3MB) = 149,299,200B（≈150MB）。
+        assert_eq!(vd_queue_max_bytes(7680, 4320), 149_299_200);
+    }
+
+    #[test]
+    fn vd_queue_max_bytes_zero_and_overflow_safe() {
+        // 极端输入不 panic：0 尺寸 / 超大尺寸（saturating 溢出保护）均安全。
+        assert_eq!(vd_queue_max_bytes(0, 0), 16 * 1024 * 1024);
+        assert_eq!(vd_queue_max_bytes(u64::MAX, u64::MAX), u64::MAX);
+    }
+
+    // ========== clarity-first-upscale：parse_dimension 宽高解析测试 ==========
+
+    #[test]
+    fn parse_dimension_success_and_failure() {
+        use serde_json::json;
+        // 成功：mpv get_property 对 video-params 子属性以字符串返回
+        assert_eq!(parse_dimension(&json!("1920")), Some(1920));
+        assert_eq!(parse_dimension(&json!("2160")), Some(2160));
+        // 失败：非数字字符串 / 小数 / 负数 / Null / 数字形式（非字符串）均跳过
+        assert_eq!(parse_dimension(&json!("abc")), None);
+        assert_eq!(parse_dimension(&json!("12.5")), None);
+        assert_eq!(parse_dimension(&json!("-1")), None);
+        assert_eq!(parse_dimension(&serde_json::Value::Null), None);
+        assert_eq!(parse_dimension(&json!(3840)), None);
+        // 失败：超出 u64 范围的超大数字字符串
+        assert_eq!(parse_dimension(&json!("18446744073709551616")), None);
     }
 
     // ========== W11 修复测试：COM 降级时跳过 WASAPI 调用 ==========
@@ -1131,6 +1555,118 @@ mod tests {
 
         // 等待监听线程退出
         monitor_thread.join().expect("监听线程应正常退出");
+
+        // 清理子进程（stop_process 对已退出进程会立即返回）
+        let _ = base.stop_process();
+    }
+
+    /// 验证正常终止路径（shared_state 已置 Terminated）不产生异常退出通知。
+    ///
+    /// 修复 A（terminate 状态一致性）：`terminate()` 现在先同步 shared_state 为
+    /// Terminated 再停止进程。本测试模拟该场景：占位进程退出前 shared_state 已为
+    /// Terminated，退出监听线程（WaitForSingleObject + state != Terminated 才通知）
+    /// 不应发送任何状态变更通知。
+    ///
+    /// 与 w002 对照：w002 验证"异常退出（state=Playing）→ 通知"；
+    /// 本测试验证"正常终止（state=Terminated）→ 不通知"，防止误报回归。
+    #[test]
+    fn w003_video_normal_terminate_no_false_exit_warning() {
+        use std::path::PathBuf;
+        use windows::Win32::System::Threading::WaitForSingleObject;
+
+        // 定位 cmd.exe（与 w002 一致）
+        let system_root = std::env::var("SystemRoot")
+            .or_else(|_| std::env::var("WINDIR"))
+            .expect("SystemRoot/WINDIR 环境变量应存在");
+        let cmd_path = PathBuf::from(system_root).join("System32").join("cmd.exe");
+        assert!(cmd_path.exists(), "cmd.exe 应存在于 {}", cmd_path.display());
+
+        // 构造 SubprocessRendererBase 并启动短生命周期进程（ping -n 2 ~1s 后自行退出）
+        let mut base =
+            SubprocessRendererBase::new(cmd_path, "test-w003-pipe".to_string(), ScalingMode::Fill);
+        base.start_process(vec!["/c".to_string(), "ping -n 2 127.0.0.1".to_string()])
+            .expect("启动测试占位进程应成功");
+
+        // 复制进程句柄（与 create_pause_sender 中的模式一致）
+        let proc_handle = base
+            .duplicate_process_handle()
+            .expect("duplicate_process_handle 应返回 Some");
+
+        // 创建共享状态与通知通道（模拟 PauseSender 的 shared_state）
+        let (sender, _rx, shared_state) = create_pause_channel();
+        // 订阅状态变更通知，验证 notify_state_changed 未被调用
+        let mut state_rx = sender.subscribe_state_changes();
+        let monitor_sender = sender.clone();
+        let monitor_display_id = "test_display_w003".to_string();
+        let monitor_shared = shared_state.clone();
+
+        // 模拟 terminate() 已同步状态：进程退出前 shared_state 已为 Terminated
+        //（修复 A 后 terminate() 先置位再停进程，退出监听线程不会误报）
+        shared_state
+            .write()
+            .unwrap_or_else(|e| e.into_inner())
+            .state = WallpaperState::Terminated;
+
+        // 使用 OwnedProcHandle 包装句柄，spawn 监听线程（与 w002 同一模式）
+        let mut owned = OwnedProcHandle::new(proc_handle);
+        let monitor_thread = std::thread::Builder::new()
+            .name("test-w003-video-proc-monitor".to_string())
+            .spawn(move || {
+                let proc_handle = match owned.take() {
+                    Some(h) => h,
+                    None => return,
+                };
+                // 无限等待子进程退出（占位进程 ~1s 后自行退出）
+                let _ = unsafe { WaitForSingleObject(proc_handle, u32::MAX) };
+                unsafe {
+                    let _ = CloseHandle(proc_handle);
+                }
+                // 检查是否为异常退出：state != Terminated 才通知（正常终止不通知）
+                let state = monitor_shared
+                    .read()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .state;
+                if state != WallpaperState::Terminated {
+                    monitor_shared
+                        .write()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .state = WallpaperState::Terminated;
+                    monitor_sender.notify_state_changed(&monitor_display_id);
+                }
+            })
+            .expect("spawn 监听线程应成功");
+
+        // 轮询等待监听线程处理完成（最多 10s；占位进程 ~1s 退出，参照 w002）
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            if monitor_thread.is_finished() {
+                break;
+            }
+            if std::time::Instant::now() > deadline {
+                panic!("监听线程 10s 内未处理完成");
+            }
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+        monitor_thread.join().expect("监听线程应正常退出");
+
+        // 给可能的（不应存在的）延迟通知一点时间，确保 try_recv 能捕获
+        std::thread::sleep(std::time::Duration::from_millis(50));
+
+        // 断言 1: shared_state.state 保持 Terminated（未被监听线程改写）
+        assert_eq!(
+            shared_state.read().unwrap_or_else(|e| e.into_inner()).state,
+            WallpaperState::Terminated,
+            "正常终止后 shared_state.state 应保持 Terminated"
+        );
+
+        // 断言 2: 无通知发送（try_recv 返回 Empty，而非 Ok(display_id)）
+        match state_rx.try_recv() {
+            Err(tokio::sync::broadcast::error::TryRecvError::Empty) => {}
+            other => panic!(
+                "正常终止（state 已置 Terminated）不应发送状态变更通知，实际结果: {:?}",
+                other
+            ),
+        }
 
         // 清理子进程（stop_process 对已退出进程会立即返回）
         let _ = base.stop_process();

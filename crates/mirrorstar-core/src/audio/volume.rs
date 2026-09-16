@@ -181,6 +181,10 @@ impl VolumeControl {
     /// `session_manager` 指向已移除的设备），自动调用 `refresh_session_manager`
     /// 重新绑定当前默认渲染设备后重试一次。重试仍失败则返回原错误。
     ///
+    /// **消除警报风暴**：若首次失败是被分类为 [`MirrorStarError::AudioSessionNotFound`]
+    /// 的"未找到音频会话"错误（静音视频无音轨，或会话尚未注册），则这不是设备错误，
+    /// 直接静默返回该错误——不刷新、不重试、不打 WARN，避免终端警报刷屏。
+    ///
     /// **A-002 日志增强**：所有 session 均失败时（首次 + 重试均未命中），
     /// 在返回 `Err` 前记录 `tracing::warn!(pid, attempted = n, "all sessions failed")`，
     /// 其中 `n` 为首次与重试两轮枚举中尝试的 session 总数，便于诊断根因
@@ -192,6 +196,17 @@ impl VolumeControl {
         let mut first_attempted = 0usize;
         let first_attempt = self.with_session_once(pid, &f, &mut first_attempted);
         if first_attempt.is_ok() {
+            return first_attempt;
+        }
+
+        // 消除 WASAPI 音量控制警报风暴：若首次失败是因为"未找到音频会话"
+        // （静音视频无音轨，或会话尚未注册），这不是设备错误，refresh_session_manager
+        // 无帮助且会触发重建 + 多重 WARN 刷屏。此时静默返回，不刷新、不重试、不 WARN。
+        if matches!(
+            first_attempt.as_ref().err(),
+            Some(crate::MirrorStarError::AudioSessionNotFound { .. })
+        ) {
+            tracing::trace!(pid, "未找到音频会话，跳过 refresh_session_manager 重试");
             return first_attempt;
         }
 
@@ -304,10 +319,7 @@ impl VolumeControl {
                 let session_enum = manager.GetSessionEnumerator()?;
 
                 let count = session_enum.GetCount()?;
-                let mut result = Err(crate::MirrorStarError::AudioControl(format!(
-                    "未找到进程 {} 的音频会话",
-                    pid
-                )));
+                let mut result = Err(crate::MirrorStarError::AudioSessionNotFound { pid });
 
                 for i in 0..count {
                     // A-002: 统计本次枚举尝试的 session 数量，

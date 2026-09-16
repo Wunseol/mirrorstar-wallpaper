@@ -263,14 +263,15 @@ fn generate_thumbnail_from_image_file(
     // 详见 `check_decoded_pixel_buffer_size` 文档。
     check_decoded_pixel_buffer_size(orig_w, orig_h)?;
 
-    // 按宽高比缩放至目标尺寸内（不放大：仅当原图大于目标尺寸时才 resize）
+    // 按宽高比缩放至目标尺寸内（不放大：仅当原图大于目标尺寸时才缩放）。
+    // scale = min(THUMB_MAX_W/orig_w, THUMB_MAX_H/orig_h)，保持宽高比，
+    // 避免非 16:9 图片缩略图被压扁。目标尺寸 round 取整且至少 1×1。
     let thumb = if orig_w > THUMB_MAX_W || orig_h > THUMB_MAX_H {
+        let scale = (THUMB_MAX_W as f64 / orig_w as f64).min(THUMB_MAX_H as f64 / orig_h as f64);
+        let dw = ((orig_w as f64 * scale).round() as u32).max(1);
+        let dh = ((orig_h as f64 * scale).round() as u32).max(1);
         // v5.0 C-PERF-007: Triangle 比 Lanczos3 快 3-5 倍，320×180 缩略图视觉差异不可察觉
-        img.resize(
-            THUMB_MAX_W,
-            THUMB_MAX_H,
-            image::imageops::FilterType::Triangle,
-        )
+        img.resize(dw, dh, image::imageops::FilterType::Triangle)
     } else {
         img
     };
@@ -645,6 +646,112 @@ mod tests {
         assert!(h <= THUMB_MAX_H, "高度 {} 应 <= {}", h, THUMB_MAX_H);
         // 1920x1080 按 16:9 缩放至 320x180
         assert_eq!((w, h), (320, 180));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn thumbnail_preserves_aspect_ratio_for_square_image() {
+        // 测试 A（1:1 方图）：800x800 → scale = min(320/800, 180/800) = 0.225
+        // → round(800*0.225) = 180，缩略图应为 180x180，宽高比保持 1.0
+        let dir = std::env::temp_dir().join("mirrorstar_thumbnail_test_square");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let src_path = dir.join("square.png");
+        let img = image::DynamicImage::new_rgb8(800, 800);
+        img.save_with_format(&src_path, ImageFormat::Png).unwrap();
+
+        let thumb_dir = dir.join("thumbnails");
+        let result = generate_thumbnail(src_path.to_str().unwrap(), &thumb_dir);
+        assert!(result.is_ok(), "缩略图生成应成功: {:?}", result.err());
+        let thumb_path = thumb_dir.join(result.unwrap());
+
+        // 用 ImageReader 解码输出的 JPEG 缩略图
+        let thumb_img = image::ImageReader::open(&thumb_path)
+            .unwrap()
+            .with_guessed_format()
+            .unwrap()
+            .decode()
+            .unwrap();
+        let (w, h) = thumb_img.dimensions();
+        assert_eq!(
+            (w, h),
+            (180, 180),
+            "800x800 方图应等比缩放为 180x180（宽高比 1.0），实际 {}x{}",
+            w,
+            h
+        );
+        assert_eq!(w as f64 / h as f64, 1.0, "方图宽高比应保持 1.0");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn thumbnail_preserves_aspect_ratio_for_wide_image() {
+        // 测试 B（超宽图）：640x180 → scale = min(320/640, 180/180) = 0.5
+        // → (round(640*0.5), round(180*0.5)) = (320, 90)
+        let dir = std::env::temp_dir().join("mirrorstar_thumbnail_test_wide");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let src_path = dir.join("wide.png");
+        let img = image::DynamicImage::new_rgb8(640, 180);
+        img.save_with_format(&src_path, ImageFormat::Png).unwrap();
+
+        let thumb_dir = dir.join("thumbnails");
+        let result = generate_thumbnail(src_path.to_str().unwrap(), &thumb_dir);
+        assert!(result.is_ok(), "缩略图生成应成功: {:?}", result.err());
+        let thumb_path = thumb_dir.join(result.unwrap());
+
+        let thumb_img = image::ImageReader::open(&thumb_path)
+            .unwrap()
+            .with_guessed_format()
+            .unwrap()
+            .decode()
+            .unwrap();
+        let (w, h) = thumb_img.dimensions();
+        assert_eq!(
+            (w, h),
+            (320, 90),
+            "640x180 超宽图应等比缩放为 320x90，实际 {}x{}",
+            w,
+            h
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn thumbnail_does_not_upscale_small_image() {
+        // 测试 C（小图不缩放）：100x50 未超过 320x180，缩略图应保持原尺寸
+        let dir = std::env::temp_dir().join("mirrorstar_thumbnail_test_small_no_upscale");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let src_path = dir.join("small.png");
+        let img = image::DynamicImage::new_rgb8(100, 50);
+        img.save_with_format(&src_path, ImageFormat::Png).unwrap();
+
+        let thumb_dir = dir.join("thumbnails");
+        let result = generate_thumbnail(src_path.to_str().unwrap(), &thumb_dir);
+        assert!(result.is_ok(), "缩略图生成应成功: {:?}", result.err());
+        let thumb_path = thumb_dir.join(result.unwrap());
+
+        let thumb_img = image::ImageReader::open(&thumb_path)
+            .unwrap()
+            .with_guessed_format()
+            .unwrap()
+            .decode()
+            .unwrap();
+        let (w, h) = thumb_img.dimensions();
+        assert_eq!(
+            (w, h),
+            (100, 50),
+            "100x50 小图不应被放大，应保持原尺寸，实际 {}x{}",
+            w,
+            h
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }

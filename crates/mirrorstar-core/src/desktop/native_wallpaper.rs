@@ -121,7 +121,9 @@ fn scaling_mode_to_style(scaling_mode: ScalingMode) -> (&'static str, &'static s
         ScalingMode::Stretch => ("2", "0"),
         ScalingMode::Fit => ("6", "0"),
         ScalingMode::Fill => ("10", "0"),
-        ScalingMode::Original => ("0", "0"), // Same as Center
+        // TileWallpaper="1" + WallPaperStyle="0" 为 Windows 平铺模式注册表约定。
+        // 返回值为 (WallPaperStyle, TileWallpaper) 元组，当前 ("0", "1") 中第二个字段即 TileWallpaper。
+        ScalingMode::Tile => ("0", "1"),
     }
 }
 
@@ -274,31 +276,37 @@ mod tests {
     /// 验证 ScalingMode → 注册表字符串值的映射稳定性
     ///
     /// 这些值是 Windows 系统约定的固定映射（参考 MSDN WallPaperStyle 文档），
-    /// 不可随意更改：0=居中、2=拉伸、6=适应、10=填充。
+    /// 不可随意更改：0=居中、2=拉伸、6=适应、10=填充；Tile 为 WallPaperStyle=0 +
+    /// TileWallpaper=1 的组合（第二个字段即 TileWallpaper）。
     #[test]
     fn scaling_mode_to_style_mapping_is_stable() {
         assert_eq!(scaling_mode_to_style(ScalingMode::Center), ("0", "0"));
         assert_eq!(scaling_mode_to_style(ScalingMode::Stretch), ("2", "0"));
         assert_eq!(scaling_mode_to_style(ScalingMode::Fit), ("6", "0"));
         assert_eq!(scaling_mode_to_style(ScalingMode::Fill), ("10", "0"));
-        assert_eq!(scaling_mode_to_style(ScalingMode::Original), ("0", "0"));
+        assert_eq!(scaling_mode_to_style(ScalingMode::Tile), ("0", "1"));
     }
 
-    /// TileWallpaper 在所有非平铺模式下均为 "0"
+    /// TileWallpaper 标志：平铺模式（Tile）下为 "1"，其余模式均为 "0"
     ///
-    /// 当前项目不支持平铺模式（ScalingMode 无 Tile 变体），
-    /// 因此 TileWallpaper 恒为 "0"，此测试锁定该不变量。
+    /// Windows 约定：TileWallpaper="1" + WallPaperStyle="0" 即平铺模式，
+    /// 因此 Tile 的 TileWallpaper 应为 "1"，其余模式恒为 "0"，此测试锁定该映射。
     #[test]
-    fn tile_wallpaper_always_zero_for_supported_modes() {
+    fn tile_wallpaper_flag_for_supported_modes() {
         for mode in [
             ScalingMode::Center,
             ScalingMode::Stretch,
             ScalingMode::Fit,
             ScalingMode::Fill,
-            ScalingMode::Original,
+            ScalingMode::Tile,
         ] {
             let (_, tile) = scaling_mode_to_style(mode);
-            assert_eq!(tile, "0", "TileWallpaper 应为 0, mode={:?}", mode);
+            let expected = if matches!(mode, ScalingMode::Tile) {
+                "1"
+            } else {
+                "0"
+            };
+            assert_eq!(tile, expected, "TileWallpaper 取值错误, mode={:?}", mode);
         }
     }
 
@@ -380,10 +388,9 @@ mod tests {
                     valid_styles,
                     style
                 );
-                assert_eq!(
-                    tile.as_str(),
-                    "0",
-                    "TileWallpaper 当前实现下应为 0，实际: {}",
+                assert!(
+                    tile.as_str() == "0" || tile.as_str() == "1",
+                    "TileWallpaper 应为 0（非平铺）或 1（平铺），实际: {}",
                     tile
                 );
             }

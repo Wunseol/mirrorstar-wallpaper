@@ -680,7 +680,7 @@ async fn sample_and_apply_unit(
     key: &str,
     app: &tauri::AppHandle,
 ) -> Option<String> {
-    let (order, active_pool, cursor, bag) = {
+    let (order, active_pool, cursor, bag, current_id) = {
         let mut play = handle.playback.lock().unwrap_or_else(|e| e.into_inner());
         let unit = play.ensure_unit(key.to_string());
         (
@@ -688,6 +688,7 @@ async fn sample_and_apply_unit(
             unit.active_pool.clone(),
             unit.order_cursor.clone(),
             unit.bag_remaining.clone(),
+            unit.current_wallpaper_id.clone(),
         )
     };
 
@@ -697,7 +698,7 @@ async fn sample_and_apply_unit(
     };
     let entries = build_pool_entries(&handle.config_manager, active_pool.as_deref());
     let filtered = filter_candidates(entries.iter().collect());
-    let target = sample_next(order, &filtered, &mut sampler);
+    let target = sample_next(order, &filtered, &mut sampler, current_id.as_deref());
 
     // 回写采样状态（无论 target，游标 / 袋已推进——DR-19 失败时游标跳过防原地卡死）。
     {

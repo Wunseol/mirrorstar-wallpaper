@@ -92,7 +92,7 @@ function isArrangement(v: string): v is Arrangement {
 }
 
 /// 合法的缩放模式集合（与 ScalingMode 类型保持同步）
-const SCALING_MODES: readonly ScalingMode[] = ["fill", "fit", "stretch", "center", "original"];
+const SCALING_MODES: readonly ScalingMode[] = ["fill", "fit", "stretch", "tile", "center"];
 function isScalingMode(v: string): v is ScalingMode {
   return (SCALING_MODES as readonly string[]).includes(v);
 }

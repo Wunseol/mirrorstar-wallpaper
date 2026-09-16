@@ -181,7 +181,7 @@ pub enum Arrangement {
     #[default]
     #[serde(rename = "per_monitor")]
     PerMonitor,
-    /// 全体员工同图（每个显示器各设一次）
+    /// 每屏同图（每个显示器各设一次）
     #[serde(rename = "all_same")]
     AllSame,
     /// 跨显示器单张壁纸

@@ -1155,14 +1155,14 @@ pub fn validate_speed(speed: f32) -> Result<(), mirrorstar_core::MirrorStarError
 
 /// 解析缩放模式字符串为 `ScalingMode` 枚举（ST-007）
 ///
-/// 接受 "fill" / "fit" / "stretch" / "center" / "original"，未知值返回错误。
+/// 接受 "fill" / "fit" / "stretch" / "tile" / "center"，未知值返回错误。
 pub fn parse_scaling_mode(mode: &str) -> Result<ScalingMode, mirrorstar_core::MirrorStarError> {
     match mode {
         "fill" => Ok(ScalingMode::Fill),
         "fit" => Ok(ScalingMode::Fit),
         "stretch" => Ok(ScalingMode::Stretch),
+        "tile" => Ok(ScalingMode::Tile),
         "center" => Ok(ScalingMode::Center),
-        "original" => Ok(ScalingMode::Original),
         _ => Err(mirrorstar_core::MirrorStarError::InvalidArgument {
             reason: format!("未知的缩放模式: {}", mode),
         }),
@@ -2001,8 +2001,8 @@ mod tests {
         assert_eq!(parse_scaling_mode("stretch").unwrap(), ScalingMode::Stretch);
         assert_eq!(parse_scaling_mode("center").unwrap(), ScalingMode::Center);
         assert_eq!(
-            parse_scaling_mode("original").unwrap(),
-            ScalingMode::Original
+            parse_scaling_mode("tile").unwrap(),
+            ScalingMode::Tile
         );
     }
 
