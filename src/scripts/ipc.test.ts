@@ -2,7 +2,6 @@ import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import { invoke } from "@tauri-apps/api/core";
 import {
   getErrorMessage,
-  getErrorCode,
   getWallpapers,
   addWallpaper,
   removeWallpaper,
@@ -11,6 +10,8 @@ import {
   resumeWallpaper,
   getConfig,
   updateConfig,
+  getArrangement,
+  updateArrangement,
   setVolume,
   toggleMute,
   setSpeed,
@@ -76,39 +77,6 @@ describe("getErrorMessage", () => {
 
   it("message 为非字符串时调用 String 转换", () => {
     expect(getErrorMessage({ message: 123 })).toBe("123");
-  });
-});
-
-// ── v16-A-013: getErrorCode 提取 MirrorStarError 的 code 字段 ──────────────────
-
-describe("v16-A-013: getErrorCode", () => {
-  it("MirrorStarError 序列化对象返回 code 字符串", () => {
-    expect(getErrorCode({ code: "InvalidConfig", message: "音频音量越界" })).toBe("InvalidConfig");
-  });
-
-  it("code 为 InvalidPath 时正确返回", () => {
-    expect(getErrorCode({ code: "InvalidPath", message: "路径不存在" })).toBe("InvalidPath");
-  });
-
-  it("Error 对象（无 code 字段）返回 null", () => {
-    expect(getErrorCode(new Error("命令超时"))).toBeNull();
-  });
-
-  it("字符串错误返回 null", () => {
-    expect(getErrorCode("网络错误")).toBeNull();
-  });
-
-  it("null/undefined 返回 null", () => {
-    expect(getErrorCode(null)).toBeNull();
-    expect(getErrorCode(undefined)).toBeNull();
-  });
-
-  it("code 为非字符串时返回 null", () => {
-    expect(getErrorCode({ code: 500, message: "server error" })).toBeNull();
-  });
-
-  it("对象无 code 字段时返回 null", () => {
-    expect(getErrorCode({ message: "无 code" })).toBeNull();
   });
 });
 
@@ -330,7 +298,6 @@ describe("IPC wrappers", () => {
       general: { auto_start: false, minimize_to_tray: true },
       audio: { volume: 50, muted: false },
       pause: { fullscreen_action: "terminate" as const, pause_on_battery: false },
-      display: { arrangement: "per_monitor" },
       video: { hwdec: true, speed: 1 },
       gif: { memory_strategy: "Balanced", balanced_keep_frames: 30, max_memory_mb: 40 },
     };
@@ -341,10 +308,10 @@ describe("IPC wrappers", () => {
 
   it("updateConfig 调用 update_config 命令并传递 config 对象", async () => {
     const config = {
+      arrangement: "per_monitor" as const,
       general: { auto_start: true, minimize_to_tray: false },
       audio: { volume: 80, muted: true },
       pause: { fullscreen_action: "pause" as const, pause_on_battery: true },
-      display: { arrangement: "span" as const },
       video: { hwdec: false, speed: 2 },
       gif: { memory_strategy: "Performance" as const, balanced_keep_frames: 10, max_memory_mb: 40 },
       rotation: {
@@ -352,7 +319,6 @@ describe("IPC wrappers", () => {
         on_boot: false,
         interval_minutes: 30,
         order: "sequential" as const,
-        arrangement: "span" as const,
       },
     };
     vi.mocked(invoke).mockResolvedValue(undefined);
@@ -772,7 +738,6 @@ describe("轮换调度器 IPC 命令封装", () => {
       on_boot: false,
       interval_minutes: 30,
       order: "sequential",
-      arrangement: "per_monitor",
     };
     vi.mocked(invoke).mockResolvedValue(cfg);
     expect(await getRotationConfig()).toBe(cfg);
@@ -785,11 +750,22 @@ describe("轮换调度器 IPC 命令封装", () => {
       on_boot: false,
       interval_minutes: 30,
       order: "sequential",
-      arrangement: "per_monitor",
     };
     vi.mocked(invoke).mockResolvedValue(undefined);
     await updateRotationConfig(cfg);
     expect(invoke).toHaveBeenCalledWith("update_rotation_config", { config: cfg });
+  });
+
+  it("getArrangement 调用 get_arrangement 并透传返回值", async () => {
+    vi.mocked(invoke).mockResolvedValue("span");
+    expect(await getArrangement()).toBe("span");
+    expect(invoke).toHaveBeenCalledWith("get_arrangement");
+  });
+
+  it("updateArrangement 调用 update_arrangement 并传参", async () => {
+    vi.mocked(invoke).mockResolvedValue(undefined);
+    await updateArrangement("all_same");
+    expect(invoke).toHaveBeenCalledWith("update_arrangement", { arrangement: "all_same" });
   });
 
   it("listPools 调用 list_pools 并透传返回值", async () => {

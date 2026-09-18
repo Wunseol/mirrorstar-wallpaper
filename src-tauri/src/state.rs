@@ -854,6 +854,12 @@ pub(crate) fn create_or_show_main_window(app: &tauri::AppHandle) {
     // v8.0 内存优化：窗口销毁后重建，destroy() 释放 WebView2 内存。
     // 窗口存在则 show/focus，不存在（关闭时已销毁）则 build 重建。
     if let Some(window) = app.get_webview_window("main") {
+        // 最小化时 ShowWindow(SW_SHOW) 无法还原窗口，需先 unminimize() 还原。
+        if window.is_minimized().unwrap_or(false) {
+            if let Err(e) = window.unminimize() {
+                tracing::warn!(error = %e, "还原主窗口失败");
+            }
+        }
         if let Err(e) = window.show() {
             tracing::warn!(error = %e, "显示主窗口失败");
         }
@@ -886,26 +892,40 @@ pub(crate) fn create_or_show_main_window(app: &tauri::AppHandle) {
 /// 全屏进入：若主窗口打开则隐藏。原销毁路径会在销毁聚焦/最大化 WebView2 窗口时
 /// 触发 wry-0.55.1 空指针崩溃（进程 abort），现改为隐藏以避免崩溃。
 ///
-/// 仅在主窗口打开时置 `FULLSCREEN_MAIN_WINDOW_HIDDEN` 标志，供退出全屏后恢复。
+/// 仅在主窗口打开且未最小化时置 `FULLSCREEN_MAIN_WINDOW_HIDDEN` 标志，供退出全屏后恢复。
+/// 最小化窗口不触碰（保持最小化），避免退出全屏后被弹出。
 /// 隐藏窗口保留其 WebView2 进程（约 6 进程 / 150-300MB 内存占用）但避免空指针崩溃。
 pub(crate) fn hide_main_window_on_fullscreen() {
     let Some(app) = SHARED_APP_HANDLE.get() else {
         return;
     };
-    if app.get_webview_window("main").is_none() {
+    let Some(window) = app.get_webview_window("main") else {
+        return;
+    };
+    // 主窗口已最小化：全屏处置完全不触碰它（不隐藏、不置位恢复标记），
+    // 退出全屏后主窗口自然保持最小化状态。
+    if window.is_minimized().unwrap_or(false) {
+        tracing::info!("主窗口已最小化，全屏时不隐藏，退出全屏后保持最小化");
         return;
     }
     FULLSCREEN_MAIN_WINDOW_HIDDEN.store(true, Ordering::SeqCst);
-    if let Some(window) = app.get_webview_window("main") {
-        if let Err(e) = window.hide() {
-            tracing::warn!(error = %e, "全屏隐藏主窗口失败");
-        }
+    if let Err(e) = window.hide() {
+        tracing::warn!(error = %e, "全屏隐藏主窗口失败");
     }
 }
 
 /// 全屏退出：若此前隐藏了主窗口则恢复（还原 UI）。
 pub(crate) fn restore_main_window_after_fullscreen() {
     if FULLSCREEN_MAIN_WINDOW_HIDDEN.swap(false, Ordering::SeqCst) {
+        // 防换图误恢复：轮换/设置壁纸时的瞬时空前台事件（旧实现里嵌入时抢前台）
+        // 可能让全屏状态机误判"已退出全屏"。若此刻仍被全屏/最大化窗口覆盖，
+        // 则不显示主窗口并重新置位隐藏标记，待真正退出全屏后由周期复查线程
+        // 再次触发恢复，避免换图瞬间主窗口闪出。
+        if crate::platform::fullscreen::still_covered_by_fullscreen_window() {
+            FULLSCREEN_MAIN_WINDOW_HIDDEN.store(true, Ordering::SeqCst);
+            tracing::info!("仍有全屏/最大化窗口覆盖，保持主窗口隐藏，待真正退出全屏后恢复");
+            return;
+        }
         if let Some(app) = SHARED_APP_HANDLE.get() {
             create_or_show_main_window(app);
         }

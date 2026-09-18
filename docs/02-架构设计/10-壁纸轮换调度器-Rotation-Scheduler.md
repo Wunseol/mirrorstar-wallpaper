@@ -11,7 +11,7 @@
 
 - 应用**开机后不会自动恢复或更换任何壁纸**，WorkerW 壁纸画面不跨重启保留 → 空屏缺口。
 - 现有换壁纸**唯一入口**是 `set_wallpaper`（三阶段：关旧 → 锁外创建渲染器 → 锁内嵌入 WorkerW 注册），一切切换本质是它的重复调用。
-- 现有配置层（`AppConfig`）无任何轮换概念；`Arrangement` 仅 `{PerMonitor, Span}`。
+- 现有配置层（`AppConfig`）无任何轮换概念；多屏排列（Arrangement）为三值 `Arrangement::{PerMonitor, AllSame, Span}`，且唯一来源为顶层 `AppConfig.arrangement`（DR-2 布局域，独立于轮换配置）。
 - 无任何调度 / 定时 / 随机 / 顺序机制。
 
 ### 1.2 目标
@@ -44,7 +44,7 @@
 | `workerw_check` 桌面就绪兜底 | 启动阶段等待 WorkerW |
 | `DISPLAYS_SETTING` per-display 防并发集合 | 串行化 guard 的接入点 |
 | `ConfigManager.update_config` + 防抖 + 热重载 | 轮换配置读取 / 热重载响应 / 写盘模式 |
-| `Arrangement` 枚举 | 重构为三值编排（§4.4） |
+| `Arrangement` 枚举 | 已重构为三值多屏排列（Arrangement）；多屏排列唯一来源 = 顶层 `AppConfig.arrangement`（§4.4，DR-2 布局域，独立于轮换配置） |
 | `VolumeControl`（共享 COM 缓存） | 新壁纸音量自动继承 |
 | `global_state_changed` broadcast 通道 | 轮换事件转发 |
 
@@ -54,11 +54,11 @@
 
 | 概念 | 定义 |
 |---|---|
-| **调度单元（Rotation Unit）** | 轮换与状态的最小载体。由编排决定：`PerMonitor` → 每屏一个；`AllSame`/`Span` → 全体一个。 |
+| **调度单元（Rotation Unit）** | 轮换与状态的最小载体。由多屏排列决定：`PerMonitor` → 每屏一个；`AllSame`/`Span` → 全体一个。 |
 | **候选池（Pool）** | 一个**有序 id 列表**（自定义顺序的载体）。一张壁纸可属 0~N 池。每单元绑定一个激活池。 |
 | **采样算法（Order）** | 池内取下一张的方式：顺序循环 / 洗牌袋 / 纯随机。 |
 | **触发源（Trigger）** | 唤醒调度器的一类时机，可组合共存。 |
-| **编排（Arrangement）** | 定义调度单元与物理屏的映射：`PerMonitor` / `AllSame` / `Span`。 |
+| **多屏排列（Arrangement）** | 定义调度单元与物理屏的映射：`PerMonitor` / `AllSame` / `Span`。**唯一来源 = 顶层 `AppConfig.arrangement`**（DR-2 布局域，独立于轮换配置）。 |
 
 ---
 
@@ -74,7 +74,7 @@ enabled = false          # 全局主开关；false 时仍执行"开机恢复当�
 on_boot = false          # 开机/唤醒是否"推进下一张"（而非仅恢复）
 interval_minutes = 30    # 定时间隔（分钟）；下限 clamp 1 分钟（60s，防短间隔反复 spawn/kill 视频进程），见 DR-16
 order = "shuffle_bag"    # sequential | shuffle_bag | pseudo_random
-arrangement = "per_monitor"  # per_monitor | all_same | span（重构后的编排）
+# 多屏排列已迁移至顶层 AppConfig.arrangement（§4.4，DR-2 布局域），不再属于 [rotation]
 ```
 
 ```rust
@@ -83,7 +83,7 @@ struct RotationConfig {
     on_boot: bool,
     interval_minutes: u32,
     order: Order,            // Sequential | ShuffleBag | PseudoRandom
-    arrangement: Arrangement, // PerMonitor | AllSame | Span
+    // 多屏排列已提升为顶层 AppConfig.arrangement（布局策略层，§4.4），不再属于本配置
 }
 ```
 
@@ -117,7 +117,7 @@ struct Unit {
 }
 ```
 
-### 4.4 编排（Arrangement 重构）与调度单元
+### 4.4 多屏排列（Arrangement）与调度单元
 
 将现有 `Arrangement::{PerMonitor, Span}` 重构为三值枚举：
 
@@ -125,13 +125,13 @@ struct Unit {
 enum Arrangement { PerMonitor, AllSame, Span }
 ```
 
-| 编排 | 调度单元 | 物理 apply 分发 | 资源成本 |
+| 多屏排列 | 调度单元 | 物理 apply 分发 | 资源成本 |
 |---|---|---|---|
 | `PerMonitor` | N 个（每屏独立池/游标） | 1 屏 = 1 次 `set_wallpaper` | 1 渲染器/屏 |
 | `AllSame` | 1 个（全体同图） | 1 张壁纸 → 每屏各 set 一次，**顺序执行** | N 渲染器 |
 | `Span` | 1 个（跨屏贯通） | 1 个跨屏渲染器 | 1 渲染器 |
 
-**结论**：资源成本 =（解析 1 次）＋（物理 apply N 次，PerMonitor/AllSame 为 N、Span 为 1）。"开机一次设置"指**一次解析**，物理分发量由编排决定（DR-12）。
+**结论**：资源成本 =（解析 1 次）＋（物理 apply N 次，PerMonitor/AllSame 为 N、Span 为 1）。"开机一次设置"指**一次解析**，物理分发量由多屏排列决定（DR-12）。
 
 **"同步随机 / 跨屏去重"不再是独立需求**——AllSame/Span 作为单一调度单元，天然全体同图、天然一池一致（DR-2）。
 
@@ -324,6 +324,32 @@ commit_atomic_swap 分三步                             [旧壁纸全程稳定�
 - **桌面重建（Explorer 重启）**：重嵌入口先**中止该 display 的 in-flight swap**（terminate 新窗、清 pending 注册），再按 map 重嵌旧窗，不产生孤儿窗口。
 - **commit 前校验**：pending 窗的父窗口仍为当前 WorkerW，否则放弃 commit（terminate 新窗），由正常重嵌接管旧窗。
 
+### 8.5 Span（跨屏合并）编排的实际行为（Task 4 审计）
+
+> **审计结论（代码核查）**：当前实现的 Span 为"**每屏渲染器窗口覆盖虚拟桌面**"（N 渲染器、N 份解码，视觉近似跨屏）；设计文档所述"**单跨屏渲染器、1 次 apply**"（见 §4.4 表格与 §8.4 注释）为**已知差距**，如需消除另立 spec。
+
+**当前实现语义（引擎侧 `Arrangement::Span` 从未实例化单跨屏渲染器）**：
+
+1. **调度单元**：`reconcile_and_align` 将 Span 映射为 `all` 单元（与 AllSame 同路径）→ 1 个单元覆盖全部显示器。
+2. **apply 分发**：`apply_wallpaper_to_unit` 对 `all` 单元覆盖的每个显示器**顺序逐屏**执行一次原子交换（`apply_to_display`，per-display guard），即 **N 次物理 apply、每屏 1 个渲染器**（视频场景每屏 1 个 mpv 进程）。
+3. **窗口定位**：`worker_w::embed_wallpaper` 的 Span 分支将渲染器窗口 `SetWindowPos` 到 **WorkerW 全尺寸**（覆盖整个虚拟桌面）；`update_positions` 的 Span 分支对每个渲染器 `set_position` 到**虚拟屏幕坐标**（负坐标不 clamp，W01）→ **每个渲染器窗口都覆盖整个虚拟桌面**。
+4. **Z 序叠加**：N 个窗口均以 `HWND_BOTTOM` 嵌入 WorkerW，内容为同一 source 的 N 份独立解码/渲染，尺寸、起点一致并互相重叠 → 顶层窗口内容即整张图，各屏显示其在虚拟屏幕坐标下对应区域的裁切。
+
+**视觉语义**：因 N 份画面完全相同（同图、同尺寸、同起点、重叠），**视觉上呈现"一张壁纸横跨多屏无缝显示"**，观感与单跨屏渲染器一致；但并非"一个渲染器渲染跨屏合成画面"，而是"N 份独立解码 + N 份全虚拟桌面尺寸渲染叠加掩盖"。
+
+**资源成本**（vs 设计目标"单跨屏渲染器、1 次 apply"）：
+
+| 维度 | 当前实现（Span） | 设计目标 |
+|---|---|---|
+| 渲染器数量 | N（每屏 1 个） | 1 |
+| 物理 apply 次数 | N（逐屏原子交换） | 1 |
+| 解码份数 | N 份（每份同一 source） | 1 份 |
+| 每份渲染输出尺寸 | 虚拟桌面全尺寸（非本屏尺寸） | 1 份全尺寸 |
+
+额外成本 ≈ (N−1) 份解码 + (N−1) 份虚拟桌面全尺寸渲染（被顶层窗口盖住，纯浪费）；视频场景为 N 个 mpv 进程。
+
+**与设计文档的差距**：§4.4 表格"Span：1 个跨屏渲染器 / 物理 apply 1 次"及 §8.4"Span 的交换单元是整个虚拟桌面（多物理屏聚合为一个 display 单元）、不逐单屏做原子交换"的表述**未在代码中落地**——Span 与 AllSame 共用 `all` 单元路径，引擎侧 Span 仅影响窗口定位（虚拟屏幕坐标）与 `update_positions` 的坐标来源，渲染器数量恒为显示器数 N。**如需消除差距（实现真正的单跨屏渲染器、1 次 apply）另立 spec**。
+
 ---
 
 ## 9. 开机 / 唤醒解析
@@ -409,7 +435,7 @@ resolve_boot(unit):
 - P1~P3 抑制 / 重计 / 手动不受限（已定）。
 - P4 apply 完成时处于暂停态 → 新壁纸跟随暂停（DR-20）。
 
-### 持久化 / 删除 / 编排
+### 持久化 / 删除 / 多屏排列
 - PS1 playback 写失败 → 内存态继续 + 日志。
 - PS2 写频防抖（DR-29）。
 - PS3 编排切换迁移（DR-22）。
@@ -445,7 +471,7 @@ resolve_boot(unit):
 |---|---|
 | `interval_minutes` | 重算下次 deadline |
 | `order` | 重建该单元采样器（袋重洗 / 游标保留） |
-| `arrangement` | 编排迁移（§4.4） |
+| `arrangement` | 多屏排列迁移（§4.4）；多屏排列唯一来源，变更时经通用配置路径（`update_config` / `update_arrangement` / 热更新回调）同步 `WallpaperEngine.arrangement`（引擎锁忙则 warn 跳过，下次配置变更补齐） |
 | `enabled`（全局/单元） | 立即参与/退出轮换 |
 | 池成员 / 重排 | 该单元 bag/cursor **整体失效重建**（DR-23，不做增量合并） |
 | `on_boot` | 下次开机/唤醒生效 |
@@ -480,7 +506,7 @@ next_wallpaper(key?)                                     # 手动下一张（当
 
 ### UI 元素
 
-- **设置面板**：轮换开关（全局）、间隔、算法、on_boot、编排模式。
+- **设置面板**：轮换开关（全局）、间隔、算法、on_boot、多屏排列（每屏独立/每屏同图/跨屏合并，多屏排列唯一入口）。
 - **池编辑器**：池 CRUD + 成员拖拽排序（自定义顺序载体）。
 - **单元配置**：每屏/全体绑定激活池、单元轮换开关。
 - **壁纸卡片**：显示所属池；Web 壁纸标注"不参与轮换"。
@@ -538,7 +564,7 @@ Tauri setup
 | # | 决策 | 状态 |
 |---|---|---|
 | DR-1 | 调度器 = 换壁纸动作的唯一决策者（WHEN/WHICH/HOW），渲染下放 set_wallpaper | 已定 |
-| DR-2 | 编排重构为 PerMonitor/AllSame/Span → 调度单元；同步/去重被吸收 | 已定 |
+| DR-2 | 多屏排列重构为 PerMonitor/AllSame/Span → 调度单元；同步/去重被吸收；**多屏排列唯一来源 = 顶层 `AppConfig.arrangement`**（DR-2 布局域，独立于轮换配置） | 已定 |
 | DR-3 | 池即有序播放列表（自定义顺序载体），顺序算法追随它 | 已定 |
 | DR-4 | 三种算法全做：顺序循环/洗牌袋/纯随机 | 已定 |
 | DR-5 | 游标 id 锚定（非 index），重排后从当前 id 继续 | 已定 |

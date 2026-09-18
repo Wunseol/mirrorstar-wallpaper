@@ -31,14 +31,14 @@
 // Shared types
 
 /// 壁纸状态联合类型，与后端 Rust WallpaperState 枚举的 serde 序列化格式一致（PascalCase）
-export type WallpaperState = "Initializing" | "Playing" | "Paused" | "Terminated";
+export type WallpaperState = "Initializing" | "Playing" | "Paused" | "Terminated" | "Error";
 
 /// 缩放模式，与后端 Rust ScalingMode 枚举的 serde 序列化格式一致（lowercase）
 export type ScalingMode = "fill" | "fit" | "stretch" | "tile" | "center";
 
-/// 显示器排列模式（三值编排，DR-2 / 设计 §4.4），与后端 Rust Arrangement
-/// 枚举的 serde 序列化格式一致（snake_case）。
-/// 注意：`all_same`（每屏同图）为新增变体，旧前端类型缺失须补齐。
+/// 多屏排列（每屏独立/每屏同图/跨屏合并，设计 §4.4）三值：per_monitor / all_same / span；
+/// 顶层 `AppConfig.arrangement` 为唯一事实来源（布局域，DR-2）；旧版 `[rotation] arrangement`
+/// 已由后端自动迁移。与后端 Rust Arrangement 枚举的 serde 序列化格式一致（snake_case）。
 export type Arrangement = "per_monitor" | "all_same" | "span";
 
 /// 采样算法（DR-4，设计 §7），与后端 Rust Order 枚举 serde 序列化格式一致（snake_case）。
@@ -71,12 +71,12 @@ export interface Pool {
 }
 
 /// 轮换配置（设计 §4.1 / DR-37），与后端 Rust RotationConfig 结构体对应。
+/// 多屏排列为顶层 `AppConfig.arrangement`（布局域），不属于轮换配置。
 export interface RotationConfig {
   enabled: boolean;
   on_boot: boolean;
   interval_minutes: number;
   order: Order;
-  arrangement: Arrangement;
 }
 
 /// 单调度单元配置回读（fix-rotation-scheduler Task 6），与后端 Rust UnitStateDto
@@ -107,10 +107,11 @@ export interface DisplayInfo {
 }
 
 export interface AppConfig {
+  /** 多屏排列（顶层布局策略，布局域）：per_monitor | all_same | span */
+  arrangement: Arrangement;
   general: GeneralConfig;
   audio: AudioConfig;
   pause: PauseConfig;
-  display: DisplayConfig;
   video: VideoConfig;
   gif: GifConfig;
   rotation: RotationConfig;
@@ -132,10 +133,6 @@ export type FullscreenAction = "none" | "pause" | "terminate";
 export interface PauseConfig {
   fullscreen_action: FullscreenAction;
   pause_on_battery: boolean;
-}
-
-export interface DisplayConfig {
-  arrangement: Arrangement;
 }
 
 export interface VideoConfig {

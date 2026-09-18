@@ -450,6 +450,8 @@ impl ConfigManager {
     /// 到合法范围，不破坏调用方契约（仍返回 `Ok(())`）。
     pub fn update_config(&self, mut config: AppConfig) -> Result<(), MirrorStarError> {
         config.validate();
+        // 多屏排列迁移：兼容旧版 [rotation] arrangement（顶层已显式设置时优先）。
+        config.migrate_legacy_arrangement();
         {
             let mut cfg = self.config.write().unwrap_or_else(|e| e.into_inner());
             *cfg = config;
@@ -1128,6 +1130,8 @@ impl ConfigManager {
             Ok(mut config) => {
                 // C02 修复：反序列化后调用 validate()，将越界值 clamp 到合法范围
                 config.validate();
+                // 多屏排列迁移：旧版 [rotation] arrangement 提升为顶层（BREAKING 兼容）
+                config.migrate_legacy_arrangement();
                 Ok((config, None))
             }
             Err(e) => {

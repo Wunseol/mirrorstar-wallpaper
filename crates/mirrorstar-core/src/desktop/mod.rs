@@ -245,7 +245,6 @@ impl DesktopIntegrator {
                     if let Err(e) = worker_w::embed_wallpaper(
                         hwnd,
                         workerw_hwnd,
-                        progman_hwnd,
                         &display_id,
                         arrangement,
                         &displays,
@@ -290,14 +289,15 @@ impl DesktopIntegrator {
     ) -> Result<(), MirrorStarError> {
         self.ensure_initialized()?;
         let workerw_hwnd = self.workerw_hwnd.ok_or(MirrorStarError::WorkerWNotFound)?;
-        let progman_hwnd = self.progman_hwnd.ok_or(MirrorStarError::WorkerWNotFound)?;
+        // 校验桌面已初始化（progman_hwnd 存在）；嵌入过程不再使用该句柄
+        //（不再抢占前台恢复焦点，见 worker_w::embed_wallpaper）。
+        let _ = self.progman_hwnd.ok_or(MirrorStarError::WorkerWNotFound)?;
         // D-013: 从缓存获取显示器列表（5s TTL），避免每次调用 enumerate_displays()。
         // clone 一份 Vec 以释放 &mut self 借用，使后续 self.active_wallpapers.insert 可用。
         let displays: Vec<DisplayInfo> = self.get_cached_displays().to_vec();
         worker_w::embed_wallpaper(
             hwnd,
             workerw_hwnd,
-            progman_hwnd,
             display_id,
             arrangement,
             &displays,

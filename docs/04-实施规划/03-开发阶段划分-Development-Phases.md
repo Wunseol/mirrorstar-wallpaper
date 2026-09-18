@@ -38,7 +38,7 @@
 | 静音按钮 | `toggle_mute` | `#mute-btn` |
 | 播放速度滑块 | `set_speed` | `#speed-slider`（0.25–4.0，mpv） |
 | 目标显示器 | `get_displays` | `#display-select` |
-| 排列模式 | `update_config` | `#arrangement-select`（per_monitor / span） |
+| 多屏排列选择器 | `update_config` | `#arrangement-select`（per_monitor / all_same / span） |
 | 缩放模式 | `set_scaling_mode` | `#scaling-mode-select`（fill/fit/stretch/center/original） |
 | 全屏处置 | `update_config` | `#fullscreen-action-select`（terminate / pause / none） |
 | 电池暂停 | `update_config` | `#pause-on-battery` |

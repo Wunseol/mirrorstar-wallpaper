@@ -16,7 +16,7 @@ config 模块是 mirrorstar-core 的配置与壁纸库管理中枢，聚合五�
 |---|---|---|
 | mod.rs | 45 | 模块导出与 `pub use` 重导出 |
 | manager.rs | 2533 | `ConfigManager` 实现、`WallpaperEntry`/`WallpaperLibrary`/`DisplayInfo` 数据模型、`atomic_write`、`normalize_path`、`read_bounded_utf8_file`、`invoke_callback_safe`、`save_with_dirty_rollback`、配置加载错误类型、`#[cfg(test)] mod tests` |
-| settings.rs | 735 | `AppConfig` 及子配置（`AudioConfig`/`VideoConfig`/`GifConfig`/`DisplayConfig`/`WebConfig`/`PauseConfig`/`GeneralConfig`）与 `validate()` 范围校验 |
+| settings.rs | 735 | `AppConfig` 及子配置（`AudioConfig`/`VideoConfig`/`GifConfig`/`WebConfig`/`PauseConfig`/`GeneralConfig`）与 `validate()` 范围校验 |
 | hot_reload.rs | 549 | `start_watching`/`reload_config_and_library`/`start_periodic_save`/`shutdown_periodic_save`/`stop_watching` |
 | detect.rs | 738 | `detect_wallpaper_type`（扩展名）、`detect_wallpaper_type_by_content`（魔数，保留无调用方）、`detect_html` |
 | thumbnail.rs | 1168 | `generate_thumbnail`/`generate_video_thumbnail`/`is_ffmpeg_available`/`TmpFrameGuard` RAII 守卫 |

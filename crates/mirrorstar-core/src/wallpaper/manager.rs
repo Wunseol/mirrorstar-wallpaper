@@ -361,10 +361,19 @@ impl WallpaperEngine {
             .keep_frames
     }
 
-    /// 设置壁纸排列方式
+    /// 设置壁纸排列方式。
+    ///
+    /// 由 src-tauri 通用配置路径同步调用（多屏排列布局域，引擎同步不再挂在轮换
+    /// reconcile 上）：`update_config` / `update_arrangement` / 热更新回调，使渲染
+    /// 嵌入层遵循顶层 `AppConfig.arrangement`。
     pub fn set_arrangement(&mut self, arrangement: Arrangement) {
         self.arrangement = arrangement;
         tracing::info!(?arrangement, "壁纸排列方式已切换");
+    }
+
+    /// 读取当前壁纸排列方式（由调度器编排同步驱动）。
+    pub fn arrangement(&self) -> Arrangement {
+        self.arrangement
     }
 
     /// 设置指定显示器的缩放模式
@@ -666,19 +675,6 @@ impl WallpaperEngine {
     /// 仅接收订阅之后发送的消息（不接收历史消息）。
     pub fn subscribe_state_changes(&self) -> tokio::sync::broadcast::Receiver<String> {
         self.global_state_changed.subscribe()
-    }
-
-    /// 查询指定显示器是否有 PauseSender
-    ///
-    /// 用于 Tauri 命令层（`pause_wallpaper` / `resume_wallpaper`）判断是否
-    /// 需要 emit 兜底：
-    /// - `true`：有 PauseSender（Video/Gif/Web/WorkerW Image 壁纸），pause 线程
-    ///   会在状态变更后 emit，命令层**不应** emit（避免重复）。
-    /// - `false`：无 PauseSender（原生壁纸或未设置壁纸），pause/resume 命令
-    ///   对其无实际效果，命令层应 emit 兜底以通知前端刷新（虽然状态未变，
-    ///   但保持前端与命令调用的一致性）。
-    pub fn has_pause_sender(&self, display_id: &str) -> bool {
-        self.pause_senders.contains_key(display_id)
     }
 
     /// 准备设置新壁纸：关闭现有壁纸 + 桌面环境就绪预检

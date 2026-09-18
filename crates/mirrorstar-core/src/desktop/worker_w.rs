@@ -435,7 +435,6 @@ fn calculate_per_monitor_child_coords(
 pub fn embed_wallpaper(
     wp_hwnd: HWND,
     workerw_hwnd: HWND,
-    progman_hwnd: HWND,
     display_id: &str,
     arrangement: Arrangement,
     displays: &[DisplayInfo],
@@ -502,10 +501,10 @@ pub fn embed_wallpaper(
         )
         .map_err(|e| MirrorStarError::DesktopIntegration(format!("SetWindowPos 失败: {}", e)))?;
 
-        // Step 5: Return focus to desktop（尽力恢复焦点，失败不影响壁纸嵌入）
-        let _ = SetForegroundWindow(progman_hwnd);
-
-        // Step 6: Show the wallpaper window (created without WS_VISIBLE to avoid flash)
+        // 嵌入时不主动抢占前台（不再为恢复焦点调用 SetForegroundWindow）：每次壁纸
+        // 嵌入（轮换/手动切换）都会触发 EVENT_SYSTEM_FOREGROUND，扰乱全屏检测状态机，
+        // 并在自动轮换时长按闪烁主控制窗口。需要恢复焦点时由调用方负责。
+        // Step 5: Show the wallpaper window (created without WS_VISIBLE to avoid flash)
         // ShowWindow 失败不影响已完成的嵌入流程，下一次刷新会重新显示
         let _ = ShowWindow(wp_hwnd, SW_SHOW);
 

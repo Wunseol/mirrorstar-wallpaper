@@ -1,6 +1,7 @@
 import { invoke } from "@tauri-apps/api/core";
 import type {
   AppConfig,
+  Arrangement,
   DisplayInfo,
   Pool,
   RotationConfig,
@@ -47,27 +48,6 @@ export async function removeWallpaper(wallpaperId: string, deleteFile: boolean):
     { wallpaperId, deleteFile },
     15000,
   );
-}
-
-/**
- * v16-A-013：从 invoke reject 的错误对象中提取 `code` 字段。
- *
- * 后端 `MirrorStarError` 序列化为 `{ code: string, message: string }`，
- * 前端可通过此函数取出 `code` 做错误类型分支（如 `InvalidConfig` 提示用户检查配置、
- * `InvalidPath` 提示文件路径问题）。
- *
- * 非 MirrorStarError 错误（如 invoke 超时抛出的 `Error("命令 xxx 超时")`、
- * 网络层错误）返回 `null`，调用方应优先使用 `getErrorMessage` 展示脱敏消息。
- *
- * @param e invoke reject 的错误对象
- * @returns 错误 code 字符串（如 "InvalidConfig" / "InvalidPath"），非结构化错误返回 null
- */
-export function getErrorCode(e: unknown): string | null {
-  if (typeof e === "object" && e !== null && "code" in e) {
-    const code = (e as { code: unknown }).code;
-    return typeof code === "string" ? code : null;
-  }
-  return null;
 }
 
 /**
@@ -349,11 +329,24 @@ export function getErrorMessage(e: unknown): string {
   return sanitizeErrorMessage(raw);
 }
 
+// ── 多屏排列（顶层布局策略，布局域）──────────────────────────────────────────────
+// 纯内存读写命令，无需超时包装。
+
+/** 读取当前多屏排列（顶层 AppConfig.arrangement） */
+export async function getArrangement(): Promise<Arrangement> {
+  return invoke<Arrangement>("get_arrangement");
+}
+
+/** 更新多屏排列（后端持久化 + 引擎同步 + 唤醒调度器重算单元） */
+export async function updateArrangement(arrangement: Arrangement): Promise<void> {
+  await invokeWithTimeout<void>("update_arrangement", { arrangement });
+}
+
 // ── 壁纸轮换调度器命令封装（Task 8 / DR-3、DR-30、DR-36）───────────────────────
 // 纯内存操作命令（get_rotation_config / list_pools）无需超时包装；写命令走
 // invokeWithTimeout 短超时（如 set_wallpaper 般的进程级操作不涉及，用默认 10s）。
 
-/** 读取轮换配置（enabled / on_boot / interval / order / arrangement） */
+/** 读取轮换配置（enabled / on_boot / interval / order） */
 export async function getRotationConfig(): Promise<RotationConfig> {
   return invoke<RotationConfig>("get_rotation_config");
 }

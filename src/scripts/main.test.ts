@@ -19,9 +19,14 @@ vi.mock("./ui/mod", () => ({
   updateWallpaperCard: vi.fn(),
   debounce: vi.fn((fn: (...args: unknown[]) => void) => fn),
   extractFileName: vi.fn(),
+  getEnabledUnitLabels: vi.fn(),
+  isArrangement: vi.fn(
+    (v: string) => v === "per_monitor" || v === "all_same" || v === "span",
+  ),
   isOrder: vi.fn(),
   loadConfig: vi.fn(),
   loadPools: vi.fn(),
+  markSourceMissingCard: vi.fn(),
   patchConfig: vi.fn(),
   patchRotation: vi.fn(),
   populateDisplaySelect: vi.fn(),
@@ -36,10 +41,14 @@ vi.mock("./ui/mod", () => ({
   showStatus: vi.fn(),
 }));
 
-// 屏蔽 init 中的事件监听注册（避免调用真实 @tauri-apps/api/event）
+// 屏蔽 init 中的事件监听注册（避免调用真实 @tauri-apps/api/event 与 DOM 事件绑定）
+// P1-1: main.ts 的 rotation-pools-changed 改用 addEventListenerWithCleanup（DOM 事件），
+// 以及 registerCleanup 注册清理回调，mock 需一并提供这两个导出。
 vi.mock("./utils/listeners", () => ({
+  addEventListenerWithCleanup: vi.fn(),
   listenWithCleanup: vi.fn(),
   cleanupAllListeners: vi.fn(),
+  registerCleanup: vi.fn(),
 }));
 
 // 屏蔽 logger，保持测试输出整洁，并允许断言错误日志
@@ -407,53 +416,6 @@ describe("interaction-mode checkbox 回滚 (F-003)", () => {
   });
 });
 
-describe("arrangement-select 回滚 (F-003)", () => {
-  let arrangementSelect: HTMLSelectElement;
-
-  beforeEach(() => {
-    document.body.innerHTML = "";
-    arrangementSelect = document.createElement("select");
-    arrangementSelect.id = "arrangement-select";
-    // 构造两个选项，初始选中 per_monitor（合法 Arrangement 值）
-    const optPerMonitor = document.createElement("option");
-    optPerMonitor.value = "per_monitor";
-    optPerMonitor.textContent = "per_monitor";
-    const optSpan = document.createElement("option");
-    optSpan.value = "span";
-    optSpan.textContent = "span";
-    arrangementSelect.appendChild(optPerMonitor);
-    arrangementSelect.appendChild(optSpan);
-    arrangementSelect.value = "per_monitor";
-    document.body.appendChild(arrangementSelect);
-    vi.clearAllMocks();
-    // init 依赖的 IPC/版本号/loadConfig 默认 resolve（clearAllMocks 不重置实现，需显式复位）
-    vi.mocked(invoke).mockResolvedValue(undefined);
-    vi.mocked(getVersion).mockResolvedValue("1.0.0");
-    vi.mocked(loadConfig).mockResolvedValue(undefined);
-  });
-
-  afterEach(() => {
-    document.body.innerHTML = "";
-  });
-
-  it("patchConfig 抛错时 select 回滚到旧值并提示错误", async () => {
-    vi.mocked(patchConfig).mockRejectedValue(new Error("ipc failure"));
-
-    await init();
-
-    // 模拟用户切换：value 变为 span，触发 change
-    arrangementSelect.value = "span";
-    arrangementSelect.dispatchEvent(new Event("change"));
-
-    // 等待异步 catch 完成，断言回滚到旧值 per_monitor
-    await vi.waitFor(() => {
-      expect(arrangementSelect.value).toBe("per_monitor");
-    });
-    expect(showStatus).toHaveBeenCalledWith("更新排列模式失败，请重试", "error");
-    expect(log.error).toHaveBeenCalledWith("更新排列模式失败:", expect.any(Error));
-  });
-});
-
 describe("scaling-mode-select 回滚 (F-003)", () => {
   let scalingSelect: HTMLSelectElement;
 
@@ -724,5 +686,73 @@ describe("wallpaper-rotated 成功 toast（DR-30 / P2-2）", () => {
     onRotated!({ key: "display-1", wallpaper_id: "w-1" });
 
     expect(showStatus).toHaveBeenCalledWith("已切换到下一张壁纸", "success");
+  });
+});
+
+// ── arrangement-select 回滚 (F-003) ──────────────────────────────────────────
+
+describe("arrangement-select 回滚 (F-003)", () => {
+  let arrangementSelect: HTMLSelectElement;
+
+  beforeEach(() => {
+    document.body.innerHTML = "";
+    arrangementSelect = document.createElement("select");
+    arrangementSelect.id = "arrangement-select";
+    const optPerMonitor = document.createElement("option");
+    optPerMonitor.value = "per_monitor";
+    optPerMonitor.textContent = "per_monitor";
+    const optSpan = document.createElement("option");
+    optSpan.value = "span";
+    optSpan.textContent = "span";
+    arrangementSelect.appendChild(optPerMonitor);
+    arrangementSelect.appendChild(optSpan);
+    arrangementSelect.value = "per_monitor";
+    document.body.appendChild(arrangementSelect);
+    vi.clearAllMocks();
+    // init 依赖的 IPC/版本号/loadConfig 默认 resolve（clearAllMocks 不重置实现，需显式复位）
+    vi.mocked(invoke).mockResolvedValue(undefined);
+    vi.mocked(getVersion).mockResolvedValue("1.0.0");
+    vi.mocked(loadConfig).mockResolvedValue(undefined);
+  });
+
+  afterEach(() => {
+    document.body.innerHTML = "";
+  });
+
+  it("updateArrangement 抛错时 select 回滚到旧值并提示错误", async () => {
+    // update_arrangement 命令失败，其余 IPC 命令正常 resolve
+    vi.mocked(invoke).mockImplementation((cmd: string) => {
+      if (cmd === "update_arrangement") {
+        return Promise.reject(new Error("ipc failure"));
+      }
+      return Promise.resolve(undefined);
+    });
+
+    await init();
+
+    // 模拟用户切换：value 变为 span，触发 change
+    arrangementSelect.value = "span";
+    arrangementSelect.dispatchEvent(new Event("change"));
+
+    await vi.waitFor(() => {
+      // 回滚到旧值 per_monitor
+      expect(arrangementSelect.value).toBe("per_monitor");
+    });
+    expect(showStatus).toHaveBeenCalledWith("更新多屏排列失败", "error");
+    expect(log.error).toHaveBeenCalledWith("更新多屏排列失败:", expect.any(Error));
+  });
+
+  it("非法值触发 change 时回退 prev 并提示无效", async () => {
+    await init();
+
+    // 模拟 select.value 被置为非法值（不在 option 集合内，DOM 会归置为空串）
+    arrangementSelect.value = "invalid";
+    arrangementSelect.dispatchEvent(new Event("change"));
+
+    await vi.waitFor(() => {
+      // 回退到旧值 per_monitor
+      expect(arrangementSelect.value).toBe("per_monitor");
+    });
+    expect(showStatus).toHaveBeenCalledWith("无效的多屏排列", "error");
   });
 });

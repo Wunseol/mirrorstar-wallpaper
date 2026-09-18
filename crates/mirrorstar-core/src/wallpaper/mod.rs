@@ -46,7 +46,7 @@ static SCREEN_SIZE: Mutex<Option<(u32, u32)>> = Mutex::new(None);
 /// 返回 `(width, height)`，失败时回退到 `(1920, 1080)`。缓存首次查询结果，
 /// 后续调用直接返回缓存值，避免重复调用 `GetSystemMetrics`。
 ///
-/// 调用方包括 `load_and_downsample_image`、`decode_gif_with_cancel`、
+/// 调用方包括 `load_and_downsample_image`、
 /// `decode_gif_first_frame`、`build_wp_proc_args` 等热路径（play() 与每次
 /// Resume 都会触发）。
 ///

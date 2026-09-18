@@ -2,6 +2,7 @@ import { getConfig, updateConfig } from "../ipc";
 import type { AppConfig } from "../types";
 import { log } from "../utils/logger";
 import { showStatus } from "./utils";
+import { syncArrangementSelect } from "./arrangement";
 
 /** AppConfig 的局部更新类型：每个 section 可选，且 section 内字段也可选 */
 type PartialAppConfig = {
@@ -27,7 +28,6 @@ interface ConfigElements {
   autoStartCheckbox: HTMLInputElement | null;
   fullscreenActionSelect: HTMLSelectElement | null;
   pauseOnBatteryCheckbox: HTMLInputElement | null;
-  arrangementSelect: HTMLSelectElement | null;
   speedSlider: HTMLInputElement | null;
   speedValue: HTMLElement | null;
   muteBtn: HTMLElement | null;
@@ -35,7 +35,6 @@ interface ConfigElements {
   rotationOnBootCheckbox: HTMLInputElement | null;
   rotationIntervalInput: HTMLInputElement | null;
   rotationOrderSelect: HTMLSelectElement | null;
-  rotationArrangementSelect: HTMLSelectElement | null;
 }
 
 let cachedConfigEls: ConfigElements | null = null;
@@ -49,7 +48,6 @@ function getConfigEls(): ConfigElements {
       "fullscreen-action-select",
     ) as HTMLSelectElement | null,
     pauseOnBatteryCheckbox: document.getElementById("pause-on-battery") as HTMLInputElement | null,
-    arrangementSelect: document.getElementById("arrangement-select") as HTMLSelectElement | null,
     speedSlider: document.getElementById("speed-slider") as HTMLInputElement | null,
     speedValue: document.getElementById("speed-value"),
     muteBtn: document.getElementById("mute-btn"),
@@ -61,9 +59,6 @@ function getConfigEls(): ConfigElements {
       "rotation-interval",
     ) as HTMLInputElement | null,
     rotationOrderSelect: document.getElementById("rotation-order") as HTMLSelectElement | null,
-    rotationArrangementSelect: document.getElementById(
-      "rotation-arrangement-select",
-    ) as HTMLSelectElement | null,
   };
   return cachedConfigEls;
 }
@@ -80,7 +75,6 @@ export async function loadConfig() {
       autoStartCheckbox,
       fullscreenActionSelect,
       pauseOnBatteryCheckbox,
-      arrangementSelect,
       speedSlider,
       speedValue,
       muteBtn,
@@ -88,7 +82,6 @@ export async function loadConfig() {
       rotationOnBootCheckbox,
       rotationIntervalInput,
       rotationOrderSelect,
-      rotationArrangementSelect,
     } = getConfigEls();
     if (volumeSlider) volumeSlider.value = String(Math.round(config.audio.volume * 100));
     if (autoStartCheckbox) autoStartCheckbox.checked = config.general.auto_start;
@@ -96,9 +89,6 @@ export async function loadConfig() {
     if (fullscreenActionSelect) fullscreenActionSelect.value = config.pause.fullscreen_action;
     // 功能6: 同步电池暂停复选框状态
     if (pauseOnBatteryCheckbox) pauseOnBatteryCheckbox.checked = config.pause.pause_on_battery;
-    // FE-013: 移除 `|| "per_monitor"` dead code——arrangement 类型为 Arrangement 联合类型
-    // （"per_monitor" | "all_same" | "span"），始终 truthy，`|| "per_monitor"` 永不触发。
-    if (arrangementSelect) arrangementSelect.value = config.display.arrangement;
     if (speedSlider && speedValue) {
       speedSlider.value = String(config.video.speed || 1.0);
       speedValue.textContent = `${parseFloat(speedSlider.value).toFixed(2)}x`;
@@ -112,9 +102,8 @@ export async function loadConfig() {
       rotationIntervalInput.value = String(config.rotation.interval_minutes);
     }
     if (rotationOrderSelect) rotationOrderSelect.value = config.rotation.order;
-    if (rotationArrangementSelect) {
-      rotationArrangementSelect.value = config.rotation.arrangement;
-    }
+    // 多屏排列（顶层布局策略）：选择器由布局域模块统一同步
+    syncArrangementSelect(config.arrangement);
     log.info("配置加载完成");
   } catch (e) {
     log.error("加载配置失败:", e);
@@ -130,10 +119,10 @@ export async function loadConfig() {
 async function doPatchConfig(patch: PartialAppConfig): Promise<void> {
   const config = await getConfig();
   const merged: AppConfig = {
+    arrangement: config.arrangement,
     general: { ...config.general, ...(patch.general ?? {}) },
     audio: { ...config.audio, ...(patch.audio ?? {}) },
     pause: { ...config.pause, ...(patch.pause ?? {}) },
-    display: { ...config.display, ...(patch.display ?? {}) },
     video: { ...config.video, ...(patch.video ?? {}) },
     gif: { ...config.gif, ...(patch.gif ?? {}) },
     rotation: { ...config.rotation, ...(patch.rotation ?? {}) },

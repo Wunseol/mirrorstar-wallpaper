@@ -770,6 +770,15 @@ fn is_previous_fullscreen_window_still_active() -> bool {
     }
 }
 
+/// 当前是否仍被全屏/最大化窗口覆盖（供 state.rs 恢复主窗口前复查，防换图误恢复）。
+///
+/// 任一命中即视为仍被覆盖：当前前台为全屏/最大化窗口，或此前记录的全屏窗口
+/// 仍然有效并覆盖其显示器。
+pub(crate) fn still_covered_by_fullscreen_window() -> bool {
+    foreground_fullscreen_level() != FullscreenLevel::None
+        || is_previous_fullscreen_window_still_active()
+}
+
 /// 判断是否应触发壁纸恢复（纯函数，便于单元测试）
 ///
 /// 仅当：之前是全屏（`was_fullscreen`）、当前不再是前台全屏（`!is_fullscreen`）、

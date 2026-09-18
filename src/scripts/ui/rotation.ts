@@ -12,9 +12,10 @@ import {
   updateRotationConfig,
 } from "../ipc";
 import { appState } from "../state";
-import type { Arrangement, DisplayInfo, Order, Pool, RotationConfig, UnitState } from "../types";
+import type { DisplayInfo, Order, Pool, RotationConfig, UnitState } from "../types";
 import { log } from "../utils/logger";
-import { showStatus } from "./utils";
+import { extractFileName, showStatus } from "./utils";
+import { getCurrentArrangement, unitKeysForArrangement } from "./arrangement";
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // 壁纸轮换调度器前端 UI（Task 10）
@@ -92,31 +93,9 @@ export function reorderMembers(ids: string[], from: number, to: number): string[
   return next;
 }
 
-// ── 纯函数：单元 key 解析（10.3）────────────────────────────────────────────
-
-/**
- * 依据编排解析调度单元 key ± 标签（对齐 backend validate_unit_key DR-40）：
- * - PerMonitor：每个显示器一个单元（key=显示器 id）
- * - AllSame / Span：唯全局单元 "all"
- */
-export function unitKeysForArrangement(
-  arrangement: Arrangement,
-  displays: readonly DisplayInfo[],
-): Array<{ key: string; label: string }> {
-  if (arrangement === "per_monitor") {
-    if (displays.length === 0) return [];
-    return displays.map((d) => ({
-      key: d.id,
-      label: d.is_primary ? `[主] ${d.name}` : d.name,
-    }));
-  }
-  return [{ key: "all", label: "全部屏幕" }];
-}
-
 // ── 模块级状态 ────────────────────────────────────────────────────────────────
 
 let poolList: Pool[] = [];
-let currentArrangement: Arrangement = "per_monitor";
 let currentDisplays: DisplayInfo[] = [];
 
 /**
@@ -149,17 +128,7 @@ export function patchRotation(patch: Partial<RotationConfig>): Promise<void> {
   return run;
 }
 
-// ── 10.3 单元配置：按编排渲染激活池 / 单元开关 ─────────────────────────────────
-
-async function resolveArrangement(): Promise<void> {
-  try {
-    const c = await getRotationConfig();
-    currentArrangement = c.arrangement;
-  } catch (e) {
-    log.warn("读取轮换配置失败，使用默认编排 per_monitor", e);
-    currentArrangement = "per_monitor";
-  }
-}
+// ── 10.3 单元配置：按多屏排列渲染激活池 / 单元开关 ─────────────────────────────
 
 async function resolveDisplays(): Promise<void> {
   try {
@@ -171,7 +140,7 @@ async function resolveDisplays(): Promise<void> {
 }
 
 /**
- * 渲染单元配置面板。按当前编排列出每个调度单元，提供：
+ * 渲染单元配置面板。按当前多屏排列列出每个调度单元，提供：
  * - 激活池 select（""=全部，DR-35；渲染前回读后端真实状态回填初始值）
  * - 单元轮换开关 checkbox（同上，回填后端真实开关态）
  * 变更即调用 set_active_pool / set_rotation_enabled。
@@ -179,13 +148,13 @@ async function resolveDisplays(): Promise<void> {
 export async function renderUnitConfig(): Promise<void> {
   const container = document.getElementById("unit-config");
   if (!container) return;
-  await Promise.all([resolveArrangement(), resolveDisplays()]);
+  const [arrangement, ] = await Promise.all([getCurrentArrangement(), resolveDisplays()]);
   // 回读后端真实单元配置，避免 UI 默认态（全部 / 关）覆盖已绑定/开启的设置（Task 6.3）。
   const states = await readUnitStates();
   const stateByKey = new Map(
     states.map((s) => [s.key, s] as const),
   );
-  const units = unitKeysForArrangement(currentArrangement, currentDisplays);
+  const units = unitKeysForArrangement(arrangement, currentDisplays);
   container.replaceChildren();
 
   if (poolList.length === 0) {
@@ -292,16 +261,16 @@ function runGuard(promise: Promise<unknown>, errorMsg: string): void {
 }
 
 /**
- * 读取当前编排下所有「已启用」单元的屏幕标签列表，供全局开关开启时提示生效屏幕。
+ * 读取当前多屏排列下所有「已启用」单元的屏幕标签列表，供全局开关开启时提示生效屏幕。
  * 依据后端真实单元状态过滤（enabled==true），默认全开模型下通常为全部单元。
  */
 export async function getEnabledUnitLabels(): Promise<string[]> {
-  const [config, displays, states] = await Promise.all([
-    getRotationConfig(),
+  const [arrangement, displays, states] = await Promise.all([
+    getCurrentArrangement(),
     getDisplays(),
     getUnitStates(),
   ]);
-  const units = unitKeysForArrangement(config.arrangement, displays);
+  const units = unitKeysForArrangement(arrangement, displays);
   const enabledKeys = new Set(states.filter((s) => s.enabled).map((s) => s.key));
   return units.filter((u) => enabledKeys.has(u.key)).map((u) => u.label);
 }
@@ -442,7 +411,7 @@ function renderPoolCard(pool: Pool): HTMLDivElement {
     if (memberSet.has(wp.id)) continue;
     const opt = document.createElement("option");
     opt.value = wp.id;
-    opt.textContent = extractName(wp.file_path);
+    opt.textContent = extractFileName(wp.file_path);
     addSelect.appendChild(opt);
   }
   addRow.appendChild(addSelect);
@@ -460,7 +429,7 @@ function renderPoolCard(pool: Pool): HTMLDivElement {
     const filePath = nameById.get(id);
     const text = document.createElement("span");
     text.className = "rotation-member-name";
-    text.textContent = filePath ? extractName(filePath) : "（已删除）";
+    text.textContent = filePath ? extractFileName(filePath) : "（已删除）";
     text.title = filePath ?? "";
     const remove = document.createElement("button");
     remove.className = "rotation-member-remove";
@@ -473,11 +442,6 @@ function renderPoolCard(pool: Pool): HTMLDivElement {
   card.appendChild(list);
 
   return card;
-}
-
-function extractName(filePath: string): string {
-  const parts = filePath.split(/[/\\]/);
-  return parts[parts.length - 1] || filePath;
 }
 
 /** 从当前 DOM 上移除某成员并提交 update_pool */

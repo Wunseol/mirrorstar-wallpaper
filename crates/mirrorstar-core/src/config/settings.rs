@@ -30,14 +30,17 @@ use crate::wallpaper::GifMemoryStrategy;
 /// 应用配置
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct AppConfig {
+    /// 多屏排列（顶层布局策略，DR-2 / 多屏排列布局域）：per_monitor | all_same | span。
+    /// 独立于轮换调度，属于"显示器布局策略"层；旧版 `[rotation] arrangement` 由
+    /// [`AppConfig::migrate_legacy_arrangement`] 自动迁移。
+    #[serde(default)]
+    pub arrangement: Arrangement,
     #[serde(default)]
     pub general: GeneralConfig,
     #[serde(default)]
     pub audio: AudioConfig,
     #[serde(default)]
     pub pause: PauseConfig,
-    #[serde(default)]
-    pub display: DisplayConfig,
     #[serde(default)]
     pub video: VideoConfig,
     #[serde(default)]
@@ -62,6 +65,27 @@ impl AppConfig {
         self.video.validate();
         self.gif.validate();
         self.rotation.validate();
+    }
+
+    /// 迁移旧版 `[rotation] arrangement`（v0.7.0 前）到顶层 `arrangement`。
+    ///
+    /// 旧配置中 `rotation.arrangement` 经 `RotationConfig::arrangement_legacy`
+    /// 反序列化进入本结构；此处将其提升为顶层字段并清空 legacy（`skip_serializing`
+    /// 保证保存时旧键不再写出）。顶层显式设置的值**优先于** legacy（仅当顶层为
+    /// 默认值时回退 legacy，避免覆盖用户新配置）。返回是否发生迁移。
+    pub fn migrate_legacy_arrangement(&mut self) -> bool {
+        let Some(legacy) = self.rotation.arrangement_legacy else {
+            return false;
+        };
+        if self.arrangement == Arrangement::default() {
+            self.arrangement = legacy;
+            tracing::warn!(
+                arrangement = ?self.arrangement,
+                "检测到旧版 [rotation] arrangement 配置，已迁移到顶层 arrangement"
+            );
+        }
+        self.rotation.arrangement_legacy = None;
+        true
     }
 }
 
@@ -206,14 +230,6 @@ pub enum Order {
     PseudoRandom,
 }
 
-/// 显示配置
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-pub struct DisplayConfig {
-    /// 壁纸排列方式
-    #[serde(default)]
-    pub arrangement: Arrangement,
-}
-
 /// 视频配置
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct VideoConfig {
@@ -300,7 +316,9 @@ impl Default for GifConfig {
 /// 防止用户通过手动编辑 `config.toml` 设置过大的 `balanced_keep_frames`
 /// （如 999999999）导致 GIF 解码后内存占用过高（OOM 风险）。
 /// 超过该上限时在 `validate()` 中回退到默认值。
-const MAX_BALANCED_KEEP_FRAMES: usize = 1000;
+/// `pub`：命令层（src-tauri，外部 crate）在写入前用同一上限做硬校验（SEC-002），
+/// 避免 1001~2.1B 的值被 `GifConfig::validate` 静默回退默认（前端收到 Ok 但实际存了默认值）。
+pub const MAX_BALANCED_KEEP_FRAMES: usize = 1000;
 
 impl GifConfig {
     /// C02 / C-005 修复：balanced_keep_frames 范围校验
@@ -361,7 +379,8 @@ fn default_gif_max_memory_mb() -> usize {
 
 /// 轮换配置（设计 §4.1 / DR-37）
 ///
-/// 配置壁纸轮换调度器的全局开关、定时、采样算法与编排。
+/// 配置壁纸轮换调度器的全局开关、定时与采样算法。多屏排列（`arrangement`）已提升为
+/// 顶层 [`AppConfig::arrangement`]（布局策略层），不再属于本配置。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RotationConfig {
     /// 全局主开关；false 时仍执行"开机恢复当前壁纸"（见设计 §9）
@@ -376,15 +395,18 @@ pub struct RotationConfig {
     /// 采样算法：sequential | shuffle_bag | pseudo_random（DR-4）
     #[serde(default)]
     pub order: Order,
-    /// 编排：per_monitor | all_same | span（DR-2）
-    #[serde(default)]
-    pub arrangement: Arrangement,
+    /// 兼容旧版配置（v0.7.0 前）：旧 `[rotation] arrangement` 键在反序列化时进入此
+    /// 字段，由 [`AppConfig::migrate_legacy_arrangement`] 迁移到顶层后清空；
+    /// `skip_serializing` 保证保存时旧键不再写出。
+    #[serde(rename = "arrangement", default, skip_serializing)]
+    pub arrangement_legacy: Option<Arrangement>,
 }
 
 /// 定时间隔默认值（分钟）
 const DEFAULT_INTERVAL_MINUTES: u32 = 30;
-/// 定时间隔下限（分钟），DR-16：clamp 到 1 分钟，防短间隔反复 spawn/kill 视频进程
-const MIN_INTERVAL_MINUTES: u32 = 1;
+/// 定时间隔下限（分钟），DR-16：clamp 到 1 分钟，防短间隔反复 spawn/kill 视频进程。
+/// `pub`：命令层 `update_rotation_config`（src-tauri，外部 crate）用同一下限做硬校验（P2-9）。
+pub const MIN_INTERVAL_MINUTES: u32 = 1;
 
 fn default_interval_minutes() -> u32 {
     DEFAULT_INTERVAL_MINUTES
@@ -397,7 +419,7 @@ impl Default for RotationConfig {
             on_boot: false,
             interval_minutes: DEFAULT_INTERVAL_MINUTES,
             order: Order::default(),
-            arrangement: Arrangement::default(),
+            arrangement_legacy: None,
         }
     }
 }
@@ -457,13 +479,6 @@ mod tests {
             "pause_on_battery should default to false"
         );
 
-        // display
-        assert_eq!(
-            config.display.arrangement,
-            Arrangement::PerMonitor,
-            "arrangement should default to per_monitor"
-        );
-
         // video
         assert!(config.video.hwdec, "hwdec should default to true");
         assert!(
@@ -489,6 +504,7 @@ mod tests {
     #[test]
     fn app_config_toml_roundtrip() {
         let config = AppConfig {
+            arrangement: Arrangement::PerMonitor,
             general: GeneralConfig {
                 auto_start: true,
                 minimize_to_tray: false,
@@ -500,9 +516,6 @@ mod tests {
             pause: PauseConfig {
                 fullscreen_action: FullscreenAction::None,
                 pause_on_battery: true,
-            },
-            display: DisplayConfig {
-                arrangement: Arrangement::Span,
             },
             rotation: RotationConfig::default(),
             video: VideoConfig {
@@ -534,7 +547,6 @@ mod tests {
             deserialized.pause.pause_on_battery,
             config.pause.pause_on_battery
         );
-        assert_eq!(deserialized.display.arrangement, config.display.arrangement);
         assert_eq!(deserialized.video.hwdec, config.video.hwdec);
         assert!((deserialized.video.speed - config.video.speed).abs() < f32::EPSILON);
         assert_eq!(deserialized.gif.memory_strategy, config.gif.memory_strategy);
@@ -564,7 +576,6 @@ mod tests {
         assert!(!config.audio.muted);
         assert_eq!(config.pause.fullscreen_action, FullscreenAction::Terminate);
         assert!(!config.pause.pause_on_battery);
-        assert_eq!(config.display.arrangement, Arrangement::PerMonitor);
         assert!(config.video.hwdec);
         assert!((config.video.speed - 1.0).abs() < f32::EPSILON);
         assert_eq!(config.gif.memory_strategy, GifMemoryStrategy::Balanced);
@@ -594,13 +605,32 @@ mod tests {
             config.pause.pause_on_battery,
             default.pause.pause_on_battery
         );
-        assert_eq!(config.display.arrangement, default.display.arrangement);
         assert_eq!(config.video.hwdec, default.video.hwdec);
         assert!((config.video.speed - default.video.speed).abs() < f32::EPSILON);
         assert_eq!(config.gif.memory_strategy, default.gif.memory_strategy);
         assert_eq!(
             config.gif.balanced_keep_frames,
             default.gif.balanced_keep_frames
+        );
+    }
+
+    // ── 旧配置向前兼容（unify-arrangement-single-source）──────────────────
+
+    #[test]
+    fn legacy_display_table_is_ignored_and_top_arrangement_uses_default() {
+        // 旧版 config.toml 残留 `[display]` 表：AppConfig 未设置 deny_unknown_fields，
+        // serde 应忽略未知表不报错；顶层 `arrangement` 仍取默认 PerMonitor。
+        let toml_str = r#"
+[display]
+arrangement = "span"
+
+[rotation]
+"#;
+        let config: AppConfig = toml::from_str(toml_str).expect("legacy [display] table ignored");
+        assert_eq!(
+            config.arrangement,
+            Arrangement::PerMonitor,
+            "top-level arrangement should stay default per_monitor despite legacy [display]"
         );
     }
 
@@ -895,9 +925,8 @@ balanced_keep_frames = 0
         assert_eq!(config.interval_minutes, 30, "interval 默认 30 分钟");
         assert_eq!(config.order, Order::ShuffleBag, "order 默认 shuffle_bag");
         assert_eq!(
-            config.arrangement,
-            Arrangement::PerMonitor,
-            "arrangement 默认 per_monitor"
+            config.arrangement_legacy, None,
+            "arrangement 已提升为顶层，RotationConfig 不再持有（legacy 仅旧配置迁移用）"
         );
     }
 
@@ -928,12 +957,13 @@ balanced_keep_frames = 0
     #[test]
     fn app_config_toml_roundtrip_rotation() {
         let config = AppConfig {
+            arrangement: Arrangement::AllSame,
             rotation: RotationConfig {
                 enabled: true,
                 on_boot: true,
                 interval_minutes: 60,
                 order: Order::Sequential,
-                arrangement: Arrangement::AllSame,
+                arrangement_legacy: None,
             },
             ..AppConfig::default()
         };
@@ -952,8 +982,12 @@ balanced_keep_frames = 0
             "rotation.order round-trip"
         );
         assert_eq!(
-            deserialized.rotation.arrangement, config.rotation.arrangement,
-            "rotation.arrangement round-trip"
+            deserialized.arrangement, config.arrangement,
+            "top-level arrangement round-trip"
+        );
+        assert_eq!(
+            deserialized.rotation.arrangement_legacy, None,
+            "旧键 [rotation] arrangement 不应被序列化（legacy skip_serializing）"
         );
     }
 
@@ -964,6 +998,56 @@ balanced_keep_frames = 0
         assert_eq!(config.rotation.enabled, default.enabled);
         assert_eq!(config.rotation.interval_minutes, default.interval_minutes);
         assert_eq!(config.rotation.order, default.order);
-        assert_eq!(config.rotation.arrangement, default.arrangement);
+        assert_eq!(
+            config.arrangement,
+            Arrangement::default(),
+            "顶层 arrangement 缺省回退 per_monitor"
+        );
+        assert_eq!(config.rotation.arrangement_legacy, None);
+    }
+
+    // ── 旧版 [rotation] arrangement 迁移（BREAKING 兼容）────────────────────
+
+    #[test]
+    fn legacy_rotation_arrangement_migrates_to_top_level() {
+        // 旧版配置：arrangement 位于 [rotation] 表内 → 反序列化进入 arrangement_legacy，
+        // 迁移后提升为顶层并清空 legacy。
+        let toml_str = r#"
+[rotation]
+enabled = true
+arrangement = "span"
+"#;
+        let mut config: AppConfig = toml::from_str(toml_str).expect("legacy config parses");
+        assert_eq!(
+            config.rotation.arrangement_legacy,
+            Some(Arrangement::Span),
+            "旧键应进入 legacy 兼容字段"
+        );
+        assert!(config.migrate_legacy_arrangement(), "应发生迁移");
+        assert_eq!(config.arrangement, Arrangement::Span, "迁移后顶层为 span");
+        assert_eq!(config.rotation.arrangement_legacy, None, "legacy 已清空");
+        // 序列化后旧键消失（skip_serializing + 迁移清空）：重新解析确认无 legacy 残留
+        let out = toml::to_string_pretty(&config).expect("serialize");
+        let reparsed: AppConfig = toml::from_str(&out).expect("reparse");
+        assert_eq!(reparsed.arrangement, Arrangement::Span, "顶层 arrangement 保留");
+        assert_eq!(
+            reparsed.rotation.arrangement_legacy, None,
+            "保存后旧键 [rotation] arrangement 应被清理"
+        );
+    }
+
+    #[test]
+    fn top_level_arrangement_wins_over_legacy() {
+        // 新旧键并存（手动编辑）：顶层显式值优先，legacy 被清空。
+        let toml_str = r#"
+arrangement = "all_same"
+
+[rotation]
+arrangement = "span"
+"#;
+        let mut config: AppConfig = toml::from_str(toml_str).expect("mixed config parses");
+        assert!(config.migrate_legacy_arrangement(), "legacy 存在即触发迁移流程");
+        assert_eq!(config.arrangement, Arrangement::AllSame, "顶层显式值优先");
+        assert_eq!(config.rotation.arrangement_legacy, None, "legacy 已清空");
     }
 }

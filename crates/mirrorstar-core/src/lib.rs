@@ -2,6 +2,7 @@ pub mod audio;
 pub mod config;
 pub mod desktop;
 pub mod ipc;
+pub mod layout;
 pub mod perf;
 pub mod process;
 pub mod scheduler;

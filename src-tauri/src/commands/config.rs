@@ -1,4 +1,5 @@
-use mirrorstar_core::{AppConfig, MirrorStarError};
+use mirrorstar_core::config::settings::MAX_BALANCED_KEEP_FRAMES;
+use mirrorstar_core::{AppConfig, Arrangement, MirrorStarError};
 use tauri::State;
 
 use crate::state::AppState;
@@ -49,6 +50,41 @@ pub fn get_config(state: State<'_, AppState>) -> Result<AppConfig, MirrorStarErr
     Ok(state.config_manager.get_config())
 }
 
+// ── 多屏排列（顶层布局策略，DR-2 布局域）─────────────────────────────────────
+
+/// 多屏排列变更的统一副作用：同步壁纸引擎排列状态 + 唤醒调度器重算。
+///
+/// 引擎同步采用 tokio Mutex 阻塞获取（异步路径，不阻塞运行时线程）。多屏排列变更
+/// 属低频操作，锁竞争可忽略；阻塞获取保证引擎排列与顶层配置最终一致——不存在
+/// "锁忙跳过"导致的静默不同步窗口（try_lock 语义下跳过永无补齐路径，且
+/// `update_arrangement` 相同值短路会使后续相同变更不再触发同步）。
+pub(crate) async fn sync_arrangement_to_engine(state: &AppState, arrangement: Arrangement) {
+    state.wallpaper_engine.lock().await.set_arrangement(arrangement);
+    state.scheduler.wake.notify_waiters();
+}
+
+/// 读取当前多屏排列。
+#[tauri::command]
+pub fn get_arrangement(state: State<'_, AppState>) -> Result<Arrangement, MirrorStarError> {
+    Ok(state.config_manager.get_config().arrangement)
+}
+
+/// 更新多屏排列（顶层字段；持久化 + 引擎同步 + 唤醒调度器）。
+#[tauri::command]
+pub async fn update_arrangement(
+    state: State<'_, AppState>,
+    arrangement: Arrangement,
+) -> Result<(), MirrorStarError> {
+    let mut cfg = state.config_manager.get_config();
+    if cfg.arrangement == arrangement {
+        return Ok(());
+    }
+    cfg.arrangement = arrangement;
+    state.config_manager.update_config(cfg)?;
+    sync_arrangement_to_engine(&state, arrangement).await;
+    Ok(())
+}
+
 /// SEC-002: 校验 AppConfig 所有数值字段的范围与有限性
 ///
 /// 在 `update_config` 写入之前调用，避免非法值（NaN/Inf/越界/负数）进入配置文件
@@ -79,12 +115,14 @@ fn validate_config_fields(config: &AppConfig) -> Result<(), MirrorStarError> {
         }
     }
 
-    // gif.balanced_keep_frames: usize，业务上限远低于 i32::MAX，此处为防御性边界校验
-    if config.gif.balanced_keep_frames > i32::MAX as usize {
+    // gif.balanced_keep_frames: usize，业务上限为 core `MAX_BALANCED_KEEP_FRAMES`（1000）。
+    // 超过上限时 `GifConfig::validate` 会静默回退默认值，前端收到 Ok 但实际存了默认值，
+    // 故此处以同一上限做硬校验，返回 InvalidConfig 让前端回滚乐观更新。
+    if config.gif.balanced_keep_frames > MAX_BALANCED_KEEP_FRAMES {
         return Err(MirrorStarError::InvalidConfig {
             reason: format!(
-                "GIF 平衡模式保留帧数超出合理范围: {}",
-                config.gif.balanced_keep_frames
+                "GIF 平衡模式保留帧数超出合理范围（上限 {}）: {}",
+                MAX_BALANCED_KEEP_FRAMES, config.gif.balanced_keep_frames
             ),
         });
     }
@@ -157,5 +195,47 @@ pub async fn update_config(
             tracing::warn!("引擎锁忙，跳过 GIF 内存策略实时更新（下次创建壁纸时从配置读取）");
         }
     }
-    state.config_manager.update_config(config)
+    // 多屏排列变更 → 统一副作用（引擎同步 + 唤醒调度器），非轮换场景同样生效
+    // （多屏排列布局域：引擎同步不再挂在轮换 reconcile 上）。
+    let arrangement_changed = state.config_manager.get_config().arrangement != config.arrangement;
+    state.config_manager.update_config(config)?;
+    if arrangement_changed {
+        sync_arrangement_to_engine(&state, state.config_manager.get_config().arrangement).await;
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ── validate_config_fields 单元测试（SEC-002 校验边界） ──────────────────
+
+    #[test]
+    fn validate_config_fields_rejects_oversized_balanced_keep_frames() {
+        // P1-2: balanced_keep_frames 超过 core 上限 MAX_BALANCED_KEEP_FRAMES（1000）应返回
+        // InvalidConfig。此前用 i32::MAX 判界，1001~2.1B 的值会通过命令层校验，但被
+        // GifConfig::validate 静默回退默认值（前端收到 Ok 实际存了默认值）。
+        let mut config = AppConfig::default();
+        config.gif.balanced_keep_frames = 5000;
+        let err = validate_config_fields(&config).unwrap_err();
+        match err {
+            MirrorStarError::InvalidConfig { reason } => {
+                assert!(
+                    reason.contains("GIF 平衡模式保留帧数"),
+                    "reason 应包含「GIF 平衡模式保留帧数」，实际: {}",
+                    reason
+                );
+            }
+            other => panic!("期望 InvalidConfig 变体，实际: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn validate_config_fields_accepts_in_range_balanced_keep_frames() {
+        // 上限内（含 1000）的值应通过校验
+        let mut config = AppConfig::default();
+        config.gif.balanced_keep_frames = MAX_BALANCED_KEEP_FRAMES;
+        assert!(validate_config_fields(&config).is_ok());
+    }
 }

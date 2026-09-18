@@ -28,6 +28,7 @@
 | 8 | Tauri 应用层 | `src-tauri/src/` | ✅ 已实现 | 95% | 中 |
 | 9 | 前端 UI | `src/scripts/` + `index.html` | ✅ 已实现 | 95% | 中 |
 | 10 | mirrorstar-wp-proc | `crates/mirrorstar-wp-proc/` | ✅ 已实现 | 100% | 高 |
+| 11 | layout (布局策略) | `crates/mirrorstar-core/src/layout/` | ✅ 已实现 | 100% | 低 |
 
 > **架构决策**：采用混合进程架构——仅 Web 壁纸运行在独立子进程（mirrorstar-wp-proc），按需创建；Image/Gif/Video 渲染器保留在主进程内。mirrorstar-watchdog 独立进程已在阶段2移除（空壳 crate 已删除）。
 >
@@ -251,7 +252,7 @@
 - 文件选择添加壁纸
 - 设置面板（音量滑块/自启动/全屏暂停/电池供电暂停）
 - 显示器选择下拉框（主显示器标记 [主]）
-- 排列模式选择器（per_monitor/span）
+- 多屏排列选择器（per_monitor/all_same/span，位于设置面板顶层多屏排列分组；原独立"排列模式"下拉已移除）
 - 缩放模式选择器（fill/fit/stretch/center/original）
 - Toast 消息提示
 - 壁纸缩略图显示（convertFileSrc + 懒加载 + 渐显）
@@ -310,6 +311,23 @@
 {"request_id":1,"status":"ok"}
 {"request_id":1,"status":"error","error":"WebView2 未初始化"}
 ```
+
+---
+
+### 2.11 layout (布局策略) — ✅ 已实现 100%
+
+**代码规模：** 344 行代码，1 个文件（mod.rs），10 个单元测试
+
+**定位：** 多屏排列（Arrangement）的**唯一逻辑归属**（DR-2 布局域）。将"多屏排列 × 显示器拓扑"以纯函数计算为布局平面 `LayoutPlane`（单元划分 / 窗口矩形 / 主显示器），**不依赖 Win32**（`LayoutMonitor` 为由 `DisplayInfo` 转换的纯数据抽象）。调度器 / 命令层 / 前端均只是该域的消费方，不再各自实现"编排 → 单元"映射（此前该规则在 `scheduler::reconcile_and_align`、`commands::rotation::validate_unit_key` 与前端 `unitKeysForArrangement` 三处重复，零单测）。
+
+**已实现：**
+- 纯函数 API：`plan()`（`Arrangement` × `LayoutMonitor[]` → `LayoutPlane`）、`unit_keys()`、`validate_unit_key()`
+- 类型：`LayoutPlane`（单元划分 / 窗口矩形 / 主显示器）、`LayoutMonitor`、`LayoutRect`（含 `union()` 联合矩形，Span 虚拟桌面）
+- 三种编排语义：`PerMonitor` → 每屏一个单元（key = 显示器 id）；`AllSame` → 全局 `all` 单元（窗口矩形 = 主屏矩形）；`Span` → 全局 `all` 单元（窗口矩形 = 虚拟桌面联合矩形）
+- `validate_unit_key()` 收敛 DR-40 规则：`PerMonitor` 校验 / 回退主显示器 key；`AllSame`/`Span` 仅允许全局 `all` key，拒绝孤儿单元
+- 10 个单元测试（三编排 × 空显示器 / 孤儿 key / 全局 key 校验等），`plan`/`unit_keys`/`validate_unit_key` 可脱离桌面环境单测
+
+**消费方：** 轮换调度器 `reconcile_and_align`（`src-tauri/src/scheduler.rs`）、命令层（`commands::rotation` / `commands::config`）、前端 `ui/arrangement.ts`
 
 ---
 

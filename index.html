@@ -37,14 +37,6 @@
             </select>
           </div>
           <div class="settings-group">
-            <label for="arrangement-select">排列模式</label>
-            <select id="arrangement-select">
-              <option value="per_monitor">每屏独立</option>
-              <option value="all_same">每屏同图</option>
-              <option value="span">跨屏合并</option>
-            </select>
-          </div>
-          <div class="settings-group">
             <label for="scaling-mode-select">缩放模式</label>
             <select id="scaling-mode-select">
               <option value="fill">填充</option>
@@ -53,6 +45,15 @@
               <option value="tile">平铺</option>
               <option value="center">居中</option>
             </select>
+          </div>
+          <div class="settings-group">
+            <label for="arrangement-select">多屏排列</label>
+            <select id="arrangement-select">
+              <option value="per_monitor">每屏独立</option>
+              <option value="all_same">每屏同图</option>
+              <option value="span">跨屏合并</option>
+            </select>
+            <p class="settings-hint">多屏排列：每屏独立（per_monitor）/ 全局同图（每屏同图 all_same / 跨屏合并 span）</p>
           </div>
           <div class="settings-group">
             <label>播放控制</label>
@@ -108,15 +109,6 @@
             <label class="rotation-row">
               <input type="checkbox" id="rotation-on-boot" /> 开机自动换图
             </label>
-            <div class="rotation-row">
-              <label for="rotation-arrangement-select">轮换编排</label>
-              <select id="rotation-arrangement-select">
-                <option value="per_monitor">每屏独立</option>
-                <option value="all_same">每屏同图</option>
-                <option value="span">跨屏合并</option>
-              </select>
-              <p class="settings-hint">决定调度单元：每屏独立（per_monitor）或全局一个（每屏同图 all_same / 跨屏合并 span）</p>
-            </div>
           </div>
           <div class="settings-group">
             <label>轮换池</label>

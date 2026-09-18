@@ -29,3 +29,4 @@ export {
   renderUnitConfig,
   getEnabledUnitLabels,
 } from "./rotation";
+export { isArrangement } from "./arrangement";

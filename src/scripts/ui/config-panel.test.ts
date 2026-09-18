@@ -23,10 +23,10 @@ import type { AppConfig } from "../types";
 /** 构造一份合法的默认 AppConfig，作为 getConfig 的返回值 */
 function baseConfig(): AppConfig {
   return {
+    arrangement: "per_monitor",
     general: { auto_start: false, minimize_to_tray: false },
     audio: { volume: 0.5, muted: false },
     pause: { fullscreen_action: "none", pause_on_battery: false },
-    display: { arrangement: "per_monitor" },
     video: { hwdec: false, speed: 1.0 },
     gif: { memory_strategy: "Balanced", balanced_keep_frames: 20, max_memory_mb: 40 },
     rotation: {
@@ -34,7 +34,6 @@ function baseConfig(): AppConfig {
       on_boot: false,
       interval_minutes: 30,
       order: "sequential",
-      arrangement: "per_monitor",
     },
   };
 }

@@ -776,7 +776,6 @@ fn test_update_positions_empty_map() {
 // 对应 `commands/wallpaper.rs` 与 `commands/system.rs` 中的壁纸命令。既有测试已覆盖
 // 大部分命令的正常/异常路径（见上方各小节），此处仅补缺失路径：
 //   - set_wallpaper：命令层 id 不存在错误路径（纯逻辑）
-//   - toggle_mute：命令层 None → false 映射（纯逻辑）
 //   - set_speed：不存在的 display_id 异常路径
 //   - set_interaction_mode：正常切换 + 传播到渲染器验证
 //   - toggle_interaction：切换翻转 + 多次切换交替
@@ -799,24 +798,6 @@ fn test_set_wallpaper_command_layer_id_not_found() {
         err.to_string().contains("壁纸不存在"),
         "错误信息应包含「壁纸不存在」"
     );
-}
-
-/// 测试 toggle_mute 命令层 None → false 映射
-/// 注：命令层 `toggle_mute` 将 toggle_mute_fast 返回的 None（无 sender）映射为 false，
-/// 保持前端兼容（commands/wallpaper.rs:220-221）
-#[test]
-fn test_toggle_mute_command_layer_none_to_false() {
-    // 无 sender 时 toggle_mute_fast 返回 None，命令层 unwrap_or(false) 得到 false
-    let command_result = false;
-    assert!(!command_result, "无 sender 时命令层应返回 false");
-
-    // 有 sender 返回 Some(true) 时，命令层原样返回 true
-    let command_result = true;
-    assert!(command_result, "Some(true) 时命令层应返回 true");
-
-    // 有 sender 返回 Some(false) 时，命令层原样返回 false
-    let command_result = false;
-    assert!(!command_result, "Some(false) 时命令层应返回 false");
 }
 
 /// 测试 set_speed 命令等价路径：对不存在的 display_id 应返回 Ok（no-op）

@@ -939,11 +939,20 @@ pub fn run() {
                 let app_handle = app.handle().clone();
                 // B3 / DR-38：捕获调度器 wake，配置热重载后同步唤醒调度器（与 §13 统一通道）。
                 let scheduler_wake = state.scheduler.wake.clone();
+                // 多屏排列布局域：热重载变更同样同步引擎排列（阻塞锁，arrangement 变更
+                // 低频，锁竞争可忽略；与 commands/config.rs sync_arrangement_to_engine 同策略）。
+                let engine = state.wallpaper_engine.clone();
+                let cm = state.config_manager.clone();
                 state.config_manager.set_on_config_changed(Arc::new(move || {
                     if let Err(e) = app_handle.emit("config-changed", ()) {
                         tracing::warn!(error = %e, "emit config-changed 失败：前端 UI 可能不刷新");
                     }
                     scheduler_wake.notify_waiters();
+                    let engine = engine.clone();
+                    let cm = cm.clone();
+                    tauri::async_runtime::spawn(async move {
+                        engine.lock().await.set_arrangement(cm.get_config().arrangement);
+                    });
                 }));
             }
 
@@ -1173,6 +1182,8 @@ pub fn run() {
             resume_wallpaper,
             get_config,
             update_config,
+            get_arrangement,
+            update_arrangement,
             set_volume,
             toggle_mute,
             set_interaction_mode,

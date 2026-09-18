@@ -1,7 +1,6 @@
 import { getVersion } from "@tauri-apps/api/app";
 import { appState } from "./state";
 import type {
-  Arrangement,
   FullscreenAction,
   RegenerateProgressPayload,
   ScalingMode,
@@ -20,8 +19,9 @@ import {
   setVolume,
   toggleAutoStart,
   toggleMute,
+  updateArrangement,
 } from "./ipc";
-import { cleanupAllListeners, listenWithCleanup, registerCleanup } from "./utils/listeners";
+import { addEventListenerWithCleanup, cleanupAllListeners, listenWithCleanup, registerCleanup } from "./utils/listeners";
 import { log } from "./utils/logger";
 import { runAsync } from "./utils/async-helpers";
 import {
@@ -29,6 +29,7 @@ import {
   debounce,
   extractFileName,
   getLowercasedFileName,
+  isArrangement,
   isOrder,
   loadConfig,
   loadPools,
@@ -65,9 +66,9 @@ import {
  *
  * 1. 当前架构：
  *    - 所有 UI 事件绑定集中在 `main.ts` 的 `init()` 函数中（含 display-select、
- *      arrangement-select、scaling-mode-select、volume-slider、speed-slider、
+ *      scaling-mode-select、volume-slider、speed-slider、
  *      mute-btn、auto-start、pause/resume-btn、interaction-mode、search-input、
- *      settings-toggle、regenerate-btn 等）
+ *      settings-toggle、regenerate-btn、arrangement-select 等）
  *    - UI 模块（如 wallpaper-list.ts、preview-modal.ts）仅导出渲染 / 业务函数，
  *      不在自身模块内绑定事件
  *
@@ -84,12 +85,6 @@ import {
 // ── 运行时类型窄化辅助 ────────────────────────────────────────────────────────
 // select.value 始终是 string，需在运行时校验是否为合法枚举值，避免 as 断言绕过类型系统。
 // 采用 Array.includes 模式，对常量数组做安全放宽转换后包含判断。
-
-/// 合法的排列模式集合（与 Arrangement 类型保持同步）
-const ARRANGEMENTS: readonly Arrangement[] = ["per_monitor", "all_same", "span"];
-function isArrangement(v: string): v is Arrangement {
-  return (ARRANGEMENTS as readonly string[]).includes(v);
-}
 
 /// 合法的缩放模式集合（与 ScalingMode 类型保持同步）
 const SCALING_MODES: readonly ScalingMode[] = ["fill", "fit", "stretch", "tile", "center"];
@@ -175,33 +170,6 @@ export async function init() {
       appState.selectedDisplayId = displaySelect.value;
       // 切换显示器时刷新按钮状态
       runAsync(() => updatePlaybackButtons(appState.selectedDisplayId), "updatePlaybackButtons 失败");
-    });
-  }
-
-  // Arrangement select
-  const arrangementSelect = document.getElementById("arrangement-select") as HTMLSelectElement;
-  if (arrangementSelect) {
-    // change 触发时 value 已是新值，无法像 checkbox 那样取反得到旧值，
-    // 通过闭包追踪上次成功提交的值，便于失败时回滚控件
-    let lastValue = arrangementSelect.value;
-    arrangementSelect.addEventListener("change", async () => {
-      const prev = lastValue;
-      try {
-        // 运行时窄化校验：select.value 为 string，需确认是合法 Arrangement 再提交
-        const arrangementValue = arrangementSelect.value;
-        if (!isArrangement(arrangementValue)) {
-          showStatus("无效的排列模式", "error");
-          arrangementSelect.value = prev;
-          return;
-        }
-        await patchConfig({ display: { arrangement: arrangementValue } });
-        showStatus("排列模式已更新", "success");
-        lastValue = arrangementSelect.value;
-      } catch (e) {
-        log.error("更新排列模式失败:", e);
-        showStatus("更新排列模式失败，请重试", "error");
-        arrangementSelect.value = prev;
-      }
     });
   }
 
@@ -460,29 +428,29 @@ export async function init() {
     });
   }
 
-  const rotationArrangementSelect = document.getElementById(
-    "rotation-arrangement-select",
+  const arrangementSelect = document.getElementById(
+    "arrangement-select",
   ) as HTMLSelectElement | null;
-  if (rotationArrangementSelect) {
-    let lastArrangement = rotationArrangementSelect.value;
-    rotationArrangementSelect.addEventListener("change", async () => {
+  if (arrangementSelect) {
+    let lastArrangement = arrangementSelect.value;
+    arrangementSelect.addEventListener("change", async () => {
       const prev = lastArrangement;
-      const value = rotationArrangementSelect.value;
+      const value = arrangementSelect.value;
       if (!isArrangement(value)) {
-        showStatus("无效的轮换编排", "error");
-        rotationArrangementSelect.value = prev;
+        showStatus("无效的多屏排列", "error");
+        arrangementSelect.value = prev;
         return;
       }
       try {
-        await patchRotation({ arrangement: value });
-        showStatus("轮换编排已更新", "success");
+        await updateArrangement(value);
+        showStatus("多屏排列已更新", "success");
         lastArrangement = value;
         // 编排变化 → 重建单元配置（单元 key 依编排而定）
         runAsync(() => renderUnitConfig(), "renderUnitConfig 失败");
       } catch (e) {
-        log.error("更新轮换编排失败:", e);
-        showStatus("更新轮换编排失败", "error");
-        rotationArrangementSelect.value = prev;
+        log.error("更新多屏排列失败:", e);
+        showStatus("更新多屏排列失败", "error");
+        arrangementSelect.value = prev;
       }
     });
   }
@@ -698,6 +666,7 @@ export async function init() {
   await listenWithCleanup<{ file_path: string; error: string }>(
     "wallpaper-thumbnail-failed",
     (payload) => {
+      if (!payload || !payload.file_path) return;
       const fileName = extractFileName(payload.file_path);
       showStatus(`缩略图生成失败：${fileName}`, "error");
     }
@@ -764,8 +733,8 @@ export async function init() {
     }
   );
 
-  // Task 10.2: 池读写后（rotation.ts 派发）触发壁纸列表重新标注池名。
-  await listenWithCleanup("rotation-pools-changed", () => {
+  // Task 10.2: 池读写后（rotation.ts 派发 DOM CustomEvent）触发壁纸列表重新标注池名。
+  addEventListenerWithCleanup(window, "rotation-pools-changed", () => {
     runAsync(() => refreshWallpaperList(), "refreshWallpaperList 失败");
   });
 

@@ -47,6 +47,7 @@ use std::time::{Duration, Instant};
 
 use crate::commands::wallpaper::DisplaySettingGuard;
 use mirrorstar_core::config::{PlaybackState, PlaybackStore, Unit};
+use mirrorstar_core::layout::{self, LayoutMonitor, LayoutPlane};
 use mirrorstar_core::scheduler::{
     filter_candidates, invalidate_sampler, resolve_boot, sample_next, BootDecision, PoolEntry,
     SamplerState,
@@ -60,10 +61,6 @@ use mirrorstar_core::{
 use tauri::Emitter;
 use tokio::sync::mpsc::{self, UnboundedReceiver, UnboundedSender};
 use tokio::sync::Notify;
-
-/// 全局 / 全体调度单元 key（`AllSame` / `Span` 编排下的唯一单元；亦作为"全局开关"
-/// 的 key，设计 §14）。
-pub const ALL_UNIT_KEY: &str = "all";
 
 /// 原子交换进行中守卫（RAII，Task 4.1/4.2）
 ///
@@ -214,38 +211,10 @@ fn set_layout_units_enabled(play: &mut PlaybackState, keys: &[String]) {
     }
 }
 
-// ── 布局（编排 + 显示器 → 单元 key → display 集合映射）──────────────────────
-
-struct Layout {
-    arrangement: Arrangement,
-    /// unit_key → 该单元覆盖的 display id 列表。
-    unit_displays: HashMap<String, Vec<String>>,
-    /// 主显示器 id（PerMonitor 下用于默认手动目标，DR-36）。
-    pub primary: Option<String>,
-}
-
-impl Layout {
-    fn new() -> Self {
-        Self {
-            arrangement: Arrangement::PerMonitor,
-            unit_displays: HashMap::new(),
-            primary: None,
-        }
-    }
-
-    fn unit_keys(&self) -> Vec<String> {
-        match self.arrangement {
-            Arrangement::PerMonitor => self.unit_displays.keys().cloned().collect(),
-            Arrangement::AllSame | Arrangement::Span => {
-                if self.unit_displays.contains_key(ALL_UNIT_KEY) {
-                    vec![ALL_UNIT_KEY.to_string()]
-                } else {
-                    Vec::new()
-                }
-            }
-        }
-    }
-}
+// ── 布局：消费 mirrorstar_core::layout 的 LayoutPlane（多屏排列布局域）────────
+//
+// 单元划分 / 窗口矩形 / 主显示器等布局规则统一由 `layout::plan` 计算（纯函数、可
+// 单测），调度器仅消费其结果，不再自行实现"编排 → 单元"映射（DR-2 布局域收敛）。
 
 // ── 候选 / 采样辅助（纯决策，复用 mirrorstar_core::scheduler）────────────────
 
@@ -297,9 +266,12 @@ async fn run_loop(
 ) {
     // 启动阶段：读配置 + 对账 + 对齐单元 + 开机解析一次（设计 §16）。
     let cfg = handle.config_manager.get_config();
-    let mut layout = Layout::new();
-    reconcile_and_align(&handle, cfg.rotation.arrangement, &mut layout);
+    let mut layout = LayoutPlane::default();
+    reconcile_and_align(&handle, cfg.arrangement, &mut layout);
     invalidate_all_samplers(&handle, &layout);
+    // 引擎构造默认 per_monitor；boot / 轮换会快照 renderer_config 读引擎内部
+    // arrangement，此处先同步顶层配置，避免 Span / AllSame 几何错位（P0-2）。
+    handle.engine.lock().await.set_arrangement(cfg.arrangement);
     apply_boot(&handle, &layout, &app).await;
     handle.flush_playback();
 
@@ -308,7 +280,7 @@ async fn run_loop(
     loop {
         // 每次醒来重读配置（热重载 / config 命令 / watcher 均落在此处生效）。
         let cfg = handle.config_manager.get_config();
-        if reconcile_and_align(&handle, cfg.rotation.arrangement, &mut layout) {
+        if reconcile_and_align(&handle, cfg.arrangement, &mut layout) {
             handle.flush_playback();
         }
 
@@ -426,14 +398,14 @@ fn resolve_migration(
         // all → 主屏单元
         (Arrangement::AllSame | Arrangement::Span, Arrangement::PerMonitor) => {
             if had_all_unit {
-                prev_primary.map(|pk| (ALL_UNIT_KEY.to_string(), pk.to_string()))
+                prev_primary.map(|pk| (layout::ALL_UNIT_KEY.to_string(), pk.to_string()))
             } else {
                 None
             }
         }
         // 主屏 → all
         (Arrangement::PerMonitor, Arrangement::AllSame | Arrangement::Span) => {
-            prev_primary.map(|pk| (pk.to_string(), ALL_UNIT_KEY.to_string()))
+            prev_primary.map(|pk| (pk.to_string(), layout::ALL_UNIT_KEY.to_string()))
         }
         // 主屏变化：old primary → new primary
         (Arrangement::PerMonitor, Arrangement::PerMonitor) => match (prev_primary, new_primary) {
@@ -444,18 +416,21 @@ fn resolve_migration(
     }
 }
 
-/// 按当前编排枚举显示器建立 / 对齐单元映射；清理引用已删壁纸 / 已删池的条目并回退；
-/// 编排切换时按 DR-22 迁移主屏 / `all` 单元状态到目标单元。
+/// 按当前排列枚举显示器，经布局域 `layout::plan` 建立 / 对齐单元映射；清理引用已删
+/// 壁纸 / 已删池的条目并回退；排列切换时按 DR-22 迁移主屏 / `all` 单元状态到目标单元。
+///
+/// 引擎同步（`engine.set_arrangement`）已剥离——那是配置变更的副作用，统一在
+/// `update_config` / `update_arrangement` / 热更新路径处理（多屏排列布局域收敛）。
 fn reconcile_and_align(
     handle: &SchedulerHandle,
     arrangement: Arrangement,
-    layout: &mut Layout,
+    layout: &mut LayoutPlane,
 ) -> bool {
     // DR-22 迁移需在上次映射被覆盖前快照"来源"侧状态。
     let mut changed = false;
     let prev_arrangement = layout.arrangement;
     let prev_primary = layout.primary.clone();
-    let had_all_unit = layout.unit_displays.contains_key(ALL_UNIT_KEY);
+    let had_all_unit = layout.unit_displays.contains_key(layout::ALL_UNIT_KEY);
 
     let displays = {
         let desktop = match handle.desktop.lock() {
@@ -464,37 +439,12 @@ fn reconcile_and_align(
         };
         desktop.enumerate_displays()
     };
-
-    layout.arrangement = arrangement;
-    layout.unit_displays.clear();
-    layout.primary = None;
-
-    let display_ids: Vec<String> = displays.iter().map(|d| d.id.clone()).collect();
-    for d in &displays {
-        if d.is_primary {
-            layout.primary = Some(d.id.clone());
-        }
-    }
-
-    match arrangement {
-        Arrangement::PerMonitor => {
-            for d in &displays {
-                layout
-                    .unit_displays
-                    .insert(d.id.clone(), vec![d.id.clone()]);
-            }
-        }
-        Arrangement::AllSame | Arrangement::Span => {
-            if !display_ids.is_empty() {
-                layout
-                    .unit_displays
-                    .insert(ALL_UNIT_KEY.to_string(), display_ids);
-            }
-        }
-    }
+    // 单元划分规则收敛到布局域（纯函数，可单测）。
+    let monitors: Vec<LayoutMonitor> = displays.iter().map(LayoutMonitor::from).collect();
+    *layout = layout::plan(arrangement, &monitors);
 
     // 对齐到已建 / 新建单元。孤儿单元（已拔屏 / 编排不再覆盖）不做任何降级、直接保留，
-    // 回归"默认全开"模型（它们不在 layout.unit_keys，天然不参与轮换迭代）；清理已删池 /
+    // 回归"默认全开"模型（它们不在 layout::unit_keys，天然不参与轮换迭代）；清理已删池 /
     // 已删壁纸引用（DR-34）。
     let mut play = handle.playback.lock().unwrap_or_else(|e| e.into_inner());
     let cm = &handle.config_manager;
@@ -588,9 +538,9 @@ fn scrub_unit_refs(
 }
 
 /// 失效重建所有单元的采样器（DR-23）：清袋，游标锚定到当前壁纸。
-fn invalidate_all_samplers(handle: &SchedulerHandle, layout: &Layout) {
+fn invalidate_all_samplers(handle: &SchedulerHandle, layout: &LayoutPlane) {
     let mut play = handle.playback.lock().unwrap_or_else(|e| e.into_inner());
-    for key in layout.unit_keys() {
+    for key in layout::unit_keys(layout) {
         let unit = play.ensure_unit(key);
         let mut sampler = SamplerState {
             order_cursor: unit.order_cursor.clone(),
@@ -604,9 +554,9 @@ fn invalidate_all_samplers(handle: &SchedulerHandle, layout: &Layout) {
 
 // ── 开机 / 唤醒解析（一次 apply，DR-12 / DR-18 / DR-21）─────────────────────
 
-async fn apply_boot(handle: &SchedulerHandle, layout: &Layout, app: &tauri::AppHandle) {
+async fn apply_boot(handle: &SchedulerHandle, layout: &LayoutPlane, app: &tauri::AppHandle) {
     let cfg = handle.config_manager.get_config();
-    for key in layout.unit_keys() {
+    for key in layout::unit_keys(layout) {
         let unit = handle
             .playback
             .lock()
@@ -664,9 +614,9 @@ async fn apply_boot(handle: &SchedulerHandle, layout: &Layout, app: &tauri::AppH
 
 // ── 轮换执行 ───────────────────────────────────────────────────────────────
 
-async fn rotate_all(handle: &SchedulerHandle, layout: &Layout, app: &tauri::AppHandle) {
-    for key in layout.unit_keys() {
-        if unit_is_rotatable(handle, layout, &key) {
+async fn rotate_all(handle: &SchedulerHandle, layout: &LayoutPlane, app: &tauri::AppHandle) {
+    for key in layout::unit_keys(layout) {
+        if unit_is_rotatable(handle, &key) {
             sample_and_apply_unit(handle, layout, &key, app).await;
         }
     }
@@ -676,7 +626,7 @@ async fn rotate_all(handle: &SchedulerHandle, layout: &Layout, app: &tauri::AppH
 /// 返回被换到的壁纸 id；返回 `None` 表示无可换（池 <2 / 采样返回 None / apply 失败）。
 async fn sample_and_apply_unit(
     handle: &SchedulerHandle,
-    layout: &Layout,
+    layout: &LayoutPlane,
     key: &str,
     app: &tauri::AppHandle,
 ) -> Option<String> {
@@ -732,7 +682,7 @@ enum ApplyOutcome {
 /// 任一屏成功即更新单元 current 并返回 `true`（DR-19：单屏失败记录，其余继续）。
 async fn apply_wallpaper_to_unit(
     handle: &SchedulerHandle,
-    layout: &Layout,
+    layout: &LayoutPlane,
     key: &str,
     wallpaper_id: &str,
     app: &tauri::AppHandle,
@@ -880,11 +830,16 @@ async fn apply_to_display(
     }
 }
 
-fn resolve_target_key(layout: &Layout, key: Option<String>) -> Option<String> {
+/// 手动"下一张"请求的目标单元解析（`None` = 主/唯一单元）。
+///
+/// 与 `layout::validate_unit_key` 的差异属有意：前者供命令层校验任意 key 合法性并
+/// 返回 `Err`；本函数面向调度器内部请求，缺省（`None`）语义为"主/唯一单元"，
+/// 且全局编排下零显示器时返回 `None`（无单元可换，静默忽略），而非报错。
+fn resolve_target_key(layout: &LayoutPlane, key: Option<String>) -> Option<String> {
     match layout.arrangement {
         Arrangement::AllSame | Arrangement::Span => {
-            if layout.unit_displays.contains_key(ALL_UNIT_KEY) {
-                Some(ALL_UNIT_KEY.to_string())
+            if layout.unit_displays.contains_key(layout::ALL_UNIT_KEY) {
+                Some(layout::ALL_UNIT_KEY.to_string())
             } else {
                 None
             }
@@ -904,7 +859,7 @@ fn resolve_target_key(layout: &Layout, key: Option<String>) -> Option<String> {
     }
 }
 
-fn unit_is_rotatable(handle: &SchedulerHandle, _layout: &Layout, key: &str) -> bool {
+fn unit_is_rotatable(handle: &SchedulerHandle, key: &str) -> bool {
     let play = handle.playback.lock().unwrap_or_else(|e| e.into_inner());
     let Some(unit) = play.units.get(key) else {
         return false;
@@ -916,11 +871,10 @@ fn unit_is_rotatable(handle: &SchedulerHandle, _layout: &Layout, key: &str) -> b
     pool_count(&handle.config_manager, unit.active_pool.as_deref()) >= 2
 }
 
-fn has_rotatable_unit(handle: &SchedulerHandle, layout: &Layout) -> bool {
-    layout
-        .unit_keys()
+fn has_rotatable_unit(handle: &SchedulerHandle, layout: &LayoutPlane) -> bool {
+    layout::unit_keys(layout)
         .into_iter()
-        .any(|k| unit_is_rotatable(handle, layout, &k))
+        .any(|k| unit_is_rotatable(handle, &k))
 }
 
 fn emit_rotated(app: &tauri::AppHandle, key: &str, wallpaper_id: &str) {
@@ -939,14 +893,17 @@ fn emit_rotated(app: &tauri::AppHandle, key: &str, wallpaper_id: &str) {
 mod tests {
     use super::*;
 
-    /// 构造布局：PerMonitor 时 keys 即各显示器单元（primary 指向其中一个）；
-    /// AllSame / Span 时以 ALL_UNIT_KEY 承载全部，primary 仅作默认值。
-    fn layout_with(arrangement: Arrangement, keys: &[&str], primary: Option<&str>) -> Layout {
-        let mut l = Layout::new();
-        l.arrangement = arrangement;
+    /// 构造布局平面：PerMonitor 时 keys 即各显示器单元（primary 指向其中一个）；
+    /// AllSame / Span 时以全局单元 key（`layout::ALL_UNIT_KEY`）承载全部，primary 仅作默认值。
+    fn layout_with(arrangement: Arrangement, keys: &[&str], primary: Option<&str>) -> LayoutPlane {
+        let mut l = LayoutPlane {
+            arrangement,
+            ..Default::default()
+        };
         for k in keys {
             l.unit_displays
                 .insert((*k).to_string(), vec![(*k).to_string()]);
+            l.display_order.push((*k).to_string());
         }
         l.primary = primary.map(str::to_owned);
         l
@@ -956,13 +913,13 @@ mod tests {
 
     #[test]
     fn target_all_same_always_returns_all_when_unit_exists() {
-        let l = layout_with(Arrangement::AllSame, &[ALL_UNIT_KEY], None);
+        let l = layout_with(Arrangement::AllSame, &[layout::ALL_UNIT_KEY], None);
         // AllSame 下无论 key 为何均回退全局单元
         assert_eq!(
             resolve_target_key(&l, Some("any".to_string())).as_deref(),
-            Some(ALL_UNIT_KEY)
+            Some(layout::ALL_UNIT_KEY)
         );
-        assert_eq!(resolve_target_key(&l, None).as_deref(), Some(ALL_UNIT_KEY));
+        assert_eq!(resolve_target_key(&l, None).as_deref(), Some(layout::ALL_UNIT_KEY));
     }
 
     #[test]
@@ -1006,7 +963,7 @@ mod tests {
                 Some("m1"),
                 true
             ),
-            Some((ALL_UNIT_KEY.to_string(), "m1".to_string()))
+            Some((layout::ALL_UNIT_KEY.to_string(), "m1".to_string()))
         );
     }
 
@@ -1036,7 +993,7 @@ mod tests {
                 None,
                 false
             ),
-            Some(("m2".to_string(), ALL_UNIT_KEY.to_string()))
+            Some(("m2".to_string(), layout::ALL_UNIT_KEY.to_string()))
         );
     }
 
@@ -1170,7 +1127,7 @@ mod tests {
         play.ensure_unit("b".to_string()).enabled = true;
         drop(play);
 
-        let mut layout = Layout::new();
+        let mut layout = LayoutPlane::default();
         reconcile_and_align(&handle, Arrangement::PerMonitor, &mut layout);
 
         let play = handle.playback.lock().unwrap();
@@ -1245,8 +1202,8 @@ mod tests {
             set_layout_units_enabled(&mut play, &["a".to_string(), "b".to_string()]);
         }
         assert!(has_rotatable_unit(&handle, &layout));
-        assert!(unit_is_rotatable(&handle, &layout, "a"));
-        assert!(unit_is_rotatable(&handle, &layout, "b"));
+        assert!(unit_is_rotatable(&handle, "a"));
+        assert!(unit_is_rotatable(&handle, "b"));
 
         // 单独关闭 b → 该单元不参与；其余开启单元（a）仍参与 → 全局仍可触发。
         {
@@ -1254,11 +1211,11 @@ mod tests {
             play.units.get_mut("b").unwrap().enabled = false;
         }
         assert!(
-            !unit_is_rotatable(&handle, &layout, "b"),
+            !unit_is_rotatable(&handle, "b"),
             "被关闭单元不应参与轮换"
         );
         assert!(
-            unit_is_rotatable(&handle, &layout, "a"),
+            unit_is_rotatable(&handle, "a"),
             "其它开启单元仍应参与"
         );
         assert!(has_rotatable_unit(&handle, &layout));
@@ -1269,8 +1226,8 @@ mod tests {
             play.units.get_mut("a").unwrap().enabled = false;
         }
         assert!(!has_rotatable_unit(&handle, &layout));
-        assert!(!unit_is_rotatable(&handle, &layout, "a"));
-        assert!(!unit_is_rotatable(&handle, &layout, "b"));
+        assert!(!unit_is_rotatable(&handle, "a"));
+        assert!(!unit_is_rotatable(&handle, "b"));
     }
 
     // ── Task 4.3：原子交换互斥标志（ATOMIC_SWAP_IN_PROGRESS）测试 ─────────────

@@ -5,6 +5,7 @@ import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 vi.mock("../ipc", () => ({
   createPool: vi.fn(),
   deletePool: vi.fn(),
+  getArrangement: vi.fn(),
   getDisplays: vi.fn(),
   getRotationConfig: vi.fn(),
   getUnitStates: vi.fn(),
@@ -14,6 +15,13 @@ vi.mock("../ipc", () => ({
   setRotationEnabled: vi.fn(),
   updatePool: vi.fn(),
   updateRotationConfig: vi.fn(),
+}));
+
+// 布局域模块保持真实实现（unitKeysForArrangement 等），仅将 getCurrentArrangement
+// 替换为可驱动的 mock（读取多屏排列统一走 ./arrangement 路径，回退语义归属该模块）
+vi.mock("./arrangement", async (importOriginal) => ({
+  ...(await importOriginal()),
+  getCurrentArrangement: vi.fn(),
 }));
 
 // 屏蔽 state，避免 getter 告警并可控地同步 pools / allWallpapers
@@ -37,8 +45,9 @@ vi.mock("../utils/logger", () => ({
   },
 }));
 
-// showStatus 用 mock，便于断言错误/成功提示
+// showStatus / extractFileName 用 mock，便于断言错误/成功提示与成员列表文件名展示
 vi.mock("./utils", () => ({
+  extractFileName: vi.fn((filePath: string) => filePath.split(/[/\\]/).pop() || filePath),
   showStatus: vi.fn(),
 }));
 
@@ -58,6 +67,7 @@ import {
   updatePool,
   updateRotationConfig,
 } from "../ipc";
+import { getCurrentArrangement } from "./arrangement";
 import type { DisplayInfo, Pool, RotationConfig, WallpaperEntry } from "../types";
 import {
   createPoolFromInput,
@@ -70,7 +80,6 @@ import {
   renderUnitConfig,
   setupNextWallpaperButton,
   setupPoolCreate,
-  unitKeysForArrangement,
 } from "./rotation";
 
 // ── 测试数据 ────────────────────────────────────────────────────────────────────
@@ -121,7 +130,6 @@ function baseRotation(): RotationConfig {
     on_boot: false,
     interval_minutes: 30,
     order: "sequential",
-    arrangement: "per_monitor",
   };
 }
 
@@ -148,6 +156,7 @@ beforeEach(() => {
   appState.pools = [];
   // IPC 默认成功返回
   vi.mocked(listPools).mockResolvedValue(samplePools());
+  vi.mocked(getCurrentArrangement).mockResolvedValue("per_monitor");
   vi.mocked(getRotationConfig).mockResolvedValue(baseRotation());
   vi.mocked(getDisplays).mockResolvedValue(sampleDisplays());
   vi.mocked(updatePool).mockResolvedValue(undefined);
@@ -254,28 +263,7 @@ describe("reorderMembers", () => {
   });
 });
 
-describe("unitKeysForArrangement", () => {
-  const displays: DisplayInfo[] = sampleDisplays();
-
-  it("PerMonitor 每个显示器一个单元（主屏加标注）", () => {
-    expect(unitKeysForArrangement("per_monitor", displays)).toEqual([
-      { key: "d1", label: "[主] 显示器 1" },
-      { key: "d2", label: "显示器 2" },
-    ]);
-  });
-
-  it("PerMonitor 无显示器时返回空数组", () => {
-    expect(unitKeysForArrangement("per_monitor", [])).toEqual([]);
-  });
-
-  it("AllSame 返回唯一 all 单元", () => {
-    expect(unitKeysForArrangement("all_same", displays)).toEqual([{ key: "all", label: "全部屏幕" }]);
-  });
-
-  it("Span 返回唯一 all 单元", () => {
-    expect(unitKeysForArrangement("span", displays)).toEqual([{ key: "all", label: "全部屏幕" }]);
-  });
-});
+// 多屏排列相关测试已随模块迁移至 ui/arrangement.test.ts（布局域）
 
 // ── 10.1 patchRotation 串行化 ──────────────────────────────────────────────────
 
@@ -376,7 +364,7 @@ describe("renderUnitConfig", () => {
   it("容器不存在时安全返回且不调用 IPC", async () => {
     container.remove();
     await renderUnitConfig();
-    expect(getRotationConfig).not.toHaveBeenCalled();
+    expect(getCurrentArrangement).not.toHaveBeenCalled();
     expect(getDisplays).not.toHaveBeenCalled();
   });
 
@@ -403,7 +391,7 @@ describe("renderUnitConfig", () => {
 
   it("all_same / span 编排：渲染唯一 all 单元", async () => {
     vi.mocked(listPools).mockResolvedValue(samplePools());
-    vi.mocked(getRotationConfig).mockResolvedValue({ ...baseRotation(), arrangement: "all_same" });
+    vi.mocked(getCurrentArrangement).mockResolvedValue("all_same");
     await loadPools();
     await renderUnitConfig();
 
@@ -499,13 +487,13 @@ describe("renderUnitConfig", () => {
     expect(log.error).toHaveBeenCalled();
   });
 
-  it("读取轮换配置失败时回退 per_monitor 并记录告警", async () => {
-    vi.mocked(getRotationConfig).mockRejectedValue(new Error("config fail"));
-    await renderUnitConfig();
+  it("读取多屏排列失败时由 getCurrentArrangement 负责回退（renderUnitConfig 信任其回退结果）", async () => {
+    // 回退语义已收敛到 ./arrangement 的 getCurrentArrangement（失败→log.warn→per_monitor，
+    // 该回退本身的单测见 arrangement.test.ts "读取失败时回退默认 per_monitor"）；
+    // renderUnitConfig 不再自行兜底——getCurrentArrangement 的失败会向上传播（生产路径由调用方 runAsync 承接）。
+    vi.mocked(getCurrentArrangement).mockRejectedValue(new Error("config fail"));
 
-    expect(log.warn).toHaveBeenCalledWith(expect.stringContaining("读取轮换配置失败"), expect.any(Error));
-    // 回退 per_monitor + 默认 displays，渲染 2 个单元
-    expect(container.querySelectorAll(".unit-config-item")).toHaveLength(2);
+    await expect(renderUnitConfig()).rejects.toThrow("config fail");
   });
 
   it("获取显示器列表失败时回退为全局单元（empty displays）", async () => {
