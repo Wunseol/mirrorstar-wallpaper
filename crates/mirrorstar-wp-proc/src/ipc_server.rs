@@ -538,6 +538,11 @@ pub(crate) fn ipc_thread(
         // WP09: 在 command move 到 cmd_tx 之前提取 request_id，
         // 供 PostMessageW 失败时构造错误响应使用。
         let request_id = command.request_id();
+        // 响应累积修复：同样在 move 之前保存"该命令是否期望响应"。仅 `Play` 走同步
+        // 请求-响应路径，其余命令为 fire-and-forget（父进程不读取响应）。若对每条命令
+        // 都写回响应，响应会在 4KB 管道输出缓冲区累积，写满后阻塞本 IPC 线程，
+        // 导致后续命令永久失联（子进程仍存活但不再处理命令）。
+        let expects_response = command.expects_response();
 
         // 创建响应通道
         let (resp_tx, resp_rx) = mpsc::channel::<WpProcResponse>();
@@ -596,6 +601,13 @@ pub(crate) fn ipc_thread(
                 continue;
             }
         };
+
+        // 响应累积修复：仅当命令期望响应（Play）时才写回管道。对 fire-and-forget
+        // 命令跳过写入——父进程不读取其响应，写回只会占满 4KB 输出缓冲区并阻塞
+        // 本线程。仍保留上方"等待主线程响应"以维持命令串行与主线程完成语义。
+        if !expects_response {
+            continue;
+        }
 
         if let Err(e) = writer.write_all(resp_str.as_bytes()) {
             tracing::warn!("写入响应失败: {}", e);
@@ -831,13 +843,6 @@ mod tests {
         assert!(matches!(
             terminate_cmd,
             WpProcCommand::Terminate { request_id: 2 }
-        ));
-
-        let navigate_line = r#"{"command":"navigate","request_id":3,"url":"x"}"#;
-        let navigate_cmd = process_line(navigate_line).expect("navigate 应解析成功");
-        assert!(matches!(
-            navigate_cmd,
-            WpProcCommand::Navigate { request_id: 3, .. }
         ));
     }
 

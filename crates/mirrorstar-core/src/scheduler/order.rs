@@ -501,7 +501,13 @@ mod tests {
             ..SamplerState::default()
         };
         let mut rng = |_n: usize| 0usize;
-        let result = sample_next_inner(Order::ShuffleBag, &candidates, &mut state, Some("a"), &mut rng);
+        let result = sample_next_inner(
+            Order::ShuffleBag,
+            &candidates,
+            &mut state,
+            Some("a"),
+            &mut rng,
+        );
         assert_eq!(result.as_deref(), Some("b"), "2 张池抽中当前应重抽到另一张");
     }
 
@@ -515,13 +521,15 @@ mod tests {
         ];
         let mut state = SamplerState::default();
         let mut rng = |_n: usize| 0usize;
-        let result = sample_next_inner(Order::ShuffleBag, &candidates, &mut state, Some("a"), &mut rng);
-        assert!(result.is_some(), "袋重洗后应能采样");
-        assert_ne!(
-            result.as_deref(),
+        let result = sample_next_inner(
+            Order::ShuffleBag,
+            &candidates,
+            &mut state,
             Some("a"),
-            "重洗后也不得抽中当前壁纸"
+            &mut rng,
         );
+        assert!(result.is_some(), "袋重洗后应能采样");
+        assert_ne!(result.as_deref(), Some("a"), "重洗后也不得抽中当前壁纸");
         assert_eq!(result.as_deref(), Some("b"));
     }
 
@@ -535,8 +543,13 @@ mod tests {
         ];
         let mut state = SamplerState::default();
         let mut rng = |_n: usize| 0usize;
-        let result =
-            sample_next_inner(Order::PseudoRandom, &candidates, &mut state, Some("a"), &mut rng);
+        let result = sample_next_inner(
+            Order::PseudoRandom,
+            &candidates,
+            &mut state,
+            Some("a"),
+            &mut rng,
+        );
         assert_eq!(result.as_deref(), Some("b"), "纯随机应跳过当前索引");
     }
 
@@ -552,8 +565,13 @@ mod tests {
             order_cursor: Some("a".into()),
             ..SamplerState::default()
         };
-        let result =
-            sample_next_inner(Order::Sequential, &candidates, &mut state, Some("b"), &mut |_| 0);
+        let result = sample_next_inner(
+            Order::Sequential,
+            &candidates,
+            &mut state,
+            Some("b"),
+            &mut |_| 0,
+        );
         assert_eq!(result.as_deref(), Some("c"), "顺序算法应跳过当前壁纸");
         assert_eq!(state.order_cursor.as_deref(), Some("c"));
     }

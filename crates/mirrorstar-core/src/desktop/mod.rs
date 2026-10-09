@@ -60,16 +60,45 @@ use std::collections::HashMap;
 
 use windows::Win32::Foundation::{GetLastError, BOOL, HWND, LPARAM, RECT};
 use windows::Win32::Graphics::Gdi::{
-    EnumDisplayMonitors, GetMonitorInfoW, HDC, HMONITOR, MONITORINFOEXW,
+    EnumDisplayMonitors, GetMonitorInfoW, InvalidateRect, HDC, HMONITOR, MONITORINFOEXW,
 };
 use windows::Win32::UI::HiDpi::{GetDpiForMonitor, MDT_EFFECTIVE_DPI};
 use windows::Win32::UI::WindowsAndMessaging::{
-    GetAncestor, GA_PARENT, IsWindow, SetParent, ShowWindow, MONITORINFOF_PRIMARY, SW_HIDE,
+    GetAncestor, IsWindow, SetParent, ShowWindow, GA_PARENT, MONITORINFOF_PRIMARY, SW_HIDE,
 };
 
 use crate::config::settings::Arrangement;
 use crate::config::DisplayInfo;
 use crate::MirrorStarError;
+
+/// 嵌回（reattach）失败后的隐藏兜底（best-effort，单一实现）。
+///
+/// 「置顶窗口回嵌 WorkerW 失败」的三种场景——`detach_for_pure_mode` 的半摘出恢复、
+/// 纯净壁纸模式进入回滚、退出降级——共用本函数：若 `IsWindow(hwnd)` 为真则
+/// `ShowWindow(SW_HIDE)`，避免该窗口继续置顶 / 漂浮遮挡桌面。隐藏失败补一条 `warn`，
+/// 随后记 `error!`（含失败原因与 `display_id`，`context` 区分调用场景）。
+///
+/// 调用方只在嵌回失败分支调用；本函数不改变调用方的错误返回（best-effort，仅记录日志）。
+pub(crate) fn hide_window_on_reattach_failure(
+    display_id: &str,
+    hwnd: HWND,
+    error: &MirrorStarError,
+    context: &str,
+) {
+    if unsafe { IsWindow(hwnd).as_bool() } && !unsafe { ShowWindow(hwnd, SW_HIDE) }.as_bool() {
+        tracing::warn!(
+            display_id,
+            context,
+            "嵌回失败后的隐藏兜底亦失败，窗口可能仍置顶遮挡桌面"
+        );
+    }
+    tracing::error!(
+        display_id,
+        context,
+        error = %error,
+        "嵌回失败，已隐藏该窗口以免其继续置顶/漂浮遮挡桌面"
+    );
+}
 
 /// 桌面集成器，负责将壁纸窗口嵌入 Windows 桌面的 WorkerW 层
 #[derive(Default)]
@@ -295,13 +324,7 @@ impl DesktopIntegrator {
         // D-013: 从缓存获取显示器列表（5s TTL），避免每次调用 enumerate_displays()。
         // clone 一份 Vec 以释放 &mut self 借用，使后续 self.active_wallpapers.insert 可用。
         let displays: Vec<DisplayInfo> = self.get_cached_displays().to_vec();
-        worker_w::embed_wallpaper(
-            hwnd,
-            workerw_hwnd,
-            display_id,
-            arrangement,
-            &displays,
-        )?;
+        worker_w::embed_wallpaper(hwnd, workerw_hwnd, display_id, arrangement, &displays)?;
         self.active_wallpapers
             .insert(display_id.to_string(), (hwnd, arrangement));
         tracing::info!(display_id, hwnd = hwnd.0 as isize, "壁纸窗口已嵌入桌面");
@@ -396,6 +419,134 @@ impl DesktopIntegrator {
         self.active_wallpapers.remove(display_id);
         tracing::info!(display_id, "壁纸窗口已从桌面移除");
         Ok(())
+    }
+
+    /// 为纯净壁纸模式摘出指定显示器的壁纸窗口（摘出 + 置顶全屏）。
+    ///
+    /// ## 与 `remove_wallpaper` 的差异（契约）
+    ///
+    /// - **不调用 `ShowWindow(SW_HIDE)`**：窗口必须保持可见以继续出画
+    ///   （`remove_wallpaper` 会在分离后隐藏窗口）。
+    /// - **必须移除 `active_wallpapers` 条目**：否则 Explorer 重启 / workerw_check 的
+    ///   重新初始化（`ensure_workerw_ready`）会把已摘出的窗口又嵌回桌面，破坏纯净模式。
+    ///
+    /// 具体行为：
+    /// - `active_wallpapers` 无该 `display_id` → 返回
+    ///   [`MirrorStarError::DesktopIntegration`]（显示器无活跃壁纸窗口）。
+    /// - `IsWindow(hwnd)` 为假（窗口已消失）→ 移除该条目并返回 `Err`。
+    /// - 调 [`crate::pure_mode::lift_wallpaper_window`] 失败 → **保留条目**并返回 `Err`
+    ///   （窗口仍嵌在 WorkerW 内，状态未变，调用方可重试）。
+    /// - 成功 → 移除 `active_wallpapers` 条目、记录 info 日志、返回摘出的 `HWND`。
+    ///
+    /// 退出纯净壁纸模式时用 [`Self::reattach_after_pure_mode`] 嵌回。
+    pub fn detach_for_pure_mode(&mut self, display_id: &str) -> Result<HWND, MirrorStarError> {
+        // HWND 与 Arrangement 均 Copy，解构复制值后即可释放 &self 借用。
+        let Some(&(hwnd, arrangement)) = self.active_wallpapers.get(display_id) else {
+            tracing::warn!(display_id, "显示器无活跃壁纸窗口，无法摘出（纯净壁纸模式）");
+            return Err(MirrorStarError::DesktopIntegration(format!(
+                "显示器 {display_id} 无活跃壁纸窗口"
+            )));
+        };
+
+        // 窗口已消失：移除条目并返回 Err（调用方无法摘出一个不存在的窗口）
+        if !unsafe { IsWindow(hwnd).as_bool() } {
+            tracing::warn!(
+                display_id,
+                hwnd = hwnd.0 as isize,
+                "壁纸窗口已无效，移除活跃条目并放弃摘出"
+            );
+            self.active_wallpapers.remove(display_id);
+            return Err(MirrorStarError::DesktopIntegration(format!(
+                "显示器 {display_id} 的壁纸窗口已消失"
+            )));
+        }
+
+        // 摘出 + 置顶（保持矩形不变，不隐藏）；失败时按 A5 做"半摘出"恢复：
+        // `lift_wallpaper_window` 的失败可能发生在 `SetParent(None)` 之后（如 SetWindowPos
+        // 失败）——窗口已脱离 WorkerW 成为普通顶层窗口，若不恢复会漂浮在桌面层遮挡图标，
+        // 且引擎回滚只处理已计入 `lifted` 的窗口，覆盖不到本次失败窗口。
+        if let Err(e) = crate::pure_mode::lift_wallpaper_window(hwnd) {
+            tracing::warn!(
+                display_id,
+                hwnd = hwnd.0 as isize,
+                error = %e,
+                "摘出壁纸窗口失败，尝试恢复半摘出窗口后保留 active_wallpapers 条目"
+            );
+            self.recover_half_detached_window(display_id, hwnd, arrangement);
+            return Err(e);
+        }
+
+        // 摘出成功后移除条目：避免 Explorer 重启 / workerw_check 的重新初始化把
+        // 已摘出的窗口又嵌回桌面（见上方契约）。
+        self.active_wallpapers.remove(display_id);
+        tracing::info!(
+            display_id,
+            hwnd = hwnd.0 as isize,
+            "壁纸窗口已摘出并置顶（纯净壁纸模式）"
+        );
+        Ok(hwnd)
+    }
+
+    /// 退出纯净壁纸模式后把窗口嵌回 WorkerW。
+    ///
+    /// 直接委托现有 [`Self::embed_wallpaper`]：它内部会重新查找 WorkerW（Explorer 重启
+    /// 后自动使用新 WorkerW）并重新写回 `active_wallpapers`，**零新增几何算法**。
+    pub fn reattach_after_pure_mode(
+        &mut self,
+        display_id: &str,
+        hwnd: HWND,
+        arrangement: Arrangement,
+    ) -> Result<(), MirrorStarError> {
+        self.embed_wallpaper(hwnd, display_id, arrangement)?;
+        // 与进入路径 lift_wallpaper_window 的保险重绘同源：重嵌后立即呈现最新帧，
+        // 消除"重嵌完成但客户区仍显示旧内容"的观感风险（失败非致命，仅 warn）。
+        unsafe {
+            if !InvalidateRect(hwnd, None, false).as_bool() {
+                tracing::warn!(
+                    display_id,
+                    hwnd = hwnd.0 as isize,
+                    "重嵌后 InvalidateRect 失败，保险重绘未触发"
+                );
+            }
+        }
+        Ok(())
+    }
+
+    /// A5：`detach_for_pure_mode` 失败后的"半摘出"恢复（best-effort）
+    ///
+    /// `lift_wallpaper_window` 任一步失败时，窗口可能已被 `SetParent(None)` 摘出但未置顶
+    /// （半摘出状态）。本方法先检测窗口是否已脱离当前 WorkerW（[`Self::is_child_of_workerw`]）：
+    /// 已脱离则用进入时的 `arrangement` 经 [`Self::embed_wallpaper`] 嵌回；嵌回仍失败则调用
+    /// [`hide_window_on_reattach_failure`] 对有效句柄做 best-effort 隐藏，避免窗口漂浮于桌面层
+    /// 遮挡图标。恢复为 best-effort：失败只记录日志（隐藏失败 `warn` / 嵌回失败 `error!`），
+    /// 不改变 `detach_for_pure_mode` 的返回值（仍为原 `Err`）。
+    ///
+    /// 说明：`ShowWindow` 的返回值是"窗口先前的可见状态"而非成败（Win32 语义），
+    /// 故共享 helper 仅在隐藏**未生效**时补一条 `warn`，不影响嵌回流程与返回值。
+    fn recover_half_detached_window(
+        &mut self,
+        display_id: &str,
+        hwnd: HWND,
+        arrangement: Arrangement,
+    ) {
+        // 未脱离（失败发生在 GetWindowRect / SetParent 阶段）：窗口仍在 WorkerW 内，无需恢复
+        if self.is_child_of_workerw(hwnd) {
+            return;
+        }
+        if let Err(e) = self.embed_wallpaper(hwnd, display_id, arrangement) {
+            hide_window_on_reattach_failure(
+                display_id,
+                hwnd,
+                &e,
+                "摘出失败后窗口已半摘出且重新嵌回失败",
+            );
+        } else {
+            tracing::warn!(
+                display_id,
+                hwnd = hwnd.0 as isize,
+                "摘出失败后检测到窗口已半摘出，已重新嵌回 WorkerW 恢复原状"
+            );
+        }
     }
 
     /// 验证 WorkerW 句柄是否仍然有效
@@ -578,7 +729,6 @@ fn build_display_info(
         y: monitor_rect.top,
         is_primary,
         dpi,
-        current_wallpaper: None,
     }
 }
 
@@ -669,7 +819,6 @@ mod tests {
         assert_eq!(info.y, 0);
         assert!(info.is_primary);
         assert_eq!(info.dpi, 96);
-        assert!(info.current_wallpaper.is_none());
     }
 
     #[test]
@@ -1040,5 +1189,146 @@ mod tests {
         // 仅调用并丢弃结果——若 panic 则测试失败，Ok/Err 均合法。
         let mut integrator = DesktopIntegrator::new();
         let _ = integrator.ensure_initialized();
+    }
+
+    /// 纯净壁纸模式摘出/嵌回契约：`detach_for_pure_mode` / `reattach_after_pure_mode`
+    /// 原语存在，且 `detach_for_pure_mode` 函数段落内不得出现 `SW_HIDE`
+    /// （保证"摘出但不隐藏、继续出画"的契约）。
+    ///
+    /// 仅在该函数段落内断言"不含 SW_HIDE"——避免匹配到文件其它位置（如
+    /// `remove_wallpaper` 的 D-005 隐藏逻辑）或本函数的文档注释。
+    #[test]
+    fn pure_mode_detach_reattach_contract_markers() {
+        let source = include_str!("mod.rs");
+        // 运行期拼接搜索串，避免 include_str! 把测试自身的字面量计入匹配
+        let detach = ["detach_for_", "pure_mode"].join("");
+        let reattach = ["reattach_after_", "pure_mode"].join("");
+        assert!(source.contains(&detach), "源码应包含 {detach} 原语");
+        assert!(source.contains(&reattach), "源码应包含 {reattach} 原语");
+
+        // 段落：从 detach 定义起，到 reattach 定义前止
+        let detach_def = ["pub fn detach_for_", "pure_mode"].join("");
+        let reattach_def = ["pub fn reattach_after_", "pure_mode"].join("");
+        let start = source
+            .find(&detach_def)
+            .expect("源码应包含 detach_for_pure_mode 定义");
+        let end = start
+            + source[start..]
+                .find(&reattach_def)
+                .expect("源码应包含 reattach_after_pure_mode 定义");
+        let segment = &source[start..end];
+
+        let hide = ["SW_", "HIDE"].join("");
+        assert!(
+            !segment.contains(&hide),
+            "detach_for_pure_mode 不得调用 {hide}（窗口须保持可见以继续出画）"
+        );
+    }
+
+    /// A5 契约：`detach_for_pure_mode` 失败后必须尝试恢复"半摘出"窗口
+    ///（`recover_half_detached_window`：先 `is_child_of_workerw` 检测，再 `embed_wallpaper` 嵌回）；
+    /// 嵌回仍失败时经共享 helper `hide_window_on_reattach_failure` 隐藏兜底（R3）。
+    #[test]
+    fn pure_mode_half_detach_recovery_markers() {
+        let source = include_str!("mod.rs");
+        let call = ["self.recover_half_", "detached_window("].join("");
+        let def = ["fn recover_half_", "detached_window("].join("");
+        let child_check = ["is_child_", "of_workerw(hwnd)"].join("");
+        let reembed = ["embed_", "wallpaper(hwnd"].join("");
+        let end_marker = ["pub fn ", "is_workerw_valid"].join("");
+        assert!(
+            source.contains(&call),
+            "detach_for_pure_mode 失败分支应调用 {call} 恢复半摘出窗口"
+        );
+        let def_at = source
+            .find(&def)
+            .expect("源码应包含 recover_half_detached_window 定义");
+        let end_at = source[def_at..]
+            .find(&end_marker)
+            .expect("恢复函数之后应有 is_workerw_valid 定义")
+            + def_at;
+        let seg = &source[def_at..end_at];
+        assert!(
+            seg.contains(&child_check),
+            "恢复函数应先用 {child_check} 检测是否已摘出"
+        );
+        assert!(seg.contains(&reembed), "恢复函数应用 {reembed} 嵌回窗口");
+        // R3：隐藏兜底已抽为共享 helper（定义在本模块，实现 `IsWindow` + `ShowWindow(SW_HIDE)`），
+        // 恢复函数改为调用它；隐藏实现断言随标记一同移动至此（断言强度不变）。
+        let hide_helper = ["hide_window_on_reattach_", "failure("].join("");
+        assert!(
+            seg.contains(&hide_helper),
+            "恢复函数应调用共享隐藏兜底 {hide_helper}（F1/A5：嵌回失败隐藏兜底）"
+        );
+        let hide_impl = ["ShowWindow(hwnd, ", "SW_HIDE)"].join("");
+        assert!(
+            source.contains(&hide_impl),
+            "共享隐藏兜底 helper 应包含 {hide_impl}（F1：隐藏兜底实现）"
+        );
+    }
+
+    /// `detach_for_pure_mode` 的无效句柄/缺失条目路径：不 panic、返回 Err，
+    /// 并按"窗口已消失"既有契约移除条目（恢复分支结构由 `pure_mode_half_detach_recovery_markers` 覆盖）。
+    #[test]
+    fn pure_mode_detach_invalid_handle_paths() {
+        // (1) 无效 HWND：IsWindow=false → 移除条目 + Err（不触达恢复分支）
+        let mut integrator = DesktopIntegrator {
+            active_wallpapers: HashMap::from([(
+                "display1".to_string(),
+                (HWND::default(), Arrangement::Span),
+            )]),
+            ..Default::default()
+        };
+        let result = integrator.detach_for_pure_mode("display1");
+        assert!(result.is_err(), "无效 HWND 应返回 Err");
+        assert!(
+            !integrator.active_wallpapers.contains_key("display1"),
+            "无效 HWND 路径应移除条目（窗口已消失契约）"
+        );
+
+        // (2) 不存在的 display_id：Err 且不影响 active_wallpapers
+        let mut integrator = DesktopIntegrator::default();
+        let result = integrator.detach_for_pure_mode("nonexistent");
+        assert!(result.is_err(), "不存在的 display_id 应返回 Err");
+        assert!(
+            integrator.active_wallpapers.is_empty(),
+            "不存在的 display_id 不应影响 active_wallpapers"
+        );
+    }
+
+    /// D5 契约：`reattach_after_pure_mode` 在 `embed_wallpaper(...)` 成功之后执行一次
+    /// 保险重绘（`InvalidateRect`），消除"重嵌完成但客户区仍显示旧内容"的观感风险。
+    ///
+    /// 沿用仓库 `include_str!` 惯例：截取 `pub fn reattach_after_pure_mode` 到其后第一个
+    /// `fn ` 之间的源码片段，断言两处调用都存在且 `embed_wallpaper(` 出现在
+    /// `InvalidateRect` 之前（顺序契约：先嵌入、后重绘）。
+    #[test]
+    fn reattach_after_pure_mode_invalidates_after_embed() {
+        let source = include_str!("mod.rs");
+        // 运行期拼接搜索串，避免 include_str! 把测试自身的字面量计入匹配。
+        let start_marker = ["pub fn reattach_", "after_pure_mode("].join("");
+        let start = source
+            .find(&start_marker)
+            .expect("源码应包含 reattach_after_pure_mode 定义");
+        // 从定义签名之后开始找下一个 `fn `（避免匹配到定义自身的 "fn "）。
+        let after_sig = start + start_marker.len();
+        let end = after_sig
+            + source[after_sig..]
+                .find("fn ")
+                .expect("reattach_after_pure_mode 之后应有下一个函数定义");
+        let segment = &source[start..end];
+
+        let embed_call = ["self.embed_", "wallpaper("].join("");
+        let invalidate = ["Invalidate", "Rect"].join("");
+        let embed_at = segment
+            .find(&embed_call)
+            .expect("reattach_after_pure_mode 应调用 embed_wallpaper");
+        let invalidate_at = segment
+            .find(&invalidate)
+            .expect("reattach_after_pure_mode 应调用 InvalidateRect（保险重绘）");
+        assert!(
+            embed_at < invalidate_at,
+            "保险重绘必须在 embed_wallpaper 成功之后执行（D5）"
+        );
     }
 }

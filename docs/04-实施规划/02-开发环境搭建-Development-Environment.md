@@ -15,27 +15,23 @@
 
 | 工具 | 版本要求 | 用途 | 安装方式 |
 |------|----------|------|----------|
-| **Rust** | stable（`rust-version` 1.80，`rust-toolchain.toml` 锁定 stable） | 核心开发语言（workspace 3 成员） | https://rustup.rs 或 `winget install Rustlang.Rustup` |
+| **Rust** | stable（`rust-version` 1.80，`rust-toolchain.toml` 锁定 stable） | 核心开发语言（workspace 4 成员） | https://rustup.rs 或 `winget install Rustlang.Rustup` |
 | **Visual Studio Build Tools** | 2022 | MSVC 编译工具链（`cargo build` 需要 link.exe） | 安装 "Desktop development with C++" 工作负载 |
 | **Windows SDK** | 10.0.19041+ | Windows API（windows-rs 需要 Windows SDK） | 随 VS Build Tools 安装 |
-| **Node.js** | 20 LTS（CI 使用 Node 20） | Tauri 前端构建（Vite） | `winget install OpenJS.NodeJS.LTS` |
+| **Tauri CLI** | 2.x | `cargo tauri dev/build` | `cargo install tauri-cli`（仓库不再使用 npm 版 CLI） |
 | **Git** | latest | 版本控制 | `winget install Git.Git` |
 
-> **包管理器**：仓库使用 **npm**（存在 `package-lock.json`）。CI（`.github/workflows/checks.yml`）使用 `npm ci`。
+> **不需要 Node.js / npm**：项目已无前端构建产物，主窗口为原生 Slint UI；CI 亦不再安装 Node。
+>
+> **包管理器**：仅使用 **Cargo**（`Cargo.lock` 锁定）。原 `package.json` / `package-lock.json` 已随前端删除。
 
 ### Rust 工具链
 
 仓库根含 `rust-toolchain.toml`（锁定 stable channel），`rustup` 会自动读取并安装对应通道，无需手动 `rustup default`。
 
-## 2. 前端依赖
+## 2. UI 依赖
 
-`package.json` 前端工具链（与 03-技术栈 一致）：
-
-- **TypeScript** `^5.5`、**Vite** `^5.4`、**Vitest** `^2.1.9`（含 `@vitest/coverage-v8`）
-- **@tauri-apps/api** `^2`、**@tauri-apps/cli** `^2.11.2`
-- **ESLint** `^9` + **typescript-eslint** `^8` + **Prettier** `^3` + **terser** `^5`
-
-原生 TS（无 React/Vue/Angular）。
+主窗口 UI 由 `crates/mirrorstar-ui/` 使用 **Slint 1.18** 实现，绑定软件渲染（`default-features = false` + `features = ["renderer-software"]`）。无需任何前端工具链（无 TypeScript / Vite / Vitest / ESLint / Prettier）。
 
 ## 3. 环境搭建步骤
 
@@ -47,8 +43,8 @@ rustup update
 # 2. 安装 VS Build Tools（选择 "Desktop development with C++"，含 Windows SDK）
 winget install Microsoft.VisualStudio.2022.BuildTools
 
-# 3. 安装 Node.js 20 LTS
-winget install OpenJS.NodeJS.LTS
+# 3. 安装 Tauri CLI
+cargo install tauri-cli
 
 # 4. 安装 Git
 winget install Git.Git
@@ -59,29 +55,19 @@ winget install Git.Git
 ```powershell
 rustc --version        # 1.8x stable
 cargo --version
-node --version         # v20.x
-npm --version
+cargo tauri --version  # Tauri CLI 2.x
 ```
 
 ### 安装依赖与运行
 
 ```powershell
-# 拉取依赖并安装前端依赖
+# 拉取依赖并构建全部 workspace 成员
 cargo build --workspace
-npm install
 
-# 开发运行（注意顺序：需先构建 wp-proc 子进程再启动 tauri dev）
-npm run tauri:dev
+# 开发运行（build.rs 会在构建时以隔离 CARGO_TARGET_DIR
+# 单独构建 mirrorstar-ui 子进程；wp-proc 已并入壳）
+cargo tauri dev
 ```
-
-`tauri:dev` 脚本已定义为 `cargo build -p mirrorstar-wp-proc && tauri dev`，会先构建 WP 子进程再启动开发环境。也可手动：
-
-```powershell
-cargo build -p mirrorstar-wp-proc
-npm run tauri dev
-```
-
-> `tauri dev` 会调用 `beforeDevCommand: npm run dev`（Vite @ `http://localhost:1420`），等待 devUrl 就绪后加载。
 
 ## 4. 常用命令
 
@@ -90,7 +76,8 @@ npm run tauri dev
 | 命令 | 说明 |
 |------|------|
 | `cargo build --workspace` | 编译全部成员 |
-| `cargo build -p mirrorstar-wp-proc` | 单独编译 WP 子进程 |
+| `cargo build -p mirrorstar-ui` | 单独编译原生 UI 子进程 |
+| `cargo build -p mirrorstar-wp-proc` | 单独编译 WP 库 crate |
 | `cargo test --workspace` | 运行全部单元/集成测试 |
 | `cargo clippy --workspace --all-targets -- -D warnings` | Lint（零警告策略） |
 | `cargo fmt --all --check` | 格式检查 |
@@ -98,32 +85,29 @@ npm run tauri dev
 
 > `cargo test --workspace` 会跳过 `#[ignore]` 的共享资源类测试；如需执行用 `cargo test --workspace -- --ignored`（CI 中以 `continue-on-error` 运行）。
 
-### 前端（package.json scripts）
+### e2e（PowerShell 驱动脚本，`crates/mirrorstar-ui/`）
 
-| npm 命令 | 说明 |
-|----------|------|
-| `npm run dev` | Vite 开发服务器（tauri conf devUrl 1420） |
-| `npm run build` | Vite 构建 → `dist/` |
-| `npm run preview` | 预览构建产物 |
-| `npm run test` | Vitest run + 覆盖率（`@vitest/coverage-v8`） |
-| `npm run test:watch` | Vitest watch |
-| `npm run lint` | ESLint（`--max-warnings 0`） |
-| `npm run typecheck` | `tsc --noEmit` |
-| `npm run format` | Prettier（`--write`） |
-| `npm run tauri` | Tauri CLI 透传 |
-| `npm run tauri:dev` | 先构建 wp-proc 再 `tauri dev` |
+| 脚本 | 说明 |
+|------|------|
+| `measure_grid.ps1` | 网格内存/CPU 测量 |
+| `measure_scroll_reverify.ps1` | 滚动性能复测 |
+| `measure_preview.ps1` | 四类预览测量 |
+| `keyboard_smoke.ps1` | 键盘交互冒烟 |
+| `shell_measure.ps1` / `single_instance_check.ps1` | 壳内存测量 / 单实例校验 |
+
+> 原 `package.json` scripts（`npm run dev/build/test/lint/typecheck/format`、`tauri:dev` 等）已随前端删除**全部移除**。
 
 ## 5. 打包
 
 ```powershell
-npm run build              # 构建前端
-cargo build -p mirrorstar-wp-proc
+# build.rs 会在进行 tauri 构建时自动以隔离 CARGO_TARGET_DIR
+# 单独构建 mirrorstar-ui，并复制到 target/release/（wp-proc 已并入壳）
 cargo tauri build          # 生成 NSIS 安装包（含资源）
 ```
 
-产物位于 `target/release/bundle/`。打包配置详见 [项目目录结构](./05-项目目录结构-Project-Structure.md) 与 `src-tauri/tauri.conf.json`（`bundle.targets=["nsis"]`，resources 捆绑 `mpv/mpv.exe`、`mpv/license.txt`、`target/release/mirrorstar-wp-proc.exe`）。
+产物位于 `target/release/bundle/`。打包配置详见 [项目目录结构](./05-项目目录结构-Project-Structure.md) 与 `src-tauri/tauri.conf.json`（`bundle.targets=["nsis"]`，resources 捆绑 `mpv/mpv.exe`、`mpv/license`、`target/release/mirrorstar-ui.exe`）。
 
-> Release 构建由 GitHub Actions `.github/workflows/release.yml` 在打 `v*` tag 时自动执行（需配置签名密钥 `TAURI_SIGNING_PRIVATE_KEY` / `_PASSWORD`）。安装包签名密钥：Tauri v2 NSIS 默认启用签名，未配置密钥会失败，需在仓库 Secrets 中配置。
+> Release 构建由 GitHub Actions `.github/workflows/release.yml` 在打 `v*` tag 时自动执行（需配置签名密钥 `TAURI_SIGNING_PRIVATE_KEY` / `_PASSWORD`），不再使用 Node/npm。安装包签名密钥：Tauri v2 NSIS 默认启用签名，未配置密钥会失败，需在仓库 Secrets 中配置。
 
 ## 6. 常见问题
 
@@ -131,8 +115,8 @@ cargo tauri build          # 生成 NSIS 安装包（含资源）
 |------|----------|
 | `link.exe not found` | 安装 VS Build Tools，勾选 "Desktop development with C++" |
 | windows-rs 编译失败 | 确保 Windows SDK (≥ 10.0.19041) 已安装 |
-| WebView2 相关错误 | WebView2 SDK 随 VS Build Tools 安装 |
-| `npm run tauri:dev` 报 wp-proc 缺失 | 需先 `cargo build -p mirrorstar-wp-proc`（脚本已含该步骤） |
+| WebView2 相关错误 | WebView2 SDK 随 VS Build Tools 安装（仅网页壁纸/预览需要） |
+| 找不到 `mirrorstar-ui.exe` | 正常构建会自动生成并复制到 `target/release/`；若手动运行，先 `cargo build -p mirrorstar-ui` |
 | 中文/空格路径 | 项目路径避免中文字符与空格 |
 
 ***

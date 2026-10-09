@@ -20,40 +20,38 @@ mirrorstar-wallpaper/
 ├── .cargo/config.toml              # Cargo 配置文件
 ├── .github/
 │   └── workflows/
-│       ├── checks.yml              # 可复用检查工作流（rust-checks + frontend-checks）
+│       ├── checks.yml              # 可复用检查工作流（仅 rust-checks）
 │       ├── ci.yml                  # 推送/PR 触发，复用 checks
 │       └── release.yml             # v* tag 触发，含签名密钥前置门，构建并发布
 ├── crates/
-│   ├── mirrorstar-core/            # 核心库（配置/桌面/壁纸/Audio/IPC/进程/性能）
-│   └── mirrorstar-wp-proc/         # Web 壁纸子进程（独立二进制）
+│   ├── mirrorstar-core/            # 核心库（配置/桌面/壁纸/Audio/IPC/进程/性能/UI 协议）
+│   ├── mirrorstar-ui/              # 原生主窗口 UI 子进程（Slint，独立二进制）
+│   └── mirrorstar-wp-proc/         # Web 壁纸逻辑库（壳 --wp-proc 模式复用，WebView2 隔离）
 ├── docs/                           # 项目文档（01 需求 / 02 架构 / 03 技术栈 / 04 实施规划 / 测试报告 / 优化文档）
 ├── mpv/                            # 捆绑的 mpv 播放器（mpv.exe + license.txt）
-├── src/                            # 前端源码（TypeScript + CSS）
-├── src-tauri/                      # Tauri 应用层（Rust + 配置 + 图标 + 测试）
+├── src-tauri/                      # Tauri 壳（Rust + 配置 + 图标 + 测试）
 ├── wallpaper/                      # 本地示例壁纸（mp4 / png）
-├── index.html                      # 前端页面入口
 ├── Cargo.toml                      # Rust workspace 清单
 ├── Cargo.lock                      # 依赖锁定
 ├── LICENSE                         # 开源许可证
 ├── README.md                       # 仓库说明
 ├── rust-toolchain.toml             # 固定 Rust 工具链（stable / MSRV 1.80）
-├── rustfmt.toml                    # rustfmt 配置
-├── package.json                    # 前端工程（Vite / Vitest / TS / ESLint / Prettier）
-├── vite.config.ts                  # Vite 构建 + Vitest 测试配置
-├── tsconfig.json                   # TypeScript 配置
-└── eslint.config.js                # ESLint 配置
+└── rustfmt.toml                    # rustfmt 配置
 ```
+
+> 原前端目录/文件（`src/`、`index.html`、`package.json`、`vite.config.ts`、`tsconfig.json`、`eslint.config.js`、`.prettierrc`、`test-resources/`、`coverage/`）已随主窗口原生 UI 重构删除。主窗口 UI 现由 `crates/mirrorstar-ui/` 的 Slint 原生实现提供。
 
 ## 2. Rust workspace
 
-`Cargo.toml`（workspace 根）声明三个成员，不含 watchdog crate：
+`Cargo.toml`（workspace 根）声明四个成员，不含 watchdog crate：
 
 ```text
 [workspace]
 members：
   - crates/mirrorstar-core      # 共享核心库
-  - crates/mirrorstar-wp-proc   # Web 壁纸子进程二进制
-  - src-tauri                   # Tauri 应用层
+  - crates/mirrorstar-ui        # 原生主窗口 UI 子进程二进制（Slint）
+  - crates/mirrorstar-wp-proc   # Web 壁纸逻辑库（由壳 --wp-proc 模式复用）
+  - src-tauri                   # Tauri 应用壳
 resolver = "2"
 rust-version = 1.80              # MSRV
 ```
@@ -96,12 +94,11 @@ rust-version = 1.80              # MSRV
 |------|------|
 | `audio_integration.rs` | 61 |
 | `ipc_timeout.rs` | 239 |
-| `video_mpv_diagnostic.rs` | 69 |
 | `video_wallpaper_fullpath.rs` | 124 |
 
 ### 2.2 crates/mirrorstar-wp-proc
 
-Web 壁纸渲染子进程（独立二进制，独立窗口渲染 Web 壁纸）：
+Web 壁纸渲染逻辑库（壳 `--wp-proc` 模式复用，独立窗口渲染 Web 壁纸）：
 
 | 文件 | 行数 | 说明 |
 |------|------|------|
@@ -111,9 +108,25 @@ Web 壁纸渲染子进程（独立二进制，独立窗口渲染 Web 壁纸）�
 | `command.rs` | 1145 | 命令路由与实现 |
 | `com.rs` | 103 | COM 初始化 |
 
-### 2.3 src-tauri
+### 2.3 crates/mirrorstar-ui
 
-Tauri 应用层（Rust）：
+原生主窗口 UI 子进程（独立二进制 `mirrorstar-ui.exe`，Slint 1.18，绑定软件渲染）：
+
+| 内容 | 说明 |
+|------|------|
+| `main.rs` | 子进程入口：`Hello` 握手、stdio NDJSON 收发、窗口生命周期 |
+| `*.slint` | Slint 声明式 UI（虚拟化壁纸网格、设置面板、预览等） |
+| 预览实现 | 图片自绘 / 视频（进程内 spawn mpv 子窗口）/ GIF 逐帧 / 网页按需临时 WebView2 子窗口 |
+| 驱动脚本 | `measure_grid.ps1`、`measure_scroll_reverify.ps1`、`measure_preview.ps1`、`keyboard_smoke.ps1`（以及可能位于此处的 `shell_measure.ps1`、`single_instance_check.ps1`） |
+
+- 依赖 Slint：`default-features = false` + `features = ["renderer-software"]`（不编译 femtovg/skia）
+- 与壳通过 `mirrorstar-core::ui_proto` 通信；不复制业务逻辑、不直接读写配置文件
+
+### 2.4 src-tauri
+
+Tauri 应用壳（Rust）：托盘、壁纸引擎、轮换调度、命令桥、UI 子进程管理、事件转发；**不创建任何 WebView2 主窗口**（`app.windows` 为 `[]`）。
+
+> 注：下表列出的文件行数为历史审计值，主窗口重构后 `src-tauri/` 内部结构已调整（移除主窗口相关模块：前端加载、CSP、WebView2 裁剪/挂起等），行数不再逐一核对。
 
 | 文件 | 行数 | 说明 |
 |------|------|------|
@@ -140,45 +153,26 @@ Tauri 应用层（Rust）：
 - `icons/` — 各尺寸应用图标。
 - `gen/schemas/` — 自动生成的 schema。
 
-## 3. 前端（src/）
+## 3. 前端（src/，已删除）
 
-`src/scripts/main.ts` (731 行) 对接 Tauri IPC 并初始化 UI；`src/scripts/ipc.ts` (341 行) 封装全部 `invoke` 调用；`src/scripts/state.ts` (57 行) 前端状态。样式在 `src/styles/main.css` (699 行)。
-
-前端按功能拆分为 `ui/` 与 `utils/` 子模块，各自带 `*.test.ts`：
-
-| 文件 | 行数 | 说明 |
-|------|------|------|
-| `ui/wallpaper-list.ts` | 683 | 壁纸列表渲染 / 搜索 / 操作 |
-| `ui/preview-modal.ts` | 267 | 壁纸预览弹窗 |
-| `ui/drag-drop.ts` | 100 | 拖放添加壁纸 |
-| `ui/config-panel.ts` | 127 | 设置面板 |
-| `ui/display-list.ts` | 54 | 显示器下拉列表 |
-| `ui/mod.ts` | 23 | UI 模块聚合导出 |
-| `utils/async-helpers.ts` | 31 | 异步辅助 |
-| `utils/listeners.ts` | 53 | 事件监听注册 |
-| `utils/logger.ts` | 17 | 日志封装 |
-| 对应 `*.test.ts` | — | 各模块单元测试 |
-
-测试文件：`src/scripts/ui/*.test.ts`、`src/scripts/utils/*.test.ts`、`src/scripts/ipc.test.ts`、`src/scripts/main.test.ts`。
-
-`index.html` (131 行) 为页面入口，包含全部已实现控件（暂停/恢复、音量/静音、速度、搜索、重新生成缩略图、电池暂停、交互模式、预览等）。
+> **历史记录**：原基于 Vite + TypeScript 的前端（`src/`、`index.html`、`src/scripts/main.ts`、`src/scripts/ipc.ts`、`src/scripts/ui/*`、`src/styles/main.css` 及 `*.test.ts`）与构建/测试配置（`package.json`、`vite.config.ts`、`tsconfig.json`、`eslint.config.js`）已随主窗口原生 UI 重构**整体删除**。主窗口 UI 现由 `crates/mirrorstar-ui/`（Slint）实现，见 2.3。前端相关 Vitest/ESLint/Prettier 与 CDP e2e（`test-resources/`）测试体系亦已移除。
 
 ## 4. CI/CD（.github/workflows/）
 
 | 工作流 | 说明 |
 |--------|------|
-| `checks.yml` | 可复用检查：`rust-checks`（fmt/clippy/test/audit）+ `frontend-checks`（tsc/vitest/eslint/build） |
+| `checks.yml` | 可复用检查：仅 `rust-checks`（fmt/clippy/test/audit），`frontend-checks` 已删除 |
 | `ci.yml` | push / PR 触发，复用 `checks.yml` |
-| `release.yml` | `v*` tag 触发，需签名密钥，前置运行 checks，然后 npm ci + tauri-action 构建发布（draft release） |
+| `release.yml` | `v*` tag 触发，需签名密钥，前置运行 checks，然后 `cargo install tauri-cli` + `tauriScript: cargo tauri` 构建发布（draft release），不再使用 Node/npm |
 
 ## 5. 配置（tauri.conf.json）
 
 - `productName`：镜星壁纸；`identifier`：`com.mirrorstar.wallpaper`。
-- `app.windows`：`[]`（主窗口与壁纸窗口均在运行时懒创建）。
-- `app.security.csp`：`default-src 'self'`，允许 `wpfile:` 自定义协议（img/media/frame）。
+- `app.windows`：`[]`（壳不创建任何主窗口；主窗口由 `mirrorstar-ui.exe` 子进程按需启动，壁纸窗口运行时创建）。
 - `bundle.targets`：`["nsis"]`。
-- `bundle.resources`：`mpv/mpv.exe`、`mpv/license.txt`、内置 `target/release/mirrorstar-wp-proc.exe`。
-- `build`：`beforeBuildCommand: npm run build`，`frontendDist: ../dist`，dev 默认端口 `1420`。
+- `bundle.resources`：`mpv/mpv.exe`、`mpv/license`、内置 `target/release/mirrorstar-ui.exe`（与主 exe 同目录，`paths.rs` 依此解析）。
+- `build`：为空（无 `beforeBuildCommand` / `frontendDist` / `devUrl`，不再依赖前端产物）。
+- `src-tauri/build.rs`：在 `tauri_build::try_build()` 前用**隔离 CARGO_TARGET_DIR**单独构建 `mirrorstar-ui`（单独一次 cargo 调用，避免 slint 特性合并）并复制到 `target/release/`；`mirrorstar-wp-proc` 已并入壳，作为库编译，不再单独构建产物。
 
 ## 6. mpv 捆绑
 

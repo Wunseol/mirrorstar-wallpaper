@@ -15,11 +15,11 @@
 
 ### 1.1 混合进程架构
 
-采用**混合进程架构**——主进程内渲染 Image/Gif/Video，仅 Web 壁纸按需启动独立子进程：
+采用**混合进程架构**——壳进程（`mirrorstar-wallpaper.exe`）内渲染 Image/Gif/Video，并按需启动三类独立子进程：原生 UI 主窗口（`mirrorstar-ui.exe`）、网页壁纸（壳进程 `--wp-proc` 模式）、外部视频播放器（`mpv.exe`）：
 
 ```
 ┌──────────────────────────────────────────────────────────┐
-│              mirrorstar-wallpaper.exe（主进程）             │
+│        mirrorstar-wallpaper.exe（壳进程，Tauri）          │
 │  ┌──────────┐ ┌──────────┐ ┌──────────┐ ┌────────────┐  │
 │  │ Tauri    │ │ 图片线程  │ │ GIF 线程  │ │ 视频线程   │  │
 │  │ 主线程   │ │ (GetMsg) │ │ (Timer)  │ │ (mpv IPC) │  │
@@ -28,37 +28,40 @@
 │  │ 全屏检测 │ │ 配置监视 │ │ WebRenderer (代理层)     │  │
 │  │ (Hook)   │ │ (notify) │ │  ├ ProcessManager       │  │
 │  └──────────┘ └──────────┘ │  └ WpProcIpcClient       │  │
-│                              └──────────────────────────┘  │
+│  ┌────────────────────────────────────────────────────┐  │
+│  │ UI 子进程管理（spawn / 握手 / 空闲退出 / 单实例）  │  │
+│  └────────────────────────────────────────────────────┘  │
 └──────────────────────────────────────────────────────────┘
-       │                              │
-       │ CreateProcessW               │ CreateProcessW + 命名管道 IPC
-       ▼                              ▼
-┌─────────────────┐         ┌──────────────────────────┐
-│   mpv.exe       │         │ mirrorstar-wp-proc.exe    │
-│   (视频壁纸)    │         │ (Web 壁纸子进程)          │
-│   按需启动      │         │  ┌────────────────────┐  │
-└─────────────────┘         │  │ WebView2 环境      │  │
-                            │  │  └ 窗口 + 消息循环  │  │
-                            │  └────────────────────┘  │
-                            └──────────────────────────┘
-                               ↑ 仅 Web 壁纸时启动
-                               ↑ 关闭 Web 壁纸时终止
+     │                 │                         │
+     │ CreateProcessW  │ CreateProcessW + 命名管道│ CreateProcessW + stdio(NDJSON)
+     ▼                 ▼                         ▼
+┌──────────────┐  ┌──────────────────────┐  ┌──────────────────────────┐
+│   mpv.exe    │  │mirrorstar-wallpaper.exe│  │ mirrorstar-ui.exe        │
+│  (视频壁纸)  │  │ --wp-proc (Web 壁纸) │  │ (原生主窗口 UI，Slint)   │
+│  按需启动    │  │  ┌────────────────┐  │  │ 软件渲染 · 虚拟化网格    │  │
+└──────────────┘  │  │ WebView2 环境  │  │  │ 按需启动 · 空闲超时退出  │  │
+                  │  └────────────────┘  │  └──────────────────────────┘
+                  └──────────────────────┘
+                     ↑ 仅 Web 壁纸时启动      ↑ 托盘"打开主窗口"时启动
+                     ↑ 关闭 Web 壁纸时终止    ↑ 窗口隐藏超时后退出
 ```
 
 **设计原则：**
-- 主进程（`mirrorstar-wallpaper.exe`）内通过 WallpaperEngine 管理所有壁纸渲染
-- Image/Gif 渲染器在主进程专用线程中运行（GDI + 双缓冲）
+- 壳进程（`mirrorstar-wallpaper.exe`）内通过 WallpaperEngine 管理所有壁纸渲染；**不再创建任何 WebView2 主窗口**（`app.windows` 为 `[]`）
+- Image/Gif 渲染器在壳进程专用线程中运行（GDI + 双缓冲）
 - Video 渲染器通过 ProcessManager 直接 spawn `mpv.exe` 子进程（按需）
-- **Web 渲染器已重构为代理层**：通过 ProcessManager spawn `mirrorstar-wp-proc.exe` 子进程（按需），通过 WpProcIpcClient 命名管道通信
-- HWND 通过 FindWindowW 获取后，主进程执行 WorkerW 嵌入（与 mpv 窗口嵌入逻辑一致）
+- **Web 渲染器为代理层**：通过 ProcessManager 以 `--wp-proc` 模式 spawn 壳进程自身（`mirrorstar-wallpaper.exe --wp-proc`，按需），仍是独立进程（崩溃隔离不变），通过 WpProcIpcClient 命名管道通信
+- **UI 主窗口为独立进程** `mirrorstar-ui.exe`（crate `crates/mirrorstar-ui/`，Slint 1.18 软件渲染）：由壳侧 UI 子进程管理模块按需 spawn，通过 `ui_proto` NDJSON 行协议 over stdio 通信；业务逻辑仅在壳侧，UI 不复制业务、不直接读写配置文件
+- HWND 通过 FindWindowW 获取后，壳进程执行 WorkerW 嵌入（与 mpv 窗口嵌入逻辑一致）
 
 **内存优化：**
-- 无 Web 壁纸时：零子进程开销（仅主进程 + 可选的 mpv）
-- WebView2 运行时仅加载在子进程中，主进程不加载 webview2-com
+- 无 Web 壁纸、无主窗口时：零子进程开销（仅壳进程 + 可选的 mpv）
+- WebView2 运行时仅加载在子进程中，壳进程不加载 webview2-com
 - 子进程在 Web 壁纸关闭时立即终止，释放全部内存
+- UI 子进程在窗口隐藏超时（默认 300s，环境变量 `MIRRORSTAR_UI_IDLE_TIMEOUT_SECS`）后退出回收内存，再次请求可重新拉起；同一时刻至多一个实例
 - 无独立看门狗进程（mirrorstar-watchdog 已在阶段2移除）
 
-**关键澄清：** wp-proc **仅**处理 Web 壁纸。视频壁纸使用外部 `mpv.exe`，GIF/图片在主进程内渲染。这**不是**一个统一处理所有壁纸类型的子进程。
+**关键澄清：** wp-proc **仅**处理 Web 壁纸。视频壁纸使用外部 `mpv.exe`，GIF/图片在壳进程内渲染，主窗口 UI 由 `mirrorstar-ui.exe` 负责。这**不是**一个统一处理所有壁纸类型的子进程。
 
 ### 1.2 单实例保护
 
@@ -107,9 +110,9 @@ fn ensure_single_instance() -> bool {
 - 互斥体句柄通过 `Box::leak` 在进程生命周期内保持，进程退出时系统自动释放
 - 检测到已有实例时弹出 `MessageBoxW` 提示用户并退出
 
-### 1.3 壁纸子进程架构
+### 1.3 子进程架构
 
-实际架构中存在**两种**按需启动的子进程，由 `ProcessManager`（`crates/mirrorstar-core/src/process/manager.rs`，1204 行）统一管理：`CreateProcessW` 启动 + 3 秒等待 + `TerminateProcess` 强制终止，提供 `is_running()` / `pid()` / `handle()` 状态查询。
+壁纸渲染层面存在**两种**按需启动的子进程，由 `ProcessManager`（`crates/mirrorstar-core/src/process/manager.rs`，1204 行）统一管理：`CreateProcessW` 启动 + 3 秒等待 + `TerminateProcess` 强制终止，提供 `is_running()` / `pid()` / `handle()` 状态查询。此外，主窗口 UI 是**第三种**按需子进程（`mirrorstar-ui.exe`），由壳侧 UI 子进程管理模块负责（见下文）。
 
 #### mpv.exe（视频壁纸子进程）
 
@@ -122,13 +125,13 @@ fn ensure_single_instance() -> bool {
   2. 回退到系统 PATH 中的 `mpv.exe`
 - **启动参数**（部分）：`--idle=no`、`--loop-file`、`--hwdec=auto`、`--vo=gpu`、`--force-window=yes`、`--input-ipc-server=\\.\pipe\mirrorstar-mpv-{uuid}`、`--title=MirrorStarVideo`
 
-#### mirrorstar-wp-proc.exe（Web 壁纸子进程）
+#### 壳进程 `--wp-proc` 模式（Web 壁纸子进程）
 
-- **启动方式**：由 `WebRenderer`（`crates/mirrorstar-core/src/wallpaper/web.rs`，652 行，代理层）通过 `ProcessManager` spawn
+- **启动方式**：由 `WebRenderer`（`crates/mirrorstar-core/src/wallpaper/web.rs`，652 行，代理层）通过 `ProcessManager` 以 `--wp-proc` 模式 spawn 壳进程自身（`mirrorstar-wallpaper.exe --wp-proc`）
 - **控制方式**：`WpProcIpcClient`（`crates/mirrorstar-core/src/ipc/wp_proc.rs`，699 行，L73）通过自定义 `WpProcCommand` 协议控制
 - **命名管道**：`\\.\pipe\{pipe_name}`（pipe_name 通过 `--pipe-name` CLI 参数传入）
-- **代码规模**：4588 行（`crates/mirrorstar-wp-proc/` 5 个文件：com 103 / command 1145 / ipc_server 1466 / main 422 / webview 1452，CLI/src 位于 main.rs），使用 `webview2-com` crate
-- **CLI 参数**：
+- **代码规模**：4588 行（`crates/mirrorstar-wp-proc/` 5 个文件：com 103 / command 1145 / ipc_server 1466 / main 422 / webview 1452；已由独立 exe 改为库 crate，随壳 exe 分发），使用 `webview2-com` crate
+- **CLI 参数**（`--wp-proc` 之后）：
   - `--source`：初始网页源（URL 或 file:// 路径）
   - `--pipe-name`：命名管道名称
   - `--title`：窗口标题（UUID，用于 `FindWindowW` 查找）
@@ -140,6 +143,16 @@ fn ensure_single_instance() -> bool {
   - 窗口类注册：固定类名 `MirrorStarWebWallpaperCls`，窗口标题使用 `--title` 参数
   - 主消息循环：`GetMessageW` + `WM_WEB_COMMAND`（`WM_USER + 20`）处理
   - 命令处理：Play（导航到源）、Terminate（销毁窗口+退出）、SetPosition（`SetWindowPos` + `SetBounds`）、Navigate（`webview.Navigate`）、Pause/Resume（状态标记）
+
+#### mirrorstar-ui.exe（原生 UI 子进程）
+
+- **启动方式**：托盘菜单"打开主窗口"时，由壳侧 UI 子进程管理模块按需 spawn（`crates/mirrorstar-ui/`，workspace 成员，二进制与主 exe 同目录）
+- **UI 技术**：Slint 1.18，**绑定软件渲染**（`default-features=false` + 仅 `renderer-software`），不编译 femtovg/skia，避免 winit 选择 OpenGL 后端带来的额外内存
+- **通信方式**：与壳进程通过 `mirrorstar-core::ui_proto` 的 **NDJSON 行协议 over stdio** 通信，消息类型 `Hello` / `Request` / `Response` / `Event` / `Control`
+- **职责边界**：仅负责界面呈现与用户交互（壁纸库展示、设置面板、拖放、搜索、虚拟化网格、四类预览）；**不复制业务逻辑、不直接读写配置文件**，所有业务经 `Request` 转发至壳侧处理
+- **生命周期**：按需启动 → 握手（`Hello`）→ 窗口隐藏后按空闲超时（默认 300s，环境变量 `MIRRORSTAR_UI_IDLE_TIMEOUT_SECS`）退出回收内存 → 再次请求可重新拉起；**同一时刻至多一个实例**
+- **窗口显隐不激活**：显示时以 `WS_EX_NOACTIVATE` 瞬时覆盖 + `SWP_NOACTIVATE`，不调用 `SetForegroundWindow` / `SetActiveWindow` 等抢前台 API，避免误触发全屏检测 / 纯净模式；窗口标题保持"镜星壁纸"
+- **网格与预览**：原生 Slint 虚拟化壁纸网格（固定卡尺寸 + 固定列数，仅实例化可见区间 ±2 行缓冲）；缩略图按本地文件路径直读（不经 IPC 传字节）；图片/GIF 自绘，视频在 UI 进程内 spawn mpv 子窗口，网页按需创建临时 WebView2 子窗口（关闭后 `msedgewebview2.exe` 计数回落 0）
 
 ### 1.4 COM 初始化策略
 
@@ -162,7 +175,7 @@ unsafe {
 }
 ```
 
-**wp-proc 子进程**（`crates/mirrorstar-wp-proc/src/main.rs`）：
+**wp-proc 子进程**（壳 `--wp-proc` 模式，`crates/mirrorstar-wp-proc/`）：
 
 ```rust
 let hr = unsafe { CoInitializeEx(None, COINIT_APARTMENTTHREADED) };
@@ -193,7 +206,7 @@ let hr = unsafe { CoInitializeEx(None, COINIT_APARTMENTTHREADED) };
 **关键说明：**
 - 启动序列中**无**看门狗进程 spawn 步骤（`mirrorstar-watchdog` crate 已在阶段2移除）
 - 主进程崩溃时操作系统自动回收子进程（父子进程关系），不需要独立看门狗进程清理资源
-- 主窗口懒创建：启动时仅创建系统托盘图标，主窗口在用户点击托盘"打开主窗口"时通过 `WebviewWindowBuilder` 动态创建，关闭即隐藏（hide）以保留 WebView2 实例
+- 主窗口 UI 子进程按需启动：启动时仅创建系统托盘图标，主窗口在用户点击托盘"打开主窗口"时由壳侧按需 spawn `mirrorstar-ui.exe`；窗口隐藏超时（默认 300s）后 UI 子进程退出回收内存，壳侧不再创建任何 WebView2 主窗口
 
 ### 1.6 崩溃恢复（退出监听）
 
@@ -208,7 +221,7 @@ let hr = unsafe { CoInitializeEx(None, COINIT_APARTMENTTHREADED) };
 
 ### 2.1 两套独立 IPC 协议
 
-MirrorStar 使用**两套完全独立**的 IPC 协议，分别对应两种子进程。两者均采用命名管道 + JSON + 换行分隔格式，并复用相同的连接重试 + request_id 响应匹配模式。
+MirrorStar 在壳进程与子进程之间使用**三套独立**的通信协议：mpv 原生 JSON IPC、wp-proc 自定义 `WpProcCommand` 协议、以及壳↔UI 子进程的 `ui_proto` NDJSON over stdio。前两者均采用命名管道 + JSON + 换行分隔格式，并复用相同的连接重试 + request_id 响应匹配模式；`ui_proto` 走标准输入输出流（非命名管道）。
 
 #### 协议一：mpv 原生 IPC（视频壁纸）
 
@@ -216,7 +229,7 @@ MirrorStar 使用**两套完全独立**的 IPC 协议，分别对应两种子进
 - **管道**：`\\.\pipe\mirrorstar-mpv-{uuid}`（UUID 由主进程生成，通过 mpv `--input-ipc-server` 参数创建）
 - **格式**：mpv 原生 JSON 协议（JSON 行，request_id 匹配响应）
 - **连接重试**：40 次尝试 × 50ms 间隔（`ipc.connect(MPV_CONNECT_RETRIES, MPV_CONNECT_INTERVAL_MS) = 2s` 总超时）
-- **命令**：`pause` / `resume` / `set_volume` / `set_loop_file` / `set_speed` / `quit` / `get_property` / `set_property`
+- **命令**：`pause` / `resume` / `set_volume` / `set_speed` / `quit` / `get_property` / `set_property`
 - **响应结构**：`{ error, data?, request_id }`（mpv 原生格式）
 
 #### 协议二：wp-proc WpProcCommand（Web 壁纸）
@@ -245,7 +258,19 @@ MirrorStar 使用**两套完全独立**的 IPC 协议，分别对应两种子进
 {"request_id":1,"status":"error","error":"WebView2 未初始化"}
 ```
 
-**关键澄清：** 这是**两套独立的协议**，不是一个统一协议。mpv 使用 mpv 原生 JSON 协议，wp-proc 使用自定义 `WpProcCommand` 协议。两者只是复用了相同的连接重试 + request_id 响应匹配设计模式。
+#### 协议三：`ui_proto` NDJSON over stdio（壳 ↔ UI 子进程）
+
+- **定义位置**：`mirrorstar-core::ui_proto`（壳与 `mirrorstar-ui` 共享）
+- **传输通道**：UI 子进程的标准输入 / 标准输出（**非**命名管道）
+- **格式**：一行一条 JSON（NDJSON 行协议）
+- **消息类型**：
+  - `Hello`：子进程启动后的握手（版本 / 能力协商）
+  - `Request`：壳 → UI 或 UI → 壳的业务请求（携带 request_id 匹配 `Response`）
+  - `Response`：对 `Request` 的应答
+  - `Event`：壳 → UI 的异步状态推送（壁纸列表、播放状态、进度等）
+  - `Control`：生命周期控制（如显示 / 隐藏 / 退出）
+
+**关键澄清：** 这是**三套独立的协议**，不是一个统一协议。mpv 使用 mpv 原生 JSON 协议，wp-proc 使用自定义 `WpProcCommand` 协议（二者走命名管道），壳与 UI 子进程使用 `ui_proto` NDJSON 行协议（走 stdio）。前两者复用了相同的连接重试 + request_id 响应匹配设计模式。
 
 ### 2.2 HWND 获取方式
 
@@ -267,10 +292,11 @@ MirrorStar 使用**两套完全独立**的 IPC 协议，分别对应两种子进
 
 **进程模型要点总结：**
 - **混合进程架构**：Image/Gif/Video 渲染器在主进程专用线程中运行，仅 Web 壁纸（及外部 Video 的 mpv）通过独立子进程渲染，均按需启动
-- **崩溃隔离**：Web 壁纸经 mirrorstar-wp-proc 子进程渲染，崩溃不影响主进程
+- **崩溃隔离**：Web 壁纸经壳进程 `--wp-proc` 模式子进程渲染，仍是独立进程，崩溃不影响主进程
 - **起进程监控**：通过 `spawn_proc_exit_monitor` 监听子进程退出 + 操作系统自动回收，无需独立看门狗进程（watchdog crate 已在阶段2移除）
 - **逻辑暂停**：通过 PauseSender 快速通道绕过引擎互斥锁，直接发送暂停/恢复/音量命令，实现安全优雅的暂停
-- **内存优化**：无 Web 壁纸时零子进程开销，WebView2 运行时仅按需加载，关闭 Web 壁纸即终止子进程释放全部内存
+- **原生 UI 子进程**：主窗口由 `mirrorstar-ui.exe`（Slint 软件渲染）承载，按需启动、空闲超时退出、单实例，经 `ui_proto` NDJSON（stdio）与壳通信；业务逻辑仅在壳侧
+- **内存优化**：无 Web 壁纸、无主窗口时零子进程开销，WebView2 运行时仅按需加载，关闭 Web 壁纸即终止子进程释放全部内存；UI 子进程在窗口隐藏超时后退出回收内存
 
 ---
 

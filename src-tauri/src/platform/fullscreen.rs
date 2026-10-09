@@ -3,10 +3,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use crate::state::{
-    hide_main_window_on_fullscreen, restore_main_window_after_fullscreen, resume_all_fast_blocking,
-    try_pause_all_fast, try_terminate_all_fast, SendWinEventHook, FULLSCREEN_MONITOR_RUNNING,
-    FULLSCREEN_MONITOR_THREAD, FULLSCREEN_MONITOR_THREAD_ID, FULLSCREEN_WAS, SHARED_CONFIG,
-    SHARED_ENGINE, WIN_EVENT_HOOK,
+    resume_all_fast_blocking, try_pause_all_fast, try_terminate_all_fast, SendWinEventHook,
+    FULLSCREEN_MONITOR_RUNNING, FULLSCREEN_MONITOR_THREAD, FULLSCREEN_MONITOR_THREAD_ID,
+    FULLSCREEN_WAS, SHARED_CONFIG, SHARED_ENGINE, WIN_EVENT_HOOK,
 };
 
 // 全屏检测算法与误判场景文档化
@@ -71,6 +70,14 @@ use crate::state::{
 // - **无缓存**：每次事件即时查询，不缓存结果（事件驱动模式下无需缓存）
 // - **若需节流**：调用方可在 `foreground_event_callback` 中添加时间窗口节流，
 //  但当前事件频率已足够低（用户切换窗口的频率），无需额外节流
+//
+// # 纯净壁纸模式与全屏处置
+//
+// 纯净壁纸模式运行期间，`state.rs` 的共享 helper（`try_pause_all_fast` /
+// `try_resume_all_fast` / `try_terminate_all_fast` / `resume_all_fast_blocking`）
+// 首部守卫会跳过全部处置动作（返回 None），`FULLSCREEN_WAS` / `FULLSCREEN_LEVEL`
+// 状态机因此保持冻结，避免打断沉浸画面。模式退出后由 `reevaluate_now()` 复用
+// `handle_foreground_event` 的逻辑补跑一次判定，纠正状态漂移。
 
 /// HWND 的 Send/Sync 包装器（HWND 原始类型包含裸指针，未实现 Send/Sync）
 ///
@@ -143,7 +150,7 @@ static LAST_TERMINATE_TS: std::sync::Mutex<Option<std::time::Instant>> =
 /// 终止代数（进程级单调递增计数器，供异步恢复线程比对"是否过期"）
 ///
 /// 竞态根因：Terminate T1 后恢复线程慢跑（2-6s 冷启动 mpv），期间用户进入新真全屏
-/// T2，T2 再次 Terminate（置 FULLSCREEN_WAS=true、hide_main_window），但 T1 的恢复
+/// T2，T2 再次 Terminate（置 FULLSCREEN_WAS=true），但 T1 的恢复
 /// 线程结束时仍无条件置 FULLSCREEN_WAS=false 并 restore 主窗口，把壁纸/主窗口恢复到
 /// T2 的全屏游戏之上。`RESUME_IN_PROGRESS` 只防并发恢复，不防"恢复被更新的终止推翻"。
 ///
@@ -167,113 +174,7 @@ unsafe extern "system" fn foreground_event_callback(
     // 用 catch_unwind 包裹整个回调体，防止回调内部 panic 穿越 FFI 边界（Win32 回调）
     // 导致的栈展开 UB 或硬崩溃。回调运行于 DispatchMessageW 消息循环上下文，
     // 任何 panic 若未被捕获都会跨越 extern "system" 边界造成未定义行为。
-    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        let config = match SHARED_CONFIG.get() {
-            Some(c) => c.clone(),
-            None => return,
-        };
-
-        // 按配置选择全屏处置策略：none / pause / terminate（默认 terminate）
-        let action = config.get_config().pause.fullscreen_action;
-        // 先检测当前前台全屏级别（分级状态机的输入），供 none 残留清理分支与主体共用
-        let level = foreground_fullscreen_level();
-
-        // none 模式：不做任何处置。但若此前已因全屏处置过（如运行中切换到 none），
-        // 清理残留：恢复壁纸 + 重建主窗口（若销毁过），保持状态一致。
-        if action == FullscreenAction::None {
-            if FULLSCREEN_WAS.load(Ordering::Acquire) {
-                tracing::info!("全屏动作已切换为无操作，恢复壁纸并清理残留");
-                resume_from_fullscreen_exit();
-                *FULLSCREEN_LEVEL.lock().unwrap_or_else(|e| e.into_inner()) = level;
-            }
-            return;
-        }
-
-        let prev_level = *FULLSCREEN_LEVEL.lock().unwrap_or_else(|e| e.into_inner());
-        let was_fullscreen = FULLSCREEN_WAS.load(Ordering::Acquire);
-
-        match compute_transition(level, prev_level, was_fullscreen, action) {
-            Transition::NoOp => {
-                // 同级别或无可处置：仅更新 HWND 与级别
-                if level != FullscreenLevel::None {
-                    update_last_fullscreen_hwnd(level);
-                }
-                *FULLSCREEN_LEVEL.lock().unwrap_or_else(|e| e.into_inner()) = level;
-            }
-            Transition::Pause => {
-                let failed = try_pause_all_fast(PauseReason::FULLSCREEN);
-                if let Some(failed) = failed {
-                    if failed.is_empty() {
-                        tracing::info!("检测到最大化/近全屏窗口，暂停壁纸（进程驻留）");
-                        FULLSCREEN_WAS.store(true, Ordering::Release);
-                        *FULLSCREEN_LEVEL.lock().unwrap_or_else(|e| e.into_inner()) = level;
-                        update_last_fullscreen_hwnd(level);
-                        hide_main_window_on_fullscreen();
-                    } else {
-                        tracing::warn!(
-                            failed_count = failed.len(),
-                            failed = ?failed,
-                            "暂停壁纸部分失败，不更新 FULLSCREEN_WAS"
-                        );
-                        *FULLSCREEN_LEVEL.lock().unwrap_or_else(|e| e.into_inner()) = level;
-                    }
-                }
-                // None → 锁忙，不更新状态（事件会重复触发）
-            }
-            Transition::Terminate => {
-                // Task 3.2：终止冷却期内跳过重复终止（安全网，打断高频死循环）
-                if !should_allow_terminate() {
-                    tracing::warn!("检测到真全屏应用，但处于终止冷却期内，跳过本次终止（防抖）");
-                    return;
-                }
-                // Task 5.1：记录前台窗口上下文，便于真机验证识别/排除逻辑
-                log_terminate_context();
-                let failed = try_terminate_all_fast(PauseReason::FULLSCREEN);
-                record_terminate_time();
-                if let Some(failed) = failed {
-                    if failed.is_empty() {
-                        tracing::info!("检测到真全屏应用，终止壁纸释放内存");
-                        FULLSCREEN_WAS.store(true, Ordering::Release);
-                        // 递增终止代数：标记本次成功终止，使之前 spawn 的恢复线程
-                        // 判定"过期"，放弃恢复，防止旧恢复覆盖后续新终止（防竞态）
-                        increment_termination_generation();
-                        *FULLSCREEN_LEVEL.lock().unwrap_or_else(|e| e.into_inner()) = level;
-                        update_last_fullscreen_hwnd(level);
-                        hide_main_window_on_fullscreen();
-                    } else {
-                        tracing::warn!(
-                            failed_count = failed.len(),
-                            failed = ?failed,
-                            "终止壁纸部分失败，不更新 FULLSCREEN_WAS"
-                        );
-                        *FULLSCREEN_LEVEL.lock().unwrap_or_else(|e| e.into_inner()) = level;
-                    }
-                }
-                // None → 锁忙，不更新状态（事件会重复触发）
-            }
-            Transition::DowngradeToMaximized => {
-                tracing::info!("级别降级 TrueFullscreen→Maximized，壁纸保持终止不恢复");
-                *FULLSCREEN_LEVEL.lock().unwrap_or_else(|e| e.into_inner()) =
-                    FullscreenLevel::Maximized;
-                update_last_fullscreen_hwnd(FullscreenLevel::Maximized);
-            }
-            Transition::Exit => {
-                // 临时覆盖层校验：原全屏窗口仍覆盖显示器 → 跳过恢复
-                if is_previous_fullscreen_window_still_active() {
-                    tracing::info!("前台切换但原全屏窗口仍覆盖显示器（临时覆盖层），跳过壁纸恢复");
-                    return;
-                }
-                // Task 3.3 / 5.2：恢复冷却期内不立即恢复，由周期复查线程兜底
-                if in_resume_cooldown() {
-                    tracing::warn!("退出全屏，但处于恢复冷却期内，延迟恢复（由周期复查线程兜底重试）");
-                    return;
-                }
-                tracing::info!("退出全屏，恢复壁纸");
-                resume_from_fullscreen_exit();
-                *FULLSCREEN_LEVEL.lock().unwrap_or_else(|e| e.into_inner()) = FullscreenLevel::None;
-            }
-        }
-    }));
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(handle_foreground_event));
 
     // catch_unwind 返回 Err(_)：回调内部发生 panic，已被捕获，防止穿越 FFI 硬崩溃
     if result.is_err() {
@@ -281,10 +182,137 @@ unsafe extern "system" fn foreground_event_callback(
     }
 }
 
+/// 前台窗口切换事件处理体（无参数、无返回值）
+///
+/// 由 `foreground_event_callback`（WinEvent 回调）与 `reevaluate_now`
+/// （纯净壁纸模式退出后补跑）共用；行为与抽取前的内联实现完全一致。
+fn handle_foreground_event() {
+    let config = match SHARED_CONFIG.get() {
+        Some(c) => c.clone(),
+        None => return,
+    };
+
+    // 按配置选择全屏处置策略：none / pause / terminate（默认 terminate）
+    let action = config.get_config().pause.fullscreen_action;
+    // 先检测当前前台全屏级别（分级状态机的输入），供 none 残留清理分支与主体共用
+    let level = foreground_fullscreen_level();
+
+    // none 模式：不做任何处置。但若此前已因全屏处置过（如运行中切换到 none），
+    // 清理残留：恢复壁纸 + 重建主窗口（若销毁过），保持状态一致。
+    if action == FullscreenAction::None {
+        if FULLSCREEN_WAS.load(Ordering::Acquire) {
+            tracing::info!("全屏动作已切换为无操作，恢复壁纸并清理残留");
+            resume_from_fullscreen_exit();
+            *FULLSCREEN_LEVEL.lock().unwrap_or_else(|e| e.into_inner()) = level;
+        }
+        return;
+    }
+
+    let prev_level = *FULLSCREEN_LEVEL.lock().unwrap_or_else(|e| e.into_inner());
+    let was_fullscreen = FULLSCREEN_WAS.load(Ordering::Acquire);
+
+    match compute_transition(level, prev_level, was_fullscreen, action) {
+        Transition::NoOp => {
+            // 同级别或无可处置：仅更新 HWND 与级别
+            if level != FullscreenLevel::None {
+                update_last_fullscreen_hwnd(level);
+            }
+            *FULLSCREEN_LEVEL.lock().unwrap_or_else(|e| e.into_inner()) = level;
+        }
+        Transition::Pause => {
+            // Task 5.1：记录前台窗口上下文，便于真机验证识别/排除逻辑
+            log_fullscreen_context(level);
+            let failed = try_pause_all_fast(PauseReason::FULLSCREEN);
+            if let Some(failed) = failed {
+                if failed.is_empty() {
+                    tracing::info!("检测到最大化/近全屏窗口，暂停壁纸（进程驻留）");
+                    FULLSCREEN_WAS.store(true, Ordering::Release);
+                    *FULLSCREEN_LEVEL.lock().unwrap_or_else(|e| e.into_inner()) = level;
+                    update_last_fullscreen_hwnd(level);
+                } else {
+                    tracing::warn!(
+                        failed_count = failed.len(),
+                        failed = ?failed,
+                        "暂停壁纸部分失败，不更新 FULLSCREEN_WAS"
+                    );
+                    *FULLSCREEN_LEVEL.lock().unwrap_or_else(|e| e.into_inner()) = level;
+                }
+            }
+            // None → 锁忙，不更新状态（事件会重复触发）
+        }
+        Transition::Terminate => {
+            // Task 3.2：终止冷却期内跳过重复终止（安全网，打断高频死循环）
+            if !should_allow_terminate() {
+                tracing::warn!("检测到真全屏应用，但处于终止冷却期内，跳过本次终止（防抖）");
+                return;
+            }
+            // Task 5.1：记录前台窗口上下文，便于真机验证识别/排除逻辑
+            log_fullscreen_context(level);
+            let failed = try_terminate_all_fast(PauseReason::FULLSCREEN);
+            record_terminate_time();
+            if let Some(failed) = failed {
+                if failed.is_empty() {
+                    tracing::info!("检测到真全屏应用，终止壁纸释放内存");
+                    FULLSCREEN_WAS.store(true, Ordering::Release);
+                    // 递增终止代数：标记本次成功终止，使之前 spawn 的恢复线程
+                    // 判定"过期"，放弃恢复，防止旧恢复覆盖后续新终止（防竞态）
+                    increment_termination_generation();
+                    *FULLSCREEN_LEVEL.lock().unwrap_or_else(|e| e.into_inner()) = level;
+                    update_last_fullscreen_hwnd(level);
+                } else {
+                    tracing::warn!(
+                        failed_count = failed.len(),
+                        failed = ?failed,
+                        "终止壁纸部分失败，不更新 FULLSCREEN_WAS"
+                    );
+                    *FULLSCREEN_LEVEL.lock().unwrap_or_else(|e| e.into_inner()) = level;
+                }
+            }
+            // None → 锁忙，不更新状态（事件会重复触发）
+        }
+        Transition::DowngradeToMaximized => {
+            tracing::info!("级别降级 TrueFullscreen→Maximized，壁纸保持终止不恢复");
+            *FULLSCREEN_LEVEL.lock().unwrap_or_else(|e| e.into_inner()) =
+                FullscreenLevel::Maximized;
+            update_last_fullscreen_hwnd(FullscreenLevel::Maximized);
+        }
+        Transition::Exit => {
+            // 临时覆盖层校验：原全屏窗口仍覆盖显示器 → 跳过恢复
+            if is_previous_fullscreen_window_still_active() {
+                tracing::info!("前台切换但原全屏窗口仍覆盖显示器（临时覆盖层），跳过壁纸恢复");
+                return;
+            }
+            // Task 3.3 / 5.2：恢复冷却期内不立即恢复，由周期复查线程兜底
+            if in_resume_cooldown() {
+                tracing::warn!("退出全屏，但处于恢复冷却期内，延迟恢复（由周期复查线程兜底重试）");
+                return;
+            }
+            tracing::info!("退出全屏，恢复壁纸");
+            resume_from_fullscreen_exit();
+            *FULLSCREEN_LEVEL.lock().unwrap_or_else(|e| e.into_inner()) = FullscreenLevel::None;
+        }
+    }
+}
+
+/// 纯净壁纸模式退出后补跑一次前台全屏判定
+///
+/// 模式运行期间共享 helper 首部守卫跳过处置动作（见 state.rs），`FULLSCREEN_WAS` /
+/// `FULLSCREEN_LEVEL` 状态机被冻结，可能与真实前台状态漂移。本入口复用
+/// `handle_foreground_event` 的完整事件处理逻辑补跑一次，纠正状态（并在必要时
+/// 走既有恢复路径）。
+pub(crate) fn reevaluate_now() {
+    tracing::info!("纯净壁纸模式退出后补跑一次前台全屏判定");
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(handle_foreground_event));
+    // 与 foreground_event_callback 一致：panic 已捕获，仅记录，不穿越调用边界
+    if result.is_err() {
+        tracing::error!("全屏补跑判定 panic 已被捕获，防止穿越 FFI 硬崩溃");
+    }
+}
+
 /// Task 5.1：记录前台窗口上下文，便于真机验证自家窗口识别/排除逻辑
 ///
-/// 在 Terminate 分支执行时记录前台窗口的 hwnd / 标题 / 类名 / 父窗口 / 进程 PID。
-fn log_terminate_context() {
+/// 在全屏处置（Pause/Terminate）分支执行时记录前台窗口的 hwnd / 标题 / 类名 / 父窗口 / 进程 PID。
+fn log_fullscreen_context(level: FullscreenLevel) {
     use windows::Win32::UI::WindowsAndMessaging::{
         GetClassNameW, GetForegroundWindow, GetParent, GetWindowTextW, GetWindowThreadProcessId,
     };
@@ -301,12 +329,13 @@ fn log_terminate_context() {
         let _ = GetWindowThreadProcessId(fg, Some(&mut pid));
         let parent = GetParent(fg);
         tracing::info!(
+            level = ?level,
             hwnd = ?fg,
             title = %String::from_utf16_lossy(&title[..tlen as usize]),
             class = %String::from_utf16_lossy(&class[..clen as usize]),
             parent = ?parent,
             pid,
-            "全屏终止上下文：前台窗口信息"
+            "全屏处置上下文：前台窗口信息"
         );
     }
 }
@@ -430,7 +459,7 @@ pub(crate) fn start_fullscreen_monitor(
                         -1 => {
                             // T02 修复：GetMessageW 返回 -1 表示错误（如窗口句柄无效），
                             // BOOL.as_bool() 对 -1 返回 true 会误判为消息到达，须显式 match ret.0。
-                            // 与 explorer.rs L224-239 修复模式一致（N-002），并按 spec 要求记录 GetLastError。
+                            // 与 explorer.rs 消息循环的同款 -1 判定（N-002）一致，并按 spec 要求记录 GetLastError。
                             let err = windows::Win32::Foundation::GetLastError();
                             tracing::error!(
                                 error = ?err,
@@ -548,8 +577,7 @@ fn foreground_fullscreen_level() -> FullscreenLevel {
 
         // 跳过我们自己的窗口（同时匹配中文标题"镜星壁纸"和英文标题"MirrorStar Wallpaper"）
         // ST-012: 改用精确匹配而非 contains，避免误排除任何标题含 "MirrorStar" 子串的第三方窗口。
-        // 自身 Tauri 窗口标题为 "镜星壁纸"（WebviewWindowBuilder::title 在 state.rs L417 设置）；
-        // "MirrorStar Wallpaper" 用于版本号 UI 显示与英文环境兼容。
+        // 标题 "镜星壁纸" 与 "MirrorStar Wallpaper" 用于识别自家窗口（后者兼容英文环境）。
         // title_str 提升到块外供后续自家壁纸窗口识别复用；GetWindowTextW 失败/空标题时为空串
         // （is_self_window_title("") 恒为 false，与原 if title_len > 0 分支语义一致）。
         let mut title = [0u16; TITLE_BUF_LEN];
@@ -770,15 +798,6 @@ fn is_previous_fullscreen_window_still_active() -> bool {
     }
 }
 
-/// 当前是否仍被全屏/最大化窗口覆盖（供 state.rs 恢复主窗口前复查，防换图误恢复）。
-///
-/// 任一命中即视为仍被覆盖：当前前台为全屏/最大化窗口，或此前记录的全屏窗口
-/// 仍然有效并覆盖其显示器。
-pub(crate) fn still_covered_by_fullscreen_window() -> bool {
-    foreground_fullscreen_level() != FullscreenLevel::None
-        || is_previous_fullscreen_window_still_active()
-}
-
 /// 判断是否应触发壁纸恢复（纯函数，便于单元测试）
 ///
 /// 仅当：之前是全屏（`was_fullscreen`）、当前不再是前台全屏（`!is_fullscreen`）、
@@ -807,8 +826,8 @@ fn clear_last_fullscreen_hwnd() {
 
 /// 退出全屏后的壁纸恢复统一入口（Task 7.2：异步后台执行）
 ///
-/// C-008：仅当 resume_all_fast 全部成功时才更新 FULLSCREEN_WAS，并清理
-/// LAST_FULLSCREEN、重建主窗口（若此前销毁过）。
+/// C-008：仅当 resume_all_fast 全部成功时才更新 FULLSCREEN_WAS 并清理
+/// LAST_FULLSCREEN。原"重建主窗口"逻辑已随 Task 10 移除（不再有 Tauri 主窗口）。
 /// 供前台事件回调退出分支与周期复查线程共用，保证两处逻辑一致。
 ///
 /// # 异步化设计（Task 7.2，修复"退出游戏后壁纸黑屏不恢复"根因）
@@ -820,7 +839,7 @@ fn clear_last_fullscreen_hwnd() {
 ///
 /// 现改为 spawn 专用后台线程 `mirrorstar-fullscreen-resume` 执行
 /// `resume_all_fast_blocking`（阻塞式获取 engine 锁，不因锁忙偶发跳过）：
-/// - 成功 → 清 `FULLSCREEN_WAS` / `LAST_FULLSCREEN` / 重建主窗口
+/// - 成功 → 清 `FULLSCREEN_WAS` / `LAST_FULLSCREEN`
 /// - 失败 → 保留 `FULLSCREEN_WAS=true`，由周期复查线程（2s 间隔）自动重试
 /// - 通过 `RESUME_IN_PROGRESS` 标志去重，防止事件回调与复查线程并发重复恢复
 ///
@@ -830,14 +849,17 @@ fn clear_last_fullscreen_hwnd() {
 /// 恢复线程在 spawn **之前**捕获当时的终止代数 `gen_at_spawn`；线程内恢复成功
 /// （failed 为空）后，**先比对代数**：若 `current_termination_generation() !=
 /// gen_at_spawn`，说明期间又发生了新的成功终止，本次恢复已"过期"，应放弃——
-/// 保持 `FULLSCREEN_WAS=true`、不 restore 主窗口（主窗口已在 T2 hide 状态），
-/// 仅打 warn 日志，防止过期恢复把壁纸/主窗口恢复到 T2 全屏游戏之上。
+/// 保持 `FULLSCREEN_WAS=true`、不恢复壁纸，仅打 warn 日志，防止过期恢复把壁纸
+/// 恢复到 T2 全屏游戏之上。
 fn resume_from_fullscreen_exit() {
     // Task 3.3：终止后恢复冷却期内不立即恢复。Exit 事件分支与周期复查线程共用本入口，
     // 冷却期内直接返回，保留 FULLSCREEN_WAS=true，由周期复查线程（2s 间隔）在冷却结束后
     // 兜底恢复。
     if in_resume_cooldown() {
-        tracing::warn!("恢复冷却期内（终止后 {}ms），延迟恢复，由周期复查线程兜底", RESUME_COOLDOWN.as_millis());
+        tracing::warn!(
+            "恢复冷却期内（终止后 {}ms），延迟恢复，由周期复查线程兜底",
+            RESUME_COOLDOWN.as_millis()
+        );
         return;
     }
 
@@ -884,8 +906,6 @@ fn resume_from_fullscreen_exit() {
                 // C-008：仅当全部成功且代数未变化才更新 FULLSCREEN_WAS
                 FULLSCREEN_WAS.store(false, Ordering::Release);
                 clear_last_fullscreen_hwnd();
-                // 若此前销毁了主窗口则重建
-                restore_main_window_after_fullscreen();
             } else {
                 // 部分失败：保留 FULLSCREEN_WAS=true，周期复查线程（2s 间隔）
                 // 会再次触发 resume_from_fullscreen_exit 重试，直到恢复成功。
@@ -913,6 +933,10 @@ fn resume_from_fullscreen_exit() {
 ///
 /// 提取为独立纯函数以便单元测试覆盖匹配逻辑（无需 Win32 环境）。
 /// 自身 Tauri 窗口标题为 "镜星壁纸"；"MirrorStar Wallpaper" 用于版本号 UI 显示与英文环境兼容。
+///
+/// TODO(Task 9.4)：主窗口 UI 迁到原生子进程后，原生 UI 窗口标题必须同样保持
+/// "镜星壁纸"（并遵守 `SWP_NOACTIVATE`），否则其成为前台窗口时会被当作"全屏应用"
+/// 而暂停壁纸。该行为依赖 Task 3 产出的 `mirrorstar-ui.exe`，需回归验证。
 fn is_self_window_title(title: &str) -> bool {
     title == "镜星壁纸" || title == "MirrorStar Wallpaper"
 }

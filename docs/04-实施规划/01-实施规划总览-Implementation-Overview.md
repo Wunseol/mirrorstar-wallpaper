@@ -9,6 +9,8 @@
 | 更新日期 | 2026-08-29                |
 | 文档状态 | 已实现（基于最新代码审计）        |
 
+> **架构变更说明（2026-10-02）**：主窗口已改为独立原生 UI 子进程（`crates/mirrorstar-ui/`，Slint 软件渲染），原前端（Vite/TypeScript）与相关测试已删除；本文中涉及"前端 UI 补全""前端 `tsc/vitest/eslint`"、`src/scripts/*` 行数等内容为历史记录，当前测试体系为 Rust（`cargo test --workspace`）+ PowerShell 驱动脚本 e2e。
+
 ***
 
 ## 1. 实现概述
@@ -65,9 +67,9 @@ graph LR
 | 进程管理 | ✅ 100% | `ProcessManager` 子进程管理 + 崩溃检测（watchdog 死代码已清理） |
 | 配置管理 | ✅ 100% | TOML + 热重载（500ms 防抖）+ 原子写入 + 校验 + 缩略图管理 |
 | Tauri 应用层 | ✅ 100% | **20 个 Tauri 命令** + 托盘（3 项菜单）+ 单实例 + DPI 感知 + 电源监控 |
-| Web 壁纸子进程 | ✅ 100% | `mirrorstar-wp-proc`（4 模块）+ `WpProcIpcClient` + `WebRenderer` 代理层 |
+| Web 壁纸子进程 | ✅ 100% | 壳进程 `--wp-proc` 模式（`mirrorstar-wp-proc` 库 crate，4 模块）+ `WpProcIpcClient` + `WebRenderer` 代理层 |
 | 前端 UI 补全 | ✅ 100% | 暂停/恢复、速度、音量/静音、搜索、重新生成缩略图、电池暂停、预览/设为壁纸、拖拽、交互模式等均已实现 |
-| 打包发布 | 🔧 已配置 | NSIS 安装包 + CSP + 资源（mpv.exe、wp-proc.exe）捆绑 + Release 流水线 |
+| 打包发布 | 🔧 已配置 | NSIS 安装包 + CSP + 资源（mpv.exe）捆绑 + Release 流水线 |
 
 ### 2.2 主要源码规模（行数实测）
 

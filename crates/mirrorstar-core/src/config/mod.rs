@@ -14,7 +14,7 @@
 //! - 配置加载错误：`mirrorstar_core::config::{ConfigKind, ConfigLoadError}`
 //! - 显示器信息：`mirrorstar_core::config::DisplayInfo`
 //! - 文件类型检测：`mirrorstar_core::config::detect_wallpaper_type`
-//! - 缩略图生成：`mirrorstar_core::config::{generate_thumbnail, generate_video_thumbnail, is_ffmpeg_available}`
+//! - 缩略图生成：`mirrorstar_core::config::{generate_thumbnail, generate_video_thumbnail, thumbnail_cache_path}`
 //! - 壁纸类型枚举：`mirrorstar_core::config::WallpaperType`（重导出自 [`crate::wallpaper`]）
 //!
 //! 注意：`AppConfig` 及其子配置（`AudioConfig` / `VideoConfig` / `GifConfig` 等）通过
@@ -43,9 +43,8 @@ pub use crate::wallpaper::WallpaperType;
 // Re-export public API to preserve backward compatibility
 pub use detect::detect_wallpaper_type;
 pub use manager::{
-    data_root, init_data_root, resolve_data_root, resolve_pool,
-    ConfigKind, ConfigLoadError, ConfigManager, DisplayInfo, Pool, WallpaperEntry,
-    WallpaperLibrary, WallpaperMetadata,
+    data_root, init_data_root, resolve_data_root, resolve_pool, ConfigKind, ConfigLoadError,
+    ConfigManager, DisplayInfo, Pool, WallpaperEntry, WallpaperLibrary, WallpaperMetadata,
 };
 pub use playback::{PlaybackState, PlaybackStore, Unit, PLAYBACK_SCHEMA_VERSION};
-pub use thumbnail::{generate_thumbnail, generate_video_thumbnail, is_ffmpeg_available};
+pub use thumbnail::{generate_thumbnail, generate_video_thumbnail, thumbnail_cache_path};

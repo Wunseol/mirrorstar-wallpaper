@@ -6,16 +6,21 @@
 //!
 //! ## 模块组织
 //!
-//! 命令按业务子系统拆分为三个子模块，每个子模块对应一个前端功能域：
+//! 命令按业务子系统拆分为四个子模块，每个子模块对应一个前端功能域：
 //!
-//! - `config`：配置管理命令（`get_config` / `update_config`）
+//! - `config`：配置管理命令（`get_config` / `update_config` /
+//!   `get_arrangement` / `update_arrangement`）
 //! - `system`：系统级命令（`get_displays` / `check_desktop_status` /
 //!   `open_file_dialog` / `toggle_auto_start` / `get_auto_start_status`）
-//! - `wallpaper`：壁纸生命周期命令（`get_wallpapers` / `add_wallpaper` /
-//!   `regenerate_thumbnails` / `remove_wallpaper` / `set_wallpaper` /
+//! - `wallpaper`：壁纸生命周期命令（`get_wallpapers` / `reorder_wallpapers` /
+//!   `add_wallpaper` / `remove_wallpaper` / `set_wallpaper` /
 //!   `pause_wallpaper` / `resume_wallpaper` / `set_volume` / `toggle_mute` /
 //!   `set_interaction_mode` / `get_wallpaper_state` / `set_scaling_mode` /
 //!   `set_speed`）
+//! - `rotation`：轮播命令（`get_rotation_config` / `update_rotation_config` /
+//!   `list_pools` / `create_pool` / `update_pool` / `delete_pool` /
+//!   `reorder_pools` / `get_unit_states` / `set_active_pool` /
+//!   `set_rotation_enabled` / `next_wallpaper` / `prev_wallpaper`）
 //!
 //! 每个子模块通过 `pub use <module>::*;` 在 `commands` 模块根重导出全部公开项，
 //! 使 `lib.rs` 可直接通过 `commands::set_wallpaper` 引用，无需写完整路径
@@ -29,14 +34,16 @@
 //! ```rust,ignore
 //! .invoke_handler(tauri::generate_handler![
 //!     get_wallpapers,
+//!     reorder_wallpapers,
 //!     add_wallpaper,
-//!     regenerate_thumbnails,
 //!     remove_wallpaper,
 //!     set_wallpaper,
 //!     pause_wallpaper,
 //!     resume_wallpaper,
 //!     get_config,
 //!     update_config,
+//!     get_arrangement,
+//!     update_arrangement,
 //!     set_volume,
 //!     toggle_mute,
 //!     set_interaction_mode,
@@ -48,6 +55,18 @@
 //!     set_scaling_mode,
 //!     set_speed,
 //!     check_desktop_status,
+//!     get_rotation_config,
+//!     update_rotation_config,
+//!     list_pools,
+//!     create_pool,
+//!     update_pool,
+//!     delete_pool,
+//!     reorder_pools,
+//!     get_unit_states,
+//!     set_active_pool,
+//!     set_rotation_enabled,
+//!     next_wallpaper,
+//!     prev_wallpaper,
 //! ])
 //! ```
 //!

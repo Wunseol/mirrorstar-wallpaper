@@ -98,17 +98,14 @@ impl<T> NamedPipeClient<T> {
 
     /// 写入一行 JSON 命令（自动追加换行符并 flush）
     ///
-    /// 分两次 write_all（json + `\n`）避免 format! 分配。
-    /// BufWriter 会缓冲两次写入，最终一次 flush，无额外堆分配。
+    /// 实现在自由函数 [`write_json_line`] 中，命名管道客户端与 stdio 协议
+    /// （`ui_proto`）共用同一套分帧写入逻辑，避免两份实现漂移。
     pub fn send_line(&mut self, json: &str) -> Result<(), MirrorStarError> {
         let writer = self
             .writer
             .as_mut()
             .ok_or_else(|| MirrorStarError::IpcNotConnected("IPC 未连接".to_string()))?;
-        writer.write_all(json.as_bytes())?;
-        writer.write_all(b"\n")?;
-        writer.flush()?;
-        Ok(())
+        write_json_line(writer, json)
     }
 
     /// 读取一行响应（自定义超时，跳过空行），返回去除首尾空白后的内容
@@ -165,6 +162,21 @@ impl<T> Drop for NamedPipeClient<T> {
     }
 }
 
+/// 将一行 JSON 写入任意 `impl Write`（自动追加换行符并 flush）
+///
+/// 分两次 write_all（json + `\n`）避免 `format!` 分配；若 `writer` 为 `BufWriter`，
+/// 两次写入会被缓冲、最终一次 flush，无额外堆分配。
+///
+/// 提取为自由函数供命名管道客户端（[`NamedPipeClient::send_line`]）与 stdio 协议
+/// （`crate::ui_proto::framing`）共用——两处都是"一行一条 JSON"的 NDJSON 分帧，
+/// 逻辑相同，集中在此避免重复实现。
+pub fn write_json_line<W: Write>(writer: &mut W, json: &str) -> Result<(), MirrorStarError> {
+    writer.write_all(json.as_bytes())?;
+    writer.write_all(b"\n")?;
+    writer.flush()?;
+    Ok(())
+}
+
 // ── 命名管道连接与读取辅助函数 ─────────────────────────────────────────────
 
 /// 连接到命名管道（客户端）
@@ -205,18 +217,19 @@ pub(crate) fn connect_named_pipe(
         // 单次 open 竞态失败 / FILE_NOT_FOUND 时的短暂休眠，避免忙等烧 CPU。
         const RETRY_SLEEP_MS: u64 = 20;
 
-        let budget_ms = retry_count
-            .saturating_mul_32_times(retry_interval_ms)
-            .unwrap_or(DEFAULT_BUDGET_MS);
+        let budget_ms = if retry_count == 0 || retry_interval_ms == 0 {
+            DEFAULT_BUDGET_MS
+        } else {
+            (retry_count as u64)
+                .checked_mul(retry_interval_ms)
+                .unwrap_or(DEFAULT_BUDGET_MS)
+        };
 
         let deadline = std::time::Instant::now() + Duration::from_millis(budget_ms);
         // 记录最后一次错误，用于预算用尽后的单条 WARN。循环每条 continue/break 路径都会赋值。
         let mut last_error;
 
-        let path_wide: Vec<u16> = pipe_path
-            .encode_utf16()
-            .chain(std::iter::once(0))
-            .collect();
+        let path_wide: Vec<u16> = pipe_path.encode_utf16().chain(std::iter::once(0)).collect();
 
         loop {
             // 剩余毫秒（至少 1ms，避免 WaitNamedPipeW(0) 使用系统默认/无限等待语义
@@ -260,7 +273,11 @@ pub(crate) fn connect_named_pipe(
                 last_error = Some(e);
                 if code == ERROR_FILE_NOT_FOUND.0 as i32 {
                     // 管道尚未创建（服务端未就绪），WaitNamedPipeW 立即返回，继续等待。
-                    tracing::debug!(pipe_path, error_code = code, "命名管道尚未创建，等待服务端就绪");
+                    tracing::debug!(
+                        pipe_path,
+                        error_code = code,
+                        "命名管道尚未创建，等待服务端就绪"
+                    );
                 } else {
                     // ERROR_SEM_TIMEOUT 表示预算用尽（有管道但超时内无空闲实例）；其他错误为真实失败。
                     // 两种情形均无需继续循环。
@@ -307,21 +324,6 @@ pub(crate) fn connect_named_pipe(
             "命名管道仅支持 Windows (path={})",
             pipe_path
         )))
-    }
-}
-
-/// u32 × u64 的饱和乘法辅助，返回 Option<u64>：溢出或任一因子为 0 时返回 None。
-/// 用于将 `retry_count` 与 `retry_interval_ms` 转为总预算毫秒数。
-trait SaturatingMul32Times {
-    fn saturating_mul_32_times(self, ms: u64) -> Option<u64>;
-}
-
-impl SaturatingMul32Times for u32 {
-    fn saturating_mul_32_times(self, ms: u64) -> Option<u64> {
-        if self == 0 || ms == 0 {
-            return None;
-        }
-        (self as u64).checked_mul(ms)
     }
 }
 

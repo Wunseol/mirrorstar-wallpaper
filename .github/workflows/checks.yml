@@ -21,11 +21,6 @@ jobs:
       - name: Cache cargo
         uses: Swatinem/rust-cache@v2
 
-      # 构建 wp-proc 资源：src-tauri/build.rs 经 tauri_build::try_build 编译期校验 bundle 资源，
-      # 必须先构建 mirrorstar-wp-proc 再编译任何触发 src-tauri 的命令
-      - name: Build wp-proc resource
-        run: cargo build -p mirrorstar-wp-proc --release
-
       # 提供 mpv 运行时：mpv/ 在 .gitignore 中（mpv.exe ~123MB 超 GitHub 100MB 入库限制），
       # 且 tauri_build::try_build 编译期校验 `../mpv/mpv.exe` 必须存在，否则 src-tauri 编译失败。
       # 从固定 release + SHA256 双保险下载，仅解出 mpv.exe（mpv/license 已随源码入库）。
@@ -82,37 +77,3 @@ jobs:
 
       - name: Security audit
         run: cargo audit
-
-  frontend-checks:
-    runs-on: windows-latest
-    steps:
-      - uses: actions/checkout@v4
-
-      # Node 20 LTS：覆盖 Vite 5 / Vitest 2 / TypeScript 5.5 / ESLint 9 官方支持矩阵
-      - name: Setup Node.js 20
-        uses: actions/setup-node@v4
-        with:
-          node-version: '20'
-          cache: npm
-
-      - name: Install dependencies
-        run: npm ci
-
-      - name: Security audit
-        run: npm audit --omit=dev --audit-level=high
-
-      - name: Security audit (dev dependencies)
-        run: npm audit --audit-level=critical
-        continue-on-error: true
-
-      - name: Build
-        run: npm run build
-
-      - name: TypeScript type check
-        run: npx tsc --noEmit
-
-      - name: Run ESLint
-        run: npm run lint
-
-      - name: Run tests
-        run: npm run test

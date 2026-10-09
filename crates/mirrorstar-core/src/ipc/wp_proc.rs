@@ -27,12 +27,14 @@ pub enum WpProcCommand {
         width: i32,
         height: i32,
     },
-    /// 导航到指定 URL
-    Navigate { request_id: u64, url: String },
     /// 暂停播放
     Pause { request_id: u64 },
     /// 恢复播放
     Resume { request_id: u64 },
+    /// 设置音量（0.0 ~ 1.0，注入 JS 到网页媒体元素）
+    SetVolume { request_id: u64, volume: f32 },
+    /// 切换静音（注入 JS 切换网页媒体元素的 muted 状态）
+    ToggleMute { request_id: u64 },
 }
 
 impl WpProcCommand {
@@ -42,9 +44,35 @@ impl WpProcCommand {
             WpProcCommand::Play { request_id, .. }
             | WpProcCommand::Terminate { request_id }
             | WpProcCommand::SetPosition { request_id, .. }
-            | WpProcCommand::Navigate { request_id, .. }
             | WpProcCommand::Pause { request_id }
-            | WpProcCommand::Resume { request_id } => *request_id,
+            | WpProcCommand::Resume { request_id }
+            | WpProcCommand::SetVolume { request_id, .. }
+            | WpProcCommand::ToggleMute { request_id } => *request_id,
+        }
+    }
+
+    /// 该命令是否会产生需要调用方读取的响应。
+    ///
+    /// 仅 `Play` 走同步请求-响应路径（`WpProcIpcClient::send_command`，等待 WebView2
+    /// 初始化确认）；其余命令均经 `send_command_no_wait` 发送，调用方不读取响应。
+    /// 子进程据此决定是否写回响应——避免响应在管道输出缓冲区（4KB）中累积，
+    /// 写满后阻塞子进程 IPC 线程导致后续命令永久失联。
+    ///
+    /// **约定**：本方法使用**穷尽 `match`（逐变体列出）**而非 `matches!`，与同文件
+    /// [`request_id`](Self::request_id) 风格一致。这样将来新增命令变体时，编译器会
+    /// 强制开发者显式决定"该命令是否期望响应"，避免协议契约（哪一侧读/写响应）被
+    /// 静默破坏——漏写会导致子进程写回无人读取的响应，最终阻塞 IPC 线程。
+    pub fn expects_response(&self) -> bool {
+        match self {
+            // 同步请求-响应路径：父进程等待 WebView2 初始化确认，必须写回响应。
+            WpProcCommand::Play { .. } => true,
+            // fire-and-forget 路径：父进程不读取响应，子进程不得写回（避免缓冲累积）。
+            WpProcCommand::Terminate { .. }
+            | WpProcCommand::SetPosition { .. }
+            | WpProcCommand::Pause { .. }
+            | WpProcCommand::Resume { .. }
+            | WpProcCommand::SetVolume { .. }
+            | WpProcCommand::ToggleMute { .. } => false,
         }
     }
 }
@@ -95,8 +123,11 @@ impl WpProcIpcClient {
     /// 发送命令到 Web 壁纸子进程并等待响应
     ///
     /// 保留用于 `play` 等需要确认子进程初始化是否成功的命令；
-    /// pause / resume / terminate / set_position / navigate 等控制类命令
+    /// pause / resume / terminate / set_position 等控制类命令
     /// 应改用 [`send_command_no_wait`](Self::send_command_no_wait) 避免 ack 等待（Bug #7）。
+    ///
+    /// 只有 `expects_response()` 为真的命令（当前仅 `Play`）会收到子进程写回的响应；
+    /// 若对其它命令使用本方法，将因等不到响应而超时。
     ///
     /// I04 超时对齐：`play` 路径需等待 WebView2 初始化完成（可能涉及进程启动、
     /// 运行时下载等），默认 5s 超时不足。此处改用 15s 超时，与 connect 的 20s
@@ -157,13 +188,15 @@ impl WpProcIpcClient {
     /// 发送命令到 Web 壁纸子进程，不等待响应（fire-and-forget）
     ///
     /// 仅序列化命令为 JSON 写入管道即返回，不读取子进程的 ack 响应。
-    /// 适用于 pause / resume / terminate / set_position / navigate 等无需返回数据的命令，
+    /// 适用于 pause / resume / terminate / set_position 等无需返回数据的命令，
     /// 避免子进程处理延迟时同步等待 5s 超时导致 UI 卡顿（Bug #7）。
     ///
-    /// I-008：延迟响应副作用（与 mpv 侧 `MpvIpcClient::send_command_no_wait` 一致）。
-    /// 注意：调用方无法感知子进程是否成功执行命令。若命令失败，子进程仍会异步
-    /// 返回 error 响应，但本方法不读取该响应——后续的 `send_command_with_timeout`
-    /// 调用可能会读到这条延迟 error 响应并因 `request_id` 不匹配而跳过。
+    /// 契约：子进程仅为 `expects_response()` 为真的命令（`Play`）写回响应，
+    /// 对本方法发送的 fire-and-forget 命令不再写响应——因此不会在管道输出缓冲区
+    /// 中累积延迟响应，也不会污染后续 [`send_command_with_timeout`](Self::send_command_with_timeout)
+    /// 的读取（后者仅等待匹配 request_id 的响应）。
+    ///
+    /// 调用方无法感知子进程是否成功执行命令（命令执行失败仅在子进程日志中体现）。
     ///
     /// 对于 `play` 等需要确认 WebView2 初始化成功的命令，仍应使用同步路径
     /// [`send_command`](Self::send_command)。
@@ -219,20 +252,6 @@ impl WpProcIpcClient {
         })
     }
 
-    /// 导航到指定 URL（fire-and-forget）
-    ///
-    /// I-009：调用方契约——URL/源路径校验由调用方负责（上层 `WallpaperEngine` /
-    /// 命令处理层已做协议白名单校验）。本方法作为 IPC 层薄封装，不做防御性校验，
-    /// 直接序列化 url 为 JSON 发送给子进程。若未来需要在 IPC 层做纵深防御，
-    /// 可参考 `MirrorStarError::InvalidUrl { scheme }` 变体添加协议白名单。
-    pub fn navigate(&mut self, url: &str) -> Result<(), crate::MirrorStarError> {
-        let request_id = self.inner.next_request_id();
-        self.send_command_no_wait(WpProcCommand::Navigate {
-            request_id,
-            url: url.to_string(),
-        })
-    }
-
     /// 暂停播放（fire-and-forget，Bug #7）
     pub fn pause(&mut self) -> Result<(), crate::MirrorStarError> {
         let request_id = self.inner.next_request_id();
@@ -243,6 +262,24 @@ impl WpProcIpcClient {
     pub fn resume(&mut self) -> Result<(), crate::MirrorStarError> {
         let request_id = self.inner.next_request_id();
         self.send_command_no_wait(WpProcCommand::Resume { request_id })
+    }
+
+    /// 设置音量（0.0 ~ 1.0，fire-and-forget）。
+    ///
+    /// 音量由上层 `WallpaperEngine` 负责钳制到 0.0 ~ 1.0（与 VideoRenderer 一致）。
+    /// 此处作为 IPC 层薄封装不做防御性钳制，直接序列化 volume 发送给子进程，
+    /// 由子进程注入 JS 设置网页 `video`/`audio` 元素的 volume。
+    pub fn set_volume(&mut self, volume: f32) -> Result<(), crate::MirrorStarError> {
+        let request_id = self.inner.next_request_id();
+        self.send_command_no_wait(WpProcCommand::SetVolume { request_id, volume })
+    }
+
+    /// 切换静音（fire-and-forget）。
+    ///
+    /// 由子进程注入 JS 切换网页 `video`/`audio` 元素的 muted 状态。
+    pub fn toggle_mute(&mut self) -> Result<(), crate::MirrorStarError> {
+        let request_id = self.inner.next_request_id();
+        self.send_command_no_wait(WpProcCommand::ToggleMute { request_id })
     }
 
     /// 断开连接
@@ -317,19 +354,6 @@ mod tests {
     }
 
     #[test]
-    fn wp_proc_command_navigate_serialization() {
-        let cmd = WpProcCommand::Navigate {
-            request_id: 4,
-            url: "https://example.com".to_string(),
-        };
-        let json = serde_json::to_string(&cmd).unwrap();
-        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
-        assert_eq!(v["command"], "navigate");
-        assert_eq!(v["request_id"], 4);
-        assert_eq!(v["url"], "https://example.com");
-    }
-
-    #[test]
     fn wp_proc_command_pause_serialization() {
         let cmd = WpProcCommand::Pause { request_id: 5 };
         let json = serde_json::to_string(&cmd).unwrap();
@@ -345,6 +369,34 @@ mod tests {
         let v: serde_json::Value = serde_json::from_str(&json).unwrap();
         assert_eq!(v["command"], "resume");
         assert_eq!(v["request_id"], 6);
+    }
+
+    #[test]
+    fn wp_proc_command_set_volume_serialization() {
+        let cmd = WpProcCommand::SetVolume {
+            request_id: 7,
+            volume: 0.75,
+        };
+        let json = serde_json::to_string(&cmd).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(v["command"], "set_volume");
+        assert_eq!(v["request_id"], 7);
+        assert_eq!(v["volume"], 0.75);
+        // 反序列化往返
+        let back: WpProcCommand = serde_json::from_str(&json).unwrap();
+        match back {
+            WpProcCommand::SetVolume { volume, .. } => assert_eq!(volume, 0.75),
+            other => panic!("期望 SetVolume，实际: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn wp_proc_command_toggle_mute_serialization() {
+        let cmd = WpProcCommand::ToggleMute { request_id: 8 };
+        let json = serde_json::to_string(&cmd).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(v["command"], "toggle_mute");
+        assert_eq!(v["request_id"], 8);
     }
 
     // --- WpProcCommand::request_id tests ---
@@ -377,15 +429,6 @@ mod tests {
     }
 
     #[test]
-    fn wp_proc_command_request_id_navigate() {
-        let cmd = WpProcCommand::Navigate {
-            request_id: 40,
-            url: "x".to_string(),
-        };
-        assert_eq!(cmd.request_id(), 40);
-    }
-
-    #[test]
     fn wp_proc_command_request_id_pause() {
         let cmd = WpProcCommand::Pause { request_id: 50 };
         assert_eq!(cmd.request_id(), 50);
@@ -395,6 +438,64 @@ mod tests {
     fn wp_proc_command_request_id_resume() {
         let cmd = WpProcCommand::Resume { request_id: 60 };
         assert_eq!(cmd.request_id(), 60);
+    }
+
+    #[test]
+    fn wp_proc_command_request_id_set_volume() {
+        let cmd = WpProcCommand::SetVolume {
+            request_id: 70,
+            volume: 0.5,
+        };
+        assert_eq!(cmd.request_id(), 70);
+    }
+
+    #[test]
+    fn wp_proc_command_request_id_toggle_mute() {
+        let cmd = WpProcCommand::ToggleMute { request_id: 80 };
+        assert_eq!(cmd.request_id(), 80);
+    }
+
+    // --- WpProcCommand::expects_response tests ---
+
+    /// 仅 `Play` 会产生需调用方读取的响应；其余命令为 fire-and-forget。
+    ///
+    /// 子进程据此决定是否写回响应，避免响应在 4KB 管道输出缓冲区累积导致 IPC 线程阻塞。
+    #[test]
+    fn wp_proc_command_expects_response_only_for_play() {
+        // Play 走同步请求-响应路径，必须写回响应。
+        assert!(WpProcCommand::Play {
+            request_id: 1,
+            source: "x".to_string(),
+        }
+        .expects_response());
+
+        // 其余 6 个变体均为 fire-and-forget，不应写回响应。
+        let fire_and_forget = [
+            WpProcCommand::Terminate { request_id: 2 },
+            WpProcCommand::SetPosition {
+                request_id: 3,
+                x: 0,
+                y: 0,
+                width: 1,
+                height: 1,
+            },
+            WpProcCommand::Pause { request_id: 4 },
+            WpProcCommand::Resume { request_id: 5 },
+            WpProcCommand::SetVolume {
+                request_id: 6,
+                volume: 0.5,
+            },
+            WpProcCommand::ToggleMute { request_id: 7 },
+        ];
+        // 6 个非 Play 变体（Terminate/SetPosition/Pause/Resume/SetVolume/ToggleMute）
+        for cmd in &fire_and_forget {
+            assert!(!cmd.expects_response(), "命令 {:?} 不应期望响应", cmd);
+        }
+        assert_eq!(
+            fire_and_forget.len(),
+            6,
+            "应覆盖全部 6 个 fire-and-forget 变体"
+        );
     }
 
     // --- WpProcResponse deserialization tests ---

@@ -40,7 +40,7 @@
 | Progman | Program Manager | Windows 桌面窗口层次结构的顶层窗口，是桌面背景的容器 |
 | DWM | Desktop Window Manager | Windows 桌面窗口管理器，负责窗口合成和视觉效果 |
 | mpv | mpv | 开源的跨平台媒体播放器，MirrorStar 通过启动外部 mpv.exe 子进程作为视频壁纸的后端，通过命名管道 `\\.\pipe\mirrorstar-mpv-*` 接收 mpv 原生 JSON IPC 命令 |
-| mirrorstar-wp-proc | mirrorstar-wp-proc | 网页壁纸子进程，承载 WebView2 渲染网页壁纸；主进程通过命名管道 `\\.\pipe\mirrorstar-wp-*`（高熵 UUID，难以猜中）与 wp-proc 通信，实现崩溃隔离和内存优化 |
+| mirrorstar-wp-proc | mirrorstar-wp-proc | 网页壁纸子进程，由壳进程以 `--wp-proc` 模式作为独立子进程承载 WebView2 渲染网页壁纸（崩溃隔离不变）；主进程通过命名管道 `\\.\pipe\mirrorstar-wp-*`（高熵 UUID，难以猜中）与 wp-proc 通信，实现崩溃隔离和内存优化 |
 | WebView2 | Microsoft Edge WebView2 | Microsoft 提供的 WebView 控件，基于 Chromium 内核，用于在应用中嵌入网页内容 |
 | SHELLDLL_DefView | Shell Default View | Windows 桌面窗口层次结构中管理桌面图标显示的窗口 |
 | 硬件加速解码 | Hardware-accelerated decoding | 利用 GPU 进行视频解码（mpv `--hwdec=auto`），降低 CPU 占用 |

@@ -7,6 +7,8 @@
 > - **v6.0 技术债**：24 项（ST-TD-001~ST-TD-024），已按 `cleanup-v6-src-tauri-tech-debt-2026-07-26` spec 全部清理（7 P0 + 12 P1/P2 + 5 P3 保留现状）。
 > - 审查日期：2026-07-25 | 模块路径：`src-tauri/src/` | 源文件数：12
 
+> **注（主窗口原生 UI 重构后，2026-10-02）**：本文涉及的主窗口 WebView2 相关实现（`WebviewWindowBuilder`、`MAIN_WINDOW_BROWSER_ARGS`、`webview_memory` 挂起/裁剪、CSP、`wpfile://`）已随主窗口重构**移除**；壳不再创建 WebView2 主窗口，主窗口改由 `mirrorstar-ui.exe`（Slint）承载。本文保留为历史记录。
+
 ## 1. 模块概览 / 现状 与 文件清单
 
 ### 1.1 模块职责
@@ -364,3 +366,56 @@
 | Bug #1-#7 | ✅ 全部修复 | ST-TD-010/017 标记清理 | 修复 + 注释收敛 |
 
 **核心结论**：src-tauri 应用层经 v3.x → v4.0 → v4.1 → v5.0 → v6 多轮修复后，工程质量与正确性已达高水平（49+ 单元测试、clippy 零警告、详尽的锁顺序/COM/shutdown 文档化）。v4 findings 17 项全部关闭；v6 技术债 24 项全部清理（8 项修复痕迹为最大类别，均已收敛）。
+
+## 5. v17.0 内存优化（2026-10-02）
+
+本轮针对「设置动态壁纸后应用组内存偏高」，新增内存归因埋点并实施 6 项手段；本模块涉及 **Task 1（归因埋点）、Task 2（主窗口参数裁剪）、Task 3（非活跃态挂起/降级）**。
+
+### 5.1 Task 1：内存归因埋点（`mirrorstar-core/src/perf.rs` + `commands/system.rs` + `lib.rs`）
+
+`mirrorstar-core` 新增逐子进程内存归因（`MemoryUsageReport` / `ProcessCategory` / `attribute_processes` / `aggregate` / `sample_memory_report` / `spawn_memory_attribution_sampler`），src-tauri 侧接入两处：
+
+| 入口 | 位置 | 说明 |
+|---|---|---|
+| Tauri 命令 `get_memory_report` | `commands/system.rs` | 按需同步返回分类别明细与总计（主进程 / `mpv.exe` / 壳同名 `--wp-proc` 子进程 / `msedgewebview2.exe` / other），开销小、无需 async |
+| 周期采样 | `lib.rs` setup | `spawn_memory_attribution_sampler(Duration::from_secs(60))`，每 60s 输出一行 `MEM-ATTRIB: 应用组逐子进程内存归因`（target `mirrorstar::perf`，含工作集与私有提交 MB） |
+
+归因限定在当前进程进程树内（以当前 pid 为根按父 pid 建树），不会误算系统上其他应用的 `msedgewebview2.exe`。命令已在 `invoke_handler` 注册。
+
+### 5.2 Task 2：主窗口 WebView2 启动参数裁剪（`state.rs`）
+
+新增常量 `MAIN_WINDOW_BROWSER_ARGS` 并挂到主窗口 `WebviewWindowBuilder::additional_browser_args`：
+
+```
+--disable-features=msWebOOUI,msPdfOOUI,msSmartScreenProtection,BackForwardCache,MediaCache,FontCache,GpuMemDiscardable
+--autoplay-policy=no-user-gesture-required
+--renderer-process-limit=1
+--js-flags=--max-old-space-size=512
+--disk-cache-size=52428800
+```
+
+- **关键点（替换语义必须保留 wry 默认项）**：wry 0.55.1 在 `create_environment`（`wry-0.55.1/src/webview2/mod.rs:294`）对 `additional_browser_args` 使用 `unwrap_or_else(...)`——一旦设置，wry 默认参数串会被整体**替换**。故常量内**显式保留**了默认的 `msWebOOUI,msPdfOOUI,msSmartScreenProtection` 与 `--autoplay-policy=no-user-gesture-required`，否则会静默丢失默认 UI/SmartScreen 裁剪与自动播放策略。所有禁用特性合并进同一个 `--disable-features=` 列表。
+- **GPU 降级结论：暂不启用 `--disable-gpu`**：无真实 GUI 实测依据，软件合成（SwiftShader/CPU 光栅化）可能反而推高 renderer 内存与 CPU，且主窗口含 CSS 过渡/拖拽排序动效。后续验证方法见 `state.rs` 常量后的注释。
+- **降级**：Chromium 对未知 flag 静默忽略；`additional_browser_args` 仅写入字符串、不参与 `.build()` 成败判定。构建前以 `tracing::info!(args = MAIN_WINDOW_BROWSER_ARGS, ...)` 记录参数便于真机核对。
+
+常量文档注释与守卫测试已固化；`state.rs` 内另有测试注释说明「替换语义」与默认项保留契约。
+
+### 5.3 Task 3：非活跃态 WebView2 挂起 / 目标等级降级（`platform/webview_memory.rs`）
+
+新增模块封装 best-effort 回收：
+
+- `suspend_main_webview`：`ICoreWebView2_3::IsSuspended` 幂等判定 + `TrySuspend` + `ICoreWebView2_19::SetMemoryUsageTargetLevel(Low)`；
+- `resume_main_webview`：目标等级置回 `Normal` + 确定已挂起时 `Resume`；
+- `sync_main_webview_active_state`：`Resized` 边沿触发，仅状态变化时投递；
+- `reset_main_webview_suspended_state`：窗口重建后重置记录，避免漏挂起。
+
+接入点：`minimize_main_window_on_fullscreen`（最小化成功后挂起）、`create_or_show_main_window` 已存在分支（恢复）与 build 分支（重置）、`lib.rs` `on_window_event` 的 `CloseRequested`（关闭前 best-effort Resume，缓解项）与 `Resized`（通用最小化/恢复同步）。
+
+- **`TrySuspend` 前置条件与降级策略**：文档要求 `controller.IsVisible == false` 否则返回 `ERROR_INVALID_STATE`（best-effort，完成回调 `isSuccessful=false`）。本模块不主动置 `IsVisible=false`（避免恢复闪失导致白屏），故最小化场景下 `TrySuspend` 很可能失败；但**目标等级降级无此前置条件，始终生效**。所有失败仅 `warn!`，不 panic、不影响窗口操作；旧运行时缺接口时优雅跳过。
+- **依赖对齐**：`Cargo.toml` 新增 `webview2-com = "0.38"` 与 `windows 0.61`（别名 `windows61`），必须与 wry 0.55.1 / tauri-runtime-wry 2.11.2 同源。
+
+### 5.4 关闭主窗口语义（核实修正）
+
+`lib.rs` 的 `on_window_event` 主窗口 `CloseRequested` 分支**不调用 `api.prevent_close()`**，让 Tauri 默认销毁主窗口、释放 WebView2 子进程树——即「关闭即销毁」而非「关闭即隐藏（hide）」。文档 `09-性能优化-Performance.md` §11.7 已据此修正。
+
+**验证结果**：`cargo test --workspace` / `cargo clippy --workspace --all-targets -- -D warnings` 见本轮质量门槛报告；**优化前后内存实测数值待真机补测**（本环境无 GUI，不伪造数据）。

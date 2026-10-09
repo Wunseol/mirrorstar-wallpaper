@@ -174,13 +174,13 @@ image crate 解码 → 帧缓冲 → GDI 双缓冲渲染到 HWND → 精确帧�
 ### 选择：WebView2（webview2-com 0.34，子进程创建）
 
 - **硬件加速**：Chromium 引擎，GPU 合成
-- **进程隔离**：WebView2 环境在 `mirrorstar-wp-proc.exe` 子进程中创建，主进程仅作代理层
+- **进程隔离**：WebView2 环境在壳进程 `--wp-proc` 模式子进程中创建，主进程仅作代理层
 - **轻量**：系统预装 WebView2 Runtime，无需捆绑 CEF
 
 ### 设计方案
 
 ```
-WebRenderer（web.rs，652 行）→ 启动 mirrorstar-wp-proc.exe → 子进程用 webview2-com 创建 WebView2 环境 → 查找窗口 HWND + PID 校验 → SetParent 嵌入 WorkerW → WpProcIpcClient 命名管道控制
+WebRenderer（web.rs，652 行）→ 以 `--wp-proc` 模式启动壳进程自身 → 子进程用 webview2-com 创建 WebView2 环境 → 查找窗口 HWND + PID 校验 → SetParent 嵌入 WorkerW → WpProcIpcClient 命名管道控制
 ```
 
 - `WebRenderer` 位于 `mirrorstar-core/src/wallpaper/web.rs`，共 **652 行**，为代理层

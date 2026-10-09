@@ -8,7 +8,7 @@
 
 ### 1.1 模块职责
 
-wp-proc 是 MirrorStar 的 Web 壁纸子进程，将 WebView2 渲染隔离到独立进程，通过命名管道接收主进程的 IPC 命令（Play/Pause/Resume/Seek/SetPosition/Navigate/Terminate）。模块由 5 个源文件组成：
+wp-proc 是 MirrorStar 的 Web 壁纸子进程，由壳进程 `mirrorstar-wallpaper.exe` 的 `--wp-proc` 模式运行（同一 exe、双入口），将 WebView2 渲染隔离到独立进程，通过命名管道接收主进程的 IPC 命令（Play/Pause/Resume/Seek/SetPosition/Navigate/Terminate）。模块由 5 个源文件组成：
 
 - **`main.rs`** — 子进程入口（Cli 解析、COM/窗口类/窗口/WebView2/管道初始化、消息循环、IPC 线程协调、Drop 顺序契约、优雅退出）
 - **`command.rs`** — IPC 命令处理（`navigate_to_url`、`execute_script_and_report`、`handle_command`、`ok/error_response` 辅助、`NavigationCompletedHandlerGuard` RAII）
@@ -16,7 +16,7 @@ wp-proc 是 MirrorStar 的 Web 壁纸子进程，将 WebView2 渲染隔离到独
 - **`ipc_server.rs`** — 命名管道服务端（`OwnedHandle` RAII、`SecurityAttributesGuard`、`build_pipe_security_attributes`、`create_pipe_server`、`process_line`、`format_response`、`read_line_with_limit`、`ipc_thread`）
 - **`webview.rs`** — WebView2 控制器封装（`parse_rect`、`default_rect`、`WindowClassGuard`、`register_window_class`、`create_window`、`ControllerGuard` RAII、`wait_with_pump_timeout`、`create_webview`、`build_url`、`percent_encode_path`）
 
-**核心结构**：独立二进制，通过 clap 接收 CLI 参数；COM 初始化为 STA（`COINIT_APARTMENTTHREADED`，WebView2 要求）；双线程架构（主线程 Win32 消息循环处理 WebView2，IPC 线程读取管道命令）；线程间通信 `std::sync::mpsc` + `PostMessageW(WM_WEB_COMMAND)`。
+**核心结构**：作为壳进程 `mirrorstar-wallpaper.exe` 的 `--wp-proc` 模式运行（同一 exe、双入口，不产出独立 exe），通过 clap 接收 CLI 参数；COM 初始化为 STA（`COINIT_APARTMENTTHREADED`，WebView2 要求）；双线程架构（主线程 Win32 消息循环处理 WebView2，IPC 线程读取管道命令）；线程间通信 `std::sync::mpsc` + `PostMessageW(WM_WEB_COMMAND)`。
 
 **设计模式**：`OwnedHandle` RAII、`read_line_with_limit` 限流读取、`ComGuard` RAII、`WindowClassGuard`/`ControllerGuard`/`SecurityAttributesGuard`/`NavigationCompletedHandlerGuard` RAII、`wait_with_pump_timeout` 超时泵（替代无限阻塞的 `GetMessageA`）、URL 协议白名单（`eq_ignore_ascii_case` 阻断大小写变体）、WebView2 创建失败退出（`return Err` 触发 RAII Drop）、纯函数提取（`process_line`/`format_response`）、退出清理（`Controller.Close()` → drop cmd_rx → IPC 线程 join → RAII 逆序释放）。
 
@@ -258,3 +258,34 @@ wp-proc 是 MirrorStar 的 Web 壁纸子进程，将 WebView2 渲染隔离到独
 - **I-001（ipc 模块）read_line 超时盲区**：属于 `mirrorstar-ipc` 客户端模块（`05-audio-ipc-process模块.md`），与本模块的 `read_line_with_limit`（OOM 防护，见 WP02）是不同模块的同类概念。I-001 已在路线图标记 ⚡ 完成于 v4.0 Wave 1C，后续 v41-I-001（UTF-8 截断）标记 ⚡ 完成于 v4.1 Wave v41-A。
 - **预热池 / WarmWpProc**：该机制已由代码审查确认**移除**（不属于 wp-proc 当前模块的组件），不作为待修复项。
 - **遗留待处理（WP-TD-008/009）**：v6 技术债清理唯一保留项——5 文件 100+ 处历史修复标记（WPxx/W-xx/SEC-xx/v41-WP-xx 前缀）的批量清理，作为独立 Wave v6-A 任务处理。
+
+## 5. v17.0 内存优化（2026-10-02）
+
+本模块涉及 **Task 5：网页壁纸 WebView2 内存裁剪与环境共享评估**。
+
+### 5.1 Task 5.1：AdditionalBrowserArguments 裁剪（`webview.rs`）
+
+从 `build_webview2_environment_options` 中抽出**纯函数** `build_additional_browser_args()`（不触碰 COM，便于单测断言参数契约），并新增两项裁剪参数：
+
+| 新增参数 | 作用 / 预期效果 |
+|---|---|
+| `--renderer-process-limit=1` | wp-proc 只渲染一个页面，限制渲染进程数为 1，省去多余 renderer 进程内存基线。风险低：跨域 iframe 会与主 frame 共用 renderer（牺牲站点隔离、单 renderer 内存略升），但本进程是 fail-closed 沙箱面，隔离损失可接受 |
+| `--js-flags=--max-old-space-size=512` | 把 V8 老生代堆上限压到 512MB（64 位默认约 2-4GB），约束失控增长。取值保守（普通网页堆通常 <100MB、WebGL 纹理不占 V8 堆），避免 OOM/白屏 |
+
+**既有参数全部保留**：`--autoplay-policy=no-user-gesture-required`（E2E 免手势播放必需）、`--disk-cache-size=10485760`、`--disable-gpu-program-cache`、`--disable-gpu-shader-disk-cache`、`--disable-features=MediaCache,FontCache,GpuMemDiscardable,BackForwardCache`。
+
+**测试**：`task5_1_additional_browser_args_contract` 断言必须存在 / 必须保留 / 不得引入的参数契约，防止后续维护误删 `--autoplay-policy=no-user-gesture-required` 或改动内存裁剪参数。
+
+### 5.2 Task 5.2/5.3：环境共享评估结论 —— **放弃**
+
+目标：让主窗口（Tauri/wry 托管的 WebView2）与 wp-proc 共用同一 UDF + 环境选项，以省下一份 `msedgewebview2` 进程基线（约 5-6 进程 / 150-300MB）。
+
+- **可行性核实**：WebView2 官方文档（Manage user data folders）明确跨进程共享同一 UDF 是**被支持的**（「A WebView2 control shares its WebView2 session with any other WebView2 control that uses the same UDF...」），且默认 `ExclusiveUserDataFolderAccess=false` 不禁止其他进程加入同一 UDF。因此现有 per-PID UDF **并非**因「不允许共享」而存在，而是**主动选择隔离**；放弃共享是**架构取舍，不是技术不可行**。
+- **放弃理由（均为架构级回退，收益不抵代价）**：
+  1. **崩溃隔离回退（决定性）**：wp-proc 存在的首要理由就是崩溃隔离（见 `wallpaper/web.rs` 的 `WebRenderer` 文档）；壁纸页面是不受信任的第三方网页（fail-closed 沙箱面），崩溃概率最高。共享 browser 进程后其崩溃会一并拖垮主窗口设置 UI。
+  2. **多显示器能力回退（决定性）**：per-PID UDF 让每个 wp-proc 成为独立进程集合，多显示器可同时开多个 Web 壁纸、各自独立 terminate/重启；共享单一 UDF 后所有实例落进同一 browser 进程集合，且 `cleanup_wp_proc_user_data_folder` 会在实例退出时 `remove_dir_all` 整个 UDF，破坏仍在运行的环境（文档明确 UDF 只能在无活动 session 时删除/移动）。
+  3. **环境选项无法对齐**：共享要求「同一 UDF + 等价环境配置」，但主窗口由 Tauri/wry 托管，wp-proc 无法控制其 UDF 与参数；壁纸侧需要主窗口不应有/不应受影响的进程级配置（`--autoplay-policy=no-user-gesture-required`、`WEBVIEW2_DEFAULT_BACKGROUND_COLOR` 透明注入、CDP 注入等）。
+  4. **净收益不确定**：即便省下一份基线，也需把壁纸移入主进程或引入集中式 UDF 生命周期管理 + 全参数对齐，复杂度与风险远超预期收益。
+- **结论落点**：已写入 `webview.rs` 中 `build_webview2_user_data_folder` 的文档注释，含「若未来仍要共享」的前置条件（移入主进程、UDF 生命周期集中管理、接受崩溃隔离降级并依赖 `ProcessFailed` 重建、用 `MEM-ATTRIB` 确认收益）。
+
+**预期效果**：约束单个网页壁纸子进程的 renderer 进程数与 JS 堆峰值，同时不因共享环境而回退崩溃隔离与多显示器能力。**优化前后实测数值待真机补测**（本环境无 GUI，不伪造数据）。

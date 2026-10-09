@@ -78,7 +78,10 @@ impl std::fmt::Display for LayoutError {
             LayoutError::NoDisplays => write!(f, "无可用的显示器"),
             LayoutError::OrphanUnit(k) => write!(f, "孤儿单元（显示器不存在）: {k}"),
             LayoutError::InvalidUnitForArrangement(k) => {
-                write!(f, "此编排下不允许设置单元: {k}（仅支持全局单元 {ALL_UNIT_KEY}）")
+                write!(
+                    f,
+                    "此编排下不允许设置单元: {k}（仅支持全局单元 {ALL_UNIT_KEY}）"
+                )
             }
         }
     }
@@ -138,10 +141,7 @@ pub fn unit_keys(plane: &LayoutPlane) -> Vec<String> {
 /// - `PerMonitor`：`key` 必须命中任一显示器 id；`None` / 空串 → 主显示器（无主则
 ///   回退首个显示器）。
 /// - `AllSame` / `Span`：仅允许全局单元 `"all"`；显式给出其它 key → 拒绝孤儿单元。
-pub fn validate_unit_key(
-    plane: &LayoutPlane,
-    key: Option<&str>,
-) -> Result<String, LayoutError> {
+pub fn validate_unit_key(plane: &LayoutPlane, key: Option<&str>) -> Result<String, LayoutError> {
     match plane.arrangement {
         Arrangement::PerMonitor => {
             let key = match key {
@@ -201,7 +201,10 @@ mod tests {
         let displays = vec![monitor("d1", false), monitor("d2", true)];
         let plane = plan(Arrangement::AllSame, &displays);
         assert_eq!(unit_keys(&plane), vec![ALL_UNIT_KEY.to_string()]);
-        assert_eq!(plane.unit_displays[ALL_UNIT_KEY], vec!["d1".to_string(), "d2".to_string()]);
+        assert_eq!(
+            plane.unit_displays[ALL_UNIT_KEY],
+            vec!["d1".to_string(), "d2".to_string()]
+        );
     }
 
     #[test]
@@ -209,7 +212,10 @@ mod tests {
         let displays = vec![monitor("d1", true), monitor("d2", false)];
         let plane = plan(Arrangement::Span, &displays);
         assert_eq!(unit_keys(&plane), vec![ALL_UNIT_KEY.to_string()]);
-        assert_eq!(plane.unit_displays[ALL_UNIT_KEY], vec!["d1".to_string(), "d2".to_string()]);
+        assert_eq!(
+            plane.unit_displays[ALL_UNIT_KEY],
+            vec!["d1".to_string(), "d2".to_string()]
+        );
     }
 
     #[test]
@@ -220,8 +226,10 @@ mod tests {
 
     #[test]
     fn validate_unit_key_per_monitor_resolves_primary_or_first() {
-        let plane =
-            plan(Arrangement::PerMonitor, &[monitor("d1", true), monitor("d2", false)]);
+        let plane = plan(
+            Arrangement::PerMonitor,
+            &[monitor("d1", true), monitor("d2", false)],
+        );
         assert_eq!(validate_unit_key(&plane, None).unwrap(), "d1");
         assert_eq!(validate_unit_key(&plane, Some("")).unwrap(), "d1");
         assert_eq!(validate_unit_key(&plane, Some("d2")).unwrap(), "d2");
@@ -239,14 +247,20 @@ mod tests {
     #[test]
     fn validate_unit_key_per_monitor_no_displays_errors() {
         let plane = plan(Arrangement::PerMonitor, &[]);
-        assert_eq!(validate_unit_key(&plane, None), Err(LayoutError::NoDisplays));
+        assert_eq!(
+            validate_unit_key(&plane, None),
+            Err(LayoutError::NoDisplays)
+        );
     }
 
     #[test]
     fn validate_unit_key_global_only_allows_all() {
         let plane = plan(Arrangement::Span, &[monitor("d1", true)]);
         assert_eq!(validate_unit_key(&plane, None).unwrap(), ALL_UNIT_KEY);
-        assert_eq!(validate_unit_key(&plane, Some("all")).unwrap(), ALL_UNIT_KEY);
+        assert_eq!(
+            validate_unit_key(&plane, Some("all")).unwrap(),
+            ALL_UNIT_KEY
+        );
         assert_eq!(
             validate_unit_key(&plane, Some("d1")),
             Err(LayoutError::InvalidUnitForArrangement("d1".to_string()))

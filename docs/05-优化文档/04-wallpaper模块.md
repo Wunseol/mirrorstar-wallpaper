@@ -47,6 +47,203 @@
 
 测试分布广泛但存在倾斜：mod.rs（~660 行测试，覆盖 calculate_scaling、枚举 serde、PauseSender 状态/广播/版本号、spawn_proc_exit_monitor 集成测试）、manager.rs（~750 行测试，含 MockRenderer 状态管理测试与 W-008 回退逻辑测试）、fast_path.rs（~500 行测试，覆盖快速路径与 PauseReason 位图协调）、gif_memory.rs（~150 行测试，4 种内存策略单元测试）、subprocess_base.rs（~55 行测试）、mode_dispatch.rs（~200 行测试，含模式判定与同步路径测试）、video.rs（~280 行测试，含 validate_renderer_speed 与 WASAPI 判断逻辑）、gif.rs（~250 行测试）、gif_decode.rs（~190 行测试）、image.rs（~220 行测试）、web.rs（~180 行测试）、gdi_base.rs（~150 行测试）。涉及 Win32 API 的失败分支普遍通过文档化注释标记验证，无法在 CI 中可靠触发真实失败分支。`paused_displays` 方法已被 v6.0 清理（见 W-TD-005）。
 
+## 纯净壁纸模式（引擎侧入口）
+
+> 实现来源：`manager.rs`（`enter_pure_mode` / `exit_pure_mode` / `abort_pure_mode` / `is_pure_mode_active` / `enter_pure_mode_temp_windows` / `revive_terminated` / `rollback_pure_mode_enter` / `shutdown`）+ `crates/mirrorstar-core/src/pure_mode/mod.rs`。模式在 src-tauri 侧的编排（托盘入口、输入钩子、状态守卫）见 `src-tauri/src/platform/pure_mode.rs` 与 `src-tauri/src/platform/pure_mode_input.rs`。
+
+### 四个入口与幂等语义
+
+| 入口 | 职责 | 幂等语义 |
+|---|---|---|
+| `enter_pure_mode()` | 把正在播放的壁纸窗口摘出 WorkerW 并置顶全屏（`HWND_TOPMOST`，保持当前矩形零 resize）；**视频显示器例外**（架构 D1）：不搬动原窗口，改由临时顶层覆盖渲染器呈现 | 已处于模式（`pure_mode.is_some()`）→ 直接 `Ok(())`；无任何壁纸（`wallpaper_mode` 为空）→ `Err(InvalidArgument)` 且**不置位**进程级标志 |
+| `exit_pure_mode()` | 把 `lifted` 中的窗口按进入时记录的排列嵌回 WorkerW（视频显示器不在 `lifted`，仅销毁其临时覆盖窗、原窗口不搬动）、终止全部临时渲染器、按 `interaction_mode` 还原鼠标穿透 | `pure_mode` 为 `None` → 直接 `Ok(())`（连续两次退出第二次为 no-op） |
+| `abort_pure_mode()` | 应用退出路径专用：只终止临时呈现渲染器 + 清置顶窗口注册表 + 清进程级标志，**不回嵌** | 无状态时为无副作用的 safe 调用（可重复调用） |
+| `is_pure_mode_active()` | 供 src-tauri 编排层查询权威运行态（`pure_mode.is_some()`） | 只读 |
+
+**标志时序（D7）**：进程级 `pure_mode::set_active(true)` 必须在任何置顶动作**之前**置位（使并发的轮换调度器 / 全屏-电源状态守卫立即开始抑制），`set_active(false)` 必须在全部回嵌**完成之后**清除；失败回滚路径亦在末尾清标志。
+
+### 状态存放约定
+
+| 存放 | 类型 | 含义 |
+|---|---|---|
+| `WallpaperEngine::pure_mode` | `Option<PureModeState>` | 是否处于模式的**权威状态**。`PureModeState { lifted: Vec<(String, HWND)>, arrangement: Arrangement }`：`lifted` 为本次摘出并置顶的（显示器ID, 窗口句柄），退出时逐个交 `DesktopIntegrator::reattach_after_pure_mode` 按 `arrangement` 嵌回；`arrangement` 为进入时刻的排列快照（模式内用户不可改配置，避免用退出时刻的排列错误重排） |
+| `WallpaperEngine::pure_mode_temp` | `Vec<(String, Box<dyn WallpaperRenderer>)>` | **两类**临时呈现渲染器：**Native 静态图片**与 **Video 视频**（架构 D1 的"临时顶层覆盖渲染器"，见下"四类呈现路径"）。**绝不**注册进 `wallpapers` / `pause_senders` / `wallpaper_sources` / `wallpaper_mode` 等权威状态映射，也不写入 `lifted`（它们无需回嵌，只需 `terminate()`：视频覆盖窗销毁后原窗口即原样显露） |
+
+> 注：`PureModeState` 因含 `HWND` 而 `unsafe impl Send`（句柄为不透明整数令牌、不指向 Rust 拥有的内存，且所有访问经 `Arc<tokio::sync::Mutex<WallpaperEngine>>` 串行化）。
+>
+> 置顶窗口注册：`collect_pure_mode_hwnds(&lifted)` 汇总 `lifted` 与 `pure_mode_temp` **两处**的窗口句柄后登记给 `pure_mode::register_lifted`，供 `TaskbarCreated` 广播后重断言 Z 序——即**临时窗口（含架构 D1 的视频覆盖窗）也在重断言覆盖范围内**。
+
+### 四类呈现路径（D3 / D4 / D8，视频为架构 D1）
+
+| 壁纸类型 | 进入动作 |
+|---|---|
+| **视频**（`WallpaperType::Video`，**架构 D1**） | **不搬动原窗口**（不 `detach_for_pure_mode`）：新建**临时顶层覆盖渲染器**——`construct_renderer(...)`（内部 `VideoRenderer::new` + `play()`；配置快照复用无副作用的 `renderer_config()`）→ `make_borderless(hwnd)`（失败仅 `warn`）+ `remove_from_taskbar(hwnd)`（与 `embed_wallpaper` Step 1 同源）→ `VideoRenderer::disable_auto_window_resize()`（IPC best-effort，早于 `lift_window_to_rect` / `loadfile`）→ `crate::pure_mode::lift_window_to_rect` 置顶全屏（1920×1080、无边框）→ `after_embed()` 从头 `loadfile`；登记进 `pure_mode_temp`，原窗口留在 WorkerW 全程继续播放。若原窗口已被终止（`hwnd().is_none()`）先 `revive_terminated` 重建后再覆盖。任一步失败即 best-effort `terminate()` 该临时渲染器并放弃本显示器覆盖（`error!`），**不回滚整个进入流程** |
+| 网页 / GIF / 非原生格式图片（`hwnd().is_some()`） | 直接 `detach_for_pure_mode` 摘出 + 置顶，**不重载、不重启子进程**，画面继续播放 |
+| 同上但 `hwnd().is_none()`（被全屏终止 / 子进程崩溃） | 先 `revive_terminated(display_id)` 重建（`play()` + `reembed_and_register_renderer`，**不触碰** `pause_reasons` 位图），成功后再摘出置顶 |
+| Native 静态图片（`WallpaperMode::Native`，根本没有窗口） | 由 `enter_pure_mode_temp_windows` 构造临时 `ImageRenderer::new(path, scaling_mode_for(display_id))` + `play()`（**不**走 `construct_renderer`，避免其 `ensure_desktop_ready` 对 WorkerW 的重试依赖与副作用）后经 `lift_window_to_rect` 置顶 |
+
+临时窗口的覆盖范围（D8）：`arrangement == Span` 时创建 **1 个**跨虚拟屏窗口（矩形取 `pure_mode::virtual_screen_rect()`）；否则逐屏为"**有 Native 记录**且**没有 WorkerW 壁纸窗口**"的显示器各建一个；两者皆无的显示器保持桌面原样（不覆盖）。
+
+> **视频为何不再走摘出置顶（架构 D1）**：实测"把正在播放的 D3D11（bitblt）视频窗口摘出 WorkerW 并置顶"会**毒化本会话的 WorkerW 子层**（此后该层不再产出可呈现帧，退出侧的重建 / 回嵌 / 窗口级唤醒手段均被证伪），而顶层窗口呈现正常。故视频改为"原窗口不搬动 + 临时顶层覆盖"，退出仅 `pure_mode_temp.drain(..)` 销毁覆盖窗、原 mpv 从不重启。根因、已证伪路径与验证结论见 [`03-desktop模块.md`](./03-desktop模块.md) 的"退出回嵌的防呈现冻结契约（架构 D1）"。
+
+> **覆盖窗全屏尺寸契约（spec `fix-pure-mode-exit-presentation-freeze`）**：视频覆盖分支必须在 `lift_window_to_rect` **之前**、且**早于 `after_embed()`（`loadfile`）**调用 `VideoRenderer::disable_auto_window_resize()`（经 mpv IPC `set_property("auto-window-resize","no")`，best-effort）——否则 mpv 默认 `auto-window-resize=yes` 会按**工作区**与视频宽高比自适配覆盖窗（实测被改成 1848×1040 @ (36,20)），覆写 `lift_window_to_rect` 请求的 1920×1080。该属性**仅由视频覆盖窗经 IPC 设置**，boot / 轮换路径与全局 mpv 启动参数均未改动。根因、实测对照与已验证结果（覆盖窗稳定 1920×1080 @ (0,0)、原 mpv 从未重启）见 [`03-desktop模块.md`](./03-desktop模块.md) 的"退出回嵌的防呈现冻结契约（架构 D1）"。
+
+### 部分失败整体回滚
+
+进入过程逐屏执行，**摘出路径**任一步失败（`revive_terminated` 失败、`detach_for_pure_mode` 失败、Native 临时窗口创建 / 置顶失败）即调用 `rollback_pure_mode_enter`：把**已摘出的全部窗口**逐个 `reattach_after_pure_mode` 嵌回、`terminate()` 并清空 `pure_mode_temp`、最后 `set_active(false)`，随后返回原错误——不留"半进入"状态。回滚为 best-effort（不阻断）：单个嵌回失败时对该窗口执行隐藏兜底并记录 `error`（见下"嵌回失败的隐藏降级"），终止失败仅 `warn`。
+
+> **视频覆盖失败不回滚整体（架构 D1）**：视频显示器走"原窗口不搬动 + 临时顶层覆盖"，其覆盖渲染器的创建 / 置顶 / `loadfile` 任一步失败只 best-effort `terminate()` 该临时渲染器并**放弃本显示器覆盖**（`error!`），继续处理其他显示器、**不触发** `rollback_pure_mode_enter`——因为原窗口从未被搬动，失败不产生"半进入"状态。仅其前置的 `revive_terminated` 失败仍按摘出路径回滚。
+
+### 嵌回失败的隐藏降级（F1）
+
+退出与进入回滚两条路径共用同一降级语义：`reattach_after_pure_mode` 失败时不止记录日志，还对窗口做 best-effort 隐藏。
+
+| 路径 | 位置 | 降级动作 |
+|---|---|---|
+| 退出 | `exit_pure_mode`（逐窗嵌回循环内） | `IsWindow(hwnd)` 为真则 `ShowWindow(hwnd, SW_HIDE)`；隐藏失败再补一条 `warn`，随后记录带 `display_id` 与失败原因的 `error!` 日志 |
+| 进入回滚 | `rollback_pure_mode_enter` | 同上，`error!` 文案前缀为"纯净壁纸模式进入失败回滚" |
+
+**理由**：嵌回失败时模式标志（`pure_mode::set_active(false)`）与输入钩子均已撤除，而该窗口仍带 `HWND_TOPMOST`；若继续置顶，用户将没有任何输入退出路径，桌面被永久遮挡。隐藏是"保证桌面恢复可用"的最后一道兜底。
+
+**恢复时机**：被隐藏的窗口在下一次设置壁纸或重启应用后恢复。
+
+### 空模式拒绝（F5）
+
+`enter_pure_mode` 在摘出窗口与临时呈现窗口均为空（`lifted.is_empty() && self.pure_mode_temp.is_empty()`）时判定为"空模式"并拒绝进入：
+
+- 记录 `warn`，调用 `rollback_pure_mode_enter` 回滚（best-effort 隐藏兜底 + 终止临时渲染器 + `set_active(false)`）
+- 返回 `Err(MirrorStarError::InvalidArgument { reason: "没有可覆盖的壁纸窗口，拒绝进入纯净壁纸模式" })`
+
+**理由**：否则会置位标志、安装输入钩子并抑制轮换调度，却没有任何窗口被覆盖——用户进入了一个"看不见的模式"，只能再次触发退出。该不一致通常源于 `wallpaper_mode` 有记录，但既无活跃窗口也无 Native 资源。
+
+### D1 渲染器层同步的豁免登记（A1）
+
+设计契约（spec `add-pure-wallpaper-mode` 的 D1）第 3 步曾要求进入置顶后调用 `renderer.set_position(x, y, w, h)` 在渲染器层同步几何（网页经 IPC 触发 WebView2 重排重绘）。第三轮审计确认**该步骤未落地**：置顶路径无此调用，全仓该调用只出现在 `update_positions` 的几何更新与各渲染器实现内部。经评估，登记为**经实测豁免的设计步骤**，不新增调用：
+
+- **零 resize ⇒ 无信息增量**：进入过程保持当前屏幕矩形（零 resize，见本节"四类呈现路径（D3 / D4 / D8）"与 D2），渲染器侧几何与进入前完全一致，再同步一次不引入任何变化。
+- **GDI 路径已有保险重绘**：置顶路径（`lift_wallpaper_window` / `lift_window_to_rect`）末尾的 `InvalidateRect` 已覆盖静态图片 / GIF 等 GDI 呈现路径的重绘。
+- **实测证据**：落地 E2E 与第三轮 E2E 均实测"置顶后视频 / 网页持续出画"——对两帧截图取哈希，哈希不同，证明画面在持续更新。
+- **补调用反而有害**：额外的 `set_position` 会引入无谓的 `SetWindowPos`（video 路径会以 `HWND_TOP` 重排 Z 序）与一次 IPC 往返，且与"零 resize"目标相悖。
+
+### 锁屏（Win+L）实际行为（D8 修订，A6）
+
+设计契约 D8 曾写"锁屏（Win+L）→ 保持模式"。该表述与实现冲突：模式内键盘钩子在 `WM_KEYDOWN`（LWIN 按下）即触发退出并进入 300ms 吞掉窗口，随后的 L 键 `WM_KEYDOWN` 与 keyup 一并被吞——LWIN-down 从未进入系统输入队列，因此 **Win+L 锁定热键大概率不生效**。
+
+**实际行为**：模式内任意键（含 Win 组合键）都会退出模式，即 **Win+L = 退出模式，而非锁屏**。
+
+**修订表述**：如需锁屏，请在模式外执行（先退出模式再 Win+L），或使用不受低级钩子影响的 SAS 路径（**Ctrl+Alt+Del**）——该路径锁屏期间模式保持，解锁后任意键退出。
+
+### 输入钩子生命周期契约（A2/A3）
+
+进入 / 退出编排位于 src-tauri 侧（`src-tauri/src/platform/pure_mode.rs` 与 `src-tauri/src/platform/pure_mode_input.rs`），遵循以下四条契约：
+
+- **进入前有界等待在途退出落位（A2）**：进入编排在安装输入钩子前会轮询 `EXIT_IN_PROGRESS`，有界等待在途退出编排（含 join 旧捕获线程的卸载步骤）落位，上界约 10s（`EXIT_WAIT_TRIES = 200`，50ms × 200）；超时则**拒绝进入并保持托盘项未勾选**，避免新旧会话钩子并发 / 误投 `HookFailed`。
+- **存储句柄前复核模式活跃（A2）**：安装新钩子后、存入句柄前复核模式仍活跃（`is_pure_mode_active`）；若不活跃（并发退出已在期间完成）则**卸载刚安装的新钩子且不存储**，避免残留句柄。
+- **显式卸载不投递 `HookFailed`（A3）**：由**显式卸载**（`InputHook::shutdown`，即退出编排 / 应用退出路径）引发的线程收尾**不投递** `ExitReason::HookFailed`，即使模式标志仍活跃也不投递——否则会在应用退出或已放弃的回调上产生误报。
+- **收尾释放退出通道（A3）**：线程收尾释放退出通道（仅同一通道才清空），使退出监听任务及时结束、不再挂在已失效的钩子会话上。
+
+### `shutdown()` 首部 `abort_pure_mode()` 的原因
+
+`shutdown()` 先调用 `abort_pure_mode()` 再走既有 `cleanup_internal()`：退出路径**不回嵌**——已摘出的窗口随后由 `cleanup_internal` 经 `close_wallpaper` 统一终止，其内部 `remove_wallpaper` 的 `SetParent(None) + SW_HIDE` 对已摘出窗口幂等安全，此时再嵌回桌面纯属浪费且会触发一次多余的 Explorer 交互。`abort_pure_mode()` 因此只做三件事：终止全部临时呈现渲染器、`clear_lifted()`、`set_active(false)`。
+
+## 渲染器存活探针与停滞自愈契约
+
+> 实现来源：`crates/mirrorstar-core/src/wallpaper/mod.rs`（`LivenessProbe` / `WallpaperRenderer::liveness_probe`）+ `video.rs`（`liveness_probe_from_status` / `video_playback_stalled`）+ `manager.rs`（`probe_playing_videos` / `heal_stalled_renderer`）+ `src-tauri/src/platform/pure_mode.rs`（退出纯净壁纸模式时的即时校验）+ `src-tauri/src/platform/liveness_watchdog.rs`（常驻看护）。
+
+**问题背景**：mpv 视频输出偶发在 `--loop-file` 循环点停滞——"最后一帧 drain 未完成"，`time-pos` 钉在最后一帧不再前进。修复前应用**没有任何卡帧检测与自愈**，该冻结会一直保留；纯净壁纸模式把它"暴露"给用户（用户此刻正盯着画面），且原退出编排只回嵌窗口、从不校验渲染器是否真的在播放。
+
+> **该停滞属上游 mpv 输出的偶发问题**：本次实测一次发生在进入纯净壁纸模式约 **10.08s** 后仍未 drain 完成；用 **5 组隔离条件复现均未复现**。本修复是"检测 + 自愈"（重建渲染器），**不消除上游停滞本身**。
+
+### 探针原语（core 侧）
+
+| 原语 | 位置 | 行为契约 |
+|---|---|---|
+| `LivenessProbe` | `wallpaper/mod.rs` | 一次查询即冻结的不可变快照：`time_pos` / `paused` / `idle_active` / `eof_reached`。经 crate 根导出为 `mirrorstar_core::LivenessProbe` |
+| `WallpaperRenderer::liveness_probe()` | `wallpaper/mod.rs`（trait 默认方法） | 默认返回 `None`（图片 / GIF / 网页渲染器不参与判定，**零副作用**）；仅 `VideoRenderer` 覆盖 |
+| `VideoRenderer::liveness_probe()` | `video.rs` | 经私有 `liveness_probe_status()` 查询 mpv：**只查判定所需的 4 个属性**（`time-pos` / `pause` / `idle-active` / `eof-reached`），逐属性容错；IPC 未连接时返回空 JSON 对象（`{}`）⇒ `liveness_probe_from_status` 返回 `None` ⇒ 本轮不判定停滞。IPC 失败仅记 `debug` 并返回 `None` |
+| `MpvIpcClient::get_property_with_timeout(name, timeout)` | `ipc/mpv_protocol.rs` | 带自定义超时的属性查询；既有 `get_property` 改为委托它并保留固定 **2s** 语义（行为逐字等价）。探针经它使用 `PROBE_PROPERTY_TIMEOUT = 500ms` 短超时 |
+| `liveness_probe_from_status(&Value)` | `video.rs` | 解析 mpv 属性 JSON。**任一必需字段缺失或为 `{"error": ...}` 对象即返回 `None`**——不把 IPC / 解析故障误判为停滞；布尔解析兼容 `true`/`false` 与 `"yes"`/`"no"` |
+| `video_playback_stalled(prev, curr)` | `video.rs`（纯函数，经 crate 根导出为 `mirrorstar_core::video_playback_stalled`） | 停滞判据，见下 |
+| `probe_playing_videos()` | `manager.rs` | 仅收集 `state() == Playing` 且探针返回 `Some` 的显示器（Terminated / Paused 不入集）；`display_id` 升序 |
+| `heal_stalled_renderer(display_id, prev_time_pos, curr_time_pos, source)` | `manager.rs` | 自愈原语，见下 |
+
+**探针查询成本上界**：探针**不再复用**"诊断用"的 `diagnostic_playback_status()`（7 属性 × 2s 超时，最坏 ≈14s），改为只查 4 个属性并使用 500ms 短超时 ⇒ 每次取锁**最坏 ≈ 4 × 500ms ≈ 2s**。`diagnostic_playback_status()` 本身**保持原样**（仍 7 属性 / 2s 超时），其调用方（原子交换就绪判断等）不受影响。
+
+### 停滞判据
+
+`video_playback_stalled(prev, curr)` 的判据（三者同时成立即判定停滞）：
+
+1. `!curr.paused`（当前非暂停）；
+2. `!curr.idle_active`（已加载文件、非 idle）；
+3. `(curr.time_pos - prev.time_pos).abs() < STALL_EPSILON_SECS`，其中 `STALL_EPSILON_SECS = 0.001`（1ms）。
+
+**为什么用"变化绝对值 < 1ms"而非 `curr <= prev`**：循环播放跨越循环点时 `time-pos` 会**大幅回退**（如 11.2 → 0.05），用 `<=` 会把这种正常循环误判为停滞；取"变化量绝对值"后回退量远大于阈值，因而不命中。正常播放即使 0.25x 倍速，两次采样（间隔 ≥500ms）间前进量也远大于 1ms，故阈值取 1ms 量级不会漏检。
+
+**`eof_reached` 不参与判定**：停滞时 mpv 仍处于 DRAINING（尚未进入 EOF），若以 `eof_reached` 为判据会漏检。
+
+### 自愈语义
+
+`heal_stalled_renderer` 固定顺序：**先 `terminate()`（失败仅 `warn` 并继续）→ 再 `revive_terminated(display_id)`**（`play()` + `reembed_and_register_renderer()` + PauseSender 状态同步）。
+
+- **禁止**在渲染器仍存活时直接 `play()`：`VideoRenderer::play()` 无条件 spawn 新 mpv 进程 / 窗口，会产生第二个 mpv。故必须先 `terminate()` 再重建。
+- **不触碰 `pause_reasons` 位图**：自愈只重建渲染器，暂停语义由调用方保证。
+- 日志携带 `display_id` / `prev_time_pos` / `curr_time_pos` / `source`，便于区分触发来源（`pure-mode-exit` / `watchdog`）。
+
+### 两级触发（分级检测）
+
+| 触发 | 位置 | 语义 |
+|---|---|---|
+| **① 退出纯净壁纸模式即时校验** | `src-tauri/src/platform/pure_mode.rs::liveness_check_and_heal` | 模式退出瞬间的强一致兜底（用户此刻正在看壁纸）。采样 #1 →（无 Playing 视频渲染器则**不 sleep 直接返回**，零额外等待）→ sleep 500ms → 采样 #2 → 命中疑似停滞才 sleep 400ms → 采样 #3 确认；两段区间都钉住（`video_playback_stalled` 均命中）才自愈，避免极低帧率内容误判。逐屏独立，失败仅 `warn`，不阻断后续编排 |
+| **② 常驻看护** | `src-tauri/src/platform/liveness_watchdog.rs` | 覆盖模式外的长时运行（用户没盯着看时冻结也会被静默自愈）。每 `LIVENESS_WATCH_INTERVAL = 5s` 采样一次（`MissedTickBehavior::Skip`），与上一轮"完整完成采样"的快照比较：首段命中**疑似停滞**后，**在锁外**等待 `CONFIRM_INTERVAL = 1.3s` 确认采样，由纯函数 `confirmed_stalls` 判定——**两段区间都"钉住"才自愈**（`source = "watchdog"`，并写入自愈冷却时间戳）；否则记为周期混叠、仅记 `debug`、不自愈（也不消耗自愈冷却）。首轮无基线不判定 |
+
+**为什么追加确认采样（周期混叠根因）**：单周期判据 `|Δtime_pos| < 1ms` 在"视频循环时长**整除**采样周期"（如 5s / 2.5s / 1.25s…）且采样抖动 < 1ms 时会出现**假阳性**——每次采样恰好落在循环的同一相位，`time-pos` 看起来"钉住"，实际在前进。确认采样间隔取 `1.3s`（与 5s **非整除**），可打乱相位：视频若确实在播，确认区间的 `time-pos` 必然恢复前进，据此**证伪混叠**；只有两段区间都钉住才判定真实停滞并自愈。
+
+**为什么需要常驻看护**：实测根因表明 mpv 输出可能在**任意时刻**停滞（本次是循环点 drain 未完成），退出编排只能覆盖"退出模式"这一个时间点。两者互补——模式内画面由置顶窗口呈现、且退出编排会即时校验，故常驻看护在模式内跳过。
+
+### 看护跳过条件（任一命中即本轮不动作，且**不更新采样基线**）
+
+| # | 跳过条件 | 原因 |
+|---|---|---|
+| 0 | 应用退出清理已开始（`crate::state::SHUTDOWN_DONE` 为真） | 退出中不再采样 / 自愈，避免与 `perform_shutdown_blocking` 的 3s 引擎锁超时竞争、避免在 `engine.shutdown()` 之外 spawn 孤儿 mpv |
+| 1 | 纯净壁纸模式活跃（`pure_mode::is_active()`） | 模式内画面由置顶窗口呈现，且退出编排会即时校验；模式内采样 / 自愈会与置顶编排竞争 |
+| 2 | 轮换原子交换进行中（`atomic_swap_in_progress()`） | 渲染器正在换槽，探针会读到过渡态（旧渲染器 Terminated / 新渲染器未就绪），据此判定会误自愈 |
+| 3 | `pause_reasons_snapshot()` 非空 | 暂停态（用户 / 全屏 / 电池）下时钟本就不前进，属预期，绝不能判为停滞 |
+| 4 | engine `try_lock` 失败（锁忙） | 如正在 `set_wallpaper`；用非阻塞 `try_lock`，下一轮再试，不阻塞 |
+
+**两层判定（锁外前置 + 锁内复核）**：跳过条件 0 ~ 2 在**锁外**先判一次（避免常见跳过路径白白产生一次 `spawn_blocking`）；随后 `watch_once` **两次取锁后都复核** `pure_mode::is_active()` 与 `atomic_swap_in_progress()`（TOCTOU 收口：堵住"锁外判非模式，取得引擎锁前模式刚进入 / 刚换槽"的窗口期），命中即跳过、不更新基线。条件 3 / 4 本身就必须在锁内 / 取锁时判定。
+
+**"跳过不更新基线"是正确性关键**：跳过轮次若把"当前（可能已冻结的）快照"写入基线，则"暂停 5s 后恢复"会在恢复后的首轮因基线过期而误判——把暂停期间的静止当成停滞。保持基线不变 ⇒ 判定始终比较"两个都真实在播放的时刻"，暂停 / 锁忙 / 模式切换都不会污染判定。
+
+### 自愈冷却
+
+常驻看护对**每个显示器**设有 `HEAL_COOLDOWN = 60s` 冷却（静态量 `LAST_HEAL_TS: LazyLock<Mutex<HashMap<String, Instant>>>`）。冷却期内再次判定停滞只记 `warn`、不重复自愈，避免"重启风暴"。退出编排（触发 ①）为一次性即时校验，不走该冷却。
+
+### 锁与阻塞
+
+- `probe_playing_videos`（含 mpv IPC）与 `heal_stalled_renderer`（含进程启停）均为阻塞调用：看护与退出编排的"采样 → 判定 → 自愈"整体在 `tokio::task::spawn_blocking` 内执行，不阻塞 tokio 工作线程与主线程。**采样与自愈在锁内**（`watch_once` 分段取锁，判定 / 自愈完成后立即释放），**确认采样的 `CONFIRM_INTERVAL = 1.3s` 等待在锁外**（先释放锁再 sleep，避免持锁等待）；探针每次取锁的上界 ≈ 4 属性 × `PROBE_PROPERTY_TIMEOUT = 500ms` ≈ **2s**（原诊断查询 7×2s ≈ 14s 已消除）。
+- 退出编排把该步骤放在补跑全屏 / 电源判定**之后**（避免"刚自愈又被终止"）、唤醒轮换调度器**之前**（保证退出完成时画面是活的）；自愈失败仅 `warn`，不阻断调度器唤醒。进入侧等待在途退出的窗口 ≈ **10s**（覆盖自愈时长）。
+- 常驻看护任务随 runtime 结束，**不做显式停止 / join**（`try_lock` 非阻塞、不持 desktop 锁等 shutdown 关键资源，与 `workerw_check` 不同）；`SHUTDOWN_DONE` 置位后下一轮即命中**跳过条件 0**，不会在退出清理开始后继续自愈。
+
+### 已知限制（本轮审查确认）
+
+> 来源：`.trae/specs/audit-pure-mode-liveness-hardening/`（"全方位审查与加固"）。以下为本轮确认、**不改代码**的边界事项，逐条说明现状与"为什么不修"。本机制是"检测 + 自愈"，**不消除上游 mpv 停滞本身**。
+
+- **F6 IPC 完全无响应时不判定**：mpv 核心线程卡死但进程仍存活时，探针询问属性无响应 ⇒ 返回 `None` ⇒ 不判定、不自愈。**为什么不修**：这里选择"不误 heal"优先（无法区分"确认在播"与"问不到"）；进程真正退出由既有的 `spawn_proc_exit_monitor` 路径处理。
+- **F7 倍速不持久**：`VideoRenderer` 不持有 speed（`set_speed` 仅发 IPC），自愈 / 换槽 / 全屏恢复后倍速回 1.0x，而 UI / 配置仍显示旧值。**为什么不修**：pre-existing（rotation 与全屏恢复同病），且当前配置 speed=1.0 无实际影响；建议单独 spec 处理。
+- **F8 `terminate()` 失败仍继续 revive**：极端情况下 `heal_stalled_renderer` 在 `terminate()` 失败后仍 `revive_terminated()`，可能出现第二个 mpv 进程。**为什么不修**：孤儿进程由下次启动的 `cleanup_stale_child_processes` 兜底（失败路径收敛改动面大于收益）。
+- **F9 自愈窗口期 `active_wallpapers` 短暂陈旧**：`terminate()` 不清理 desktop 条目，恰逢 WorkerW 兜底检查 / Explorer 重启会走"无效 hwnd → 删条目"，随后重嵌再登记。**为什么不修**：最终一致、无残留（自愈窗口为秒级）。
+- **F10 `InputHook` 无 `Drop`**：极端 panic 路径可能残留低级钩子且槽位已空。**为什么不修**：既有多处显式 `shutdown`；加 `Drop` 涉及阻塞与重复卸载语义，需单独评估。
+- **F11 模式内"位图暂停 + Terminated"渲染器会被复活为 Playing**：`enter_pure_mode` 经 `revive_terminated` 会把该渲染器恢复为 Playing。**为什么不修**：这是"沉浸优先"的设计取舍（进入模式需呈现画面），退出后由补跑判定纠正，**非缺陷**。
+- **F12 全屏 terminate 在引擎锁忙时被跳过且不置 `FULLSCREEN_WAS`**：仅靠事件重复兜底。**为什么不修**：既有弱点；本轮缩短看护持锁时长（≈14s → ≈2s）后风险已下降。
+
+### 覆盖边界：呈现层冻结不可见（spec `fix-pure-mode-exit-presentation-freeze`，2026-09-30）
+
+> 上文探针 / 自愈的全部判据都只读 mpv 属性（`time-pos` / `pause` / `idle-active` / `eof-reached`），即**时钟层**。2026-09-30 实测确认存在一种本机制**天然不可见**的失效模式——**"呈现层冻结"**：`time-pos` **继续前进**（mpv 从未收到 `pause`、存活校验与 5s 看护均判"时钟前进"），但**窗口画面定格**（停在最后一帧不再刷新）。此时 `video_playback_stalled` 因 `time-pos` 在变而**永不命中**，探针与自愈都不会触发。
+
+**本机制的盲区**：探针**不做**截图级 / 画面哈希级检测（成本高、需每轮截屏比对），故对"时钟前进 + 画面定格"**运行时不可见**——这是本轮确认的**已知限制**，非本轮改动项。该失效模式的根因与修复（架构 D1：视频进入纯净壁纸模式不再搬动原窗口，改由临时顶层覆盖渲染器呈现）见 [`03-desktop模块.md`](./03-desktop模块.md) 的"退出回嵌的防呈现冻结契约（架构 D1）"。
+
+> 两种失效模式对照：**① 时钟层停滞**（循环点 drain 未完成、`time-pos` 钉住）= 本机制覆盖，检测 + 自愈；**② 呈现层冻结**（微时钟前进、画面定格）= 本机制盲区，改由架构 D1 规避。二者互不替代。
+
 ## v4.0 审查发现（13 项）
 
 > 来源：`.trae/specs/comprehensive-project-review-and-doc-restructure-2026-07-15/findings/03-wallpaper.md`
@@ -186,7 +383,7 @@ wallpaper 模块是项目最大且最复杂的模块，整体架构清晰：`Wal
 | ID | 类型 | 位置 | 描述/影响 | 清理建议（复杂度） | 清理状态 | 落实说明 |
 |---|---|---|---|---|---|---|
 | W-TD-001 | 死代码 | mod.rs:279 | `WallpaperState::Error` 变体仅在 serde roundtrip 测试出现，生产无代码置 Error；前端需处理永不出现的状态 | 删除 `Error` 变体 + 同步 serde 测试与前端 TS 类型（低） | ✅ 已修复于 v6.0 | 删除 `WallpaperState::Error` 变体，前端类型同步 |
-| W-TD-002 | 死代码 | mod.rs:575 | `PauseReason::USER` 仅测试用，生产仅用 FULLSCREEN/BATTERY/TRAY | 评估保留（doc 注明）或移除改 TRAY（低） | ✅ 已决策保留 | `PauseReason::USER` 保留，doc 注明"仅测试使用" |
+| W-TD-002 | 死代码 | mod.rs:575 | `PauseReason::USER` 仅测试用，生产仅用 FULLSCREEN/BATTERY/TRAY | 评估保留（doc 注明）或移除改 TRAY（低） | ✅ 已修复于 v6.0 | 移除 `PauseReason::USER` 变体（生产仅 FULLSCREEN/BATTERY/TRAY；测试改用 TRAY） |
 | W-TD-003 | 死代码 | mod.rs:663-664 | `navigate` trait 方法默认 no-op，全项目无 trait 对象调用 | 移除 `navigate` trait 方法（低） | ✅ 已修复于 v6.0 | 移除 `navigate` trait 方法，WebRenderer 保留为非 trait 方法 |
 | W-TD-004 | 死代码 | fast_path.rs:274-278 | `any_playing` 仅测试调用，生产无调用点 | 删除该方法（低） | ✅ 已修复于 v6.0 | 删除 `any_playing` 方法及测试 |
 | W-TD-005 | 死代码 | fast_path.rs:286-292 | `paused_displays` 仅测试调用，生产无调用点 | 删除该方法（低） | ✅ 已修复于 v6.0 | 删除 `paused_displays` 方法及测试 |
@@ -245,3 +442,24 @@ wallpaper 模块是项目最大且最复杂的模块，整体架构清晰：`Wal
 2. **W-002 video 子进程退出监听**：✅ 已修复 — 复用 `spawn_proc_exit_monitor`。
 3. **W-003 Resume 失败状态回滚**：✅ 已修复 — 壁纸线程回滚 `shared_state.state = Paused` + 前端通知。
 4. **W-004 pause_all 部分失败回滚**：✅ 已修复 — 部分失败不回滚 bit + `resume_all_fast` 兜底。
+
+## v17.0 内存优化（2026-10-02）
+
+本轮针对「设置动态壁纸后应用组内存偏高」，新增内存归因埋点并实施 6 项手段；本模块涉及 **Task 4：mpv 进一步限流**。
+
+### Task 4：mpv 解码限流（`wallpaper/video.rs`）
+
+`build_mpv_args` 在 v10-A / v11-A 限流基础上追加两项，用于压低视频壁纸（尤其 hwdec 失败回退软解）的内存：
+
+| 新增参数 | 作用 |
+|---|---|
+| `--vd-lavc-threads=4` | 限制视频解码线程数（mpv 默认 0 = 按 CPU 核数自动上探，最多 16）。帧级多线程解码为每条线程保留参考帧缓冲（1080p 单帧 ≈3MB、4K ≈12MB）。固定 4 对 1080p/4K 软解仍流畅，同时显著压低线程缓冲上限；`--hwdec=auto` 硬件解码时不参与软解线程创建，无副作用 |
+| `--demuxer-readahead-secs=0.5` | demuxer 前向预读时间窗由默认 1s 减半。`--cache=no` 下无 stream 缓存层，但 demuxer 仍按本参数预读数据包进入其包队列；降低该值直接压缩该队列内存，本地文件循环播放 0.5s 预读绰绰有余 |
+
+**既有限流参数全部保留**：`--cache=no`、`--vd-queue-max-bytes=16777216`、`--ad-queue-max-bytes=4194304`、`--demuxer-max-back-bytes=0`、`--cache-secs=0`、`--hwdec=auto`、`--vo=gpu` 等。
+
+> **硬约束（勿破坏）**：**禁止新增 `--demuxer-max-bytes=`**。该参数会把解复用器缓冲上限清零，导致 demuxer 无法缓冲任何数据包（`Too many packets in the demuxer packet queues: 0 packets`），mpv 立即 video EOF + `No media data to loop` 退出（约 0.2s），已嵌入壁纸层的空窗口被销毁 → 桌面黑屏 + 设置失败。
+
+**测试**：`build_mpv_args_contains_task4_memory_limiting_args` 断言新增参数存在；`build_mpv_args_contains_common_args` / `build_mpv_args_does_not_contain_file_path` 及五种缩放模式用例保证既有必需参数与禁止项约束仍成立。
+
+**预期效果**：降低视频壁纸软解场景的线程参考帧缓冲与 demuxer 前向预读包队列占用。**优化前后实测数值待真机补测**（用 `get_memory_report` / `MEM-ATTRIB` 采集 `mpv.exe` 归类，本环境无 GUI 不伪造数据）。

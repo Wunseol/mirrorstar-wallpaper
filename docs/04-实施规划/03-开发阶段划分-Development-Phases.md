@@ -11,21 +11,26 @@
 
 > 本文档按真实代码审计记录各阶段完成情况。已实现的核心能力（四种壁纸类型端到端、桌面集成、渲染优化、全屏检测、音量控制、IPC、进程管理、配置管理、Tauri 应用层、Web 壁纸子进程、前端 UI）不再列入未完成任务。
 
+> **架构变更说明**：本项目的**主窗口已重构为独立原生 UI 子进程**（`crates/mirrorstar-ui/`，Slint 1.18 软件渲染）。原来基于 Vite + TypeScript 的前端（`src/`、`index.html`、`package.json` 等）及相关测试（Vitest / ESLint / Prettier / CDP e2e）**已全部删除**，测试体系改为 Rust 单元/集成测试（`cargo test --workspace`）+ PowerShell 驱动脚本 e2e。下文 Phase 1 关于"前端 UI 补全"的描述为历史记录，仅作演进参考；当前主窗口能力见 Phase 6。
+
 ---
 
 ## 阶段总览
 
 | 阶段 | 内容 | 状态 |
 |------|------|------|
-| Phase 1 | 前端 UI 补全 | ✅ 已完成 |
+| Phase 1 | 前端 UI 补全 | ✅ 已完成（前端已删除，能力迁至 Phase 6 原生 UI 子进程） |
 | Phase 2 | 架构优化与代码清理 | ✅ 已完成 |
 | Phase 3 | Web 壁纸子进程 | ✅ 已完成 |
 | Phase 4 | 体验优化 | ✅ 已完成 |
 | Phase 5 | 打包发布 | 🔧 已配置（NSIS + 资源 + 发布流水线） |
+| Phase 6 | 主窗口原生 UI 重构 | ✅ 已完成 |
 
 ---
 
-### Phase 1: 前端 UI 补全 ✅ 已完成
+### Phase 1: 前端 UI 补全 ✅ 已完成（历史）
+
+> **历史记录**：本阶段实现的前端（`index.html`、`src/scripts/main.ts`、Vitest 单测等）已在"主窗口原生 UI 重构"中整体删除，UI 能力由 Phase 6 的原生 UI 子进程重新实现。以下内容保留作演进参考。
 
 **目标**：补全前端 UI 控件，接通后端命令。
 
@@ -73,7 +78,7 @@
 
 **已完成内容**：
 
-- `mirrorstar-wp-proc` 子进程（crate），模块划分：
+- `mirrorstar-wp-proc` 库 crate（壳 `--wp-proc` 模式复用），模块划分：
   | 文件 | 职责 | 行数（实测） |
   |------|------|-------------|
   | `main.rs` | 入口 + 消息循环 | 422 |
@@ -113,19 +118,39 @@
 |------|------|------|
 | CSP 安全策略 | ✅ 已配置 | `app.security.csp`：`default-src 'self'`，允许 `wpfile:` 自定义协议加载图片/media/frame |
 | NSIS 打包 | ✅ 已配置 | `bundle.targets=["nsis"]` |
-| 资源捆绑 | ✅ 已配置 | `resources`：`mpv/mpv.exe`、`mpv/license.txt`、`target/release/mirrorstar-wp-proc.exe` |
+| 资源捆绑 | ✅ 已配置 | `resources`：`mpv/mpv.exe`、`mpv/license`、`target/release/mirrorstar-ui.exe`（与主 exe 同目录） |
 | 图标 / 版本 | ✅ 已配置 | `icons/*`，productName `镜星壁纸`，identifier `com.mirrorstar.wallpaper` |
-| 发布流水线 | ✅ 已配置 | `.github/workflows/release.yml`：打 `v*` tag 触发，需签名密钥，构建 NSIS 并起草 Release |
+| 发布流水线 | ✅ 已配置 | `.github/workflows/release.yml`：打 `v*` tag 触发，需签名密钥，构建 NSIS 并起草 Release（不再使用 Node/npm，改为 `cargo install tauri-cli` + `tauriScript: cargo tauri`） |
 | 正式打 tag 发布 | ⬜ 待执行 | 在发布时机打 `v0.x.x` tag 触发 Release 工作流 |
 
 **验收标准**：
 
-- ✅ CSP 安全策略生效
-- ✅ NSIS 安装包可正常安装/卸载，含 mpv.exe 与 mirrorstar-wp-proc.exe
-- ✅ WebView2 Runtime 缺失时提示
+- ✅ NSIS 安装包可正常安装/卸载，含 mpv.exe 与 mirrorstar-ui.exe
+- ✅ WebView2 Runtime 缺失时提示（仅网页壁纸/预览需要）
 - ✅ mpv.exe 随包分发
 - ✅ 应用图标、版本信息正确
 - ⬜ 完成一次正式 tag 发布
+
+> **说明**：原表中"CSP 安全策略"行（`app.security.csp`）针对 Tauri 内嵌 WebView2 主窗口，该主窗口已移除，CSP 约束不再适用于主窗口；前端已无 `wpfile://` 协议与页面入口。
+
+---
+
+### Phase 6: 主窗口原生 UI 重构 ✅ 已完成
+
+**目标**：将主窗口从 Tauri 内嵌 WebView2 改为独立原生 UI 子进程，大幅降低内存占用。
+
+**已完成内容**：
+
+- 新增 crate `crates/mirrorstar-ui/`（Slint 1.18，**绑定软件渲染**：`default-features=false` + 仅 `renderer-software`）
+- 壳（`src-tauri/`）不再创建任何 WebView2 主窗口（`app.windows: []`），仅保留托盘、壁纸引擎、轮换调度、命令桥与 UI 子进程管理
+- 壳↔UI 通过 `mirrorstar-core::ui_proto` 的 NDJSON 行协议 over stdio（`Hello` / `Request` / `Response` / `Event` / `Control`）；业务逻辑仅在壳侧
+- UI 生命周期：按需启动 + 握手 + 窗口隐藏超时（默认 300s，`MIRRORSTAR_UI_IDLE_TIMEOUT_SECS`）退出 + 单实例
+- 窗口显隐不激活（`WS_EX_NOACTIVATE` + `SWP_NOACTIVATE`，不抢前台）
+- 原生虚拟化壁纸网格（固定卡尺寸 + 固定列数，仅实例化可见区间 ±2 行缓冲）；缩略图按本地文件路径直读
+- 四类预览：图片（自绘）、视频（UI 进程内 mpv 子窗口）、GIF（逐帧动画）、网页（按需临时 WebView2 子窗口）
+- 删除旧前端与 `mirrorstar-ui-poc` MLP；删除 WebView2 主窗口裁剪（`MAIN_WINDOW_BROWSER_ARGS`）与挂起回收（`webview_memory`）
+- **行为变更**：移除"全屏应用时自动最小化主窗口 / 退出全屏恢复"逻辑（主窗口已是独立进程，无需最小化/恢复）；`fullscreen_action`（none/pause/terminate，作用于壁纸）不受影响
+- 验收实测：主窗口打开并静置时壳 + UI 合计 private ≈ **16.8MB**（门槛 ≤40MB）；关闭后回落至 ≈7.6MB；idle CPU ≈0.4%；网格滚动 CPU 10.5%
 
 ---
 
@@ -144,5 +169,6 @@
 | M3 Web 壁纸子进程稳定运行 | Phase 3 | ✅ 达成 |
 | M4 用户体验完善 | Phase 4 | ✅ 达成 |
 | M5 可分发安装包 | Phase 5 | 🔧 等待正式发布 |
+| M6 主窗口原生 UI 低内存 | Phase 6 | ✅ 达成 |
 
 **相关章节：** [← 总览](./01-实施规划总览-Implementation-Overview.md) | [项目目录结构](./05-项目目录结构-Project-Structure.md)

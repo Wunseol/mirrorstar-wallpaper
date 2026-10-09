@@ -1,0 +1,921 @@
+// 设置面板 / 轮换池管理用的**自研控件族**（Task 6.1）。
+//
+// 为什么自研而不是用 `std-widgets`：本项目关闭了 Slint 默认特性（只启用软件渲染），
+// `std-widgets` 的样式依赖默认后端且体积/行为不受控；这里只需下拉、滑块、开关、数字输入、
+// 按钮五种轻量控件，自绘完全可控且与既有卡片风格（`#1a1a2e` 深色系）一致。
+//
+// 关键实现取舍：
+// - **下拉列表由根级浮层渲染（`DropdownList`）**：`Dropdown` 自身只渲染头部、不改变布局高度，
+//   展开的选项列表由根组件在根级浮层中绘制（覆盖在设置内容之上、不参与布局），避免展开时推挤
+//   后续设置项。此处刻意不使用 `PopupWindow`，以免新增原生弹窗窗口带来 z 序 / 焦点 / DPI 的
+//   不确定性。
+// - **滑块用 `in-out` 双向绑定**：拖动过程中直接把归一化值写回宿主属性（平滑），
+//   释放时经 `committed` 交回 Rust 提交；失败时由 Rust 重写宿主属性实现回滚。
+// - **循环内每个控件都是独立子组件**：实例各自持有局部状态，规避"在 `for`
+//   内引用命名元素"的限制。
+
+// ── 数据模型（与 Rust 侧 `store::{OptionItemData, PoolRowData, UnitRowData, MemberRowData}` 对齐）
+
+export struct OptionItem {
+    value: string,
+    label: string,
+}
+
+export struct PoolRow {
+    id: string,
+    name: string,
+    members: int,
+    up: bool,
+    down: bool,
+}
+
+export struct UnitRow {
+    key: string,
+    label: string,
+    pool-index: int,
+    enabled: bool,
+}
+
+export struct MemberRow {
+    id: string,
+    name: string,
+    up: bool,
+    down: bool,
+}
+
+// ── 主题令牌（Task 7.1）─────────────────────────────────────────────────────
+//
+// 把两文件中出现 ≥3 次的重复色值 / 关键尺寸收敛为具名令牌：改色只改一处，顶栏、网格与
+// 控件族保持一致。低频或形状专用的一次性色值（按压叠加色、语义提示色、胶囊半径等）保持
+// 字面量，避免过度抽象。
+export global Theme {
+    // 品牌强调色：选中态 / 焦点边框 / 滚动指示 / 链接
+    out property <color> accent: #4fc3f7;
+    // 面板 / 顶栏 / 骨架铺色
+    out property <color> panel: #16213e;
+    // 输入框与下拉主体的更深背景
+    out property <color> bg-deep: #0d1a30;
+    // 描边
+    out property <color> border: #24406b;
+
+    // 文本层级（由亮到暗）
+    out property <color> text-light: #cfe3ff;
+    out property <color> text-input: #dbe7f7;
+    out property <color> text-strong: #e6eefc;
+    out property <color> text-secondary: #9fb3d9;
+    out property <color> text-muted: #5c6f8f;
+    out property <color> text-dim: #6f86b3;
+
+    // 按钮态
+    out property <color> button-bg: #1b355c;
+    out property <color> button-hover: #2a5c8a;
+    out property <color> button-hover-subtle: #2a4a7a;
+    out property <color> button-prominent: #1c4171;
+    out property <color> button-pressed: #14294a;
+    out property <color> button-text: #e6f2ff;
+    out property <color> danger: #a83434;
+
+    // 类型矢量图标主色
+    out property <color> glyph: #8fa8cf;
+
+    // 圆角与关键尺寸
+    out property <length> radius-sm: 4px;
+    out property <length> radius-md: 6px;
+    out property <length> radius-lg: 8px;
+    out property <length> topbar-height: 52px;
+}
+
+// ── 通用按钮 ────────────────────────────────────────────────────────────────
+export component PanelButton inherits Rectangle {
+    in property <string> label;
+    in property <bool> enabled: true;
+    in property <bool> danger: false;
+    in property <bool> prominent: false;
+
+    callback clicked();
+
+    height: 24px;
+    border-radius: Theme.radius-sm;
+    background: !root.enabled ? #1a2740
+        : hit.pressed ? (root.danger ? #5c1f1f : Theme.button-pressed)
+        : hit.has-hover ? (root.danger ? Theme.danger : Theme.button-hover)
+        : (root.danger ? #7f2b2b : (root.prominent ? Theme.button-prominent : Theme.button-bg));
+
+    // TouchArea 先声明，便于上方背景绑定引用其 `has-hover`。
+    hit := TouchArea {
+        enabled: root.enabled;
+        clicked => { root.clicked(); }
+    }
+
+    Text {
+        text: root.label;
+        color: root.enabled ? Theme.button-text : Theme.text-muted;
+        font-size: 11px;
+        width: 100%;
+        height: 100%;
+        horizontal-alignment: center;
+        vertical-alignment: center;
+    }
+}
+
+// ── 下拉展开列表（根级浮层承载）───────────────────────────────────────────────
+//
+// 只承载「展开的选项列表」：由根组件在浮层中实例化并给定窗口坐标，故自身不参与设置面板的
+// `VerticalLayout`，展开不会把后续设置项推下去。选择经 `chosen(i)` 回派根组件按身份分发。
+export component DropdownList inherits Rectangle {
+    in property <[OptionItem]> options;
+    in property <int> current-index: 0;
+
+    callback chosen(int);
+
+    height: list.preferred-height;
+    background: #0b1729;
+    border-radius: 5px;
+    border-width: 1px;
+    border-color: Theme.border;
+
+    list := VerticalLayout {
+        padding: 2px;
+        spacing: 0px;
+
+        for opt[i] in root.options : Rectangle {
+            height: 24px;
+            border-radius: 3px;
+            background: item-hit.has-hover ? #17335c : transparent;
+
+            item-hit := TouchArea {
+                clicked => {
+                    root.chosen(i);
+                }
+            }
+
+            Text {
+                x: 8px;
+                y: 0;
+                width: parent.width - 16px;
+                height: parent.height;
+                text: opt.label;
+                color: i == root.current-index ? Theme.accent : Theme.text-light;
+                font-size: 12px;
+                vertical-alignment: center;
+                overflow: elide;
+            }
+        }
+    }
+}
+
+// ── 下拉头部（列表由根级浮层绘制）──────────────────────────────────────────────
+export component Dropdown inherits Rectangle {
+    in property <string> label;
+    in property <[OptionItem]> options;
+    in property <int> current-index: 0;
+    in property <bool> enabled: true;
+    // 调用方指定的身份，用于浮层回派选择结果。
+    in property <int> id: 0;
+    // 展开态为**只读输入**，由根级浮层状态驱动，仅控制外观与箭头方向。
+    in property <bool> expanded: false;
+
+    // 上报浮层应绘制的窗口坐标（左上角）与当前索引；由根组件据此展开 / 收起浮层。
+    callback open-requested(x: length, y: length, w: length, index: int);
+
+    height: body.preferred-height;
+    background: transparent;
+
+    body := VerticalLayout {
+        spacing: 4px;
+
+        Text {
+            text: root.label;
+            height: 15px;
+            color: Theme.text-secondary;
+            font-size: 11px;
+            vertical-alignment: center;
+        }
+
+        head-box := Rectangle {
+            height: 26px;
+            background: Theme.bg-deep;
+            border-radius: 5px;
+            border-width: 1px;
+            border-color: root.expanded ? Theme.accent : Theme.border;
+
+            head := TouchArea {
+                enabled: root.enabled;
+                clicked => {
+                    root.open-requested(head-box.absolute-position.x, head-box.absolute-position.y + head-box.height, head-box.width, root.current-index);
+                }
+            }
+
+            Text {
+                x: 8px;
+                y: 0;
+                width: parent.width - 26px;
+                height: parent.height;
+                text: root.current-index >= 0 && root.current-index < root.options.length
+                    ? root.options[root.current-index].label
+                    : "—";
+                color: root.enabled ? Theme.text-input : Theme.text-muted;
+                font-size: 12px;
+                vertical-alignment: center;
+                overflow: elide;
+            }
+
+            // 指示箭头：内联矢量绘制，方向随展开态翻转（软件渲染不依赖字体字形）。
+            Path {
+                x: parent.width - 20px;
+                y: (parent.height - 12px) / 2;
+                width: 12px;
+                height: 12px;
+                viewbox-width: 12;
+                viewbox-height: 12;
+                // 禁用态弱化箭头颜色（对齐 NumberStepper 的 text-muted 风格）。
+                stroke: root.enabled ? #7f9bc4 : Theme.text-muted;
+                stroke-width: 1.5px;
+                stroke-line-cap: round;
+                stroke-line-join: round;
+                fill: transparent;
+                commands: root.expanded ? "M 2 8 L 6 4 L 10 8" : "M 2 4 L 6 8 L 10 4";
+            }
+        }
+    }
+}
+
+// ── 喇叭图标按钮（静音切换）：内联矢量，未静音=喇叭+两段声波，已静音=喇叭+叉 ──
+//
+// `icon-size`：整体尺寸（矢量按容器等比缩放），预览控制条用默认 28px。
+// `flat`：内联小图标变体——去掉常驻底色、悬停用更淡的高亮，并把图标降到与正文
+// 同级的次要色，使其紧贴文字时融为一体，而不是工具栏按钮的观感。
+export component SpeakerIconButton inherits Rectangle {
+    in property <bool> muted: false;
+    in property <bool> enabled: true;
+    in property <length> icon-size: 28px;
+    in property <bool> flat: false;
+
+    callback clicked();
+
+    // 图标色：flat（内联）同正文次要色；否则按钮前景色；禁用一律置灰。
+    property <color> glyph-color: !root.enabled
+        ? Theme.text-muted
+        : (root.flat ? Theme.text-secondary : Theme.button-text);
+
+    width: root.icon-size;
+    height: root.icon-size;
+    border-radius: root.flat ? Theme.radius-sm : Theme.radius-md;
+    background: !root.enabled
+        ? transparent
+        : (mute-hit.pressed
+            ? Theme.button-pressed
+            : (mute-hit.has-hover
+                ? (root.flat ? Theme.button-hover-subtle : Theme.button-hover)
+                : (root.flat ? transparent : Theme.button-bg)));
+
+    mute-hit := TouchArea {
+        enabled: root.enabled;
+        clicked => { root.clicked(); }
+    }
+
+    // 喇叭主体（两态通用）
+    Path {
+        width: 100%;
+        height: 100%;
+        viewbox-width: 16;
+        viewbox-height: 16;
+        fill: root.glyph-color;
+        commands: "M 2 6 H 4.5 L 8 2.8 V 13.2 L 4.5 10 H 2 Z";
+    }
+    // 未静音：两段声波
+    if (!root.muted) : Path {
+        width: 100%;
+        height: 100%;
+        viewbox-width: 16;
+        viewbox-height: 16;
+        stroke: root.glyph-color;
+        stroke-width: 1.5px;
+        stroke-line-cap: round;
+        fill: transparent;
+        commands: "M 9.5 5.5 Q 11.5 8 9.5 10.5";
+    }
+    if (!root.muted) : Path {
+        width: 100%;
+        height: 100%;
+        viewbox-width: 16;
+        viewbox-height: 16;
+        stroke: root.glyph-color;
+        stroke-width: 1.5px;
+        stroke-line-cap: round;
+        fill: transparent;
+        commands: "M 11.8 3.8 Q 14.5 8 11.8 12.2";
+    }
+    // 已静音：一个叉
+    if (root.muted) : Path {
+        width: 100%;
+        height: 100%;
+        viewbox-width: 16;
+        viewbox-height: 16;
+        stroke: root.glyph-color;
+        stroke-width: 1.5px;
+        stroke-line-cap: round;
+        fill: transparent;
+        commands: "M 9.5 5.5 L 14 10.5 M 14 5.5 L 9.5 10.5";
+    }
+}
+
+// ── 内联步进按钮（− / +）：小尺寸扁平矢量，用于紧贴文字的微调 ─────────────────
+//
+// 与 `SpeakerIconButton` 的 `flat` 变体同一套视觉：无常驻底色、图标取正文次要色、
+// 悬停给浅高亮；`minus` 为 true 画「−」，否则画「+」。
+export component StepIconButton inherits Rectangle {
+    in property <bool> minus: false;
+    in property <bool> enabled: true;
+    in property <length> icon-size: 16px;
+
+    callback clicked();
+
+    property <color> glyph-color: !root.enabled ? Theme.text-muted : Theme.text-secondary;
+
+    width: root.icon-size;
+    height: root.icon-size;
+    border-radius: Theme.radius-sm;
+    background: !root.enabled
+        ? transparent
+        : (step-hit.pressed
+            ? Theme.button-pressed
+            : (step-hit.has-hover ? Theme.button-hover-subtle : transparent));
+
+    step-hit := TouchArea {
+        enabled: root.enabled;
+        clicked => { root.clicked(); }
+    }
+
+    // 「−」/「+」内联矢量（软件渲染不依赖字体字形）。
+    Path {
+        width: 100%;
+        height: 100%;
+        viewbox-width: 16;
+        viewbox-height: 16;
+        stroke: root.glyph-color;
+        stroke-width: 1.6px;
+        stroke-line-cap: round;
+        fill: transparent;
+        commands: root.minus ? "M 4.5 8 H 11.5" : "M 8 4.5 V 11.5 M 4.5 8 H 11.5";
+    }
+}
+
+// ── 滑块（归一化 0..1，`in-out` 双向绑定）─────────────────────────────────────
+export component SliderRow inherits Rectangle {
+    in property <string> label;
+    in property <string> value-text;
+    in property <bool> enabled: true;
+    in-out property <float> value: 0.0;
+
+    callback committed(float);
+
+    height: 40px;
+    background: transparent;
+
+    Text {
+        x: 0;
+        y: 0;
+        width: parent.width - 80px;
+        height: 16px;
+        text: root.label;
+        color: root.enabled ? Theme.text-secondary : Theme.text-muted;
+        font-size: 11px;
+        vertical-alignment: center;
+    }
+
+    Text {
+        x: parent.width - 80px;
+        y: 0;
+        width: 80px;
+        height: 16px;
+        text: root.value-text;
+        color: root.enabled ? Theme.text-input : Theme.text-muted;
+        font-size: 11px;
+        horizontal-alignment: right;
+        vertical-alignment: center;
+    }
+
+    Rectangle {
+        x: 0;
+        y: 22px;
+        width: parent.width;
+        height: 10px;
+        border-radius: 5px;
+        background: Theme.bg-deep;
+
+        Rectangle {
+            x: 0;
+            y: 0;
+            width: parent.width * root.value;
+            height: parent.height;
+            border-radius: 5px;
+            background: root.enabled ? #2f6fb5 : Theme.border;
+        }
+
+        Rectangle {
+            x: (parent.width - 12px) * root.value;
+            y: -3px;
+            width: 12px;
+            height: 16px;
+            border-radius: Theme.radius-md;
+            background: root.enabled ? Theme.accent : Theme.text-muted;
+        }
+
+        bar := TouchArea {
+            x: 0;
+            y: -8px;
+            width: parent.width;
+            height: 26px;
+            enabled: root.enabled;
+            moved => {
+                if (self.pressed) {
+                    root.value = Math.max(0.0, Math.min(1.0, self.mouse-x / self.width));
+                }
+            }
+            pointer-event(event) => {
+                if (event.kind == PointerEventKind.down) {
+                    root.value = Math.max(0.0, Math.min(1.0, self.mouse-x / self.width));
+                } else if (event.kind == PointerEventKind.up) {
+                    root.committed(root.value);
+                }
+            }
+        }
+    }
+}
+
+// ── 播放音量行：标签 + 紧贴其右侧的内联喇叭图标 + 播放音量滑块 ─────────────────
+//
+// 标签由本组件自绘，这样喇叭图标才能精确跟在「播放音量」四字右侧（尺寸与字号同级）；
+// 下层 `SliderRow` 只负责数值与滑轨，`label` 置空以避免重复绘制。
+export component VolumeRow inherits Rectangle {
+    in property <string> label;
+    in property <string> value-text;
+    in property <bool> enabled: true;
+    in property <bool> muted: false;
+    in-out property <float> value: 0.0;
+
+    callback committed(float);
+    callback mute-toggled(bool);
+
+    height: 40px;
+    background: transparent;
+
+    vol-label := Text {
+        x: 0;
+        y: 0;
+        height: 16px;
+        text: root.label;
+        color: root.enabled ? Theme.text-secondary : Theme.text-muted;
+        font-size: 11px;
+        vertical-alignment: center;
+    }
+
+    // 与「播放音量」四字等高的内联小图标（16px 盒内可见笔画约 10px ≈ 11px 字号），
+    // 紧贴文字右侧、随文字行垂直居中；flat 去掉常驻底色以贴合正文观感。
+    SpeakerIconButton {
+        x: vol-label.x + vol-label.preferred-width + 4px;
+        y: 0;
+        icon-size: 16px;
+        flat: true;
+        muted: root.muted;
+        enabled: root.enabled;
+        clicked => { root.mute-toggled(!root.muted); }
+    }
+
+    SliderRow {
+        x: 0;
+        y: 0;
+        width: parent.width;
+        label: "";
+        value-text: root.value-text;
+        enabled: root.enabled;
+        value <=> root.value;
+        committed(v) => { root.committed(v); }
+    }
+}
+
+// ── 播放速度行：标签 + 紧贴其右侧的 −/+ 微调按钮 + 速度滑块 ───────────────────
+//
+// 与 `VolumeRow` 同一思路：标签自绘，−/+ 精确跟在「播放速度」右侧、尺寸与字号同级；
+// 下层 `SliderRow` 只负责数值与滑轨，`label` 置空。−/+ 经 `stepped(delta)` 回派速度
+// 增量（单位即速度本身，如 ±0.01），由 Rust 侧 clamp 到量程并写回。
+export component SpeedRow inherits Rectangle {
+    in property <string> label;
+    in property <string> value-text;
+    in property <bool> enabled: true;
+    in-out property <float> value: 0.0;
+
+    callback committed(float);
+    callback stepped(float);
+
+    // 归一化值到达两端（0 = 0.25×、1 = 4.0×）时禁用对应按钮。
+    property <bool> minus-enabled: root.enabled && root.value > 0.0001;
+    property <bool> plus-enabled: root.enabled && root.value < 0.9999;
+
+    height: 40px;
+    background: transparent;
+
+    speed-label := Text {
+        x: 0;
+        y: 0;
+        height: 16px;
+        text: root.label;
+        color: root.enabled ? Theme.text-secondary : Theme.text-muted;
+        font-size: 11px;
+        vertical-alignment: center;
+    }
+
+    StepIconButton {
+        x: speed-label.x + speed-label.preferred-width + 4px;
+        y: 0;
+        minus: true;
+        enabled: root.minus-enabled;
+        clicked => { root.stepped(-0.01); }
+    }
+
+    StepIconButton {
+        x: speed-label.x + speed-label.preferred-width + 4px + 16px;
+        y: 0;
+        minus: false;
+        enabled: root.plus-enabled;
+        clicked => { root.stepped(0.01); }
+    }
+
+    SliderRow {
+        x: 0;
+        y: 0;
+        width: parent.width;
+        label: "";
+        value-text: root.value-text;
+        enabled: root.enabled;
+        value <=> root.value;
+        committed(v) => { root.committed(v); }
+    }
+}
+
+// ── 开关 ────────────────────────────────────────────────────────────────────
+export component ToggleSwitch inherits Rectangle {
+    in property <string> label;
+    in property <bool> checked: false;
+    in property <bool> enabled: true;
+
+    callback toggled(bool);
+
+    height: 28px;
+    background: transparent;
+
+    Text {
+        x: 0;
+        y: 0;
+        width: parent.width - 48px;
+        height: parent.height;
+        text: root.label;
+        color: root.enabled ? Theme.text-light : Theme.text-muted;
+        font-size: 12px;
+        vertical-alignment: center;
+    }
+
+    Rectangle {
+        x: parent.width - 40px;
+        y: 4px;
+        width: 40px;
+        height: 20px;
+        border-radius: 10px;
+        background: root.checked && root.enabled ? #2f6fb5 : Theme.border;
+
+        Rectangle {
+            x: root.checked ? parent.width - 18px : 2px;
+            y: 2px;
+            width: 16px;
+            height: 16px;
+            border-radius: Theme.radius-lg;
+            background: root.enabled ? Theme.text-input : Theme.text-muted;
+            animate x { duration: 120ms; easing: ease-in-out; }
+        }
+
+        hit := TouchArea {
+            enabled: root.enabled;
+            clicked => { root.toggled(!root.checked); }
+        }
+    }
+}
+
+// ── 数字输入（± 步进 + 回车提交）─────────────────────────────────────────────
+//
+// 直接输入在 `accepted`（回车）时提交，避免逐字符写回；步进按钮每次提交 ±1，
+// 具体 clamp（下限 1 分钟等）一律由 Rust 侧 sanitize，控件不自带数值规则。
+export component NumberStepper inherits Rectangle {
+    in property <string> label;
+    in property <int> value: 30;
+    in property <int> min-value: 1;
+    in property <int> max-value: 100000;
+    in property <bool> enabled: true;
+    // 输入框文本与宿主同步（刷新时由 Rust 写回）。
+    in-out property <string> text: "";
+    // ± 按钮可用性：同时驱动命中与禁用态视觉（Task 7.4）。
+    property <bool> minus-enabled: root.enabled && root.value > root.min-value;
+    property <bool> plus-enabled: root.enabled && root.value < root.max-value;
+
+    /// ±1 步进。
+    callback step(int);
+    /// 回车提交的原始文本（可能非法，由 Rust 解析 + clamp）。
+    callback submitted(string);
+
+    height: 28px;
+    background: transparent;
+
+    Text {
+        x: 0;
+        y: 0;
+        width: parent.width - 130px;
+        height: parent.height;
+        text: root.label;
+        color: root.enabled ? Theme.text-light : Theme.text-muted;
+        font-size: 12px;
+        vertical-alignment: center;
+    }
+
+    Rectangle {
+        x: parent.width - 126px;
+        y: 2px;
+        width: 24px;
+        height: 24px;
+        border-radius: Theme.radius-sm;
+        background: !root.minus-enabled ? #16233a
+            : minus-hit.has-hover ? Theme.button-hover-subtle
+            : Theme.button-bg;
+
+        minus-hit := TouchArea {
+            enabled: root.minus-enabled;
+            clicked => { root.step(-1); }
+        }
+
+        Text {
+            text: "−";
+            color: root.minus-enabled ? Theme.text-strong : Theme.text-muted;
+            font-size: 14px;
+            width: 100%;
+            height: 100%;
+            horizontal-alignment: center;
+            vertical-alignment: center;
+        }
+    }
+
+    Rectangle {
+        x: parent.width - 98px;
+        y: 2px;
+        width: 66px;
+        height: 24px;
+        border-radius: Theme.radius-sm;
+        background: Theme.bg-deep;
+        border-width: 1px;
+        border-color: Theme.border;
+
+        input := TextInput {
+            x: 4px;
+            y: 0;
+            width: parent.width - 8px;
+            height: parent.height;
+            single-line: true;
+            color: Theme.text-input;
+            font-size: 12px;
+            horizontal-alignment: center;
+            vertical-alignment: center;
+            enabled: root.enabled;
+            text <=> root.text;
+            accepted => { root.submitted(self.text); }
+        }
+    }
+
+    Rectangle {
+        x: parent.width - 28px;
+        y: 2px;
+        width: 24px;
+        height: 24px;
+        border-radius: Theme.radius-sm;
+        background: !root.plus-enabled ? #16233a
+            : plus-hit.has-hover ? Theme.button-hover-subtle
+            : Theme.button-bg;
+
+        plus-hit := TouchArea {
+            enabled: root.plus-enabled;
+            clicked => { root.step(1); }
+        }
+
+        Text {
+            text: "+";
+            color: root.plus-enabled ? Theme.text-strong : Theme.text-muted;
+            font-size: 14px;
+            width: 100%;
+            height: 100%;
+            horizontal-alignment: center;
+            vertical-alignment: center;
+        }
+    }
+}
+
+// ── 池列表行 ────────────────────────────────────────────────────────────────
+export component PoolRowUi inherits Rectangle {
+    in property <PoolRow> data;
+    in property <bool> editing: false;
+    in property <bool> confirming: false;
+
+    callback select(string);
+    callback move-up(string);
+    callback move-down(string);
+    callback request-delete(string);
+    callback confirm-delete(string);
+    callback cancel-delete();
+
+    height: 28px;
+    border-radius: Theme.radius-sm;
+    background: root.editing ? #17335c : transparent;
+
+    Text {
+        x: 6px;
+        y: 0;
+        width: parent.width - 120px;
+        height: parent.height;
+        text: "\{root.data.name}（\{root.data.members}）";
+        color: root.editing ? Theme.accent : Theme.text-light;
+        font-size: 12px;
+        vertical-alignment: center;
+        overflow: elide;
+    }
+
+    body := TouchArea {
+        x: 0;
+        y: 0;
+        width: parent.width - 116px;
+        height: parent.height;
+        clicked => { root.select(root.data.id); }
+    }
+
+    if (!root.confirming) : Rectangle {
+        x: parent.width - 112px;
+        y: 2px;
+        width: 112px;
+        height: 24px;
+        background: transparent;
+
+        PanelButton {
+            x: 0;
+            width: 24px;
+            label: "▲";
+            enabled: root.data.up;
+            clicked => { root.move-up(root.data.id); }
+        }
+        PanelButton {
+            x: 26px;
+            width: 24px;
+            label: "▼";
+            enabled: root.data.down;
+            clicked => { root.move-down(root.data.id); }
+        }
+        PanelButton {
+            x: 86px;
+            width: 24px;
+            label: "✕";
+            danger: true;
+            clicked => { root.request-delete(root.data.id); }
+        }
+    }
+
+    if (root.confirming) : Rectangle {
+        x: parent.width - 112px;
+        y: 2px;
+        width: 112px;
+        height: 24px;
+        background: transparent;
+
+        PanelButton {
+            x: 0;
+            width: 52px;
+            label: "删除";
+            danger: true;
+            clicked => { root.confirm-delete(root.data.id); }
+        }
+        PanelButton {
+            x: 56px;
+            width: 52px;
+            label: "取消";
+            clicked => { root.cancel-delete(); }
+        }
+    }
+}
+
+// ── 池成员 / 可添加壁纸行 ────────────────────────────────────────────────────
+export component MemberRowUi inherits Rectangle {
+    in property <MemberRow> data;
+    /// `true` = 池成员（可排序 / 移除）；`false` = 可添加项（显示 ＋）。
+    in property <bool> removable: true;
+
+    callback move-up(string);
+    callback move-down(string);
+    callback remove(string);
+    callback add(string);
+
+    height: 24px;
+    background: transparent;
+
+    Text {
+        x: 6px;
+        y: 0;
+        width: parent.width - 88px;
+        height: parent.height;
+        text: root.data.name;
+        color: Theme.text-light;
+        font-size: 11px;
+        vertical-alignment: center;
+        overflow: elide;
+    }
+
+    if (root.removable) : Rectangle {
+        x: parent.width - 82px;
+        y: 0;
+        width: 82px;
+        height: 24px;
+        background: transparent;
+
+        PanelButton {
+            x: 0;
+            width: 24px;
+            label: "▲";
+            enabled: root.data.up;
+            clicked => { root.move-up(root.data.id); }
+        }
+        PanelButton {
+            x: 28px;
+            width: 24px;
+            label: "▼";
+            enabled: root.data.down;
+            clicked => { root.move-down(root.data.id); }
+        }
+        PanelButton {
+            x: 58px;
+            width: 24px;
+            label: "✕";
+            danger: true;
+            clicked => { root.remove(root.data.id); }
+        }
+    }
+
+    if (!root.removable) : Rectangle {
+        x: parent.width - 26px;
+        y: 0;
+        width: 24px;
+        height: 24px;
+        background: transparent;
+
+        PanelButton {
+            x: 0;
+            width: 24px;
+            label: "＋";
+            prominent: true;
+            clicked => { root.add(root.data.id); }
+        }
+    }
+}
+
+// ── 调度单元行 ──────────────────────────────────────────────────────────────
+export component UnitRowUi inherits Rectangle {
+    in property <UnitRow> data;
+    in property <[OptionItem]> pool-options;
+    // 浮层身份与展开态由根组件下发（该下拉位于 `for` 循环内，需按行号区分身份）。
+    in property <int> dd-id: 0;
+    in property <bool> dd-expanded: false;
+
+    callback dd-open-requested(id: int, x: length, y: length, w: length, index: int);
+    callback enabled-toggled(string, bool);
+
+    height: body.preferred-height;
+    background: transparent;
+
+    body := VerticalLayout {
+        spacing: 3px;
+
+        Text {
+            text: root.data.label;
+            height: 15px;
+            color: Theme.text-light;
+            font-size: 11px;
+            vertical-alignment: center;
+        }
+
+        Dropdown {
+            id: root.dd-id;
+            label: "激活壁纸池";
+            options: root.pool-options;
+            current-index: root.data.pool-index;
+            expanded: root.dd-expanded;
+            open-requested(x, y, w, idx) => { root.dd-open-requested(root.dd-id, x, y, w, idx); }
+        }
+
+        ToggleSwitch {
+            label: "启用该屏幕轮换";
+            checked: root.data.enabled;
+            toggled(v) => { root.enabled-toggled(root.data.key, v); }
+        }
+    }
+}

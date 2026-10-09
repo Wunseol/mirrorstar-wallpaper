@@ -1,0 +1,11 @@
+#pragma code_page(65001)
+
+// 镜星应用图标。资源 id 取 1（最低 id）：
+// Windows 在窗口与窗口类都未显式持有图标时，会回退到可执行文件中最低 id 的
+// RT_GROUP_ICON 作为「进程默认图标」，用于任务栏 / 标题栏 / Alt-Tab / 资源管理器。
+// rc.exe 处理 ICON 语句时会自动生成 RT_GROUP_ICON 与其中各尺寸的 RT_ICON，
+// 因此多分辨率 .ico 会被完整保留。
+//
+// 路径相对**包根**（crates/mirrorstar-ui）解析：Cargo 将构建脚本的工作目录固定为包根。
+// 直接复用托盘同一份 src-tauri/icons/icon.ico，不新增图标副本。
+1 ICON "../../src-tauri/icons/icon.ico"

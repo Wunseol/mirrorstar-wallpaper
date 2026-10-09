@@ -12,6 +12,8 @@
 
 本文档描述 MirrorStar Wallpaper（镜星壁纸）的模块划分与各模块详细状态。所有数据均基于真实代码审计，反映当前实现状态。
 
+> **注（主窗口原生 UI 重构后，2026-10-02）**：原"前端 UI"模块（`src/scripts/` + `index.html`，Vite/TypeScript）已**整体删除**，其能力由新增的**原生 UI 子进程** `crates/mirrorstar-ui/`（Slint 1.18）承载；壳（`src-tauri/`）不再创建 WebView2 主窗口。本文中涉及前端/Tauri IPC（`emit`）与"主窗口懒创建/关闭即隐藏"的描述为历史记录，以本注为准。
+
 ---
 
 ## 1. 模块总览
@@ -53,8 +55,8 @@
        │ CreateProcessW               │ CreateProcessW + 命名管道 IPC
        ▼                              ▼
 ┌─────────────────┐         ┌──────────────────────────┐
-│   mpv.exe       │         │ mirrorstar-wp-proc.exe    │
-│   (视频壁纸)    │         │ (Web 壁纸子进程)          │
+│   mpv.exe       │         │mirrorstar-wallpaper.exe  │
+│   (视频壁纸)    │         │ --wp-proc Web 壁纸子进程 │
 │   按需启动      │         │  ┌────────────────────┐  │
 └─────────────────┘         │  │ WebView2 环境      │  │
                             │  │  └ 窗口 + 消息循环  │  │
@@ -68,7 +70,7 @@
 - 主进程（`mirrorstar-wallpaper.exe`）内通过 WallpaperEngine 管理所有壁纸渲染
 - Image/Gif 渲染器在主进程专用线程中运行（GDI + 双缓冲）
 - Video 渲染器通过 ProcessManager 直接 spawn `mpv.exe` 子进程（按需），通过 mpv 原生命名管道 IPC（`MpvIpcClient`，定义于 `ipc/mpv_protocol.rs`）控制，**不使用 libmpv2 FFI 库嵌入**
-- **Web 渲染器已重构为代理层**：通过 ProcessManager spawn `mirrorstar-wp-proc.exe` 子进程（按需），通过 `WpProcIpcClient`（定义于 `ipc/wp_proc.rs`）命名管道通信
+- **Web 渲染器已重构为代理层**：通过 ProcessManager 以 `--wp-proc` 模式 spawn 壳进程自身（`mirrorstar-wallpaper.exe --wp-proc`，按需），通过 `WpProcIpcClient`（定义于 `ipc/wp_proc.rs`）命名管道通信
 - HWND 通过 FindWindowW 获取后，主进程执行 WorkerW 嵌入（与 mpv 窗口嵌入逻辑一致）
 
 **内存优化：**
@@ -134,7 +136,7 @@
 - **ImageRenderer**（1104 行）：GDI + 双缓冲 + HALFTONE + 专用线程消息循环 + 超屏幕分辨率降采样 + 暂停时释放像素数据
 - **GifRenderer**（2172 行）：image crate GIF 解码 + GDI 双缓冲 + WM_TIMER 帧驱动 + 40MB 内存预算限制 + 暂停时释放帧数据 + 速度控制
 - **VideoRenderer**（1259 行）：mpv 子进程 + 命名管道 IPC + WASAPI 音量控制 + 7 个单元测试
-- **WebRenderer**（652 行，✅ 代理层）：通过 ProcessManager 启动 `mirrorstar-wp-proc.exe` 子进程 + WpProcIpcClient 命名管道 IPC 通信 + FindWindowW + PID 验证获取 HWND，实现崩溃隔离和内存优化
+- **WebRenderer**（652 行，✅ 代理层）：通过 ProcessManager 以 `--wp-proc` 模式启动壳进程自身子进程 + WpProcIpcClient 命名管道 IPC 通信 + FindWindowW + PID 验证获取 HWND，实现崩溃隔离和内存优化
 
 ---
 
@@ -166,7 +168,7 @@
 
 > **重要说明**：项目中存在**两套独立的 IPC 协议**，并非统一协议：
 > - **mpv 原生 IPC**（管道名 `mirrorstar-mpv-{uuid}`）：由 `MpvIpcClient` 实现（定义于 `ipc/mpv_protocol.rs` L27），用于主进程与 mpv.exe 子进程通信
-> - **wp-proc WpProcCommand 协议**：由 `WpProcIpcClient` 实现（定义于 `ipc/wp_proc.rs` L73），用于主进程与 mirrorstar-wp-proc.exe 子进程通信
+> - **wp-proc WpProcCommand 协议**：由 `WpProcIpcClient` 实现（定义于 `ipc/wp_proc.rs` L73），用于主进程与壳 `--wp-proc` 模式子进程通信
 >
 > 两者均采用命名管道 + JSON + 换行分隔的传输格式，并复用连接重试 + request_id 响应匹配模式，但命令集与协议语义各自独立。**注意：不存在 `ipc/protocol.rs` 文件**，协议定义位于 `mpv_protocol.rs` 与 `wp_proc.rs` 中。
 
@@ -176,7 +178,7 @@
 - 连接重试机制（详见下方重试参数）：mpv `MPV_CONNECT_RETRIES` = 40 × 50ms = 2s；wp-proc `WP_PROC_CONNECT_RETRIES` = 160 × 50ms = 8s；窗口查找重试 = 20 × 100ms = 2s（均位于 `wallpaper/subprocess_base.rs`）
 - `send_command` 命令发送 + request_id 响应匹配
 - `get_property` / `set_property` 属性读写
-- `pause` / `resume` / `set_volume` / `set_loop_file` / `set_speed` / `quit` 控制命令（wp-proc 另有 play/terminate/set_position/navigate）
+- `pause` / `resume` / `set_volume` / `set_speed` / `quit` 控制命令（wp-proc 另有 play/terminate/set_position/navigate）
 - 9 + 17 个单元测试
 
 ---
@@ -224,7 +226,7 @@
 
 ---
 
-### 2.9 前端 UI — ✅ 已实现 95%
+### 2.9 前端 UI — ⚠️ 已删除（由原生 UI 子进程取代）
 
 **代码规模：** 13 个 TS 文件（共 1523 行）+ 546 行 main.css + 114 行 index.html
 

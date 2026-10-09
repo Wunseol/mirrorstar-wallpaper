@@ -24,7 +24,8 @@ MirrorStar 的架构围绕以下几项关键设计决策进行根本性重构，
 * **统一命名管道 IPC**：对外部渲染进程建立两套独立命名管道协议（mpv 原生 JSON IPC + wp-proc 自定义协议），实现稳定的跨进程通信。
 * **TOML 配置**：使用 TOML（serde）作为配置格式，简洁、类型安全且便于解析。
 * **编译期内存安全**：依托 Rust 所有权模型在编译期保证无数据竞争、无悬垂指针、无缓冲区溢出，规避运行时 GC 泄漏风险。
-* **精简进程模型**：采用"主进程 + 壁纸子进程"模型，不引入独立看门狗进程（watchdog 已移除），子进程异常退出由操作系统自动回收。
+* **精简进程模型**：采用"壳进程 + UI 子进程 + 壁纸子进程"模型，不引入独立看门狗进程（watchdog 已移除），子进程异常退出由操作系统自动回收。
+* **原生 UI 子进程**：主窗口改为独立进程 `mirrorstar-ui.exe`（Slint 1.18，绑定软件渲染），壳（Tauri）不再创建任何 WebView2 主窗口；壳与 UI 之间通过 `mirrorstar-core::ui_proto` 的 NDJSON 行协议（over stdio）通信，业务逻辑仅保留在壳侧。
 
 ### 1.2 设计原则
 
@@ -38,7 +39,7 @@ MirrorStar 的架构围绕以下几项关键设计决策进行根本性重构，
 
 * **静态壁纸零资源**：JPG/JPEG/PNG/BMP/TIF/TIFF/DIB 使用 Windows 原生壁纸 API（`SystemParametersInfoW`），无需创建窗口、线程或 GDI 对象
 
-* **WebView2 懒创建**：主窗口不在启动时创建，仅创建系统托盘图标；窗口关闭时隐藏（hide），保留 WebView2 实例
+* **UI 子进程按需启动**：主窗口 UI 运行在独立进程 `mirrorstar-ui.exe`（Slint 原生渲染），启动时仅创建系统托盘图标；窗口隐藏超时（默认 300s）后 UI 子进程退出回收内存（壳侧≈7.6MB），再次打开时按需拉起；同一时刻至多一个实例
 
 #### 1.2.2 高性能（High Performance）
 
@@ -76,15 +77,16 @@ MirrorStar 的架构围绕以下几项关键设计决策进行根本性重构，
 
 ```mermaid
 graph TB
-    subgraph UI["UI 层 (Tauri WebView2 Frontend)"]
-        UI_Main["主窗口（懒创建）<br/>WebviewWindowBuilder 按需创建<br/>关闭即隐藏（hide），保留 WebView2 实例便于快速恢复"]
-        UI_Tray["系统托盘<br/>图标 / 右键菜单<br/>启动时仅创建托盘图标"]
-        UI_DnD["拖放处理<br/>文件类型识别"]
+    subgraph UI["UI 层 (原生 UI 子进程 mirrorstar-ui.exe + Tauri 壳托盘)"]
+        UI_Main["主窗口（Slint 1.18，软件渲染）<br/>独立子进程按需启动 · 隐藏超时退出<br/>虚拟化壁纸网格 · 四类预览（图片/视频/GIF/网页）"]
+        UI_Tray["系统托盘（壳进程）<br/>图标 / 右键菜单<br/>启动时仅创建托盘图标"]
+        UI_Proto["壳↔UI 协议<br/>ui_proto NDJSON over stdio"]
     end
 
-    subgraph BIZ["业务逻辑层 (Rust Core)"]
+    subgraph BIZ["业务逻辑层 (Rust Core，仅壳侧)"]
         BIZ_Engine["壁纸引擎<br/>WallpaperEngine<br/>WallpaperMode 双路径（Native/WorkerW）"]
         BIZ_ProcMgr["进程管理器<br/>ProcessManager"]
+        BIZ_UiMgr["UI 子进程管理<br/>spawn / 握手 / 空闲退出 / 单实例"]
         BIZ_Config["配置管理器<br/>ConfigManager"]
         BIZ_Audio["音频控制<br/>AudioController"]
         BIZ_PauseSender["PauseSender 快速通道<br/>绕过 Mutex，直接 mpsc 通道"]
@@ -101,7 +103,7 @@ graph TB
         OS_Registry["注册表<br/>WallPaperStyle / TileWallpaper"]
         OS_CoreAudio["Core Audio API<br/>ISimpleAudioVolume"]
         OS_Kernel32["kernel32.dll<br/>CreateProcessW"]
-        OS_WebView2["WebView2 Runtime<br/>Edge Chromium"]
+        OS_WebView2["WebView2 Runtime<br/>Edge Chromium（仅网页壁纸/按需网页预览）"]
         OS_mpv["mpv.exe<br/>视频解码（外部子进程）"]
     end
 
@@ -119,7 +121,7 @@ graph TB
 
 | 层次        | 职责                      | 关键技术                                        |
 | --------- | ----------------------- | ------------------------------------------- |
-| **UI 层**  | 用户交互、壁纸库展示、设置面板、拖放处理；主窗口懒创建，关闭即隐藏（hide）；系统托盘在 Tauri 应用层构建（lib.rs setup + state.rs 状态管理，3 项菜单：打开/暂停-恢复/退出）；全屏检测在 platform/fullscreen.rs（SetWinEventHook 事件驱动） | Tauri (Rust + WebView2)、HTML/CSS/TypeScript、WebviewWindowBuilder、tray-icon |
+| **UI 层**  | 用户交互、壁纸库展示、设置面板、拖放处理；主窗口为独立进程 `mirrorstar-ui.exe`（Slint 原生，按需启动 + 隐藏超时退出 + 单实例 + stdio NDJSON 协议），不复制业务逻辑、不直接读写配置；系统托盘在 Tauri 壳应用层构建（lib.rs setup + state.rs 状态管理，3 项菜单：打开/暂停-恢复/退出）；全屏检测在 platform/fullscreen.rs（SetWinEventHook 事件驱动） | Slint 1.18（软件渲染）、`mirrorstar-core::ui_proto`（Hello/Request/Response/Event/Control）、tray-icon |
 | **业务逻辑层** | 壁纸生命周期管理（WallpaperMode 双路径）、进程调度、配置读写、音频控制、PauseSender 快速通道 | Rust、tokio 异步运行时、mpsc 通道 |
 | **系统层**   | 桌面窗口嵌入（异步初始化）、原生壁纸 API（SystemParametersInfoW + 注册表） | windows-rs、SetWinEventHook、SystemParametersInfoW |
 | **OS 层**  | Windows 系统调用、硬件加速、进程操作、原生壁纸设置 | Win32 API、Core Audio、mpv.exe（外部子进程）、WebView2、SystemParametersInfoW、注册表 |

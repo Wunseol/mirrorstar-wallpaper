@@ -71,4 +71,4 @@ MirrorStar Wallpaper（镜星壁纸）是一款基于 Rust + Tauri v2 开发的�
 - **当前版本**：0.1.0（开发中）
 - **目标平台**：Windows 10 (1809+) / Windows 11，x86_64
 - **项目状态**：积极开发中，API 与功能可能调整
-- **Rust workspace**：三个成员 `src-tauri`（应用主进程）/ `mirrorstar-core`（核心库）/ `mirrorstar-wp-proc`（壁纸渲染子进程）
+- **Rust workspace**：四个成员 `src-tauri`（应用主进程）/ `mirrorstar-core`（核心库）/ `mirrorstar-ui`（原生 UI 子进程）/ `mirrorstar-wp-proc`（Web 壁纸逻辑库，壳 `--wp-proc` 模式复用）

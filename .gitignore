@@ -14,12 +14,6 @@
 # rustfmt 备份文件（仅 nightly rustfmt 在格式化失败时生成）
 **/*.rs.bk
 
-# Node 依赖与前端构建产物
-# node_modules: npm install 安装的依赖，体积大且可由 package-lock.json 复现
-/node_modules/
-# dist: Vite 生产构建产物（npm run build 生成），由 CI/release 重新生成
-/dist/
-
 # Tauri 构建产物（src-tauri 独立 target，避免与 workspace target 混淆）
 /src-tauri/target/
 
@@ -75,10 +69,3 @@ __tmp_patch_*.ps1
 # 由 CI 的 provisioning 步骤按固定 release + SHA256 下载（详见 .github/workflows/checks.yml）
 mpv/*
 !mpv/license
-
-# Reference projects（第三方参考源码，仅本地保留用于对照实现）
-# 不属于本仓库构建，应通过 external link 或 git submodule 跟踪
-lively-reference/
-
-# 前端测试覆盖率报告（vitest --coverage 生成，由 CI 重新生成）
-/coverage/

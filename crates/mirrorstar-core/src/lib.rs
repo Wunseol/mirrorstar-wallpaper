@@ -5,7 +5,9 @@ pub mod ipc;
 pub mod layout;
 pub mod perf;
 pub mod process;
+pub mod pure_mode;
 pub mod scheduler;
+pub mod ui_proto;
 pub mod wallpaper;
 
 pub use audio::volume::VolumeControl;
@@ -22,9 +24,11 @@ pub use wallpaper::manager::{
     ATOMIC_SWAP_READY_TIMEOUT,
 };
 pub use wallpaper::{
-    GifMemoryStrategy, PauseCommand, PauseReason, PauseSender, ScalingMode, WallpaperRenderer,
-    WallpaperSource, WallpaperState, WallpaperType,
+    GifMemoryStrategy, LivenessProbe, PauseCommand, PauseReason, PauseSender, ScalingMode,
+    WallpaperRenderer, WallpaperSource, WallpaperState, WallpaperType,
 };
+// 停滞判定纯函数：src-tauri 侧退出编排 / 看护任务持有上一轮探针快照做比较。
+pub use wallpaper::video::video_playback_stalled;
 
 /// MirrorStar 全局错误类型
 #[derive(Debug, thiserror::Error)]

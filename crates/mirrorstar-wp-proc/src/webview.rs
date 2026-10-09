@@ -1,23 +1,31 @@
 //! WebView2 初始化、窗口管理、URL 构建
 
+use std::cell::Cell;
 use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
-use windows::core::HSTRING;
+use windows::core::{Interface, HSTRING};
 use windows::Win32::Foundation::{
-    GetLastError, ERROR_CLASS_ALREADY_EXISTS, E_POINTER, HINSTANCE, HWND, LPARAM, LRESULT, RECT,
-    WPARAM,
+    GetLastError, BOOL, ERROR_CLASS_ALREADY_EXISTS, E_POINTER, HINSTANCE, HWND, LPARAM, LRESULT,
+    RECT, WPARAM,
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::System::Threading::Sleep;
+use windows::Win32::System::WinRT::EventRegistrationToken;
 use windows::Win32::UI::WindowsAndMessaging::*;
 
 use webview2_com::Microsoft::Web::WebView2::Win32::{
-    CreateCoreWebView2Environment, CreateCoreWebView2EnvironmentWithOptions,
-    ICoreWebView2Controller, ICoreWebView2EnvironmentOptions,
+    CreateCoreWebView2Environment, CreateCoreWebView2EnvironmentWithOptions, ICoreWebView2,
+    ICoreWebView2Controller, ICoreWebView2Controller2, ICoreWebView2EnvironmentOptions,
+    ICoreWebView2NewWindowRequestedEventArgs, ICoreWebView2ProcessFailedEventArgs,
+    ICoreWebView2Settings3, COREWEBVIEW2_COLOR, COREWEBVIEW2_PROCESS_FAILED_KIND,
+    COREWEBVIEW2_PROCESS_FAILED_KIND_BROWSER_PROCESS_EXITED,
+    COREWEBVIEW2_PROCESS_FAILED_KIND_RENDER_PROCESS_EXITED,
 };
 use webview2_com::{
+    AddScriptToExecuteOnDocumentCreatedCompletedHandler,
     CreateCoreWebView2ControllerCompletedHandler, CreateCoreWebView2EnvironmentCompletedHandler,
+    NewWindowRequestedEventHandler, ProcessFailedEventHandler,
 };
 
 use mirrorstar_core::MirrorStarError;
@@ -40,6 +48,78 @@ const FALLBACK_SCREEN_HEIGHT: i32 = 1080;
 
 /// 窗口类名（注册与 WindowClassGuard 注销处共用，避免字面量重复导致不一致）
 const CLASS_NAME: windows::core::PCWSTR = windows::core::w!("MirrorStarWebWallpaperCls");
+
+/// 远程域名白名单（SEC-005，默认空 = 拒绝所有远程 http/https）。
+///
+/// 说明：Web 壁纸的源由用户显式添加，`build_url` 已通过协议白名单（仅允许
+/// http/https/本地路径）限定加载范围。此处提供**可配置的**远程域名白名单作为纵深防御：
+/// - 空列表（默认）→ **拒绝所有远程 http/https**（默认收紧）：仅放行
+///   `localhost` / `127.0.0.1`（本机回环调试，无 SSRF 风险）。远程壁纸源需在
+///   `ALLOWED_REMOTE_DOMAINS` 中显式加入其域名，避免壁纸源意外指向任意远程内容。
+/// - 非空时 → 仅允许列表内域名（及始终允许 localhost/127.0.0.1 本地调试）。
+///
+/// 命中白名单之外的 http/https 宿主时，`build_url` 返回 `InvalidUrl`
+/// （scheme="remote-domain-not-allowed:<host>"），阻止 WebView2 加载任意远程内容
+/// （防 SSRF / 防诱导加载）。空表收紧是默认安全策略（fail-closed），
+/// 而非"空表不限制"（fail-open）——后者已被 SEC-005 第二轮正确性优化移除。
+const ALLOWED_REMOTE_DOMAINS: &[&str] = &[];
+
+/// 注入 CSP 用的 JS 脚本（插入 <meta http-equiv="Content-Security-Policy">）。
+///
+/// 时序约束（实测）：`AddScriptToExecuteOnDocumentCreated` 在**文档创建阶段**执行，
+/// 此时 `document.head` 与 `document.documentElement` **均为 null**（两者都由 HTML
+/// 解析器在解析过程中创建）。因此：
+/// - 原实现 `if (document.head) { ... }` 的守卫恒为假 → CSP 从未插入
+///   （实测 `document.querySelector('meta[http-equiv="Content-Security-Policy"]')` 为 null）。
+/// - 直接在此刻 `document.write('<meta ...>')` 虽可让解析器插入 meta，但实测会导致
+///   Play 命令等待的 `NavigationCompleted` 永不触发（Web 壁纸无法加载），故不可用。
+///
+/// 采用方案：文档创建时先尝试一次（head 已存在的少数场景），否则挂 `DOMContentLoaded`
+/// 监听，待解析出 `<head>` 后再插入 meta。已实测本 WebView2 会强制**脚本插入**的
+/// CSP meta（插入 `script-src 'none'` 的 meta 后，随后插入的内联 `<script>` 被拦截）。
+///
+/// **作用域限定（R2）**：`AddScriptToExecuteOnDocumentCreated` 对**每个 document**
+/// （含 iframe 子 frame）都执行本脚本。若不加限定，嵌入壁纸的第三方内容也会被插入
+/// `object-src/base-uri/form-action 'none'`，破坏其 `<base href>` 相对 URL 解析、
+/// 表单提交与 `<object>`/`<embed>` 加载——而加固的本意只是加固**壁纸顶层文档本身**。
+/// 故脚本首行以 `window.top !== window.self` 提前返回，仅顶层文档注入。
+///
+/// **幂等守卫（R3）**：守卫必须基于**自有标记** `meta[data-mirrorstar-csp]`，而非
+/// `meta[http-equiv="Content-Security-Policy"]`。后者判断的是**页面可控的 DOM**：
+/// 若壁纸 HTML 自带一条精确大小写的同名 meta，原守卫会直接 `return`，导致应用侧
+/// CSP 从未插入（多条 CSP 取交集 → 页面自己的策略生效），本轮加固被页面绕过。
+///
+/// 局限（如实说明）：CSP 在 `DOMContentLoaded` 时才生效，晚于页面自身的解析期脚本，
+/// 因此它**不能**约束页面首屏的解析期资源；它约束的是此后发生的 `base-uri` 变更、
+/// `form-action` 提交与 `object-src` 加载。若需在解析前即强制 CSP，须改用
+/// `WebResourceRequested` 注入响应头方案（本轮未实施）。
+const INJECT_CSP_SCRIPT: &str = r#"
+(function () {
+  // R2: 仅顶层文档注入——本脚本对每个 document（含 iframe 子 frame）都会执行，
+  // 若向嵌入内容也注入 base-uri/form-action/object-src 'none'，会破坏其相对 URL
+  // 解析（<base href>）、表单提交与 <object>/<embed> 加载。
+  if (window.top !== window.self) return;
+  var csp = "object-src 'none'; base-uri 'none'; form-action 'none'";
+  function inject() {
+    // R3: 幂等守卫用自有标记，而非页面可控的 http-equiv 查询——否则页面自带的同名
+    // meta 会让应用侧 CSP 被跳过（加固被绕过）。每个文档最多插入一次。
+    if (document.querySelector('meta[data-mirrorstar-csp]')) return;
+    var root = document.head || document.documentElement;
+    if (!root) return;
+    var m = document.createElement('meta');
+    m.setAttribute('http-equiv', 'Content-Security-Policy');
+    m.setAttribute('data-mirrorstar-csp', '1');
+    m.setAttribute('content', csp);
+    root.appendChild(m);
+  }
+  inject();
+  if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', inject, { once: true });
+  } else {
+    inject();
+  }
+})();
+"#;
 
 /// 将 `controller.CoreWebView2()` 失败转换为 `MirrorStarError::DesktopIntegration`。
 ///
@@ -254,7 +334,10 @@ pub(crate) fn create_window(
 
     let hwnd = unsafe {
         CreateWindowExW(
-            WINDOW_EX_STYLE::default(),
+            // 透明壁纸（防白闪）：宿主窗口启用 WS_EX_LAYERED，配合下方
+            // SetLayeredWindowAttributes + 透明的 WebView2 DefaultBackgroundColor，
+            // 使未渲染区域以透明（而非白底）呈现，避免导航完成前的白闪。
+            WINDOW_EX_STYLE(WS_EX_LAYERED.0),
             class_name,
             &title_h,
             WS_POPUP | WS_CLIPCHILDREN | WS_CLIPSIBLINGS,
@@ -269,16 +352,39 @@ pub(crate) fn create_window(
         )
     };
 
-    match hwnd {
-        Ok(h) if !h.is_invalid() && h != HWND::default() => Ok(h),
-        Ok(_) => Err(MirrorStarError::DesktopIntegration(
-            "创建窗口失败: 无效句柄".to_string(),
-        )),
-        Err(e) => Err(MirrorStarError::DesktopIntegration(format!(
-            "创建窗口失败: {}",
-            e
-        ))),
+    let hwnd = match hwnd {
+        Ok(h) if !h.is_invalid() && h != HWND::default() => h,
+        Ok(_) => {
+            return Err(MirrorStarError::DesktopIntegration(
+                "创建窗口失败: 无效句柄".to_string(),
+            ))
+        }
+        Err(e) => {
+            return Err(MirrorStarError::DesktopIntegration(format!(
+                "创建窗口失败: {}",
+                e
+            )))
+        }
+    };
+
+    // 透明壁纸：将分层窗口配置为按像素 alpha 合成（全局不透明度 100%），
+    // 透明区域由 WebView2 的 per-pixel alpha（DefaultBackgroundColor alpha=0）提供。
+    // 刻意不使用 LWA_COLORKEY 透明色键——色键会把 WebView 内容中同色像素也变透明，
+    // 导致壁纸画面缺失。LWA_ALPHA(255) 仅指定合成规则，不遮挡内容。
+    unsafe {
+        if SetLayeredWindowAttributes(
+            hwnd,
+            windows::Win32::Foundation::COLORREF(0),
+            255,
+            LWA_ALPHA,
+        )
+        .is_err()
+        {
+            tracing::warn!("SetLayeredWindowAttributes 失败，将退回不透明窗口");
+        }
     }
+
+    Ok(hwnd)
 }
 
 // ── WebView2 初始化 ──────────────────────────────────────────────────────────
@@ -406,19 +512,73 @@ impl Drop for ControllerGuard {
 
 /// v10.0: 构建 WebView2 UserDataFolder 路径
 ///
-/// 指向数据根（安装目录）下的 `webview2-cache/`，便于便携化：删除安装目录即全部清除。
+/// 指向数据根（安装目录）下的 `webview2-cache/<pid>/`，便于便携化：删除安装目录即全部清除。
+///
+/// 多显示器修复：每个 wp-proc 实例使用**独立的**子目录（以本进程 PID 命名）。
+/// WebView2 不允许两个进程同时使用同一 user data folder 创建环境（第二个会失败），
+/// 若所有实例共用 `webview2-cache/`，per_monitor 模式下同时开启两个 Web 壁纸时，
+/// 第二个实例的环境创建会失败，该显示器 Web 壁纸不可用。以 PID 作为子目录名即可
+/// 让每个实例互不干扰。
+///
+/// 子目录名安全性：PID 仅由十进制数字构成（`[0-9]`），天然满足文件名安全要求，
+/// 无需再做字符替换（管道名等含反斜杠/冒号的标识才需要转义，此处未采用）。
+///
 /// 若目录不存在则创建（`create_dir_all` 忽略失败，WebView2 会按需创建）。
+///
+/// 路径由 `mirrorstar_core::wallpaper::web::wp_proc_user_data_folder` 单源提供——父进程
+/// 退出后回收该目录时用的是同一个函数，避免两处拼接漂移（见该函数文档）。
 ///
 /// 返回 `Option<HSTRING>`：`Some` 时由调用方传给 `CreateCoreWebView2EnvironmentWithOptions`；
 /// `None`（仅在 `HSTRING::from_wide` 失败时，极端罕见）时调用方回退到默认环境创建。
 /// 路径计算与目录创建通过 `OnceLock` 缓存仅执行一次。`HSTRING` 实现 `Send + Sync`，
 /// 可安全存入 `static`。
+///
+/// # Task 5.2 评估结论：**放弃**「主窗口与网页壁纸共享 WebView2 环境/浏览器进程」
+///
+/// 目标：让主窗口（Tauri/wry 托管的 WebView2）与 wp-proc 共用同一 UDF + 环境选项，
+/// 以省下一份 msedgewebview2 进程基线（约 5-6 进程 / 150-300MB）。
+///
+/// **核实（WebView2 官方文档 Microsoft Learn）**：跨进程共享在模型上**是被支持的**——
+/// 「A WebView2 control shares its WebView2 session with any other WebView2 control
+/// that uses the same UDF. This is true whether the WebView2 controls are in the same
+/// host app or different host apps.」（Manage user data folders），且默认
+/// `ExclusiveUserDataFolderAccess=false` 不禁止其他进程加入同一 UDF
+/// （ICoreWebView2EnvironmentOptions2）。因此本目录采用 per-PID UDF **并非**因为
+/// 「WebView2 不允许共享」，而是**主动选择隔离**。故放弃共享是架构取舍，不是技术不可行。
+///
+/// **放弃理由（均为架构级回退，收益不抵代价）**：
+/// 1. **崩溃隔离回退（决定性）**：wp-proc 存在的首要理由就是崩溃隔离（见
+///    `mirrorstar-core/src/wallpaper/web.rs` 中 `WebRenderer` 的文档"实现崩溃隔离和内存优化"）。
+///    壁纸页面是不受信任的第三方网页（fail-closed 沙箱面），是崩溃概率最高的一方；
+///    共享 browser 进程后，其 browser/GPU 进程崩溃会一并拖垮主窗口设置 UI。
+/// 2. **多显示器能力回退（决定性）**：per-PID UDF 让每个 wp-proc 成为独立进程集合，
+///    多显示器可同时开多个 Web 壁纸、可各自独立 terminate/重启；共享单一 UDF 后所有
+///    实例落进同一 browser 进程集合，且 `cleanup_wp_proc_user_data_folder` 会在实例退出
+///    时 `remove_dir_all` 整个 UDF——若该 UDF 正被主窗口/其他实例使用，会破坏仍在运行的
+///    环境（文档明确 UDF 只能在无活动 session 时删除/移动）。
+/// 3. **环境选项无法对齐（历史理由，现已不适用）**：共享要求"同一 UDF + 等价环境配置"，
+///    该约束此前指向与主窗口 WebView2 环境的对齐；但主窗口现已迁移为原生 Slint 子进程
+///    （`crates/mirrorstar-ui`，进程内无 WebView2），不再存在可比对的主窗口 WebView2 环境，
+///    此关切随之失效。历史上主窗口由 Tauri/wry 托管（`src-tauri/src/state.rs` 的
+///    `WebviewWindowBuilder`，未指定 UDF 与 AdditionalBrowserArguments），wp-proc 无法控制
+///    其 UDF 与参数；此外壁纸侧仍需 `--autoplay-policy=no-user-gesture-required`、进程级
+///    `WEBVIEW2_DEFAULT_BACKGROUND_COLOR` 透明注入、CDP 注入等配置，不应与主窗口混用。
+/// 4. **净收益不确定**：即便省下一份基线，也需把壁纸移入主进程或引入集中式 UDF 生命周期
+///    管理 + 全参数对齐，复杂度与风险远超预期收益。
+///
+/// **若未来仍要共享，前置条件**：
+/// - 把网页壁纸移入主进程，在同一 `ICoreWebView2Environment` 下为每个显示器创建独立
+///   `CoreWebView2Controller`（挂到各显示器 WorkerW 子窗口）；
+/// - UDF 生命周期集中管理，禁止单个 renderer 退出即删除 UDF；
+/// - 接受崩溃隔离降级，并依赖 `ProcessFailed` 事件重建挂掉的壁纸 controller；
+/// - 用 Task 1 的 MEM-ATTRIB 埋点对比总 `msedgewebview2.exe` 进程数与工作集，确认收益后再决策。
 fn build_webview2_user_data_folder() -> Option<windows::core::HSTRING> {
     use std::os::windows::ffi::OsStrExt;
     static FOLDER: OnceLock<Option<windows::core::HSTRING>> = OnceLock::new();
     FOLDER
         .get_or_init(|| {
-            let path = mirrorstar_core::config::data_root().join("webview2-cache");
+            // 每个 wp-proc 实例独立的子目录（PID 唯一且为纯数字，文件名安全）。
+            let path = mirrorstar_core::wallpaper::web::wp_proc_user_data_folder(std::process::id());
             let _ = std::fs::create_dir_all(&path);
             tracing::info!(webview2_cache = %path.display(), "WebView2 UserDataFolder");
             let wide: Vec<u16> = path.as_os_str().encode_wide().collect();
@@ -443,17 +603,58 @@ fn build_webview2_user_data_folder() -> Option<windows::core::HSTRING> {
 /// - --disable-gpu-shader-disk-cache：禁用着色器磁盘缓存
 /// - --disable-features=FontCache,GpuMemDiscardable,BackForwardCache：禁用字体缓存、GPU 可丢弃内存、前进后退缓存
 ///
+/// Task 5.1 内存裁剪（与主窗口裁剪同方向，保守低风险）：
+/// - --renderer-process-limit=1：wp-proc 只渲染**一个**页面，限制渲染进程数为 1，
+///   省去多余 renderer 进程的内存基线。风险低：跨域 iframe 会与主 frame 共用同一
+///   renderer（牺牲站点隔离、单个 renderer 内存略升），但本进程是 fail-closed 沙箱面
+///   （无导航/无用户输入/远程域名白名单收紧），该隔离损失可接受。
+/// - --js-flags=--max-old-space-size=512：把 V8 老生代堆上限压到 512MB（64 位默认约
+///   2-4GB）。**风险**：过小会让复杂网页壁纸（重 WebGL/长动画）OOM 或白屏，故取
+///   保守的 512MB（普通网页堆通常 <100MB，重负载壁纸也极少超此值），仍能约束失控增长。
+///   WebGL 纹理等不占 V8 堆，512MB 对图形型壁纸足够安全。
+/// - 未追加其他 `--disable-features` 项：现有列表已覆盖可确认有效的缓存类特性，
+///   其余特性 flag 未经实测，可能破坏渲染且收益不可测，故不引入。
+///
+/// E2E-02 音频自动播放修复：追加 `--autoplay-policy=no-user-gesture-required`。
+///
+/// 根因（模拟人类操作测试实证）：wp-proc 的 WebView2 实际生效的是严格的
+/// `user-gesture-required` 自动播放策略——即使元素 `muted`，页面加载期 play()
+/// 也返回 `NotAllowedError`（"play() failed because the user didn't interact with
+/// the document first."）；宿主 ExecuteScript 注入 play() 同样被拒；唯一解锁途径是
+/// 真实用户手势（CDP 合成点击验证 `navigator.userActivation.hasBeenActive` 由 false
+/// 变 true 后 play() 成功）。而壁纸窗口是点击穿透（WorkerW 之上、不接收任何输入），
+/// 永远不会获得用户激活 → 带背景音频的 Web 壁纸音频永远无法开始，音量/静音控制
+/// 形同虚设。原"默认策略允许 muted 自动播放"的假设经实测为误。
+///
+/// 方案权衡：微软官方不建议在生产应用使用浏览器 flag（可能随时变更），但本场景
+/// 壁纸 WebView2 是 fail-closed 沙箱面（无导航/无用户输入/远程域名白名单收紧），
+/// `no-user-gesture-required` 是该受控面下恢复"壁纸环境音频自动播放"语义的必要手段，
+/// 也是实证后唯一可靠的方案（宿主注入 play 被同策略拦截，无法绕过）。
+/// 其余自动播放策略值（user-gesture-required / document-user-activation-required）
+/// 均无法满足壁纸免手势播放需求。
+///
 /// 返回 `None` 时调用方应回退到 `CreateCoreWebView2Environment`（默认行为），
 /// 保证环境选项创建失败不影响壁纸进程正常启动（降级路径）。
+/// wp-proc WebView2 的 AdditionalBrowserArguments 参数串（**纯函数，便于单测**）。
+///
+/// 从 `build_webview2_environment_options` 中拆分出来：本函数不触碰 COM 对象，
+/// 因此可在单测里直接断言"必须保留 / 必须存在 / 不得引入"的参数契约，防止后续
+/// 维护误删 `--autoplay-policy=no-user-gesture-required`（E2E 实测必需）或改动
+/// 内存裁剪参数。参数用途与风险见 `build_webview2_environment_options` 的文档注释。
+fn build_additional_browser_args() -> &'static str {
+    "--autoplay-policy=no-user-gesture-required \
+     --disk-cache-size=10485760 \
+     --disable-gpu-program-cache \
+     --disable-gpu-shader-disk-cache \
+     --renderer-process-limit=1 \
+     --js-flags=--max-old-space-size=512 \
+     --disable-features=MediaCache,FontCache,GpuMemDiscardable,BackForwardCache"
+}
+
 fn build_webview2_environment_options() -> Option<ICoreWebView2EnvironmentOptions> {
     let options: ICoreWebView2EnvironmentOptions =
         webview2_com::CoreWebView2EnvironmentOptions::default().into();
-    let additional_args = windows::core::HSTRING::from(
-        "--disk-cache-size=10485760 \
-         --disable-gpu-program-cache \
-         --disable-gpu-shader-disk-cache \
-         --disable-features=MediaCache,FontCache,GpuMemDiscardable,BackForwardCache",
-    );
+    let additional_args = windows::core::HSTRING::from(build_additional_browser_args());
     unsafe {
         if let Err(e) = options.SetAdditionalBrowserArguments(&additional_args) {
             tracing::warn!(error = %e, "SetAdditionalBrowserArguments 失败, 回退到默认环境选项");
@@ -463,16 +664,283 @@ fn build_webview2_environment_options() -> Option<ICoreWebView2EnvironmentOption
     Some(options)
 }
 
-/// 创建 WebView2 控制器并导航到指定源
+/// 将 WebView2 控制器设为透明背景（防白闪，H3 兜底）
+///
+/// 通过 `ICoreWebView2Controller2::SetDefaultBackgroundColor` 把默认背景色 alpha 置 0，
+/// 使页面在导航/首帧渲染前以透明呈现（宿主窗口已启用 WS_EX_LAYERED，见 create_window），
+/// 避免加载期间的白底闪烁。
+///
+/// H3 优化后：首帧透明已由环境变量 `WEBVIEW2_DEFAULT_BACKGROUND_COLOR=00ffffff`
+/// （create_webview 中环境创建前设置）根治，本函数降级为**兜底**：覆盖环境变量
+/// 被外部覆盖/未生效的场景，以及运行时动态调整默认背景色的需求。
+///
+/// WebView2 仅支持 alpha 为 0 或 255，透明即 alpha=0。
+fn apply_transparent_controller(controller: &ICoreWebView2Controller) {
+    let controller2 = match controller.cast::<ICoreWebView2Controller2>() {
+        Ok(c) => c,
+        Err(e) => {
+            tracing::warn!(error = %e, "cast 到 ICoreWebView2Controller2 失败，跳过透明背景设置");
+            return;
+        }
+    };
+    let color = COREWEBVIEW2_COLOR {
+        A: 0,
+        R: 0,
+        G: 0,
+        B: 0,
+    };
+    unsafe {
+        if let Err(e) = controller2.SetDefaultBackgroundColor(color) {
+            tracing::warn!(error = %e, "SetDefaultBackgroundColor 失败，可能残留白底");
+        }
+    }
+}
+
+// 网页音视频自动播放策略（E2E-02 修复后）
+//
+// 早期注释假设"WebView2 默认 autoplay 策略允许 muted 媒体免手势自动播放"，该假设
+// 已被模拟人类操作测试**证伪**：wp-proc 的 WebView2 实际生效的是严格
+// `user-gesture-required` 策略，muted 元素冷启动 play() 仍返回 NotAllowedError。
+// 因此现在统一通过 `build_webview2_environment_options()` 注入
+// `--autoplay-policy=no-user-gesture-required`（见其上方的 E2E-02 根因分析），
+// 恢复"壁纸环境音频自动播放"语义。壁纸页面内自动播放/暂停仍由
+// `command.rs` 的 Pause/Resume JS 注入控制。
+
+/// 硬化 WebView2 安全配置（SEC-005）：防止用户手势从壁纸逃逸/加载任意内容。
+///
+/// 全部为**尽力而为**（每次调用均记录日志，单个失败不阻断壁纸创建），
+/// 避免安全配置异常时导致壁纸无法加载。包含：
+/// 1. 禁用右键上下文菜单（防止"在新标签页打开图像/查看源代码"等逃逸）
+/// 2. 禁用状态栏（隐藏 URL，避免诱导点击）
+/// 3. 禁用浏览器加速键（如 F3 查找、Ctrl+R 刷新等全局快捷键）
+/// 4. 禁用内置错误页（隐藏敏感错误信息，避免误导）
+/// 5. 阻止新窗口请求（`window.open` / `target=_blank` 被 SetHandled 拦截）
+/// 6. 注入最小化 CSP（`object-src`/`base-uri`/`form-action` 收紧逃逸与 elevation 面）。
+///    经 `AddScriptToExecuteOnDocumentCreated` 注入，实际在 `DOMContentLoaded` 时插入
+///    meta（文档创建阶段 `head` 尚不存在，详见 `INJECT_CSP_SCRIPT` 的时序说明）。
+///    **仅作用于壁纸顶层文档**：该注入 API 对每个 document（含 iframe 子 frame）都执行，
+///    脚本内以 `window.top !== window.self` 提前返回，避免破坏嵌入内容的 `<base href>`
+///    解析/表单提交/`<object>` 加载（R2）；幂等守卫用自有标记 `data-mirrorstar-csp`，
+///    避免页面自带的同名 CSP meta 让应用侧注入被跳过（R3）。
+fn harden_webview(webview: &ICoreWebView2) {
+    // 1. ICoreWebView2Settings：禁用上下文菜单 / 状态栏 / 内置错误页。
+    //    Settings() 失败时仅记录日志，不影响下方新窗口拦截与 CSP 注入。
+    match unsafe { webview.Settings() } {
+        Ok(settings) => {
+            unsafe {
+                if let Err(e) = settings.SetAreDefaultContextMenusEnabled(BOOL(0)) {
+                    tracing::warn!(error = %e, "禁用右键菜单失败");
+                }
+            }
+            unsafe {
+                if let Err(e) = settings.SetIsStatusBarEnabled(BOOL(0)) {
+                    tracing::warn!(error = %e, "禁用状态栏失败");
+                }
+            }
+            unsafe {
+                if let Err(e) = settings.SetIsBuiltInErrorPageEnabled(BOOL(0)) {
+                    tracing::warn!(error = %e, "禁用内置错误页失败");
+                }
+            }
+
+            // 2. 禁用浏览器加速键（ICoreWebView2Settings3，须 cast）。
+            if let Ok(settings3) = settings.cast::<ICoreWebView2Settings3>() {
+                unsafe {
+                    if let Err(e) = settings3.SetAreBrowserAcceleratorKeysEnabled(BOOL(0)) {
+                        tracing::warn!(error = %e, "禁用浏览器加速键失败");
+                    }
+                }
+            } else {
+                tracing::warn!("cast 到 ICoreWebView2Settings3 失败，跳过加速键禁用");
+            }
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, "获取 Settings 失败，跳过上下文菜单/状态栏/加速键禁用");
+        }
+    }
+
+    // 3. 阻止新窗口逃逸：任何 NewWindowRequested 一律 SetHandled(true)。
+    let handler = NewWindowRequestedEventHandler::create(Box::new(
+        |_sender,
+         args: Option<ICoreWebView2NewWindowRequestedEventArgs>|
+         -> windows::core::Result<()> {
+            if let Some(args) = args {
+                // SAFETY: SetHandled(true) 告知 WebView2 该新窗口请求已被处理，
+                // WebView2 不会创建新窗口，达到阻止从壁纸弹出独立窗口逃逸的目的。
+                unsafe {
+                    let _ = args.SetHandled(BOOL(1));
+                }
+            }
+            Ok(())
+        },
+    ));
+    let mut token = EventRegistrationToken::default();
+    unsafe {
+        if let Err(e) = webview.add_NewWindowRequested(&handler, &mut token) {
+            tracing::warn!(error = %e, "注册 NewWindowRequested 拦截失败");
+        }
+    }
+
+    // 4. 注入最小化 CSP。AddScriptToExecuteOnDocumentCreated 在每次文档创建时注入脚本；
+    //    脚本在 head 就绪（DOMContentLoaded）后插入 CSP meta——文档创建阶段 head 尚不存在，
+    //    且**仅顶层文档生效**（脚本内 `window.top !== window.self` 提前返回，R2），
+    //    详见 INJECT_CSP_SCRIPT 的时序、作用域与局限说明（尽力而为，失败不阻断）。
+    let csp_handler = AddScriptToExecuteOnDocumentCreatedCompletedHandler::create(Box::new(
+        |_error_code: windows::core::Result<()>, _id: String| -> windows::core::Result<()> {
+            Ok(())
+        },
+    ));
+    unsafe {
+        if let Err(e) = webview
+            .AddScriptToExecuteOnDocumentCreated(&HSTRING::from(INJECT_CSP_SCRIPT), &csp_handler)
+        {
+            tracing::warn!(error = %e, "注入 CSP 脚本失败");
+        }
+    }
+}
+
+/// H2: 渲染进程崩溃自愈——注册 `ICoreWebView2::ProcessFailed` 事件。
+///
+/// - `RENDER_PROCESS_EXITED`（渲染进程已退出，可自愈）：调用 `Reload()` 重新加载页面。
+///   带防抖与预算限制，避免渲染进程反复崩溃时 Reload 死循环：
+///   - 两次重载之间最小间隔 `RELOAD_MIN_INTERVAL`（5s），窗口内连续崩溃只重载一次
+///   - 预算窗口 `RELOAD_BUDGET_WINDOW`（30s）内最多重载 `RELOAD_MAX_BUDGET`（3）次，
+///     超出后放弃自愈并 `PostQuitMessage(0)` 退出子进程
+/// - `BROWSER_PROCESS_EXITED`（浏览器进程已退出，不可自愈）：直接 `PostQuitMessage(0)`
+///   退出子进程，由父进程既有进程退出监听（spawn_proc_exit_monitor，state != Terminated
+///   即上报异常）兜底通知 UI，无需新增 IPC。
+/// - 其他进程失败类型（GPU/utility/frame 等）：由 WebView2 自行处理，仅记录日志。
+///
+/// 防抖状态用 `Cell` 存储：COM 事件回调为 `FnMut`（无 Send bound），始终在
+/// 拥有 WebView2 的线程上串行触发，无需跨线程同步。
+fn install_crash_recovery(webview: &ICoreWebView2) {
+    // 防抖常量：Reload 最小间隔与预算窗口内的最大重载次数。
+    const RELOAD_MIN_INTERVAL: Duration = Duration::from_secs(5);
+    const RELOAD_MAX_BUDGET: u32 = 3;
+    const RELOAD_BUDGET_WINDOW: Duration = Duration::from_secs(30);
+
+    // 防抖状态：最近一次 Reload 时间、预算窗口内的重载次数、预算耗尽标记。
+    let last_reload = Cell::new(None::<Instant>);
+    let reload_count = Cell::new(0u32);
+    let reload_disabled = Cell::new(false);
+    // 闭包内需调用 Reload，捕获 webview 的独立引用计数（COM AddRef），
+    // 事件处理器存活期间 webview 不会被释放。原参数引用仍用于下方注册事件。
+    let webview_owned = webview.clone();
+
+    let handler = ProcessFailedEventHandler::create(Box::new(
+        move |_sender,
+              args: Option<ICoreWebView2ProcessFailedEventArgs>|
+              -> windows::core::Result<()> {
+            let Some(args) = args else {
+                tracing::warn!("ProcessFailed 事件参数为空，忽略");
+                return Ok(());
+            };
+            let mut kind = COREWEBVIEW2_PROCESS_FAILED_KIND::default();
+            if let Err(e) = unsafe { args.ProcessFailedKind(&mut kind) } {
+                tracing::warn!(error = %e, "获取 ProcessFailedKind 失败，忽略");
+                return Ok(());
+            }
+            match kind {
+                COREWEBVIEW2_PROCESS_FAILED_KIND_RENDER_PROCESS_EXITED => {
+                    // 渲染进程已退出：Reload 自愈（带防抖/预算）
+                    let now = Instant::now();
+                    if reload_disabled.get() {
+                        tracing::error!("渲染进程频繁崩溃（预算已耗尽），退出子进程交由父进程兜底");
+                        unsafe { PostQuitMessage(0) };
+                        return Ok(());
+                    }
+                    // 距上次重载超过预算窗口 → 重置计数（重新开窗）
+                    if last_reload
+                        .get()
+                        .is_some_and(|t| now.duration_since(t) >= RELOAD_BUDGET_WINDOW)
+                    {
+                        reload_count.set(0);
+                    }
+                    // 距上次重载不足最小间隔 → 崩溃过于频繁，跳过 Reload（防抖）
+                    if last_reload
+                        .get()
+                        .is_some_and(|t| now.duration_since(t) < RELOAD_MIN_INTERVAL)
+                    {
+                        tracing::warn!("渲染进程短时间内再次崩溃，跳过 Reload（防抖）");
+                        return Ok(());
+                    }
+                    if reload_count.get() >= RELOAD_MAX_BUDGET {
+                        reload_disabled.set(true);
+                        tracing::error!("渲染进程反复崩溃（预算耗尽），放弃 Reload，退出子进程");
+                        unsafe { PostQuitMessage(0) };
+                        return Ok(());
+                    }
+                    reload_count.set(reload_count.get() + 1);
+                    last_reload.set(Some(now));
+                    tracing::warn!(
+                        count = reload_count.get(),
+                        "渲染进程已退出，Reload 重新加载页面自愈"
+                    );
+                    // Reload 失败（如浏览器进程也已退出）→ 退出子进程让父进程兜底
+                    // 闭包捕获的 webview_owned 为独立 COM 引用计数（'static），非参数借用
+                    if let Err(e) = unsafe { webview_owned.Reload() } {
+                        tracing::error!(error = %e, "Reload 失败，退出子进程交由父进程兜底");
+                        unsafe { PostQuitMessage(0) };
+                    }
+                }
+                COREWEBVIEW2_PROCESS_FAILED_KIND_BROWSER_PROCESS_EXITED => {
+                    // 浏览器进程已退出：不可自愈，退出子进程，父进程退出监听会上报
+                    tracing::error!("浏览器进程已退出，退出子进程交由父进程兜底");
+                    unsafe { PostQuitMessage(0) };
+                }
+                _ => {
+                    tracing::warn!(kind = ?kind.0, "其他进程失败类型，由 WebView2 自行处理");
+                }
+            }
+            Ok(())
+        },
+    ));
+    let mut token = EventRegistrationToken::default();
+    unsafe {
+        if let Err(e) = webview.add_ProcessFailed(&handler, &mut token) {
+            tracing::warn!(error = %e, "注册 ProcessFailed 崩溃自愈事件失败");
+        }
+    }
+}
+
+/// 创建 WebView2 控制器（不执行导航，导航由 Play 命令驱动）
+///
+/// E2E-01 竞态修复：create_webview 只负责环境/控制器/透明/安全加固等初始化，
+/// 不再做预热导航——导航唯一入口是父进程的 Play 命令，从根源消除双重导航竞态
+/// （预热导航 + Play 重复 Navigate → 第二次取消进行中导航 → NavigationCompleted
+/// 误报 IsSuccess=false）。此处仍调用 build_url 做同步校验，无效源可快速失败。
 ///
 /// v10.0 内存优化：通过 `CreateCoreWebView2EnvironmentWithOptions` 设置自定义
-/// `UserDataFolder`（数据根下 `webview2-cache/`）与磁盘缓存限制
-/// （10MB + 禁用 MediaCache），降低 WebView2 实际内存占用 20-50MB。若环境选项创建
-/// 失败则回退到默认 `CreateCoreWebView2Environment`。
+/// `UserDataFolder`（数据根下 `webview2-cache/<pid>/`，每实例独立子目录以支持多显示器）
+/// 与磁盘缓存限制（10MB + 禁用 MediaCache），降低 WebView2 实际内存占用 20-50MB。
+/// 若环境选项创建失败则回退到默认 `CreateCoreWebView2Environment`。
 pub(crate) fn create_webview(
     hwnd: HWND,
     source: &str,
+    cdp_port: Option<u16>,
 ) -> Result<ICoreWebView2Controller, MirrorStarError> {
+    // H3: 首帧透明根治——在创建 WebView2 环境之前设置 WEBVIEW2_DEFAULT_BACKGROUND_COLOR
+    // 环境变量（AARRGGBB 格式，前 2 位 alpha=00 = 全透明），使环境从创建起即透明，
+    // 消除导航/首帧渲染前的白底闪烁（比 controller 创建后 SetDefaultBackgroundColor
+    // 更早生效）。仅在子进程内设置（std::env 仅影响本进程，不影响父进程）。
+    // 保留下方 apply_transparent_controller（SetDefaultBackgroundColor）作为兜底，
+    // 覆盖环境变量被外部覆盖/未生效的场景。
+    std::env::set_var("WEBVIEW2_DEFAULT_BACKGROUND_COLOR", "00ffffff");
+
+    // CDP 观察通道（仅测试）：传 --cdp-port 时在 WebView2 环境创建前注入
+    // WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS，使浏览器进程监听 --remote-debugging-port，
+    // 供模拟人类操作测试做 DOM 断言。保留环境中已有参数（合并而非覆盖）。
+    if let Some(port) = cdp_port {
+        let existing = std::env::var("WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS").unwrap_or_default();
+        let arg = format!("--remote-debugging-port={port}");
+        let merged = if existing.is_empty() {
+            arg
+        } else {
+            format!("{existing} {arg}")
+        };
+        std::env::set_var("WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS", merged);
+    }
+
     // 创建 WebView2 环境（W-006: 用 wait_with_pump_timeout 替代 wait_for_async_operation，
     // 避免外部函数内部 GetMessageA 无限阻塞导致子进程挂起）
     let environment = {
@@ -609,20 +1077,30 @@ pub(crate) fn create_webview(
         })?;
     }
 
+    // 透明背景（防白闪）：在首次 Navigate 前设置。仅尝试，失败不阻断壁纸加载。
+    apply_transparent_controller(&controller);
+
     // 获取 WebView
     let webview = unsafe { controller.CoreWebView2() }.map_err(corewebview2_error)?;
 
-    // 构建导航 URL（SEC-004: build_url 会拒绝 javascript:/data:/vbscript:/about:/file: 等危险协议）
-    let url = build_url(source)?;
+    // 安全加固（SEC-005）：禁右键/状态栏/加速键/内置错误页/新窗口逃逸 + 注入最小化 CSP。
+    // 全部尽力而为，失败仅 warn，不中断导航。
+    harden_webview(&webview);
 
-    tracing::info!(url = %url, "WebView2 导航到");
+    // H2: 渲染进程崩溃自愈——注册 ProcessFailed 事件（尽力而为，失败仅 warn，不中断导航）。
+    install_crash_recovery(&webview);
 
-    // 导航到源
-    unsafe {
-        webview
-            .Navigate(&HSTRING::from(&url))
-            .map_err(|e| MirrorStarError::DesktopIntegration(format!("导航失败: {}", e)))?;
-    }
+    // 构建导航 URL（SEC-004: build_url 会拒绝 javascript:/data:/vbscript:/about:/file: 等危险协议）。
+    // E2E-01 竞态修复：此处仅做 URL 校验，不再执行预热导航。
+    //
+    // 根因：父进程 Play 命令到达前 create_webview 已 Navigate 一次（预热），Play 再 Navigate
+    // 同一 URL 时第二次 Navigate 会取消进行中的首次导航，导致 NavigationCompleted 以
+    // IsSuccess=false 回调，Play 命令误判加载失败，父进程随之终止子进程。
+    //
+    // 优雅方案（单一导航来源）：删除预热导航，让 Play 命令成为唯一导航入口——创建 WebView2
+    // 控制器（含环境/控制器/透明/安全加固）与导航解耦，导航时机完全由父进程 Play 命令掌控，
+    // 从根源消除双重导航竞态，同时保留 build_url 的同步校验（无效源仍可快速失败）。
+    let _url = build_url(source)?;
 
     // 设置初始边界
     // WP08: GetClientRect 失败时直接返回 Err，避免使用 (0,0,0,0) 边界导致 WebView2 不可见。
@@ -714,6 +1192,67 @@ fn has_scheme_prefix(source: &str, prefix: &str) -> bool {
         .is_some_and(|s| s.eq_ignore_ascii_case(prefix))
 }
 
+/// 从 http/https URL 提取主机名（不含端口）。
+///
+/// 简单解析（不依赖外部 URL 库，避免引入新依赖）：
+/// 1. 去 scheme（`"://"` 之前的部分）
+/// 2. 截止到首个 `/` / `?` / `#`（路径、查询、片段分隔符）
+/// 3. 处理主机部分：
+///    - 以 `[` 开头 → IPv6 字面量，取方括号内内容（保留 scope id，如 `[fe80::1%3]`
+///      → `fe80::1%3`；`[::1]` → `::1`），并忽略 `]` 之后可能的端口
+///    - 否则 → 按首个 `:` 截止（剥离端口，兼容 IPv4 / 域名）
+///
+/// 仅用于远程域名白名单比对（SEC-005）。local 路径/非法输入返回 `None`。
+fn extract_host(url: &str) -> Option<&str> {
+    let rest = url.split_once("://").map(|(_, r)| r).unwrap_or(url);
+    // 截止到首个路径/查询/片段分隔符（主机部分之后不允许再出现这些字符）
+    let host_part = match rest.find(['/', '?', '#']) {
+        Some(idx) => &rest[..idx],
+        None => rest,
+    };
+    // IPv6 字面量 `[addr]` / `[addr%scope]`：取方括号内内容（保留 scope id），
+    // 并忽略 `]` 之后的 `:port`。非方括号形式按首个 `:` 截止剥离端口。
+    let host = if let Some(inner) = host_part.strip_prefix('[') {
+        match inner.split_once(']') {
+            Some((addr, _)) => addr,
+            None => inner, // 防御：未闭合的 `[`，按剩余内容处理
+        }
+    } else {
+        host_part.split(':').next().unwrap_or("")
+    };
+    if host.is_empty() {
+        None
+    } else {
+        Some(host)
+    }
+}
+
+/// 判断远程域名是否在白名单内（或本身是本地调试域名），白名单由参数显式传入。
+///
+/// SEC-005：空白名单 → **拒绝所有远程域名**（默认收紧，fail-closed）；非空时仅放行
+/// 白名单内域名，且始终放行 `localhost` / `127.0.0.1`（本机回环调试，无 SSRF 风险）。
+/// 大小写不敏感（主机名不区分大小写）。解析不出主机名（无 scheme / 非法输入）时
+/// **拒绝**（fail-closed），由 `build_url` 返回明确错误。
+fn is_remote_domain_allowed_with(whitelist: &[&str], url: &str) -> bool {
+    let host = match extract_host(url) {
+        Some(h) => h.to_ascii_lowercase(),
+        // 解析不出主机名时拒绝（fail-closed）：build_url 仅对 http/https 调用本函数，
+        // 解析失败意味着输入异常，不应放行
+        None => return false,
+    };
+    if host == "localhost" || host == "127.0.0.1" {
+        return true;
+    }
+    whitelist
+        .iter()
+        .any(|allowed| allowed.eq_ignore_ascii_case(&host))
+}
+
+/// 使用默认白名单 `ALLOWED_REMOTE_DOMAINS` 判断远程域名是否允许。
+fn is_remote_domain_allowed(url: &str) -> bool {
+    is_remote_domain_allowed_with(ALLOWED_REMOTE_DOMAINS, url)
+}
+
 /// 构建导航 URL，支持 http/https 和本地文件路径
 ///
 /// SEC-004: 显式拒绝 `javascript:` / `data:` / `vbscript:` / `file:` 等危险协议，
@@ -749,6 +1288,15 @@ pub(crate) fn build_url(source: &str) -> Result<String, MirrorStarError> {
     }
 
     if has_scheme_prefix(source, "http://") || has_scheme_prefix(source, "https://") {
+        // SEC-005: 远程域名白名单（纵深防御）。默认空表 = 拒绝所有远程 http/https
+        // （fail-closed，仅放行 localhost/127.0.0.1），与既有"空表不限制"语义相反：
+        // 远程壁纸源必须在 ALLOWED_REMOTE_DOMAINS 中显式加入其域名。
+        if !is_remote_domain_allowed(source) {
+            let host = extract_host(source).unwrap_or("");
+            return Err(MirrorStarError::InvalidUrl {
+                scheme: format!("remote-domain-not-allowed:{}", host),
+            });
+        }
         return Ok(source.to_string());
     }
 
@@ -783,6 +1331,52 @@ pub(crate) fn build_url(source: &str) -> Result<String, MirrorStarError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── Task 5.1: AdditionalBrowserArguments 参数契约 ──────────────────────
+
+    /// Task 5.1：参数串必须保留 E2E 实测必需项，并包含本任务新增的内存裁剪项。
+    ///
+    /// 该测试锁定"必须保留"与"必须存在"两集合，防止后续维护误删
+    /// `--autoplay-policy=no-user-gesture-required`（壁纸点击穿透、永远拿不到用户手势，
+    /// 去掉会导致带音频网页壁纸无法自动播放）或回退内存裁剪参数。
+    #[test]
+    fn task5_1_additional_browser_args_contract() {
+        let args = build_additional_browser_args();
+
+        // E2E-02 必需项（保留原样）
+        assert!(
+            args.contains("--autoplay-policy=no-user-gesture-required"),
+            "必须保留 autoplay-policy=no-user-gesture-required，实际: {args}"
+        );
+        // 既有磁盘缓存限制与 GPU 缓存裁剪（不得回退）
+        assert!(
+            args.contains("--disk-cache-size=10485760"),
+            "应保留磁盘缓存限制，实际: {args}"
+        );
+        assert!(args.contains("--disable-gpu-program-cache"));
+        assert!(args.contains("--disable-gpu-shader-disk-cache"));
+        assert!(args.contains(
+            "--disable-features=MediaCache,FontCache,GpuMemDiscardable,BackForwardCache"
+        ));
+        // Task 5.1 新增项
+        assert!(
+            args.contains("--renderer-process-limit=1"),
+            "应限制渲染进程数为 1，实际: {args}"
+        );
+        assert!(
+            args.contains("--js-flags=--max-old-space-size=512"),
+            "应限制 V8 老生代堆上限为保守值 512MB，实际: {args}"
+        );
+        // 负向约束：不得引入会破坏透明首帧/WebGL 壁纸的激进开关
+        assert!(
+            !args.contains("--disable-gpu "),
+            "不得整块禁用 GPU（会破坏 WebGL 壁纸与透明首帧）"
+        );
+        assert!(
+            !args.contains("--disable-javascript"),
+            "不得禁用 JavaScript（网页壁纸依赖 JS 渲染）"
+        );
+    }
 
     // ── parse_rect 测试 ─────────────────────────────────────────────────────
 
@@ -901,18 +1495,28 @@ mod tests {
 
     #[test]
     fn test_build_url_http() {
-        assert_eq!(
-            build_url("http://example.com").unwrap(),
-            "http://example.com"
-        );
+        // H1 收紧后：远程域名默认不在白名单，应返回 Err（scheme=remote-domain-not-allowed:<host>）
+        let result = build_url("http://example.com");
+        assert!(result.is_err(), "远程 http 默认应被拒绝");
+        match result {
+            Err(MirrorStarError::InvalidUrl { scheme }) => {
+                assert_eq!(scheme, "remote-domain-not-allowed:example.com");
+            }
+            other => panic!("期望 InvalidUrl 错误，实际: {:?}", other),
+        }
     }
 
     #[test]
     fn test_build_url_https() {
-        assert_eq!(
-            build_url("https://example.com/page").unwrap(),
-            "https://example.com/page"
-        );
+        // H1 收紧后：远程域名默认不在白名单，应返回 Err（scheme=remote-domain-not-allowed:<host>）
+        let result = build_url("https://example.com/page");
+        assert!(result.is_err(), "远程 https 默认应被拒绝");
+        match result {
+            Err(MirrorStarError::InvalidUrl { scheme }) => {
+                assert_eq!(scheme, "remote-domain-not-allowed:example.com");
+            }
+            other => panic!("期望 InvalidUrl 错误，实际: {:?}", other),
+        }
     }
 
     #[test]
@@ -1122,16 +1726,22 @@ mod tests {
 
     #[test]
     fn test_build_url_allows_http_https_case_variants() {
-        // WP-001: http/https 大小写变体也应被允许（RFC 3986 scheme 大小写不敏感）
-        assert_eq!(
-            build_url("HTTP://example.com").unwrap(),
-            "HTTP://example.com"
-        );
-        assert_eq!(
-            build_url("Https://example.com/page").unwrap(),
-            "Https://example.com/page"
-        );
+        // WP-001: http/https 大小写变体也应被允许（RFC 3986 scheme 大小写不敏感）。
+        // H1 收紧后：远程域名默认拒绝（大小写变体同样拒绝），仅 localhost 大小写变体放行。
+        for input in ["HTTP://example.com", "Https://example.com/page"] {
+            let result = build_url(input);
+            assert!(
+                result.is_err(),
+                "远程 http/https 大小写变体默认应被拒绝（输入: {}）",
+                input
+            );
+        }
+        // localhost 大小写变体仍放行（始终允许本机回环）
         assert_eq!(build_url("HTTP://localhost").unwrap(), "HTTP://localhost");
+        assert_eq!(
+            build_url("HTTPS://LOCALHOST:8443/w").unwrap(),
+            "HTTPS://LOCALHOST:8443/w"
+        );
     }
 
     #[test]
@@ -1156,6 +1766,143 @@ mod tests {
         // 空前缀（边界：任何字符串都以空前缀开头）
         assert!(has_scheme_prefix("anything", ""));
         assert!(has_scheme_prefix("", ""));
+    }
+
+    // ── SEC-005: 远程域名白名单 helper 测试 ─────────────────────────────
+    // 注：ALLOWED_REMOTE_DOMAINS 默认为空表 = 拒绝所有远程 http/https（fail-closed，
+    // 仅放行 localhost/127.0.0.1）。白名单命中/不命中/大小写通过显式传参的
+    // is_remote_domain_allowed_with 测试（不依赖全局常量）。
+
+    #[test]
+    fn sec005_extract_host_basic() {
+        assert_eq!(
+            extract_host("https://example.com/page"),
+            Some("example.com")
+        );
+        assert_eq!(
+            extract_host("http://example.com:8080/p"),
+            Some("example.com")
+        );
+        assert_eq!(extract_host("https://localhost:8080"), Some("localhost"));
+        assert_eq!(
+            extract_host("https://sub.example.com/"),
+            Some("sub.example.com")
+        );
+    }
+
+    // ── M4: extract_host IPv6 / 端口 / 路径增强测试 ─────────────────────
+
+    #[test]
+    fn m4_extract_host_ipv6_literal() {
+        // IPv6 字面量 `[::1]`：取方括号内内容，不含端口
+        assert_eq!(extract_host("http://[::1]:8080/w"), Some("::1"));
+        assert_eq!(extract_host("https://[::1]/"), Some("::1"));
+    }
+
+    #[test]
+    fn m4_extract_host_ipv6_scope_id() {
+        // IPv6 scope id（`%3` 等）是地址的一部分，应保留
+        assert_eq!(extract_host("http://[fe80::1%3]/w"), Some("fe80::1%3"));
+        assert_eq!(
+            extract_host("https://[fe80::1%25eth0]:443/x"),
+            Some("fe80::1%25eth0")
+        );
+    }
+
+    #[test]
+    fn m4_extract_host_port_path_query_cutoff() {
+        // 端口剥离（IPv4 与域名）
+        assert_eq!(extract_host("http://example.com:8080"), Some("example.com"));
+        // 路径/查询/片段截止
+        assert_eq!(
+            extract_host("http://example.com/a/b?x=1#frag"),
+            Some("example.com")
+        );
+        assert_eq!(extract_host("http://example.com?x=1"), Some("example.com"));
+        assert_eq!(extract_host("http://example.com#frag"), Some("example.com"));
+        // 无 scheme 的裸主机（local 解析场景）
+        assert_eq!(extract_host("example.com/path"), Some("example.com"));
+        // 非法/空输入返回 None
+        assert_eq!(extract_host(""), None);
+        assert_eq!(extract_host("://"), None);
+    }
+
+    #[test]
+    fn sec005_is_remote_domain_allowed_local_host() {
+        // 本地调试域名始终放行（与白名单内容无关）。
+        assert!(is_remote_domain_allowed("http://localhost/w"));
+        assert!(is_remote_domain_allowed("http://127.0.0.1:3000/w"));
+    }
+
+    #[test]
+    fn sec005_is_remote_domain_allowed_default_empty_list() {
+        // H1 收紧后：默认空白名单拒绝所有远程域名（fail-closed）。
+        assert!(
+            !is_remote_domain_allowed("https://example.com/page"),
+            "空白名单应拒绝远程域名"
+        );
+        // build_url 对远程 http/https 也应返回 Err
+        assert!(build_url("https://example.com/page").is_err());
+    }
+
+    #[test]
+    fn sec005_is_remote_domain_allowed_with_empty_list() {
+        // 空表语义（H1）：仅放行 localhost/127.0.0.1，其余远程一律拒绝
+        assert!(is_remote_domain_allowed_with(
+            &[],
+            "http://localhost:8080/w"
+        ));
+        assert!(is_remote_domain_allowed_with(&[], "http://127.0.0.1/w"));
+        assert!(!is_remote_domain_allowed_with(
+            &[],
+            "https://example.com/page"
+        ));
+        assert!(!is_remote_domain_allowed_with(&[], "http://192.168.1.10/w"));
+    }
+
+    #[test]
+    fn sec005_is_remote_domain_allowed_with_whitelist_hit_miss() {
+        // 白名单命中：匹配时放行
+        assert!(is_remote_domain_allowed_with(
+            &["example.com"],
+            "https://example.com/page"
+        ));
+        // 白名单未命中：拒绝
+        assert!(!is_remote_domain_allowed_with(
+            &["example.com"],
+            "https://other.com/page"
+        ));
+        // 端口/路径不影响命中
+        assert!(is_remote_domain_allowed_with(
+            &["example.com"],
+            "https://example.com:8443/api?x=1#f"
+        ));
+        // 解析失败（无 scheme 的非法输入）→ 拒绝（fail-closed）
+        assert!(!is_remote_domain_allowed_with(&["example.com"], ""));
+    }
+
+    #[test]
+    fn sec005_is_remote_domain_allowed_with_case_insensitive() {
+        // 白名单匹配大小写不敏感（主机名不区分大小写）
+        assert!(is_remote_domain_allowed_with(
+            &["Example.COM"],
+            "https://example.com/page"
+        ));
+        assert!(is_remote_domain_allowed_with(
+            &["example.com"],
+            "HTTPS://EXAMPLE.COM/Page"
+        ));
+        assert!(is_remote_domain_allowed_with(
+            &["EXAMPLE.COM"],
+            "https://Example.com/"
+        ));
+    }
+
+    #[test]
+    fn sec005_host_extraction_case_insensitive() {
+        // 主机名大小写不敏感（升/降序比对逻辑正确性）。
+        let host = extract_host("HTTPS://EXAMPLE.COM/Path").expect("应解析出主机");
+        assert_eq!(host.to_ascii_lowercase(), "example.com");
     }
 
     // ── percent_encode_path 测试 ───────────────────────────────────────────

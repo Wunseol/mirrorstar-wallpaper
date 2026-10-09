@@ -4,6 +4,7 @@ members = [
     "src-tauri",
     "crates/mirrorstar-core",
     "crates/mirrorstar-wp-proc",
+    "crates/mirrorstar-ui",
 ]
 
 [workspace.package]
@@ -56,9 +57,10 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 tracing-appender = "0.2"
 
 # Image processing
-# default-features = false，仅启用实际使用的格式（png/jpeg/gif/bmp/webp/tiff）
-# 移除默认启用的 dds/exr/ff/hdr/ico/pnm/qoi/tga，减小编译时间与二进制体积
-image = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif", "bmp", "webp", "tiff", "rayon"] }
+# default-features = false，仅启用实际使用的格式（png/jpeg/gif/bmp/webp/tiff/ico）
+# ico：core 的 IMAGE_EXTS 含 "ico"，静态 .ico 壁纸需经此特性生成缩略图与解码，缺失会降级为类型图标
+# 移除默认启用的 dds/exr/ff/hdr/pnm/qoi/tga，减小编译时间与二进制体积
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif", "bmp", "webp", "tiff", "ico", "rayon"] }
 
 # File system
 dirs = "6"
@@ -84,14 +86,11 @@ clap = { version = "4", features = ["derive"] }
 webview2-com = "0.34"
 
 # Tauri
-# v16-D-011：移除 "protocol-asset" feature（前端全面切换 wpfile，asset 协议为死代码）
+# v16-D-011：移除 "protocol-asset" feature（主窗口前端已删除，asset 协议为死代码）
 # v16-D-013：收紧到 minor 级，Tauri 生态 minor 版本含 command API 变更
 tauri = { version = "2.11", features = ["tray-icon"] }
 tauri-plugin-dialog = "2.7"
 tauri-plugin-autostart = "2.5"
-
-# URL percent-decoding（wpfile:// 自定义协议路径解码）
-percent-encoding = "2"
 
 [profile.release]
 lto = true

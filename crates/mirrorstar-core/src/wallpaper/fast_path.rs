@@ -121,6 +121,113 @@ impl WallpaperEngine {
         }
     }
 
+    // ── `display_id = "all"` 广播（对全部活跃显示器逐个生效）────────────────────
+    //
+    // 命令层在 `display_id == Some("all")` 时调用以下方法。目标集合取
+    // `active_display_ids()`（`wallpaper_mode` 为权威：WorkerW 与 Native 均记录）。
+    // 失败语义与 `WallpaperEngine::set_scaling_mode_for_all` 一致——单个显示器失败
+    // 仅记录 warn 并继续处理其余显示器，最终返回首错；无活跃显示器时为 no-op 返回 Ok。
+
+    /// 遍历全部活跃显示器执行 `op`；返回「`Ok(false)` 而被忽略」的显示器 id 列表。
+    ///
+    /// 与单显示器 `pause_wallpaper_fast` / `resume_wallpaper_fast` 的 `Ok(false)`
+    /// 语义对齐（无 pause_sender 被忽略），供命令层决定是否 emit 状态兜底。
+    fn broadcast_ignored_fast(
+        &self,
+        mut op: impl FnMut(&str) -> Result<bool, MirrorStarError>,
+    ) -> Result<Vec<String>, MirrorStarError> {
+        let mut ignored = Vec::new();
+        let mut first_err: Option<MirrorStarError> = None;
+        for id in self.active_display_ids() {
+            match op(&id) {
+                Ok(true) => {}
+                Ok(false) => ignored.push(id),
+                Err(e) => {
+                    tracing::warn!(
+                        display_id = %id,
+                        error = %e,
+                        "广播快速路径命令对单个显示器失败，继续处理其余显示器"
+                    );
+                    if first_err.is_none() {
+                        first_err = Some(e);
+                    }
+                }
+            }
+        }
+        match first_err {
+            Some(e) => Err(e),
+            None => Ok(ignored),
+        }
+    }
+
+    /// 广播暂停到全部活跃显示器（`display_id = "all"`）。
+    ///
+    /// 返回「无 pause_sender 而被忽略」的显示器 id 列表。
+    pub fn broadcast_pause_fast(&self) -> Result<Vec<String>, MirrorStarError> {
+        self.broadcast_ignored_fast(|id| self.pause_wallpaper_fast(id))
+    }
+
+    /// 广播恢复到全部活跃显示器（`display_id = "all"`）。
+    ///
+    /// 返回「无 pause_sender 而被忽略」的显示器 id 列表。
+    pub fn broadcast_resume_fast(&self) -> Result<Vec<String>, MirrorStarError> {
+        self.broadcast_ignored_fast(|id| self.resume_wallpaper_fast(id))
+    }
+
+    /// 广播音量到全部活跃显示器（`display_id = "all"`）。
+    pub fn broadcast_set_volume_fast(&self, volume: f32) -> Result<(), MirrorStarError> {
+        let mut first_err: Option<MirrorStarError> = None;
+        for id in self.active_display_ids() {
+            if let Err(e) = self.set_volume_fast(&id, volume) {
+                tracing::warn!(
+                    display_id = %id,
+                    error = %e,
+                    "广播音量对单个显示器失败，继续处理其余显示器"
+                );
+                if first_err.is_none() {
+                    first_err = Some(e);
+                }
+            }
+        }
+        match first_err {
+            Some(e) => Err(e),
+            None => Ok(()),
+        }
+    }
+
+    /// 广播静音切换到全部活跃显示器（`display_id = "all"`）。
+    ///
+    /// 返回首个可读的新静音状态（`Some`）；全部无 pause_sender 时返回 `Ok(None)`
+    /// （与单显示器 `toggle_mute_fast` 的 `None` 语义一致）。
+    pub fn broadcast_toggle_mute_fast(&self) -> Result<Option<bool>, MirrorStarError> {
+        let mut result: Option<bool> = None;
+        let mut first_err: Option<MirrorStarError> = None;
+        for id in self.active_display_ids() {
+            match self.toggle_mute_fast(&id) {
+                Ok(Some(muted)) => {
+                    if result.is_none() {
+                        result = Some(muted);
+                    }
+                }
+                Ok(None) => {}
+                Err(e) => {
+                    tracing::warn!(
+                        display_id = %id,
+                        error = %e,
+                        "广播静音切换对单个显示器失败，继续处理其余显示器"
+                    );
+                    if first_err.is_none() {
+                        first_err = Some(e);
+                    }
+                }
+            }
+        }
+        match first_err {
+            Some(e) => Err(e),
+            None => Ok(result),
+        }
+    }
+
     /// 暂停所有壁纸（通过快速路径）
     ///
     /// 返回失败的 display_id 列表；空 Vec 表示全部发送成功。
@@ -255,40 +362,14 @@ impl WallpaperEngine {
                 .unwrap_or(false);
             if terminated {
                 // 全屏终止的渲染器需 play() 完整重启，随后 reembed 重新嵌入 WorkerW、
-                // 执行 after_embed（IPC loadfile 重新加载视频）并重建 PauseSender。
+                // 执行 after_embed（IPC loadfile 重新加载视频）并重建 PauseSender，
+                // 最后把共享状态同步为 Playing 并通知前端。
                 //
-                // 先通过 `get_mut().map(|r| r.play())` 得到 `Option<Result<..>>`：
-                // 闭包返回 play() 的 Result，借用随 map 调用结束而释放，之后才能
-                // 以 `&mut self` 调用 reembed_and_register_renderer（避免借用冲突）。
-                match self.wallpapers.get_mut(&display_id).map(|r| r.play()) {
-                    Some(Ok(())) => {
-                        match self.reembed_and_register_renderer(&display_id) {
-                            Ok(()) => {
-                                // 此处 get 返回 reembed 替换后的新 sender；将共享状态
-                                // 同步为 Playing 并通知前端 UI。
-                                if let Some(sender) = self.pause_senders.get(&display_id) {
-                                    sender.set_state(WallpaperState::Playing);
-                                    sender.notify_state_changed(&display_id);
-                                }
-                            }
-                            Err(e) => {
-                                tracing::error!(
-                                    display_id,
-                                    error = %e,
-                                    "全屏终止后重启壁纸失败：重新嵌入失败"
-                                );
-                                failed.push(display_id);
-                            }
-                        }
-                    }
-                    Some(Err(e)) => {
-                        tracing::error!(display_id, error = %e, "全屏终止后重启壁纸失败");
-                        failed.push(display_id);
-                    }
-                    None => {
-                        tracing::error!(display_id, "全屏终止后重启壁纸失败：渲染器不存在");
-                        failed.push(display_id);
-                    }
+                // 该分支逻辑已抽取为 `WallpaperEngine::revive_terminated`（纯净壁纸
+                // 模式 `enter_pure_mode` 复用同一实现，见 D3），此处仅聚合失败列表；
+                // 失败日志由 `revive_terminated` 内部按原文案记录（**不修改暂停位图**）。
+                if self.revive_terminated(&display_id).is_err() {
+                    failed.push(display_id);
                 }
             } else if let Some(sender) = self.pause_senders.get(&display_id) {
                 if let Err(e) = sender.send(PauseCommand::Resume) {
@@ -703,6 +784,76 @@ mod tests {
         let desktop = Arc::new(Mutex::new(DesktopIntegrator::new()));
         let volume_control = Arc::new(Mutex::new(VolumeControl::new_disabled()));
         WallpaperEngine::new(desktop, volume_control)
+    }
+
+    // ---------- "all" 广播（broadcast_*_fast）测试 ----------
+
+    #[test]
+    fn broadcast_fast_methods_apply_to_every_active_display() {
+        use crate::wallpaper::manager::WallpaperMode;
+
+        let mut engine = create_test_engine_no_com();
+        let (s0, mut rx0, _sh0) = create_pause_channel();
+        let (s1, mut rx1, _sh1) = create_pause_channel();
+        engine.pause_senders.insert("monitor_0".to_string(), s0);
+        engine.pause_senders.insert("monitor_1".to_string(), s1);
+        engine
+            .wallpaper_mode
+            .insert("monitor_0".to_string(), WallpaperMode::WorkerW);
+        engine
+            .wallpaper_mode
+            .insert("monitor_1".to_string(), WallpaperMode::WorkerW);
+
+        // 暂停广播：两个显示器各收到一次 Pause，忽略列表为空。
+        assert!(engine.broadcast_pause_fast().unwrap().is_empty());
+        assert!(matches!(rx0.try_recv(), Ok(PauseCommand::Pause)));
+        assert!(matches!(rx1.try_recv(), Ok(PauseCommand::Pause)));
+
+        // 恢复广播：对称。
+        assert!(engine.broadcast_resume_fast().unwrap().is_empty());
+        assert!(matches!(rx0.try_recv(), Ok(PauseCommand::Resume)));
+        assert!(matches!(rx1.try_recv(), Ok(PauseCommand::Resume)));
+
+        // 音量广播：逐个下发。
+        engine.broadcast_set_volume_fast(0.5).unwrap();
+        assert!(matches!(
+            rx0.try_recv(),
+            Ok(PauseCommand::SetVolume(v)) if (v - 0.5).abs() < 1e-6
+        ));
+        assert!(matches!(
+            rx1.try_recv(),
+            Ok(PauseCommand::SetVolume(v)) if (v - 0.5).abs() < 1e-6
+        ));
+
+        // 静音广播：逐个切换，返回首个可读的新状态（首次切换 → 静音 true）。
+        assert_eq!(engine.broadcast_toggle_mute_fast().unwrap(), Some(true));
+        assert!(matches!(rx0.try_recv(), Ok(PauseCommand::ToggleMute)));
+        assert!(matches!(rx1.try_recv(), Ok(PauseCommand::ToggleMute)));
+    }
+
+    #[test]
+    fn broadcast_fast_methods_no_active_displays_are_noop() {
+        // 无活跃显示器：暂停/恢复广播返回空忽略列表，音量 no-op，静音返回 None。
+        let engine = create_test_engine_no_com();
+        assert!(engine.broadcast_pause_fast().unwrap().is_empty());
+        assert!(engine.broadcast_resume_fast().unwrap().is_empty());
+        assert!(engine.broadcast_set_volume_fast(0.3).is_ok());
+        assert_eq!(engine.broadcast_toggle_mute_fast().unwrap(), None);
+    }
+
+    #[test]
+    fn broadcast_pause_reports_ignored_displays_without_sender() {
+        use crate::wallpaper::manager::WallpaperMode;
+
+        // 活跃但无 pause_sender（Native 模式）→ 计入忽略列表，不报错。
+        let mut engine = create_test_engine_no_com();
+        engine
+            .wallpaper_mode
+            .insert("monitor_0".to_string(), WallpaperMode::Native);
+        assert_eq!(
+            engine.broadcast_pause_fast().unwrap(),
+            vec!["monitor_0".to_string()]
+        );
     }
 
     #[test]

@@ -147,10 +147,10 @@ tracing_subscriber::fmt()
 
 - 使用 `CreateNamedPipeW` / `ConnectNamedPipe`（`std::fs` 读写），**不使用** `tokio::net::windows::named_pipe`
 - 双向、可靠有序，Windows 原生，无外部依赖
-- 管道服务端由子进程（mpv.exe / mirrorstar-wp-proc.exe）创建，主进程作为客户端连接
+- 管道服务端由子进程（mpv.exe / 壳进程 `--wp-proc` 模式实例）创建，主进程作为客户端连接
 - 消息为 JSON 文本，换行分隔
 
-### 两套独立 IPC 协议
+### 三套独立 IPC 协议
 
 #### 1. mpv 原生 JSON IPC（视频壁纸）
 
@@ -171,6 +171,15 @@ tracing_subscriber::fmt()
 | 协议格式 | `WpProcCommand` JSON + 换行分隔（自定义协议） |
 | 通信方式 | 主进程作为客户端连接 wp-proc 管道服务端 |
 | 命令 | `Play` / `Terminate` / `SetPosition` / `Navigate` / `Pause` / `Resume` |
+
+#### 3. `ui_proto` NDJSON over stdio（壳 ↔ 原生 UI 子进程）
+
+| 项 | 说明 |
+|----|------|
+| 定义位置 | `mirrorstar-core::ui_proto`（壳与 `mirrorstar-ui` 共享） |
+| 传输方式 | UI 子进程标准输入 / 标准输出（**非**命名管道；同步 stdio 行读写） |
+| 协议格式 | 一行一条 JSON（NDJSON 行协议） |
+| 消息类型 | `Hello`（握手）/ `Request`（业务请求 + request_id）/ `Response`（应答）/ `Event`（壳→UI 异步推送）/ `Control`（生命周期控制） |
 
 ### 连接重试（实测自 subprocess_base.rs）
 
@@ -196,7 +205,7 @@ workspace 配置：`tokio = { version = "1.52", features = ["rt", "rt-multi-thre
 |------|------|
 | 广播通道 | WallpaperEngine 状态变更 broadcast 订阅（`sync`） |
 | 事件监听 | 全屏 / 电池事件驱动处理 |
-| 前端通信 | Tauri 命令与事件异步消息 |
+| UI 通信 | 壳与原生 UI 子进程的 `ui_proto` 消息（stdio NDJSON） |
 
 > **注意**：命名管道 IPC 使用同步 Win32 API，**不经过** tokio 异步运行时；文件监控热重载均在独立线程完成。
 

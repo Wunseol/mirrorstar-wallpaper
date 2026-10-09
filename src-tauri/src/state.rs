@@ -1,11 +1,10 @@
 use crate::scheduler::SchedulerHandle;
 use mirrorstar_core::{
-    ATOMIC_SWAP_IN_PROGRESS, ConfigManager, DesktopIntegrator, PauseReason, WallpaperEngine,
+    ConfigManager, DesktopIntegrator, PauseReason, WallpaperEngine, ATOMIC_SWAP_IN_PROGRESS,
 };
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
-use std::time::{SystemTime, UNIX_EPOCH};
-use tauri::{AppHandle, Manager, WebviewUrl, WebviewWindowBuilder};
+use tauri::AppHandle;
 
 /// 应用状态
 ///
@@ -104,6 +103,7 @@ use tauri::{AppHandle, Manager, WebviewUrl, WebviewWindowBuilder};
 /// | `desktop` | `Arc<std::sync::Mutex<DesktopIntegrator>>` | std 同步 `Mutex` | `.lock().unwrap_or_else(\|e\| e.into_inner())` |
 /// | `tray_paused` | `AtomicBool` | 原子变量 | `.load(Ordering::SeqCst)` / `.store(_, Ordering::SeqCst)` |
 /// | `tray_pause_resume_item` | `OnceLock<MenuItem>` | 一次性写入 | `.get()` / `.set(item)` |
+/// | `tray_pure_mode_item` | `OnceLock<CheckMenuItem>` | 一次性写入 | `.get()` / `.set(item)` |
 ///
 /// 注意：`wallpaper_engine` 与 `desktop` 是不同类型的 `Mutex`（tokio vs std），
 /// 不可互换使用——详见 workerw_check.rs 的 async 锁使用场景说明。
@@ -127,6 +127,9 @@ pub struct AppState {
     pub tray_paused: AtomicBool,
     /// 托盘"暂停/恢复壁纸"菜单项引用，用于在切换状态后更新菜单文本
     pub tray_pause_resume_item: OnceLock<tauri::menu::MenuItem<tauri::Wry>>,
+    /// 托盘"纯净壁纸（按任意键退出）"勾选项引用，用于进入/退出模式后同步勾选态
+    /// （见 `platform::pure_mode::set_checked`，须在非主线程调用 `set_checked`）
+    pub tray_pure_mode_item: OnceLock<tauri::menu::CheckMenuItem<tauri::Wry>>,
 }
 
 // ── Global Statics ──────────────────────────────────────────────────────────
@@ -182,56 +185,6 @@ pub struct AppState {
 /// 在 `lib.rs` 的 `setup` hook 中通过 `SHARED_APP_HANDLE.set(app.handle().clone())`
 /// 设置一次。workerw_check 任务在 reinit 成功后读取此 handle emit 事件。
 pub(crate) static SHARED_APP_HANDLE: OnceLock<AppHandle> = OnceLock::new();
-
-/// 全屏时是否隐藏了主窗口（退出全屏后需恢复以还原 UI）
-///
-/// 全屏动作生效（pause/terminate）时若主窗口打开则隐藏其 WebView2，
-/// 接受瞬时内存占用，避免销毁聚焦 WebView2 窗口触发 wry 空指针崩溃。
-/// 此标志记录"需在退出全屏后恢复"。`swap(false)` 消费标志，避免重复恢复。
-pub(crate) static FULLSCREEN_MAIN_WINDOW_HIDDEN: AtomicBool = AtomicBool::new(false);
-
-/// 最近一次主窗口销毁的 Unix 毫秒时间戳（0 = 从未销毁）。
-///
-/// 主窗口采用"关闭即销毁以释放 WebView2 内存"的策略（v8.0），窗口销毁会触发
-/// WebView2 子进程退出 + 托盘区域重绘，可能在关闭后的极短窗口内再次派发
-/// `TrayIconEvent::Click(Up)`，导致 `create_or_show_main_window` 重入 build 路径
-/// 重建窗口（表现为"关窗后窗口自动重现"）。此时间戳用于阻断该同批次重入。
-///
-/// 注意：该记录仅用于**竞态防抖**，不改变"用户主动点击托盘可打开窗口"的语义——
-/// 冷却窗口极短，用户主动操作总是晚于关闭瞬间，不受影响。
-pub(crate) static MAIN_WINDOW_LAST_DESTROYED: AtomicU64 = AtomicU64::new(0);
-
-/// 主窗口关闭后拒绝"托盘重入重建"的冷却窗口。销毁瞬间的系统重绘/事件重入
-/// 通常在几百毫秒内完成，取 1.5s 作为安全边界。
-const MAIN_WINDOW_REOPEN_COOLDOWN_MS: u64 = 1500;
-
-/// 获取当前 Unix 毫秒时间戳（时钟异常时按 0 处理）。
-fn now_unix_ms() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_millis() as u64)
-        .unwrap_or(0)
-}
-
-/// 记录主窗口刚被销毁（须在主窗口关闭导致的 `ExitRequested(code=None)` 路径调用）。
-///
-/// 供 `create_or_show_main_window` 判断是否处于销毁后冷却窗口，阻断托盘重入重建。
-pub(crate) fn record_main_window_destroyed() {
-    MAIN_WINDOW_LAST_DESTROYED.store(now_unix_ms(), Ordering::SeqCst);
-}
-
-/// 是否处于"最近一次主窗口销毁后的冷却窗口"内。
-///
-/// 若为 true，则 `create_or_show_main_window` 应忽略本次重建请求（判定为
-/// 销毁瞬间的托盘事件重入），避免窗口自动重现。用户主动操作必然晚于关闭瞬间，
-/// 故不会被误拦。
-fn within_reopen_cooldown() -> bool {
-    let last = MAIN_WINDOW_LAST_DESTROYED.load(Ordering::SeqCst);
-    if last == 0 {
-        return false;
-    }
-    now_unix_ms().saturating_sub(last) < MAIN_WINDOW_REOPEN_COOLDOWN_MS
-}
 
 /// 全局状态用于 Win32 回调（回调需要函数指针，无法使用闭包）
 /// 全屏检测和电源监控共享同一个 wallpaper_engine Arc
@@ -377,7 +330,7 @@ pub(crate) static WORKERW_INIT_THREAD: Mutex<Option<std::thread::JoinHandle<()>>
 /// - **执行环境**：tokio blocking 线程池（与 `set_wallpaper` 的 `spawn_blocking` 共享）
 /// - **典型耗时**：
 ///   - Image/Gif：<100ms（解码 + 缩放 + 写入）
-///   - Video：500ms-2s（ffmpeg 抽帧，取决于视频长度与 ffmpeg 可用性）
+///   - Video：500ms-2s（随包 mpv 抽帧，取决于视频长度）
 /// - **完成判定**：`JoinHandle::is_finished()` 返回 `true` 表示任务已退出
 ///   （无论成功/失败/panic）
 /// - **结果回调**：任务内部通过 `app.emit("wallpaper-updated" / "wallpaper-thumbnail-failed")`
@@ -448,6 +401,22 @@ pub(crate) static SHUTDOWN_DONE: AtomicBool = AtomicBool::new(false);
 /// - 锁忙时返回 `None`：事件会重复触发（`WM_POWERBROADCAST` / `EVENT_SYSTEM_FOREGROUND`），
 ///   可容忍偶发跳过。
 pub(crate) fn try_pause_all_fast(reason: PauseReason) -> Option<Vec<String>> {
+    // 纯净壁纸模式守卫（D5）：模式内跳过暂停/恢复/终止处置，状态冻结。
+    // 返回 None 与现有"原子交换进行中跳过"语义一致——调用方把 None 当作"锁忙/跳过"，
+    // 不更新 FULLSCREEN_WAS / POWER_WAS_ON_BATTERY 等状态机标志，因此模式内状态保持冻结，
+    // 由模式退出后的补跑判定（fullscreen::reevaluate_now / power::reevaluate_now）统一纠正。
+    if mirrorstar_core::pure_mode::is_active() {
+        tracing::warn!(reason = ?reason, "纯净壁纸模式运行中，跳过壁纸暂停/恢复/终止处置（模式退出后会补跑判定）");
+        return None;
+    }
+    // 原子交换进行中跳过暂停（与 try_terminate_all_fast / resume_all_fast_blocking 一致）：
+    // 轮换原子交换 build 阶段（新渲染器构建/嵌入中）触发的 Pause 会让旧渲染器无谓暂停，
+    // 并在主窗口打开时触发 hide→restore 闪烁。返回 None 与"锁忙跳过"语义一致：
+    // 调用方不更新状态，事件会重复触发。
+    if atomic_swap_in_progress() {
+        tracing::warn!(reason = ?reason, "原子交换进行中，跳过 pause_all_fast（事件会重复触发）");
+        return None;
+    }
     let engine = SHARED_ENGINE.get()?;
     let engine = match engine.try_lock() {
         Ok(e) => e,
@@ -467,6 +436,12 @@ pub(crate) fn try_pause_all_fast(reason: PauseReason) -> Option<Vec<String>> {
 ///
 /// 与 [`try_pause_all_fast`] 对称，调用 `resume_all_fast`。返回值语义相同。
 pub(crate) fn try_resume_all_fast(reason: PauseReason) -> Option<Vec<String>> {
+    // 纯净壁纸模式守卫（D5）：模式内跳过恢复处置，状态冻结。返回 None 语义同
+    // "原子交换进行中跳过"——调用方不更新状态标志，由退出后的补跑判定统一纠正。
+    if mirrorstar_core::pure_mode::is_active() {
+        tracing::warn!(reason = ?reason, "纯净壁纸模式运行中，跳过壁纸暂停/恢复/终止处置（模式退出后会补跑判定）");
+        return None;
+    }
     let engine = SHARED_ENGINE.get()?;
     let mut engine = match engine.try_lock() {
         Ok(e) => e,
@@ -510,6 +485,12 @@ pub(crate) fn atomic_swap_in_progress() -> bool {
 /// - `Some(failed)`：已调用 `resume_all_fast`，`failed` 为失败的 display_id 列表
 ///   （空表示全部成功）。调用方据此决定是否更新 FULLSCREEN_WAS。
 pub(crate) fn resume_all_fast_blocking(reason: PauseReason) -> Option<Vec<String>> {
+    // 纯净壁纸模式守卫（D5）：模式内跳过恢复处置，状态冻结。返回 None 语义同
+    // "原子交换进行中跳过"——调用方保留 FULLSCREEN_WAS，由退出后的补跑判定统一纠正。
+    if mirrorstar_core::pure_mode::is_active() {
+        tracing::warn!(reason = ?reason, "纯净壁纸模式运行中，跳过壁纸暂停/恢复/终止处置（模式退出后会补跑判定）");
+        return None;
+    }
     // Task 4.3：原子交换进行中时跳过全屏恢复（语义同 try_terminate_all_fast）。
     // 返回 None 使调用方保留 FULLSCREEN_WAS，由周期复查线程在交换结束后重试恢复。
     if atomic_swap_in_progress() {
@@ -533,6 +514,13 @@ pub(crate) fn resume_all_fast_blocking(reason: PauseReason) -> Option<Vec<String
 /// - `None`：`SHARED_ENGINE` 未设置或锁忙，调用方应跳过本次事件，不更新状态标志
 /// - `Some(failed)`：已调用 `terminate_all_fast`，`failed` 为失败的 display_id 列表
 pub(crate) fn try_terminate_all_fast(reason: PauseReason) -> Option<Vec<String>> {
+    // 纯净壁纸模式守卫（D5）：模式内跳过终止处置，状态冻结（避免终止 mpv 后画面消失）。
+    // 返回 None 语义同"原子交换进行中跳过"——调用方不更新状态标志，
+    // 由模式退出后的补跑判定统一纠正。
+    if mirrorstar_core::pure_mode::is_active() {
+        tracing::warn!(reason = ?reason, "纯净壁纸模式运行中，跳过壁纸暂停/恢复/终止处置（模式退出后会补跑判定）");
+        return None;
+    }
     // Task 4.3：原子交换进行中时跳过全屏终止。原子交换阶段 A→C 期间 WorkerW
     // 正在被新窗嵌入/换槽，此时终止会重建 WorkerW 导致 commit 前校验失败
     // （"新窗父窗口已非当前 WorkerW"）与首帧等待超时。返回 None 与"锁忙跳过"语义
@@ -711,6 +699,12 @@ pub(crate) fn perform_shutdown_blocking(
     // 停止文件监视器：take 并 drop watcher，watcher 线程检测到后退出循环
     config_manager.stop_watching();
 
+    // 卸载纯净壁纸模式输入钩子线程（PostThreadMessageW(WM_QUIT) + join），
+    // 避免应用退出后残留低级键盘/鼠标钩子与隐藏顶层窗口。内部会 join 线程，属阻塞调用，
+    // 放在本函数（同步退出上下文）合适；必须在获取 engine 锁之前完成，
+    // 避免与仍持有 engine 锁的退出编排任务相互等待。
+    crate::platform::pure_mode::shutdown_input_hook();
+
     // 唤醒消息循环线程（GetMessageW 阻塞，需 PostThreadMessage 唤醒）
     // ST-005：抽取 signal_thread_exit 辅助函数，避免 FULLSCREEN/EXPLORER 重复 2 次
     signal_thread_exit(&FULLSCREEN_MONITOR_THREAD_ID);
@@ -846,90 +840,6 @@ pub(crate) fn perform_shutdown_blocking(
     // 原在此处手动调 CoUninitialize 会导致 VolumeControl Drop 时 COM 已反初始化。
 
     tracing::info!("应用退出清理完成");
-}
-
-/// 创建或显示主窗口。
-/// 如果窗口已存在则显示并聚焦，否则动态创建新窗口（延迟初始化 WebView2 以节省内存）。
-pub(crate) fn create_or_show_main_window(app: &tauri::AppHandle) {
-    // v8.0 内存优化：窗口销毁后重建，destroy() 释放 WebView2 内存。
-    // 窗口存在则 show/focus，不存在（关闭时已销毁）则 build 重建。
-    if let Some(window) = app.get_webview_window("main") {
-        // 最小化时 ShowWindow(SW_SHOW) 无法还原窗口，需先 unminimize() 还原。
-        if window.is_minimized().unwrap_or(false) {
-            if let Err(e) = window.unminimize() {
-                tracing::warn!(error = %e, "还原主窗口失败");
-            }
-        }
-        if let Err(e) = window.show() {
-            tracing::warn!(error = %e, "显示主窗口失败");
-        }
-        if let Err(e) = window.set_focus() {
-            tracing::warn!(error = %e, "聚焦主窗口失败");
-        }
-    } else {
-        // 销毁后冷却防抖：窗口刚被关闭销毁时，系统托盘区域重绘可能引发
-        // TrayIconEvent::Click 重入，走此 build 路径重建窗口（表现为"关窗后窗口
-        // 自动重现"）。若距最近销毁仍在冷却窗口内，判定为同批次重入并忽略。
-        if within_reopen_cooldown() {
-            tracing::info!("主窗口刚于销毁冷却窗口内，忽略托盘非主动重入，避免窗口自动重现");
-            return;
-        }
-        match WebviewWindowBuilder::new(app, "main", WebviewUrl::App("index.html".into()))
-            .title("镜星壁纸")
-            .inner_size(900.0, 600.0)
-            .min_inner_size(700.0, 500.0)
-            .center()
-            .build()
-        {
-            Ok(_) => {}
-            Err(e) => {
-                tracing::error!(error = %e, "创建主窗口失败");
-            }
-        }
-    }
-}
-
-/// 全屏进入：若主窗口打开则隐藏。原销毁路径会在销毁聚焦/最大化 WebView2 窗口时
-/// 触发 wry-0.55.1 空指针崩溃（进程 abort），现改为隐藏以避免崩溃。
-///
-/// 仅在主窗口打开且未最小化时置 `FULLSCREEN_MAIN_WINDOW_HIDDEN` 标志，供退出全屏后恢复。
-/// 最小化窗口不触碰（保持最小化），避免退出全屏后被弹出。
-/// 隐藏窗口保留其 WebView2 进程（约 6 进程 / 150-300MB 内存占用）但避免空指针崩溃。
-pub(crate) fn hide_main_window_on_fullscreen() {
-    let Some(app) = SHARED_APP_HANDLE.get() else {
-        return;
-    };
-    let Some(window) = app.get_webview_window("main") else {
-        return;
-    };
-    // 主窗口已最小化：全屏处置完全不触碰它（不隐藏、不置位恢复标记），
-    // 退出全屏后主窗口自然保持最小化状态。
-    if window.is_minimized().unwrap_or(false) {
-        tracing::info!("主窗口已最小化，全屏时不隐藏，退出全屏后保持最小化");
-        return;
-    }
-    FULLSCREEN_MAIN_WINDOW_HIDDEN.store(true, Ordering::SeqCst);
-    if let Err(e) = window.hide() {
-        tracing::warn!(error = %e, "全屏隐藏主窗口失败");
-    }
-}
-
-/// 全屏退出：若此前隐藏了主窗口则恢复（还原 UI）。
-pub(crate) fn restore_main_window_after_fullscreen() {
-    if FULLSCREEN_MAIN_WINDOW_HIDDEN.swap(false, Ordering::SeqCst) {
-        // 防换图误恢复：轮换/设置壁纸时的瞬时空前台事件（旧实现里嵌入时抢前台）
-        // 可能让全屏状态机误判"已退出全屏"。若此刻仍被全屏/最大化窗口覆盖，
-        // 则不显示主窗口并重新置位隐藏标记，待真正退出全屏后由周期复查线程
-        // 再次触发恢复，避免换图瞬间主窗口闪出。
-        if crate::platform::fullscreen::still_covered_by_fullscreen_window() {
-            FULLSCREEN_MAIN_WINDOW_HIDDEN.store(true, Ordering::SeqCst);
-            tracing::info!("仍有全屏/最大化窗口覆盖，保持主窗口隐藏，待真正退出全屏后恢复");
-            return;
-        }
-        if let Some(app) = SHARED_APP_HANDLE.get() {
-            create_or_show_main_window(app);
-        }
-    }
 }
 
 #[cfg(test)]
@@ -1132,17 +1042,6 @@ mod tests {
         );
     }
 
-    // ── SubTask 5.3.2: create_or_show_main_window 测试说明 ─────────────────────
-    //
-    // `create_or_show_main_window` 接收 `&tauri::AppHandle` 参数，需要运行中的 Tauri
-    // 应用实例。在单元测试环境中无法构造有效的 AppHandle（Tauri v2 的 AppHandle
-    // 必须通过 Builder::build() 创建，而 build() 需要 tauri.conf.json 上下文和
-    // 平台资源初始化）。
-    //
-    // 因此 create_or_show_main_window 的两种路径（窗口存在→show/focus、窗口不存在→build）
-    // 无法在单元测试中覆盖，需要通过端到端测试或手动测试验证。
-    // 跳过原因：Tauri AppHandle 无法在单元测试环境中构造。
-
     // ── 测试辅助函数 ──────────────────────────────────────────────────────────
 
     /// 创建测试用 WallpaperEngine（Arc<tokio::sync::Mutex<WallpaperEngine>>）
@@ -1213,6 +1112,54 @@ mod tests {
             flush_count >= 2,
             "perform_shutdown_blocking 应至少调用 config_manager.flush() 两次，实际: {}",
             flush_count
+        );
+    }
+
+    // ── 纯净壁纸模式状态守卫契约（D5）──────────────────────────────────────
+
+    /// D5：4 个共享 helper（`try_pause_all_fast` / `try_resume_all_fast` /
+    /// `try_terminate_all_fast` / `resume_all_fast_blocking`）均须含纯模式守卫，
+    /// 使模式内全屏/电源处置动作被跳过（返回 None，状态冻结）。
+    #[test]
+    fn pure_mode_guards_present_in_all_shared_helpers() {
+        let source = include_str!("state.rs");
+        // 运行期拼接搜索串，避免 include_str! 把测试自身的字面量计入匹配
+        let needle = ["mirrorstar_core::pure_mode::", "is_active()"].join("");
+        // 逐个 helper 切出函数体（签名到下一个 `pub(crate) fn` 之间）再断言守卫，
+        // 避免只统计全文件出现次数时被"复制粘贴漏改一处"绕过。
+        let next_sig = ["\npub(crate) ", "fn "].join("");
+        for name in [
+            "try_pause_all_fast",
+            "try_resume_all_fast",
+            "resume_all_fast_blocking",
+            "try_terminate_all_fast",
+        ] {
+            let sig = ["pub(crate) fn ", name].join("");
+            let start = source
+                .find(&sig)
+                .unwrap_or_else(|| panic!("源码应含共享 helper 定义 {sig}"));
+            let rest = &source[start + sig.len()..];
+            let end = match rest.find(&next_sig) {
+                Some(off) => start + sig.len() + off,
+                None => source.len(),
+            };
+            let body = &source[start..end];
+            assert!(
+                body.contains(&needle),
+                "共享 helper {name} 函数体内应含 {needle} 纯模式守卫"
+            );
+        }
+    }
+
+    /// 退出清理须先卸载纯净壁纸模式输入钩子线程（避免残留低级键盘/鼠标钩子
+    /// 与隐藏顶层窗口），且该调用须在获取 engine 锁之前完成。
+    #[test]
+    fn perform_shutdown_blocking_unloads_pure_mode_input_hook() {
+        let source = include_str!("state.rs");
+        let needle = ["shutdown_", "input_hook"].join("");
+        assert!(
+            source.contains(&needle),
+            "perform_shutdown_blocking 应调用 {needle}() 卸载输入钩子线程"
         );
     }
 }

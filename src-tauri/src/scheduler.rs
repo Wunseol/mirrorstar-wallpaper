@@ -38,7 +38,7 @@
 //! 同屏并发。Native 图片 / 无现有壁纸回退现有 `set_wallpaper` 同步便利路径（先关后设，
 //! DR-33 注）。失败保持旧壁纸、游标已推进跳过（DR-19）。
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::atomic::Ordering;
@@ -46,7 +46,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use crate::commands::wallpaper::DisplaySettingGuard;
-use mirrorstar_core::config::{PlaybackState, PlaybackStore, Unit};
+use mirrorstar_core::config::{DisplayInfo, PlaybackState, PlaybackStore, Unit};
 use mirrorstar_core::layout::{self, LayoutMonitor, LayoutPlane};
 use mirrorstar_core::scheduler::{
     filter_candidates, invalidate_sampler, resolve_boot, sample_next, BootDecision, PoolEntry,
@@ -188,6 +188,67 @@ impl SchedulerHandle {
         self.wake.notify_waiters();
     }
 
+    /// 手动「设为壁纸」成功后同步单元状态（DR-5 锚点 / DR-23 失效重建）。
+    ///
+    /// 手动设壁纸只经渲染引擎、不经过调度器采样；若不回写单元状态，「下一张」会从
+    /// 陈旧游标推进，与用户实际看到的壁纸脱节（游标缺失时更会回到池中第一张）。
+    /// 此方法把该单元：
+    /// - `current_wallpaper_id` 置为该壁纸；
+    /// - 采样游标锚定到该壁纸并清空洗牌袋（与 [`invalidate_sampler`] 在
+    ///   `current_id = Some(wallpaper_id)` 下的语义一致，DR-23）。
+    ///
+    /// 不写历史栈——保持既有「上一张」语义不变；写后立即落盘。
+    pub fn note_manual_set(&self, key: &str, wallpaper_id: &str) {
+        {
+            let mut play = self.playback.lock().unwrap_or_else(|e| e.into_inner());
+            apply_manual_anchor(&mut play, key, wallpaper_id);
+        }
+        self.flush_playback();
+    }
+
+    // ── 上一张（prev_wallpaper，Task 1 边界表 1/3/4/5/6/7/8/9/10/11/12） ─────────
+
+    /// 回退上一张：pop 历史栈顶经 [`apply_wallpaper_to_unit`] 应用；栈空返回 None。
+    ///
+    /// Task 1 边界：prev 消费即 pop 不放回（3/10）；只读历史栈、与采样算法无关（4）；
+    /// 不受暂停限制（5/6）；按单元隔离（7）；目标已删除 / apply 真失败则继续 pop 下一个
+    /// （8/9）；prev 目标即当前视为无效回退继续找更早（12）。成功后 emit
+    /// `wallpaper-rotated` 并落盘 `playback.toml`（暂停态下播放器维持暂停，DR-20）。
+    /// 显示器被并发换图占用（Busy，瞬时态）时恢复入栈返回 None，不吞历史条目。
+    ///
+    /// 循环主体提取为 [`pop_history_until_applied`]（apply 步骤注入闭包），单测
+    /// 用假 apply 覆盖边界 1/3/8/9——无需构造 Tauri App。历史依据：测试中构造
+    /// 真实 Wry App（或 tauri::test::mock_app）会单态化 Builder::build 海量代码，
+    /// 触发 rustc 1.98 LLVM 优化 ICE（write.rs:847）且产物加载即崩 0xc0000139。
+    pub async fn prev_wallpaper(&self, key: &str, app: &tauri::AppHandle) -> Option<String> {
+        // 布局平面与调度器主循环一致：配置编排 + 真实显示器枚举 → layout::plan。
+        let plane = {
+            let arrangement = self.config_manager.get_config().arrangement;
+            let displays = {
+                let desktop = self.desktop.lock().unwrap_or_else(|e| e.into_inner());
+                desktop.enumerate_displays()
+            };
+            let monitors: Vec<LayoutMonitor> = displays.iter().map(LayoutMonitor::from).collect();
+            layout::plan(arrangement, &monitors)
+        };
+
+        let target = pop_history_until_applied(&self.playback, key, |t| {
+            // 闭包内先取 plane 的引用再移入 async 块（FnMut 需可重复调用，
+            // 不能把非 Copy 的 LayoutPlane 直接移入）。
+            let plane = &plane;
+            async move {
+                apply_wallpaper_to_unit(
+                    self, plane, key, &t, /* record_history = */ false, app,
+                )
+                .await
+            }
+        })
+        .await?;
+        emit_rotated(app, key, &target);
+        self.flush_playback();
+        Some(target)
+    }
+
     // ── playback 防抖落盘（DR-29 简化：轮换/开机低频，直接原子写，PS1） ────────
 
     pub(crate) fn flush_playback(&self) {
@@ -201,6 +262,55 @@ impl SchedulerHandle {
     }
 }
 
+/// 回退循环主体：从单元历史栈 pop 栈顶，经 `apply`（返回 [`UnitApplyResult::Applied`]
+/// 表示应用成功）决定是否返回；栈空返回 None（Task 1 边界 1/3/8/9：栈空→None；
+/// 消费即 pop 不放回；apply 失败 / 目标已删除 → 继续 pop 下一个可用历史）。
+///
+/// 边界 8/9/12 的"失败继续 pop"只针对真失败（`Failed`：目标已删除 / 换图失败 /
+/// 同目标短路）；`Busy`（显示器被并发换图占用，瞬时态）不吞历史——把条目恢复入栈并
+/// 返回 None，用户稍后重试仍可命中该条目，避免并发窗口内有效历史被永久消耗。
+///
+/// `apply` 注入闭包而非硬编码 [`apply_wallpaper_to_unit`]，单测可注入假 apply
+/// 覆盖边界语义，无需构造 Tauri App——测试中构造 App 会单态化 Builder::build
+/// 海量代码，触发 rustc 1.98 LLVM 优化 ICE 且产物加载即崩（0xc0000139 排查结论）。
+async fn pop_history_until_applied<F, Fut>(
+    playback: &Arc<Mutex<PlaybackState>>,
+    key: &str,
+    mut apply: F,
+) -> Option<String>
+where
+    F: FnMut(String) -> Fut,
+    Fut: Future<Output = UnitApplyResult>,
+{
+    loop {
+        let target = {
+            let mut play = playback.lock().unwrap_or_else(|e| e.into_inner());
+            let unit = play.ensure_unit(key.to_string());
+            match unit.history.pop() {
+                Some(t) => t,
+                None => return None,
+            }
+        };
+        match apply(target.clone()).await {
+            UnitApplyResult::Applied => return Some(target),
+            // 真失败（目标已删除 / 换图失败 / 同目标短路）：继续找更早历史（边界 8/9/12）
+            UnitApplyResult::Failed => continue,
+            // 显示器正忙（并发换图占用，瞬时态）：恢复入栈不吞条目，本次返回无上一张，
+            // 稍后重试可再次弹出该条目（防 Busy 吞历史）。
+            UnitApplyResult::Busy => {
+                let mut play = playback.lock().unwrap_or_else(|e| e.into_inner());
+                play.ensure_unit(key.to_string()).push_history(&target);
+                tracing::info!(
+                    key,
+                    wallpaper_id = %target,
+                    "prev 目标显示器正忙，恢复入栈待重试（不吞历史）"
+                );
+                return None;
+            }
+        }
+    }
+}
+
 /// 无副作用地批量置位布局单元的 `enabled`（供测试复用；生产路径不再使用——单元默认
 /// 全开，用户按需经 `SchedulerHandle::set_unit_enabled` 单独开关是唯一控制通道）。
 /// 单元不存在则经 `ensure_unit` 新建后启用；不落盘、不唤醒。
@@ -209,6 +319,24 @@ fn set_layout_units_enabled(play: &mut PlaybackState, keys: &[String]) {
     for key in keys {
         play.ensure_unit(key.clone()).enabled = true;
     }
+}
+
+/// 手动「设为壁纸」成功后同步单元状态的纯逻辑（供 [`SchedulerHandle::note_manual_set`]
+/// 调用，可独立单测——无需构造 Tauri App / [`SchedulerHandle`]）。
+///
+/// 把 `key` 单元的当前壁纸置为 `wallpaper_id`，并清空洗牌袋、把顺序游标锚定到该壁纸
+/// （与 [`invalidate_sampler`] 在 `current_id = Some(wallpaper_id)` 下的语义一致，DR-23）。
+/// 不改动历史栈——保持既有「上一张」语义不变（DR-5 锚点）。
+fn apply_manual_anchor(play: &mut PlaybackState, key: &str, wallpaper_id: &str) {
+    let unit = play.ensure_unit(key.to_string());
+    unit.current_wallpaper_id = Some(wallpaper_id.to_string());
+    let mut sampler = SamplerState {
+        order_cursor: unit.order_cursor.clone(),
+        bag_remaining: unit.bag_remaining.clone(),
+    };
+    invalidate_sampler(&mut sampler, Some(wallpaper_id));
+    unit.order_cursor = sampler.order_cursor;
+    unit.bag_remaining = sampler.bag_remaining;
 }
 
 // ── 布局：消费 mirrorstar_core::layout 的 LayoutPlane（多屏排列布局域）────────
@@ -272,25 +400,47 @@ async fn run_loop(
     // 引擎构造默认 per_monitor；boot / 轮换会快照 renderer_config 读引擎内部
     // arrangement，此处先同步顶层配置，避免 Span / AllSame 几何错位（P0-2）。
     handle.engine.lock().await.set_arrangement(cfg.arrangement);
+    // 记录已生效的排列：主循环据此检测排列变更并按新布局即时重建（Task 5）。
+    let mut applied_arrangement = cfg.arrangement;
     apply_boot(&handle, &layout, &app).await;
     handle.flush_playback();
 
     let mut next_rotation: Option<Instant> = None;
 
+    // 显示器热插拔检测（Task 7）：以启动时枚举结果初始化"已知集合"，避免首个 tick
+    // 误报为变化；此后每 3 秒轮询一次（Windows 侧消息窗口为 message-only 窗口，收不到
+    // WM_DISPLAYCHANGE 广播，故用轮询）。错过 tick 直接跳过，不补跑。
+    let mut known_display_ids: Vec<String> = display_ids(&enumerate_displays(&handle));
+    let mut display_check = tokio::time::interval(Duration::from_secs(3));
+    display_check.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
     loop {
         // 每次醒来重读配置（热重载 / config 命令 / watcher 均落在此处生效）。
         let cfg = handle.config_manager.get_config();
+        // 多屏排列变更即时生效（Task 5）：同步引擎排列 → 对齐布局 → 立即按新布局
+        // 重建渲染器（关闭不再属于新布局的渲染器，并按各单元当前壁纸重新应用；不重新
+        // 采样，不改变用户当前壁纸）。排列未变化时不触发任何重建，避免无谓重建/闪屏。
+        let arr_changed = arrangement_changed(applied_arrangement, cfg.arrangement);
+        if arr_changed {
+            applied_arrangement = cfg.arrangement;
+            handle.engine.lock().await.set_arrangement(cfg.arrangement);
+        }
         if reconcile_and_align(&handle, cfg.arrangement, &mut layout) {
             handle.flush_playback();
         }
+        if arr_changed {
+            rebuild_for_layout(&handle, &layout, &app).await;
+        }
 
         // 暂停抑制（Layer 2，DR-9）：pause_reasons 非空 → 不安排定时轮换。
-        let paused = {
+        // 纯净壁纸模式期间同样不安排定时轮换（DR-9 同效），模式退出后由 wake 重算 deadline。
+        // 纯模式判断无需 engine 锁，`||` 短路时跳过加锁。
+        let suppressed = mirrorstar_core::pure_mode::is_active() || {
             let engine = handle.engine.lock().await;
             !engine.pause_reasons_snapshot().is_empty()
         };
 
-        let can_time = cfg.rotation.enabled && !paused && has_rotatable_unit(&handle, &layout);
+        let can_time = cfg.rotation.enabled && !suppressed && has_rotatable_unit(&handle, &layout);
 
         let desired: Option<Instant> = if can_time {
             match next_rotation {
@@ -325,12 +475,14 @@ async fn run_loop(
             Timed,
             Wake,
             Manual(Option<Option<String>>),
+            DisplayCheck,
         }
 
         let why = tokio::select! {
             _ = &mut sleep => Why::Timed,
             _ = &mut notified => Why::Wake,
             m = &mut manual_fut => Why::Manual(m),
+            _ = display_check.tick() => Why::DisplayCheck,
         };
 
         match why {
@@ -338,11 +490,13 @@ async fn run_loop(
                 // B3 / DR-38（3.2）：到点执行前重读暂停位图。若在此期间被暂停
                 // （全屏 / 电池 / 托盘），跳过本轮（幂等），回到循环顶部重算 deadline
                 // 并等待下次唤醒，避免暂停期误换图。
-                let paused_now = {
+                // 纯净壁纸模式期间同样不触达定时轮换（DR-9 同效），模式退出后由 wake 重算 deadline。
+                // 纯模式判断无需 engine 锁，`||` 短路时跳过加锁。
+                let suppressed_now = mirrorstar_core::pure_mode::is_active() || {
                     let engine = handle.engine.lock().await;
                     !engine.pause_reasons_snapshot().is_empty()
                 };
-                if paused_now {
+                if suppressed_now {
                     next_rotation = None;
                 } else {
                     let interval = rotation_interval(&handle.config_manager.get_config());
@@ -356,6 +510,33 @@ async fn run_loop(
                 invalidate_all_samplers(&handle, &layout);
                 next_rotation = None;
             }
+            Why::DisplayCheck => {
+                // 显示器热插拔（Task 7）：仅当 id 集合真正变化时推送新列表并即时生效
+                //（与排列变更一致）；集合未变化不做任何副作用，避免误触发重建 / 闪屏。
+                let displays = enumerate_displays(&handle);
+                let current_ids = display_ids(&displays);
+                if display_set_changed(&known_display_ids, &current_ids) {
+                    known_display_ids = current_ids;
+                    // 热插拔发生在 `tokio::select!` 等待期，循环顶部的 reconcile 用的是
+                    // 旧显示器集 → 此处 layout 已过期。重建前必须按新显示器集重新对账，
+                    // 否则 `rebuild_for_layout` 无法关闭已拔出显示器的渲染器（残留 / 可能
+                    // 回写），且下一轮顶部虽修正 layout 也不会再重建（无自愈）。
+                    if reconcile_and_align(&handle, cfg.arrangement, &mut layout) {
+                        handle.flush_playback();
+                    }
+                    // 按新布局即时重建（关闭已拔出显示器的渲染器，并按各单元当前壁纸重新应用）。
+                    if let Err(e) = app.emit("displays-changed", &displays) {
+                        tracing::warn!(
+                            error = %e,
+                            "推送 displays-changed 事件失败（UI 侧显示器列表可能滞后）"
+                        );
+                    }
+                    invalidate_all_samplers(&handle, &layout);
+                    next_rotation = None;
+                    rebuild_for_layout(&handle, &layout, &app).await;
+                    handle.flush_playback();
+                }
+            }
             Why::Manual(m) => {
                 match m {
                     None => {
@@ -364,9 +545,21 @@ async fn run_loop(
                         break;
                     }
                     Some(key) => {
-                        let target = resolve_target_key(&layout, key);
-                        if let Some(k) = target {
-                            sample_and_apply_unit(&handle, &layout, &k, &app).await;
+                        // 纯壁纸模式门控（A4）：手动"下一张"虽不受**暂停**抑制
+                        //（DR-20/DR-28 语义），但纯净壁纸模式下必须抑制——轮换会
+                        // terminate 被摘出的渲染器并换槽（commit_atomic_swap 校验的是
+                        // 新窗父窗口，拦不下该场景），导致置顶失效、退出时回嵌悬空。
+                        // 模式内画面与置顶状态不可被壁纸变更破坏。
+                        if mirrorstar_core::pure_mode::is_active() {
+                            tracing::info!(
+                                key = ?key,
+                                "纯净壁纸模式运行中，跳过手动『下一张壁纸』（模式内画面与置顶状态保持）"
+                            );
+                        } else {
+                            let target = resolve_target_key(&layout, key);
+                            if let Some(k) = target {
+                                sample_and_apply_unit(&handle, &layout, &k, &app).await;
+                            }
                         }
                         handle.flush_playback();
                     }
@@ -599,7 +792,12 @@ async fn apply_boot(handle: &SchedulerHandle, layout: &LayoutPlane, app: &tauri:
 
         match decision {
             BootDecision::Restore(id) => {
-                if apply_wallpaper_to_unit(handle, layout, &key, &id, app).await {
+                if apply_wallpaper_to_unit(
+                    handle, layout, &key, &id, /* record_history = */ true, app,
+                )
+                .await
+                    == UnitApplyResult::Applied
+                {
                     emit_rotated(app, &key, &id);
                 }
             }
@@ -609,6 +807,151 @@ async fn apply_boot(handle: &SchedulerHandle, layout: &LayoutPlane, app: &tauri:
             }
             BootDecision::None => {}
         }
+    }
+
+    // v17 启动期内存埋点：开机壁纸应用完成，标签带上各单元当前壁纸类型。
+    // 先取出 current id 并释放 playback 锁，再查配置解析类型，避免跨锁嵌套。
+    let current_ids: Vec<(String, Option<String>)> = {
+        let play = handle.playback.lock().unwrap_or_else(|e| e.into_inner());
+        layout::unit_keys(layout)
+            .into_iter()
+            .map(|key| {
+                let id = play
+                    .units
+                    .get(&key)
+                    .and_then(|u| u.current_wallpaper_id.clone());
+                (key, id)
+            })
+            .collect()
+    };
+    let mut parts: Vec<String> = Vec::with_capacity(current_ids.len());
+    for (key, id) in current_ids {
+        let ty = id
+            .as_deref()
+            .and_then(|id| handle.config_manager.get_wallpaper(id))
+            .map(|e| match e.wallpaper_type {
+                WallpaperType::Video => "Video",
+                WallpaperType::Gif => "Gif",
+                WallpaperType::Web => "Web",
+                WallpaperType::Image => "Image",
+            })
+            .unwrap_or("none");
+        parts.push(format!("{key}:{ty}"));
+    }
+    let type_summary = if parts.is_empty() {
+        "none".to_string()
+    } else {
+        parts.join(",")
+    };
+    mirrorstar_core::perf::mark_lifecycle(&format!("boot_wallpaper_applied {type_summary}"));
+}
+
+// ── 排列变更即时重建（Task 5）─────────────────────────────────────────────────
+
+/// 排列是否发生变化（同值短路，Task 5）：仅当已生效排列与当前配置排列不同才需重建，
+/// 避免无谓重建 / 闪屏。
+fn arrangement_changed(applied: Arrangement, current: Arrangement) -> bool {
+    applied != current
+}
+
+// ── 显示器热插拔检测（Task 7）─────────────────────────────────────────────────
+
+/// 提取显示器 id 列表（顺序不保证，集合比较由 [`display_set_changed`] 归一）。
+fn display_ids(displays: &[DisplayInfo]) -> Vec<String> {
+    displays.iter().map(|d| d.id.clone()).collect()
+}
+
+/// 显示器 id 集合是否发生变化（纯函数，顺序无关，Task 7）。
+///
+/// 排序后逐项比较，忽略枚举顺序差异；集合相同返回 `false`（同值短路，避免周期性
+/// 检测误触发重建 / 闪屏）。
+fn display_set_changed(prev: &[String], next: &[String]) -> bool {
+    let mut a: Vec<&str> = prev.iter().map(String::as_str).collect();
+    let mut b: Vec<&str> = next.iter().map(String::as_str).collect();
+    a.sort_unstable();
+    b.sort_unstable();
+    a != b
+}
+
+/// 枚举当前显示器列表（加锁取 `DesktopIntegrator` 后调用）。
+fn enumerate_displays(handle: &SchedulerHandle) -> Vec<DisplayInfo> {
+    let desktop = handle.desktop.lock().unwrap_or_else(|e| e.into_inner());
+    desktop.enumerate_displays()
+}
+
+/// 计算"不再属于新布局"的渲染器显示器 id（纯函数，供单测）。
+///
+/// `active` 为引擎当前活跃壁纸的显示器 id；`layout.unit_displays` 的并集为新布局
+/// 覆盖范围。返回 `active` 中不在覆盖范围内的项（例如已拔出的显示器）。
+fn stale_renderer_displays(active: &[String], layout: &LayoutPlane) -> Vec<String> {
+    let covered: HashSet<&str> = layout
+        .unit_displays
+        .values()
+        .flat_map(|v| v.iter().map(String::as_str))
+        .collect();
+    active
+        .iter()
+        .filter(|id| !covered.contains(id.as_str()))
+        .cloned()
+        .collect()
+}
+
+/// 关闭不再属于新布局的渲染器（引擎侧，不依赖 Tauri App，可单测）。
+///
+/// 排列切换时（如多屏 → 单屏、显示器被拔出）旧布局覆盖的显示器可能已不在新布局内，
+/// 其渲染器须关闭，避免残留窗口覆盖无意义的屏幕区域。
+async fn close_stale_renderers(handle: &SchedulerHandle, layout: &LayoutPlane) {
+    let active = {
+        let engine = handle.engine.lock().await;
+        engine.active_display_ids()
+    };
+    let stale = stale_renderer_displays(&active, layout);
+    if stale.is_empty() {
+        return;
+    }
+    let mut engine = handle.engine.lock().await;
+    for id in &stale {
+        if let Err(e) = engine.close_wallpaper(id) {
+            tracing::warn!(
+                display_id = %id,
+                error = %e,
+                "排列切换：关闭不再属于新布局的渲染器失败（保持其余渲染器）"
+            );
+        }
+    }
+}
+
+/// 多屏排列变更后按新布局立即重建渲染器（Task 5，即时生效）。
+///
+/// 步骤：
+/// 1. 关闭不再属于新布局的渲染器（[`close_stale_renderers`]）；
+/// 2. 对每个新布局单元，用其**当前** `current_wallpaper_id` 重新应用
+///    （[`apply_wallpaper_to_unit`]，`record_history = false`）——不重新采样，
+///    不改变用户当前壁纸。
+///
+/// 在各单元当前壁纸与目标显示器相同时由 apply 路径短路，不产生换槽（无闪屏）。
+async fn rebuild_for_layout(
+    handle: &SchedulerHandle,
+    layout: &LayoutPlane,
+    app: &tauri::AppHandle,
+) {
+    close_stale_renderers(handle, layout).await;
+
+    for key in layout::unit_keys(layout) {
+        let current = handle
+            .playback
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .units
+            .get(&key)
+            .and_then(|u| u.current_wallpaper_id.clone());
+        let Some(id) = current else { continue };
+        // 重建非轮换：不记录历史、不 emit rotated（避免误报"已换壁纸"），
+        // 逐屏的 wallpaper-state-changed 由 apply_wallpaper_to_unit 内部按需发出。
+        let _ = apply_wallpaper_to_unit(
+            handle, layout, &key, &id, /* record_history = */ false, app,
+        )
+        .await;
     }
 }
 
@@ -659,11 +1002,16 @@ async fn sample_and_apply_unit(
     }
 
     let target = target?;
-    if apply_wallpaper_to_unit(handle, layout, key, &target, app).await {
-        emit_rotated(app, key, &target);
-        Some(target)
-    } else {
-        None
+    match apply_wallpaper_to_unit(
+        handle, layout, key, &target, /* record_history = */ true, app,
+    )
+    .await
+    {
+        UnitApplyResult::Applied => {
+            emit_rotated(app, key, &target);
+            Some(target)
+        }
+        _ => None,
     }
 }
 
@@ -678,20 +1026,45 @@ enum ApplyOutcome {
     Busy,
 }
 
+/// 单元级 apply 的结果（聚合单元内全部显示器的 [`ApplyOutcome`]）。
+///
+/// 供 [`pop_history_until_applied`] 区分"真失败（继续找更早历史）"与
+/// "瞬时忙碌（不可吞历史，恢复入栈待重试）"，防 Busy 吞掉有效历史条目。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum UnitApplyResult {
+    /// 至少一屏换槽成功（current 已更新，prev 命中）
+    Applied,
+    /// 真失败：目标已删除 / 无显示器 / 任一屏 Err / 全部同目标短路（边界 8/9/12）
+    Failed,
+    /// 全部显示器被并发换图操作占用（瞬时态，prev 应恢复入栈返回 None，稍后重试）
+    Busy,
+}
+
 /// 把指定壁纸应用到单元覆盖的所有显示器（AllSame / Span 顺序逐屏；PerMonitor 单屏）。
-/// 任一屏成功即更新单元 current 并返回 `true`（DR-19：单屏失败记录，其余继续）。
+/// 任一屏成功即更新单元 current 并返回 [`UnitApplyResult::Applied`]（DR-19：单屏失败
+/// 记录，其余继续）；全部显示器被并发占用返回 [`UnitApplyResult::Busy`]（prev 调用方
+/// 据此恢复入栈不吞历史）；其余（目标已删除 / 无显示器 / 任一屏 Err / 全部同目标短路）
+/// 返回 [`UnitApplyResult::Failed`]。
+///
+/// `record_history`：设置成功后是否把"被换下的旧 current"压入轮换历史栈。
+/// - 旋转类路径（手动 next / 定时 rotate / boot Restore|Advance）传 `true`：旧壁纸
+///   入栈成为"上一张"候选（build 回退列表）。
+/// - prev 路径传 `false`：prev 是"回退导航"，**不应再入栈**它正在离开的壁纸——否则
+///   连续点击 prev 时前一次 push 的 entry 会让第二次 pop 弹回刚才的壁纸，造成
+///   w3→w2→w3 震荡，而非逐级回退（Task 1 边界 3：连点逐级回退，prev 消费即不放回）。
 async fn apply_wallpaper_to_unit(
     handle: &SchedulerHandle,
     layout: &LayoutPlane,
     key: &str,
     wallpaper_id: &str,
+    record_history: bool,
     app: &tauri::AppHandle,
-) -> bool {
+) -> UnitApplyResult {
     let entry = match handle.config_manager.get_wallpaper(wallpaper_id) {
         Some(e) => e,
         None => {
             tracing::warn!(key, wallpaper_id, "轮换目标壁纸已不存在，跳过");
-            return false;
+            return UnitApplyResult::Failed;
         }
     };
     let source = WallpaperSource::File(entry.file_path.clone());
@@ -699,10 +1072,12 @@ async fn apply_wallpaper_to_unit(
 
     let displays = layout.unit_displays.get(key).cloned().unwrap_or_default();
     if displays.is_empty() {
-        return false;
+        return UnitApplyResult::Failed;
     }
 
     let mut any_ok = false;
+    let mut any_err = false;
+    let mut any_busy = false;
     for disp in &displays {
         let scaling = {
             let engine = handle.engine.lock().await;
@@ -713,11 +1088,16 @@ async fn apply_wallpaper_to_unit(
                 any_ok = true;
                 let _ = app.emit("wallpaper-state-changed", disp.clone());
             }
-            Ok(ApplyOutcome::Skipped) | Ok(ApplyOutcome::Busy) => {
-                // 未换（同目标短路 / 显示器正在切换）：不 emit rotated、不算错误。
+            Ok(ApplyOutcome::Skipped) => {
+                // 未换（同目标短路）：不 emit rotated、不算错误。
+            }
+            Ok(ApplyOutcome::Busy) => {
+                // 该显示器正在切换：记录为瞬时忙碌（prev 据此不吞历史）。
+                any_busy = true;
             }
             Err(e) => {
                 // DR-19 skip-broken：保持旧壁纸，游标已推进。
+                any_err = true;
                 tracing::warn!(key, display = %disp, error = %e, "轮换 apply 失败（保持旧壁纸、游标推进跳过，DR-19）");
             }
         }
@@ -726,10 +1106,26 @@ async fn apply_wallpaper_to_unit(
     if any_ok {
         let mut play = handle.playback.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(u) = play.units.get_mut(key) {
+            // 入栈（单一咽喉）：记录历史仅用于旋转类前向换图（record_history=true）；
+            // prev 回退传 false，不把正在离开的壁纸压栈（否则连续 prev 震荡，见函数
+            // doc）。同目标短路不入栈（边界 11/12）。
+            if record_history && u.current_wallpaper_id.as_deref() != Some(wallpaper_id) {
+                if let Some(old) = u.current_wallpaper_id.take() {
+                    u.push_history(&old);
+                }
+            }
             u.current_wallpaper_id = Some(wallpaper_id.to_string());
         }
+        return UnitApplyResult::Applied;
     }
-    any_ok
+    if any_err {
+        return UnitApplyResult::Failed;
+    }
+    if any_busy {
+        return UnitApplyResult::Busy;
+    }
+    // 全部 Skipped（同目标短路，边界 12 视为无效回退）
+    UnitApplyResult::Failed
 }
 
 /// 原子交换 apply（设计 §8.4，方案 C，DR-33 / DR-40）。
@@ -919,7 +1315,10 @@ mod tests {
             resolve_target_key(&l, Some("any".to_string())).as_deref(),
             Some(layout::ALL_UNIT_KEY)
         );
-        assert_eq!(resolve_target_key(&l, None).as_deref(), Some(layout::ALL_UNIT_KEY));
+        assert_eq!(
+            resolve_target_key(&l, None).as_deref(),
+            Some(layout::ALL_UNIT_KEY)
+        );
     }
 
     #[test]
@@ -1061,6 +1460,7 @@ mod tests {
             active_pool: Some("pool-ok".to_string()),
             order_cursor: Some("gone".to_string()),
             bag_remaining: vec!["alive".to_string(), "gone".to_string(), "gone2".to_string()],
+            history: Vec::new(),
             enabled: true,
         };
         let live = |id: &str| id == "alive" || id == "pool-ok"; // 壁纸与池同集判断
@@ -1079,6 +1479,7 @@ mod tests {
             active_pool: Some("deleted-pool".to_string()),
             order_cursor: Some("alive".to_string()),
             bag_remaining: vec!["alive".to_string()],
+            history: Vec::new(),
             enabled: true,
         };
         let paper_live = |id: &str| id == "alive";
@@ -1098,6 +1499,7 @@ mod tests {
             active_pool: Some("pool".to_string()),
             order_cursor: Some("alive".to_string()),
             bag_remaining: vec!["alive".to_string()],
+            history: Vec::new(),
             enabled: true,
         };
         let live = |id: &str| id == "alive" || id == "pool";
@@ -1186,6 +1588,42 @@ mod tests {
         assert!(state.units["b"].enabled);
     }
 
+    // ── note_manual_set / apply_manual_anchor（手动设壁纸回写单元状态，DR-5 / DR-23）──
+
+    #[test]
+    fn apply_manual_anchor_sets_current_and_reanchors_cursor() {
+        let mut state = PlaybackState::default();
+        apply_manual_anchor(&mut state, "m0", "w5");
+        let unit = &state.units["m0"];
+        assert_eq!(unit.current_wallpaper_id.as_deref(), Some("w5"));
+        assert_eq!(unit.order_cursor.as_deref(), Some("w5"), "游标应锚定该壁纸");
+        assert!(unit.bag_remaining.is_empty(), "洗牌袋应清空（DR-23）");
+    }
+
+    #[test]
+    fn apply_manual_anchor_clears_residual_bag_and_reanchors() {
+        let mut state = PlaybackState::default();
+        // 构造"先前有残留袋 / 陈旧游标"的单元（模拟「下一张」已推进过的状态）。
+        {
+            let unit = state.ensure_unit("m0".to_string());
+            unit.current_wallpaper_id = Some("w_old".to_string());
+            unit.order_cursor = Some("w_old".to_string());
+            unit.bag_remaining = vec!["w1".to_string(), "w2".to_string()];
+            unit.history = vec!["w0".to_string()];
+        }
+        apply_manual_anchor(&mut state, "m0", "w9");
+        let unit = &state.units["m0"];
+        assert_eq!(unit.current_wallpaper_id.as_deref(), Some("w9"));
+        assert_eq!(unit.order_cursor.as_deref(), Some("w9"), "陈旧游标应被重锚");
+        assert!(unit.bag_remaining.is_empty(), "残留袋应清空（DR-23）");
+        // 历史栈不写——保持既有「上一张」语义不变。
+        assert_eq!(
+            unit.history,
+            vec!["w0".to_string()],
+            "apply_manual_anchor 不应改动历史栈"
+        );
+    }
+
     #[test]
     fn layout_units_enabled_yields_rotatable_and_disabled_unit_excluded() {
         let (handle, _dir) = handle_with_two_wallpapers();
@@ -1210,14 +1648,8 @@ mod tests {
             let mut play = handle.playback.lock().unwrap();
             play.units.get_mut("b").unwrap().enabled = false;
         }
-        assert!(
-            !unit_is_rotatable(&handle, "b"),
-            "被关闭单元不应参与轮换"
-        );
-        assert!(
-            unit_is_rotatable(&handle, "a"),
-            "其它开启单元仍应参与"
-        );
+        assert!(!unit_is_rotatable(&handle, "b"), "被关闭单元不应参与轮换");
+        assert!(unit_is_rotatable(&handle, "a"), "其它开启单元仍应参与");
         assert!(has_rotatable_unit(&handle, &layout));
 
         // 全关 → 皆不参与，全局不再可触发。
@@ -1301,5 +1733,382 @@ mod tests {
         drop(guard);
         // 复位后：跳过分支不再命中。
         assert!(!crate::state::atomic_swap_in_progress());
+    }
+
+    // ── Task 2：prev_wallpaper（上一张回退，边界 1/3/8/9）测试 ──────────────────
+    //
+    // 循环主体提取为 `pop_history_until_applied`（apply 注入闭包），单测用假 apply
+    // 覆盖边界语义，无需构造 Tauri App。历史依据：测试中构造真实 Wry App
+    // （`tauri::Builder::default().build(...)`）或 `tauri::test::mock_app()` 都会
+    // 单态化 Builder::build 海量代码，触发 rustc 1.98 LLVM 优化 ICE（write.rs:847）
+    // 且产物加载即崩 0xc0000139，故不构造 App、直接测循环主体。
+    // "目标已删除"在真实路径由 `apply_wallpaper_to_unit` 的 `get_wallpaper` 短路
+    // （warn "轮换目标壁纸已不存在，跳过" → `UnitApplyResult::Failed`）体现；循环层
+    // 统一抽象为 "Failed（真失败）继续 pop、Busy（瞬时忙碌）恢复入栈返回 None"。
+
+    #[tokio::test]
+    async fn prev_wallpaper_empty_history_returns_none() {
+        let (handle, _dir) = handle_with_two_wallpapers();
+        // 隔离测试状态（清除可能来自 data_root 的残留 playback）。
+        {
+            let mut play = handle.playback.lock().unwrap();
+            play.units.clear();
+            play.ensure_unit("a".to_string());
+        }
+
+        let result = pop_history_until_applied(&handle.playback, "a", |_t| async move {
+            UnitApplyResult::Failed
+        })
+        .await;
+        assert!(result.is_none(), "无历史时应返回 None（无上一张）");
+
+        // 无副作用：历史保持空、current 不变
+        let play = handle.playback.lock().unwrap();
+        assert!(play.units["a"].history.is_empty());
+        assert!(play.units["a"].current_wallpaper_id.is_none());
+    }
+
+    #[tokio::test]
+    async fn prev_wallpaper_pops_lifo_and_continues_after_deleted() {
+        let (handle, _dir) = handle_with_two_wallpapers();
+        {
+            let mut play = handle.playback.lock().unwrap();
+            play.units.clear();
+            // 按消费时间序入栈：oldest → middle → newest（栈顶 = newest）
+            let unit = play.ensure_unit("a".to_string());
+            unit.history = vec!["oldest".into(), "middle".into(), "newest".into()];
+        }
+
+        let attempts = Arc::new(Mutex::new(Vec::<String>::new()));
+        let attempts_cb = attempts.clone();
+        let result = pop_history_until_applied(&handle.playback, "a", move |t| {
+            let attempts = attempts_cb.clone();
+            async move {
+                attempts.lock().unwrap_or_else(|e| e.into_inner()).push(t);
+                UnitApplyResult::Failed // 全部 apply 失败（含目标已删除）→ 继续 pop
+            }
+        })
+        .await;
+        assert!(result.is_none(), "目标全部失败 → 回退 None");
+
+        // 后入先出：newest → middle → oldest 逐个被尝试（均失败跳过继续）
+        assert_eq!(
+            *attempts.lock().unwrap(),
+            vec!["newest", "middle", "oldest"],
+            "应后入先出弹出，且跳过失败目标继续 pop"
+        );
+        // prev 消费即不放回：栈已全部弹出
+        let play = handle.playback.lock().unwrap();
+        assert!(play.units["a"].history.is_empty());
+    }
+
+    #[tokio::test]
+    async fn prev_wallpaper_skips_failed_then_tries_existing() {
+        let (handle, _dir) = handle_with_two_wallpapers();
+        {
+            let mut play = handle.playback.lock().unwrap();
+            play.units.clear();
+            // 栈顶 = deleted（apply 失败 / 已删除 → 跳过）；栈底 = w1（apply 成功）。
+            // Vec::pop 自尾部弹出：vec![底, 顶] = vec!["w1", "deleted"]。
+            let unit = play.ensure_unit("a".to_string());
+            unit.history = vec!["w1".into(), "deleted".into()];
+        }
+
+        let result = pop_history_until_applied(&handle.playback, "a", |t| async move {
+            if t == "w1" {
+                UnitApplyResult::Applied
+            } else {
+                UnitApplyResult::Failed
+            }
+        })
+        .await;
+        assert_eq!(result.as_deref(), Some("w1"), "跳过失败目标后命中可用目标");
+        let play = handle.playback.lock().unwrap();
+        assert!(play.units["a"].history.is_empty());
+    }
+
+    #[tokio::test]
+    async fn prev_wallpaper_busy_restores_entry_and_returns_none() {
+        let (handle, _dir) = handle_with_two_wallpapers();
+        {
+            let mut play = handle.playback.lock().unwrap();
+            play.units.clear();
+            let unit = play.ensure_unit("a".to_string());
+            unit.history = vec!["w1".into()];
+        }
+
+        // 全部 apply 返回 Busy（显示器被并发换图占用，瞬时态）→ 不吞历史：
+        // 条目恢复入栈、返回 None（本次无上一张，稍后重试仍可命中）。
+        let result =
+            pop_history_until_applied(
+                &handle.playback,
+                "a",
+                |_t| async move { UnitApplyResult::Busy },
+            )
+            .await;
+        assert!(result.is_none(), "Busy 时应返回 None（无上一张）");
+
+        let play = handle.playback.lock().unwrap();
+        assert_eq!(
+            play.units["a"].history,
+            vec!["w1".to_string()],
+            "Busy 不应吞掉历史条目，应恢复入栈待重试"
+        );
+    }
+
+    #[tokio::test]
+    async fn prev_wallpaper_applied_consumes_only_top_entry() {
+        let (handle, _dir) = handle_with_two_wallpapers();
+        {
+            let mut play = handle.playback.lock().unwrap();
+            play.units.clear();
+            let unit = play.ensure_unit("a".to_string());
+            unit.history = vec!["w1".into(), "w2".into()]; // 栈顶 = w2
+        }
+
+        // 第一次尝试：w2 命中（Applied）→ 仅消费 w2；w1 仍留在栈内可后续回退。
+        let result = pop_history_until_applied(&handle.playback, "a", |t| async move {
+            if t == "w2" {
+                UnitApplyResult::Applied
+            } else {
+                UnitApplyResult::Failed
+            }
+        })
+        .await;
+        assert_eq!(result.as_deref(), Some("w2"));
+        let play = handle.playback.lock().unwrap();
+        assert_eq!(play.units["a"].history, vec!["w1".to_string()]);
+    }
+
+    /// 源标记回归测试（沿用 ST-006 / include_str! 先例：构造真实 Tauri App 会触发
+    /// LLVM ICE / 0xc0000139）。锁定"连续 prev 不再震荡"的关键约束：
+    /// ① prev 的 apply 以 `record_history = false` 调用（不把正在离开的壁纸压栈）；
+    /// ② 旋转类路径（boot Restore / 定时与手动 next 的 sample）以 `true` 调用（旧壁纸
+    ///    入栈成为"上一张"候选）；
+    /// ③ 入栈动作被 `record_history &&` 门控（三者任一被误删都会破坏逐级回退语义）。
+    #[test]
+    fn prev_does_not_record_history_to_avoid_double_click_oscillation() {
+        let src = include_str!("scheduler.rs");
+        // prev 路径传 false
+        assert!(
+            src.contains(
+                "apply_wallpaper_to_unit(self, plane, key, &t, /* record_history = */ false, app)"
+            ),
+            "prev 回退必须用 record_history=false（不把离开的壁纸再入栈，否则连续 prev 震荡）"
+        );
+        // 旋转类调用方传 true
+        assert!(
+            src.contains("apply_wallpaper_to_unit(&handle, layout, &key, &id, /* record_history = */ true, app)"),
+            "boot Restore 路径应记录历史（true）"
+        );
+        assert!(
+            src.contains("apply_wallpaper_to_unit(&handle, layout, key, &target, /* record_history = */ true, app)"),
+            "轮换/手动 next 的 sample 路径应记录历史（true）"
+        );
+        // 入栈被 record_history 门控
+        assert!(
+            src.contains("if record_history && u.current_wallpaper_id"),
+            "入栈必须以 record_history 门控（否则 prev 也会入栈）"
+        );
+    }
+
+    // ── 纯净壁纸模式轮换抑制契约（DR-9 Layer 2）────────────────────────────
+
+    /// DR-9 Layer 2：轮换排期处、到点前复核处与手动"下一张"分支三处门控均须含
+    /// 纯模式判断，使模式运行期间既不安排、也不触达定时轮换，且手动换图亦被抑制。
+    #[test]
+    fn rotation_gates_check_pure_mode() {
+        let source = include_str!("scheduler.rs");
+        // 运行期拼接搜索串，避免 include_str! 把测试自身的字面量计入匹配
+        let schedule_gate = [
+            "let suppressed = mirrorstar_core::pure_mode::",
+            "is_active() || {",
+        ]
+        .join("");
+        let recheck_gate = [
+            "let suppressed_now = mirrorstar_core::pure_mode::",
+            "is_active() || {",
+        ]
+        .join("");
+        let manual_gate = ["if mirrorstar_core::pure_mode::", "is_active() {"].join("");
+        let needle = ["mirrorstar_core::pure_mode::", "is_active()"].join("");
+
+        // 三处门控写法各异，逐处校验精确上下文（防止统计次数时被同形重复写法蒙混）。
+        assert!(
+            source.contains(&schedule_gate),
+            "轮换排期处应含门控上下文 {schedule_gate}"
+        );
+        assert!(
+            source.contains(&recheck_gate),
+            "到点前复核处应含门控上下文 {recheck_gate}"
+        );
+        assert!(
+            source.contains(&manual_gate),
+            "手动『下一张』分支应含门控上下文 {manual_gate}"
+        );
+
+        // 数量契约：恰好三处轮换门控。
+        let count = source.matches(&needle).count();
+        assert_eq!(
+            count, 3,
+            "排期处、到点前复核处与手动『下一张』分支三处轮换门控均应含 {needle}，实际出现 {count} 次"
+        );
+    }
+
+    // ── Task 5：多屏排列切换即时重建 ───────────────────────────────────────
+
+    #[test]
+    fn arrangement_changed_short_circuits_on_same_value() {
+        // 同值排列不触发重建（避免无谓重建 / 闪屏）；异值触发。
+        assert!(!arrangement_changed(Arrangement::Span, Arrangement::Span));
+        assert!(!arrangement_changed(
+            Arrangement::PerMonitor,
+            Arrangement::PerMonitor
+        ));
+        assert!(!arrangement_changed(
+            Arrangement::AllSame,
+            Arrangement::AllSame
+        ));
+        assert!(arrangement_changed(
+            Arrangement::PerMonitor,
+            Arrangement::Span
+        ));
+        assert!(arrangement_changed(
+            Arrangement::AllSame,
+            Arrangement::PerMonitor
+        ));
+    }
+
+    #[test]
+    fn stale_renderer_displays_returns_uncovered_ids() {
+        let layout = layout_with(Arrangement::PerMonitor, &["a", "b"], Some("a"));
+        // c 不在新布局覆盖范围内 → stale。
+        let active = vec!["a".to_string(), "b".to_string(), "c".to_string()];
+        assert_eq!(
+            stale_renderer_displays(&active, &layout),
+            vec!["c".to_string()]
+        );
+        // 全部被覆盖 → 无 stale（排列切换时通常如此，不产生多余关闭）。
+        let covered = vec!["a".to_string(), "b".to_string()];
+        assert!(stale_renderer_displays(&covered, &layout).is_empty());
+    }
+
+    #[test]
+    fn stale_renderer_displays_all_stale_on_empty_layout() {
+        // 新布局无任何单元（无显示器）→ 全部活跃渲染器均 stale。
+        let layout = layout_with(Arrangement::Span, &[], None);
+        let active = vec!["a".to_string()];
+        assert_eq!(
+            stale_renderer_displays(&active, &layout),
+            vec!["a".to_string()]
+        );
+    }
+
+    // ── Task 7：显示器热插拔检测 ───────────────────────────────────────────
+
+    #[test]
+    fn display_set_changed_ignores_order_but_detects_add_remove_swap() {
+        let ids = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<String>>();
+        let base = ids(&["d1", "d2"]);
+
+        // 相同集合（含顺序不同）→ 不视为变化（同值短路）。
+        assert!(!display_set_changed(&base, &ids(&["d1", "d2"])));
+        assert!(!display_set_changed(&base, &ids(&["d2", "d1"])));
+
+        // 新增 / 删除 → 变化。
+        assert!(display_set_changed(&base, &ids(&["d1", "d2", "d3"])));
+        assert!(display_set_changed(&ids(&["d1", "d2", "d3"]), &base));
+
+        // 数量不变但 id 变化（换屏）→ 变化。
+        assert!(display_set_changed(&base, &ids(&["d1", "d9"])));
+
+        // 空 ↔ 非空。
+        assert!(display_set_changed(&[], &base));
+        assert!(display_set_changed(&base, &[]));
+        assert!(!display_set_changed(&[], &[]));
+    }
+
+    /// 最小测试渲染器（无窗口，`hwnd() = None` 跳过 WorkerW 嵌入），用于驱动引擎侧
+    /// 渲染器注册 / 关闭，验证排列切换重建后的渲染器集合。
+    struct TestRenderer {
+        state: mirrorstar_core::wallpaper::WallpaperState,
+    }
+
+    impl TestRenderer {
+        fn new() -> Self {
+            Self {
+                state: mirrorstar_core::wallpaper::WallpaperState::Playing,
+            }
+        }
+    }
+
+    impl WallpaperRenderer for TestRenderer {
+        fn play(&mut self) -> Result<(), MirrorStarError> {
+            self.state = mirrorstar_core::wallpaper::WallpaperState::Playing;
+            Ok(())
+        }
+        fn pause(&mut self) -> Result<(), MirrorStarError> {
+            self.state = mirrorstar_core::wallpaper::WallpaperState::Paused;
+            Ok(())
+        }
+        fn resume(&mut self) -> Result<(), MirrorStarError> {
+            self.state = mirrorstar_core::wallpaper::WallpaperState::Playing;
+            Ok(())
+        }
+        fn set_position(
+            &mut self,
+            _x: i32,
+            _y: i32,
+            _w: i32,
+            _h: i32,
+        ) -> Result<(), MirrorStarError> {
+            Ok(())
+        }
+        fn terminate(&mut self) -> Result<(), MirrorStarError> {
+            self.state = mirrorstar_core::wallpaper::WallpaperState::Terminated;
+            Ok(())
+        }
+        fn hwnd(&self) -> Option<windows::Win32::Foundation::HWND> {
+            None
+        }
+        fn state(&self) -> mirrorstar_core::wallpaper::WallpaperState {
+            self.state
+        }
+    }
+
+    /// 排列切换重建的渲染器集合侧写：`close_stale_renderers` 只关闭"不再属于新布局"
+    /// 的渲染器，保留仍在布局内的渲染器。
+    ///
+    /// 直接驱动引擎侧辅助函数，不构造 Tauri App——本模块既有说明：构造 App 会单态化
+    /// `Builder::build` 海量代码，触发 rustc LLVM 优化 ICE（write.rs:847）且产物加载
+    /// 即崩 0xc0000139。`apply_wallpaper_to_unit` 的"按单元重新应用"路径依赖 App 与
+    /// 真实渲染器构建，此处以纯函数 `stale_renderer_displays` + 引擎关闭行为等价覆盖。
+    #[tokio::test]
+    async fn close_stale_renderers_closes_only_uncovered() {
+        let (handle, _dir) = handle_with_two_wallpapers();
+        {
+            let mut engine = handle.engine.lock().await;
+            for id in ["a", "b"] {
+                let source = WallpaperSource::File(format!("/test/{id}.mp4"));
+                engine
+                    .embed_and_register_renderer(
+                        Box::new(TestRenderer::new()),
+                        id,
+                        &source,
+                        WallpaperType::Video,
+                    )
+                    .expect("注册测试渲染器");
+            }
+            assert!(engine.has_wallpaper("a"));
+            assert!(engine.has_wallpaper("b"));
+        }
+
+        // 新布局仅覆盖 a（b 不再属于新布局）→ 仅 b 的渲染器应被关闭。
+        let layout = layout_with(Arrangement::PerMonitor, &["a"], Some("a"));
+        close_stale_renderers(&handle, &layout).await;
+
+        let engine = handle.engine.lock().await;
+        assert!(engine.has_wallpaper("a"), "仍属于新布局的渲染器应保留");
+        assert!(!engine.has_wallpaper("b"), "不再属于新布局的渲染器应被关闭");
     }
 }

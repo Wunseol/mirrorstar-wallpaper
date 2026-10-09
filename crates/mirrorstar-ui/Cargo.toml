@@ -1,0 +1,83 @@
+[package]
+name = "mirrorstar-ui"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "mirrorstar-ui"
+path = "src/main.rs"
+
+[dependencies]
+mirrorstar-core = { path = "../mirrorstar-core" }
+
+# 主窗口原生 UI。这里**关闭默认特性**并只启用 `renderer-software`，
+# 是为了把"软件渲染"从运行期选择变成**编译期唯一选项**：
+# winit 后端在 `try_create_window_with_fallback_renderer` 里按
+# `skia → femtovg-wgpu → femtovg → software → vello` 的优先级挑选渲染器
+# （见 i-slint-backend-winit 1.18 `lib.rs`）。只要不编译进 femtovg/skia，
+# software 就是唯一命中项，无需依赖 `SLINT_BACKEND=software` 环境变量。
+# `compat-1-2` 保留 Slint 1.2 语义，`std` 提供系统字体（文本渲染所需）。
+# `raw-window-handle-06`（Task 5.5）：需要从 Slint 窗口取原生 HWND 才能挂载
+# 文件拖入接收器（`DragAcceptFiles` / `WM_DROPFILES`），而该能力按 feature 门控。
+slint = { version = "1.18", default-features = false, features = [
+    "std",
+    "compat-1-2",
+    "renderer-software",
+    "backend-winit",
+    "raw-window-handle-06",
+] }
+
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+# Slint 只用 `raw_window_handle_06` 命名空间、**不 re-export** 该 crate，
+# 故本 crate 需直接依赖；版本与 slint 统一到 0.6（同一 semver 只编译一份）。
+raw-window-handle = "0.6"
+
+# 缩略图按本地文件路径直读 + 限幅解码（Task 4.3）。复用 workspace 声明，
+# 但不启用默认特性：格式集合与 core 保持一致，避免多编译一份解码后端。
+image = { workspace = true }
+
+# 原生文件拖入（Task 5.5）：`Win32_UI_Shell` 提供 DragAcceptFiles/DragQueryFileW/DragFinish/HDROP；
+# `Win32_System_Ole` 提供 RevokeDragDrop（winit 0.30 默认把窗口注册成 OLE 放置目标，需先撤销，
+# 否则系统不会走 WM_DROPFILES 通道）；`Win32_System_Memory` 提供 GlobalAlloc/GlobalLock，仅供
+# 单测在进程内构造合法 HDROP 以覆盖多文件读取。仅在本 crate 追加 feature，不改根 Cargo.toml。
+#
+# Task 8 预览：`Win32_System_Com`（CoInitializeEx/CoTaskMemFree）、`Win32_System_LibraryLoader`
+# （GetModuleHandleW）、`Win32_Graphics_Gdi`（ClientToScreen）为宿主子窗口与 WebView2 所需；
+# `Win32_UI_WindowsAndMessaging` 提供 CreateWindowExW/SetWindowPos 等（与 drag&drop 共用）。
+#
+# Task 9.7.4 悬停高亮：改用自实现 OLE `IDropTarget` 以获得 DragEnter/DragLeave，故追加
+# `implement`（启用 `#[implement]` 属性宏生成 COM vtable）、`Win32_System_SystemServices`
+# （`MODIFIERKEYS_FLAGS`，`IDropTarget` 方法签名所需）、`Win32_System_Com_StructuredStorage`
+# （`STGMEDIUM` 与 `ReleaseStgMedium` 由该 feature 门控）。
+#
+# 第三轮：Win32_UI_Input_KeyboardAndMouse 提供 GetAsyncKeyState / VK_LBUTTON / GetDoubleClickTime，用于全屏 chrome 的点击与按住判定。
+[target.'cfg(windows)'.dependencies]
+windows = { workspace = true, features = [
+    "Win32_UI_Shell",
+    "Win32_System_Ole",
+    "Win32_System_Memory",
+    "Win32_System_Com",
+    "Win32_System_Com_StructuredStorage",
+    "Win32_System_SystemServices",
+    "Win32_System_LibraryLoader",
+    "Win32_Graphics_Gdi",
+    "Win32_UI_Input_KeyboardAndMouse",
+    "implement",
+] }
+
+# Task 8.5 网页预览：UI 进程内按需创建临时 WebView2 子窗口。
+# 与壁纸侧（wp-proc）使用同一版本，复用 workspace 声明。
+webview2-com = { workspace = true }
+
+# Task 9.7.4：`#[implement(IDropTarget)]` 生成的代码以 `::windows_core::…` 绝对路径引用
+# 运行时 crate，故需把 `windows-core` 作为直接依赖引入（版本与 `windows` 0.58 对齐）。
+[target.'cfg(windows)'.dependencies.windows-core]
+version = "0.58"
+
+[build-dependencies]
+slint-build = "1.18"
+embed-resource = "3.0"

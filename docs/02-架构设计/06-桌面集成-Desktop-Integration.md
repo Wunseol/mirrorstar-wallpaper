@@ -355,7 +355,7 @@ Windows Explorer（explorer.exe）可能在运行期间重启（如用户通过�
 
 #### 8.6.1 检测方案
 
-通过 `start_workerw_check()`（`crates/mirrorstar-core/src/desktop/workerw_check.rs`，236 行）实现：使用 `tokio interval(300s)` + `Notify` 事件触发结构，事件驱动为主（`TaskbarCreated` 消息），并在超时（5 分钟）后周期性地调用`check_and_reinitialize()` 校验/重建 WorkerW。辅助地通过定时验证 WorkerW 句柄有效性来兜底检测 Explorer 重启：
+通过 `start_workerw_check()`（`src-tauri/src/platform/workerw_check.rs`，236 行）实现：使用 `tokio interval(300s)` + `Notify` 事件触发结构，事件驱动为主（`TaskbarCreated` 消息），并在超时（5 分钟）后周期性地调用`check_and_reinitialize()` 校验/重建 WorkerW。辅助地通过定时验证 WorkerW 句柄有效性来兜底检测 Explorer 重启：
 
 ```rust
 impl DesktopIntegrator {
@@ -421,6 +421,78 @@ flowchart TD
     J --> K[刷新桌面]
     K --> L[记录恢复日志]
 ```
+
+### 8.7 纯净壁纸模式：窗口层级临时提升
+
+正常模式下壁纸窗口被 `SetParent` 挂到 WorkerW 层，其 Z 序位于**桌面图标之下**，因此无法覆盖任何应用窗口。纯净壁纸模式通过"临时把壁纸窗口提升为顶层置顶窗口"实现全屏纯壁纸沉浸态（唯一入口：托盘勾选项「纯净壁纸（按任意键退出）」），退出后再用 `embed_wallpaper` 嵌回。
+
+#### 8.7.1 层级对比
+
+| 状态 | Z 序（自顶向下） | 说明 |
+|------|------------------|------|
+| 正常模式 | 应用窗口 > 桌面图标（`SHELLDLL_DefView`）> 壁纸窗口（WorkerW 子窗口）> Progman | 壁纸位于图标层下方，桌面交互（右键菜单、图标点击）不受影响 |
+| 纯净壁纸模式 | 壁纸窗口（`HWND_TOPMOST`）> 其他顶层窗口 + 任务栏 > Progman | 壁纸窗口置顶覆盖全部（含桌面图标、应用窗口与任务栏） |
+
+**图片 / GIF / 网页**路径的置顶实现（`crates/mirrorstar-core/src/pure_mode/mod.rs::lift_wallpaper_window`）：
+
+```text
+GetWindowRect(hwnd) → (x, y, w, h)                                    // ① 先读当前屏幕矩形
+SetParent(hwnd, None)                                                  // ② 从 WorkerW 摘出
+SetWindowPos(hwnd, HWND_TOPMOST, x, y, w, h,
+             SWP_NOACTIVATE | SWP_SHOWWINDOW | SWP_FRAMECHANGED)       // ③ 原矩形置顶
+InvalidateRect(hwnd, None, false)                                      // ④ GDI 渲染器保险重绘
+```
+
+**视频**路径（**架构 D1，例外**）：视频壁纸**原窗口留在 WorkerW 全程不搬动**（不 `detach_for_pure_mode`），改为**新建临时顶层覆盖渲染器窗口**并置顶到同一屏幕矩形——`construct_renderer` 新建 `VideoRenderer`（配置快照复用无副作用的 `renderer_config()`）→ `make_borderless`（失败仅 `warn`）+ `remove_from_taskbar` → `VideoRenderer::disable_auto_window_resize()`（IPC best-effort，须早于置顶 / `loadfile`）→ `lift_window_to_rect` 置顶全屏 → `after_embed()` 从头 `loadfile`；**退出时销毁该临时窗，原窗口原样显露**（原 mpv 从不重启）。任一步失败即 best-effort `terminate()` 该临时渲染器并放弃本显示器覆盖，不回滚整体进入。措辞与契约详见 [`04-wallpaper模块.md`](../05-优化文档/04-wallpaper模块.md) 的「四类呈现路径（D3 / D4 / D8，视频为架构 D1）」与 [`03-desktop模块.md`](../05-优化文档/03-desktop模块.md) 的「退出回嵌的防呈现冻结契约（架构 D1）」。
+
+Native 静态图片没有窗口，改为创建临时 `ImageRenderer` 窗口后用 `lift_window_to_rect`（**不做**重定父级）置顶到同一矩形。
+
+#### 8.7.2 关键约束
+
+- **双路径呈现（架构 D1）**：**图片 / GIF / 网页**路径为「摘出 WorkerW + 原窗口置顶」；**视频**路径为「原窗口留在 WorkerW 不搬动 + 新建临时顶层覆盖渲染器置顶」（退出仅销毁覆盖窗、原窗口原样显露）。二者并非所有类型都搬动原窗口——勿据单一描述推断。
+- **保持当前屏幕矩形，零 resize**：摘出 / 置顶复用第 ① 步读到的矩形，宽度高度不做任何调整。mpv 的 D3D11 输出在"窗口重父化 + resize"时会重配置（项目已用 `--d3d11-flip=no` 做双保险），零尺寸变化是规避该路径的核心降险手段。
+- **不抢前台**：置顶只做"重定父级 + 设置 `HWND_TOPMOST`"，全程带 `SWP_NOACTIVATE`；窗口在嵌入阶段已由 `remove_from_taskbar` 设置 `WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW`（`make_borderless` 不会清除），因此置顶后不会成为前台窗口、不进 Alt+Tab，从根上避免触发全屏检测。
+- **鼠标穿透在模式内强制关闭**（D2）：置顶窗若保持 `WS_EX_TRANSPARENT`，点击会穿透到下层桌面图标。进入时对每个置顶窗 `set_mouse_passthrough(false)`（保留 `WS_EX_LAYERED`，仅去 `WS_EX_TRANSPARENT`），退出时按 `interaction_mode` 还原（`set_mouse_passthrough(!interaction_mode)`）。
+- **摘出即从 `active_wallpapers` 移除条目**：避免 Explorer 重启 / `workerw_check` 的重新初始化把已摘出的窗口又嵌回桌面（契约详见 [`03-desktop模块.md`](../05-优化文档/03-desktop模块.md) 第 5 节）。
+- **退出回嵌**：`DesktopIntegrator::reattach_after_pure_mode` 委托既有 `embed_wallpaper`，零新增几何算法，自动使用 Explorer 重启后的新 WorkerW；**并在 `embed_wallpaper` 成功之后追加一次 `InvalidateRect(hwnd, None, false)` 保险重绘**（失败仅 `warn`），与进入路径 `pure_mode::lift_wallpaper_window` 末尾的保险重绘同源。该顺序契约由 `crates/mirrorstar-core/src/desktop/mod.rs` 的契约测试 `reattach_after_pure_mode_invalidates_after_embed` 守护。
+- **退出方式**：模式内**任意键** / **鼠标左、中、右键点击**（宽限期外）/（任务栏可达时）**托盘二次点击**均触发退出。**Win+L 不锁屏**：模式内任意键（含 Win 组合键）先退出模式，键盘钩子在 LWIN 按下即吞掉整段按键序列，系统锁定热键不生效——如需锁屏请在模式外执行，或使用不受低级钩子影响的 SAS 路径（Ctrl+Alt+Del，锁屏期间模式保持、解锁后任意键退出）。
+
+#### 8.7.3 进入 / 退出时序（简化）
+
+```mermaid
+sequenceDiagram
+    participant Tray as 托盘
+    participant Orch as platform::pure_mode
+    participant Input as 输入捕获线程（低级钩子 + 隐藏顶层窗口）
+    participant Engine as WallpaperEngine
+    participant Desktop as DesktopIntegrator
+
+    Tray->>Orch: 勾选「纯净壁纸（按任意键退出）」
+    Note over Orch: 进入互斥守卫（F2）+ 幂等检查 + 等待在途退出落位（≈10s 上界）
+    Orch->>Input: install（WH_KEYBOARD_LL / WH_MOUSE_LL，键盘钩子失败即拒绝进入）
+    Input-->>Orch: 安装结果
+    Orch->>Orch: ④b 关闭托盘溢出浮出窗（best-effort；必须在壁纸窗口置顶之前）
+    Orch->>Engine: enter_pure_mode()
+    Engine->>Desktop: detach_for_pure_mode(display_id)（图片 / GIF / 网页：摘出 + 置顶，移除条目）
+    Engine->>Engine: 关闭鼠标穿透 + register_lifted + pure_mode = Some(..)
+    Note over Engine,Desktop: 视频（架构 D1）：原窗口不搬动，新建临时顶层覆盖渲染器窗口置顶
+    Orch->>Tray: set_checked(true)（置勾选早于启动退出监听）
+
+    Note over Input,Engine: 任意键 / 鼠标左中右键点击 / 托盘二次点击（宽限期外）
+    Input->>Orch: ExitReason::Input（吞掉触发输入）
+    Orch->>Engine: exit_pure_mode()
+    Engine->>Desktop: reattach_after_pure_mode(..)（embed_wallpaper 嵌回 + InvalidateRect）
+    Engine->>Engine: 终止临时渲染器（视频覆盖窗销毁后原窗口原样显露）+ 还原穿透 + set_active(false)
+    Orch->>Input: shutdown（PostThreadMessageW(WM_QUIT) + join）
+    Orch->>Tray: set_checked(false)（③ 取消勾选，提前到回嵌 + 卸载钩子之后）
+    Orch->>Orch: 补跑全屏 / 电源判定
+    Orch->>Orch: 存活校验 + 自愈（liveness_check_and_heal，含暂停短路）
+    Orch->>Orch: 唤醒轮换调度器
+```
+
+> 退出时**必须先恢复桌面（`exit_pure_mode` 回嵌）再卸载输入钩子**，否则钩子卸载后到回嵌完成之间，用户输入会落到仍处于置顶全屏状态的壁纸窗口上。退出编排完整的 ①-⑥ 步骤表（含 ③ 取消勾选**提前**、⑤ 存活校验/自愈的位置与顺序理由）见 [`03-desktop模块.md`](../05-优化文档/03-desktop模块.md) §5.4。
+
+> 进入侧 **④b 关闭托盘溢出浮出窗必须在壁纸窗口置顶（`enter_pure_mode`）之前**：进入编排刻意不抢前台，浮出窗收不到"失去激活"关闭信号，若在置顶之后才关闭会被置顶窗覆盖而无法再关闭。
 
 ***
 

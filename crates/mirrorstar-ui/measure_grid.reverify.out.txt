@@ -1,0 +1,112 @@
+﻿=== items=0 ===
+powershell.exe : [mirrorstar-ui] 握手成功：壳=measure-harness 协议v1 能力=0x000f
+At line:15 char:2228
++ ...  " #####"); powershell.exe -NoProfile -ExecutionPolicy Bypass -File c ...
++                 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    + CategoryInfo          : NotSpecified: ([mirrorstar-ui]... 协议v1 能力=0x000f:String) [], RemoteException
+    + FullyQualifiedErrorId : NativeCommandError
+ 
+UI hello: {"type":"hello","protocol_version":1,"capabilities":15,"client":"mirrorstar-ui"}
+answered: get_arrangement,get_auto_start_status,get_config,get_displays,get_rotation_config,get_unit_states,get_wallpaper_state,get_wallpapers,list_pools
+[mirrorstar-ui] 已撤销 winit 默认 OLE 放置目标
+[mirrorstar-ui] 原生文件拖入已就绪（OLE IDropTarget，支持悬停高亮；HWND=0x9f064e）
+window hwnd: 10421838
+screenshot: C:\Users\w\AppData\Local\Temp\mirrorstar-ui-measure\shot_0.png
+
+
+Items             : 0
+PrivateMB         : 6.5
+WSMB              : 20.6
+Threads           : 13
+IdleCpuPct        : 0
+ScrollCpuPct      : 0
+PrivAfterScrollMB : 6.5
+WSAfterScrollMB   : 20.6
+
+
+
+
+===== SUMMARY =====
+
+Items PrivateMB WSMB Threads IdleCpuPct ScrollCpuPct PrivAfterScrollMB WSAfterScrollMB
+----- --------- ---- ------- ---------- ------------ ----------------- ---------------
+    0       6.5 20.6      13          0            0               6.5            20.6
+
+
+
+=== items=200 ===
+powershell.exe : [mirrorstar-ui] 握手成功：壳=measure-harness 协议v1 能力=0x000f
+At line:15 char:2228
++ ...  " #####"); powershell.exe -NoProfile -ExecutionPolicy Bypass -File c ...
++                 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    + CategoryInfo          : NotSpecified: ([mirrorstar-ui]... 协议v1 能力=0x000f:String) [], RemoteException
+    + FullyQualifiedErrorId : NativeCommandError
+ 
+UI hello: {"type":"hello","protocol_version":1,"capabilities":15,"client":"mirrorstar-ui"}
+answered: get_arrangement,get_auto_start_status,get_config,get_displays,get_rotation_config,get_unit_states,get_wallpaper_state,get_wallpapers,list_pools
+[mirrorstar-ui] 视频首帧生成失败：C:\Users\w\AppData\Local\Temp\mirrorstar-ui-measure\big_src.png — 图片解码失败: 调用 ffmpeg 失败: progra
+m not found
+[mirrorstar-ui] 已撤销 winit 默认 OLE 放置目标
+[mirrorstar-ui] 原生文件拖入已就绪（OLE IDropTarget，支持悬停高亮；HWND=0x540534）
+window hwnd: 5506356
+screenshot: C:\Users\w\AppData\Local\Temp\mirrorstar-ui-measure\shot_200.png
+
+
+Items             : 200
+PrivateMB         : 10.2
+WSMB              : 24.1
+Threads           : 13
+IdleCpuPct        : 0
+ScrollCpuPct      : 0
+PrivAfterScrollMB : 10.2
+WSAfterScrollMB   : 24.1
+
+
+
+
+===== SUMMARY =====
+
+Items PrivateMB WSMB Threads IdleCpuPct ScrollCpuPct PrivAfterScrollMB WSAfterScrollMB
+----- --------- ---- ------- ---------- ------------ ----------------- ---------------
+  200      10.2 24.1      13          0            0              10.2            24.1
+
+
+
+=== items=4200 ===
+powershell.exe : [mirrorstar-ui] 握手成功：壳=measure-harness 协议v1 能力=0x000f
+At line:15 char:2228
++ ...  " #####"); powershell.exe -NoProfile -ExecutionPolicy Bypass -File c ...
++                 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    + CategoryInfo          : NotSpecified: ([mirrorstar-ui]... 协议v1 能力=0x000f:String) [], RemoteException
+    + FullyQualifiedErrorId : NativeCommandError
+ 
+UI hello: {"type":"hello","protocol_version":1,"capabilities":15,"client":"mirrorstar-ui"}
+answered: get_arrangement,get_auto_start_status,get_config,get_displays,get_rotation_config,get_unit_states,get_wallpaper_state,get_wallpapers,list_pools
+[mirrorstar-ui] 视频首帧生成失败：C:\Users\w\AppData\Local\Temp\mirrorstar-ui-measure\big_src.png — 图片解码失败: 调用 ffmpeg 失败: progra
+m not found
+[mirrorstar-ui] 已撤销 winit 默认 OLE 放置目标
+[mirrorstar-ui] 原生文件拖入已就绪（OLE IDropTarget，支持悬停高亮；HWND=0x4b0380）
+window hwnd: 4916096
+screenshot: C:\Users\w\AppData\Local\Temp\mirrorstar-ui-measure\shot_4200.png
+
+
+Items             : 4200
+PrivateMB         : 12.4
+WSMB              : 26.9
+Threads           : 13
+IdleCpuPct        : 0
+ScrollCpuPct      : 0
+PrivAfterScrollMB : 12.4
+WSAfterScrollMB   : 26.9
+
+
+
+
+===== SUMMARY =====
+
+Items PrivateMB WSMB Threads IdleCpuPct ScrollCpuPct PrivAfterScrollMB WSAfterScrollMB
+----- --------- ---- ------- ---------- ------------ ----------------- ---------------
+ 4200      12.4 26.9      13          0            0              12.4            26.9
+
+
+

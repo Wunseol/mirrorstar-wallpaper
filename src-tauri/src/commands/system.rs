@@ -20,6 +20,30 @@ pub fn get_displays(
     Ok(desktop.enumerate_displays())
 }
 
+/// v17 内存归因：按需返回应用组逐子进程内存归因报告。
+///
+/// 归因限定在当前进程进程树内（主进程 / mpv.exe / 与本进程同 exe 名的 wp-proc 子进程 /
+/// msedgewebview2.exe / other），供前端或排查工具按需查询优化前后的量化基线。
+/// wp-proc 采用「同一 exe、双入口」，其 exe 名与本进程相同，按 exe 名归因而不依赖固定文件名。
+/// 采样为同步 Win32 调用（快照 + 逐进程 `GetProcessMemoryInfo`），开销很小，
+/// 无需 async 或阻塞线程池。单进程打开失败时内部跳过并记日志，命令仍返回成功。
+#[tauri::command]
+pub fn get_memory_report(
+) -> Result<mirrorstar_core::perf::MemoryUsageReport, mirrorstar_core::MirrorStarError> {
+    Ok(mirrorstar_core::perf::sample_memory_report())
+}
+
+/// v17 启动期内存埋点：前端上报一个生命周期事件标签。
+///
+/// 供前端在「前端初始化完成」「壁纸列表渲染完成」等节点调用，使前端事件与后端
+/// 启动期时间线对齐。内部调用 `perf::mark_lifecycle`（非阻塞、best-effort，失败不
+/// panic），命令恒返回成功。受 `MIRRORSTAR_MEM_TRACE` 开关控制（关闭时静默无输出）。
+#[tauri::command]
+pub fn report_lifecycle_mark(label: String) -> Result<(), mirrorstar_core::MirrorStarError> {
+    mirrorstar_core::perf::mark_lifecycle(&label);
+    Ok(())
+}
+
 // ST-013: check_desktop_status 保留 async 标注的设计权衡
 // - 当前函数体内无 `.await`（desktop 为 std::sync::Mutex，state.desktop.lock() 为同步阻塞调用），
 //   async 标注带来轻微调度开销（约 1-2 个 future state machine 状态转换）
@@ -74,6 +98,15 @@ pub async fn set_interaction_mode(
     enabled: bool,
 ) -> Result<(), mirrorstar_core::MirrorStarError> {
     let mut engine = state.wallpaper_engine.lock().await;
+    // 纯净壁纸模式守卫（D2）：模式内强制关闭已置顶窗口的鼠标穿透，禁止外部切换破坏该契约。
+    // 此处只做可观测提示，实际判定与跳过集中在 `WallpaperEngine::set_interaction_mode`
+    // 单一实现（它仍会记录交互模式字段供退出时还原），避免两条入口行为不一致。
+    if engine.is_pure_mode_active() {
+        tracing::info!(
+            enabled,
+            "纯净壁纸模式进行中：交互模式变更只记录、不切换穿透（模式内强制关闭穿透）"
+        );
+    }
     engine.set_interaction_mode(enabled)
 }
 

@@ -1,0 +1,2147 @@
+// MirrorStar 主窗口 —— Task 4 虚拟化壁纸网格 + Task 5 网格交互。
+//
+// 设计要点（与 Rust 侧 `grid.rs` / `dnd.rs` / `store.rs` 配套）：
+// - 网格**只把可见行 ± 缓冲**的卡片放进 `cards` 模型；Slint 的 `for` 只为模型内条目创建实例，
+//   因此不会为全量条目建常驻实例（虚拟化的核心）。卡片位置由 Rust 预算好的 `(row, col)` 绝对定位。
+// - 拖拽排序：每卡一个 `DragArea`（负载是 `data-transfer`，由 Rust 构造，Slint 侧不透明），
+//   网格上一个覆盖视口的 `DropArea`。`can-drop` 期间把指针位置交回 Rust 反算插入位并写回
+//   `drop-index`，据此绘制插入线；`dropped` 时把负载与索引交回 Rust 提交重排（经壳落盘）。
+// - 搜索过滤在 Rust 侧完成（`store.filtered_indices`），Slint 只消费结果；搜索激活时禁用拖拽。
+// - 选中 / 当前壁纸为纯 UI 态，Rust 写入 `selected-id` / `active-id`，只影响描边与角标，不重建模型。
+//
+// 窗口标题固定为"镜星壁纸"：Tauri 侧全屏检测以窗口**标题**排除自身，标题一旦不一致，
+// 主窗口前台时可能被误判为全屏应用。
+
+// 设置面板 / 轮换池管理（Task 6 / Task 7）的自研控件族与数据模型。
+import {
+    Dropdown,
+    DropdownList,
+    MemberRow,
+    MemberRowUi,
+    NumberStepper,
+    OptionItem,
+    PanelButton,
+    PoolRow,
+    PoolRowUi,
+    SpeakerIconButton,
+    SpeedRow,
+    Theme,
+    ToggleSwitch,
+    UnitRow,
+    UnitRowUi,
+    VolumeRow,
+} from "widgets.slint";
+
+// 卡片状态：0=正常（有图像） 1=网页占位 2=源文件缺失 3=类型图标占位（生成失败/视频无缩略图）
+export struct CardData {
+    id: string,
+    name: string,
+    kind-index: int,   // 0=图片 1=视频 2=GIF 3=网页
+    state: int,
+    thumb: image,
+    row: int,          // 全局行号（绝对定位用）
+    col: int,          // 全局列号
+    pos: int,          // 过滤后序列中的绝对索引（键盘焦点 / 邻居让位用）
+}
+
+// ── 类型标签 ────────────────────────────────────────────────────────────────
+component TypeBadge inherits Rectangle {
+    in property <string> label;
+    in property <int> kind-index;
+
+    width: 40px;
+    height: 17px;
+    border-radius: Theme.radius-sm;
+    background: kind-index == 0 ? #66bb6a
+        : kind-index == 1 ? #42a5f5
+        : kind-index == 2 ? #ffa726
+        : #ab47bc;
+
+    Text {
+        text: root.label;
+        color: #ffffff;
+        font-size: 10px;
+        horizontal-alignment: center;
+        vertical-alignment: center;
+        width: 100%;
+        height: 100%;
+    }
+}
+
+// ── 卡片操作按钮 ────────────────────────────────────────────────────────────
+component CardActionButton inherits Rectangle {
+    in property <string> label;
+    in property <bool> danger: false;
+
+    callback clicked();
+
+    // 58px 让「设为壁纸」4 个中文字（font 11 ≈ 44px）左右各留 ~7px，不裁切。
+    width: 58px;
+    height: 20px;
+    border-radius: Theme.radius-md;
+    background: hover.pressed
+        ? (root.danger ? #5c1f1f : Theme.button-pressed)
+        : hover.has-hover
+        ? (root.danger ? Theme.danger : #35609c)
+        : (root.danger ? #6b2626 : #1d3a63);
+
+    // TouchArea 先声明，便于上方 hover 绑定引用；其后 Text 仅作绘制，不参与命中。
+    hover := TouchArea {
+        clicked => { root.clicked(); }
+    }
+
+    Text {
+        text: root.label;
+        color: #e8f0fb;
+        font-size: 11px;
+        horizontal-alignment: center;
+        vertical-alignment: center;
+        width: 100%;
+        height: 100%;
+    }
+}
+
+// ── 类型占位矢量图标（Task 7.4）───────────────────────────────────────────────
+// 用内联几何图形替代 emoji / 制表符号，避免软件渲染下的字形回退差异。
+// kind-index：0=图片 1=视频 2=GIF 3=网页。（须先于 WallpaperCardUi 声明）
+component TypeGlyph inherits Rectangle {
+    in property <int> kind-index: 0;
+
+    width: 100%;
+    height: 100%;
+    background: transparent;
+
+    // 视频：播放三角
+    if (root.kind-index == 1) : Path {
+        x: (parent.width - 18px) / 2;
+        y: (parent.height - 24px) / 2;
+        width: 18px;
+        height: 24px;
+        commands: "M 0 0 L 18 12 L 0 24 Z";
+        fill: Theme.glyph;
+    }
+
+    // GIF：文字标签（纯 ASCII，不依赖字形回退）
+    if (root.kind-index == 2) : Text {
+        width: 100%;
+        height: 100%;
+        text: "GIF";
+        color: Theme.glyph;
+        font-size: 22px;
+        font-weight: 700;
+        horizontal-alignment: center;
+        vertical-alignment: center;
+    }
+
+    // 图片 / 网页：相框 + 山峦 + 太阳
+    if (root.kind-index == 0 || root.kind-index == 3) : Rectangle {
+        x: (parent.width - 34px) / 2;
+        y: (parent.height - 26px) / 2;
+        width: 34px;
+        height: 26px;
+        background: transparent;
+        border-width: 2px;
+        border-color: Theme.glyph;
+        border-radius: 3px;
+
+        Path {
+            x: 4px;
+            y: 9px;
+            width: 26px;
+            height: 13px;
+            commands: "M 0 13 L 9 3 L 15 9 L 21 0 L 26 13 Z";
+            fill: Theme.glyph;
+        }
+        Rectangle {
+            x: 6px;
+            y: 5px;
+            width: 5px;
+            height: 5px;
+            border-radius: 3px;
+            background: Theme.glyph;
+        }
+    }
+}
+
+// ── 设置齿轮 / 关闭图标（Task 6）：内联矢量 Path，避免 emoji / 符号字形回退差异 ──
+component GearIcon inherits Rectangle {
+    in property <color> icon-color: Theme.button-text;
+
+    width: 16px;
+    height: 16px;
+    background: transparent;
+
+    Path {
+        width: 100%;
+        height: 100%;
+        viewbox-width: 16;
+        viewbox-height: 16;
+        stroke: root.icon-color;
+        stroke-width: 1.5px;
+        stroke-line-cap: round;
+        stroke-line-join: round;
+        fill: transparent;
+        // 半径 4 的齿环（两段圆弧）+ 8 根径向齿（r=4 → r=6.6）。
+        commands: "M 4 8 A 4 4 0 1 1 12 8 A 4 4 0 1 1 4 8 M 12 8 L 14.6 8 M 10.828 10.828 L 12.667 12.667 M 8 12 L 8 14.6 M 5.172 10.828 L 3.333 12.667 M 4 8 L 1.4 8 M 5.172 5.172 L 3.333 3.333 M 8 4 L 8 1.4 M 10.828 5.172 L 12.667 3.333";
+    }
+}
+
+component CloseIcon inherits Rectangle {
+    in property <color> icon-color: Theme.button-text;
+
+    width: 14px;
+    height: 14px;
+    background: transparent;
+
+    Path {
+        width: 100%;
+        height: 100%;
+        viewbox-width: 14;
+        viewbox-height: 14;
+        stroke: root.icon-color;
+        stroke-width: 1.6px;
+        stroke-line-cap: round;
+        fill: transparent;
+        commands: "M 3 3 L 11 11 M 11 3 L 3 11";
+    }
+}
+
+// ── 预览控制条播放/暂停按钮（Task 2）─────────────────────────────────────────
+// 图标用内联矢量（竖条=暂停 / 三角=播放），与 TypeGlyph 同风格，避免软件渲染下的字形回退。
+component PreviewPlayButton inherits Rectangle {
+    in property <bool> playing: false;
+    callback clicked();
+
+    width: 28px;
+    height: 28px;
+    border-radius: Theme.radius-md;
+    background: btn-hit.pressed
+        ? Theme.button-pressed
+        : (btn-hit.has-hover ? Theme.button-hover : Theme.button-bg);
+
+    btn-hit := TouchArea {
+        clicked => { root.clicked(); }
+    }
+
+    // 暂停：两根竖条
+    if (root.playing) : Rectangle {
+        x: (parent.width - 12px) / 2;
+        y: (parent.height - 14px) / 2;
+        width: 12px;
+        height: 14px;
+        background: transparent;
+
+        Rectangle {
+            x: 0;
+            y: 0;
+            width: 4px;
+            height: parent.height;
+            border-radius: 1px;
+            background: Theme.button-text;
+        }
+        Rectangle {
+            x: 8px;
+            y: 0;
+            width: 4px;
+            height: parent.height;
+            border-radius: 1px;
+            background: Theme.button-text;
+        }
+    }
+
+    // 播放：三角形（略微右移 1px 以视觉居中）
+    if (!root.playing) : Path {
+        x: (parent.width - 10px) / 2 + 1px;
+        y: (parent.height - 12px) / 2;
+        width: 10px;
+        height: 12px;
+        commands: "M 0 0 L 10 6 L 0 12 Z";
+        fill: Theme.button-text;
+    }
+}
+
+// ── 预览控制条速度按钮（Task 2）：文本显示当前倍速，点击循环切换 ──────────────
+component PreviewSpeedButton inherits Rectangle {
+    in property <string> label: "1×";
+    callback clicked();
+
+    width: 40px;
+    height: 28px;
+    border-radius: Theme.radius-md;
+    background: speed-hit.pressed
+        ? Theme.button-pressed
+        : (speed-hit.has-hover ? Theme.button-hover : Theme.button-bg);
+
+    speed-hit := TouchArea {
+        clicked => { root.clicked(); }
+    }
+
+    Text {
+        width: 100%;
+        height: 100%;
+        text: root.label;
+        color: Theme.button-text;
+        font-size: 11px;
+        horizontal-alignment: center;
+        vertical-alignment: center;
+    }
+}
+
+// ── 预览全屏/退出全屏按钮（Task 3/7）：内联矢量图标，避免软件渲染字形回退 ────
+component PreviewIconButton inherits Rectangle {
+    in property <bool> fullscreen: false;
+    callback clicked();
+
+    width: 28px;
+    height: 28px;
+    border-radius: Theme.radius-md;
+    background: icon-hit.pressed
+        ? Theme.button-pressed
+        : (icon-hit.has-hover ? Theme.button-hover : Theme.button-bg);
+
+    icon-hit := TouchArea {
+        clicked => { root.clicked(); }
+    }
+
+    // 非全屏（进入全屏）：四角向外箭头。
+    if (!root.fullscreen) : Path {
+        width: 100%;
+        height: 100%;
+        viewbox-width: 14;
+        viewbox-height: 14;
+        stroke: Theme.button-text;
+        stroke-width: 1.5px;
+        stroke-line-cap: round;
+        fill: transparent;
+        commands: "M 2 6 V 2 H 6 M 8 2 H 12 V 6 M 12 8 V 12 H 8 M 6 12 H 2 V 8";
+    }
+
+    // 全屏（退出全屏）：四角向内箭头。
+    if (root.fullscreen) : Path {
+        width: 100%;
+        height: 100%;
+        viewbox-width: 14;
+        viewbox-height: 14;
+        stroke: Theme.button-text;
+        stroke-width: 1.5px;
+        stroke-line-cap: round;
+        fill: transparent;
+        commands: "M 5 2 V 5 H 2 M 12 5 H 9 V 2 M 9 12 V 9 H 12 M 2 9 H 5 V 12";
+    }
+}
+
+// ── 预览控制条音量滑块（Task 3）：0..100，拖动实时下发 / 释放持久化 ──────────
+component PreviewVolumeSlider inherits Rectangle {
+    in-out property <float> value: 50;
+    callback changed(float);
+    callback committed(float);
+
+    width: 72px;
+    height: 28px;
+    background: transparent;
+
+    // 轨道
+    Rectangle {
+        x: 0;
+        y: (parent.height - 6px) / 2;
+        width: parent.width;
+        height: 6px;
+        border-radius: 3px;
+        background: Theme.text-muted;
+    }
+    // 已设音量填充
+    Rectangle {
+        x: 0;
+        y: (parent.height - 6px) / 2;
+        width: parent.width * (root.value / 100);
+        height: 6px;
+        border-radius: 3px;
+        background: Theme.accent;
+    }
+    // 拖柄：随值移动
+    Rectangle {
+        x: (root.value / 100) * (parent.width - 12px);
+        y: (parent.height - 12px) / 2;
+        width: 12px;
+        height: 12px;
+        border-radius: 6px;
+        background: Theme.accent;
+    }
+    // 命中区：拖动 / 释放按比例设置音量。
+    vol-hit := TouchArea {
+        width: 100%;
+        height: 100%;
+        moved => {
+            if (self.pressed) {
+                root.value = Math.max(0.0, Math.min(100.0,
+                    self.mouse-x / Math.max(self.width, 1px) * 100.0));
+                root.changed(root.value);
+            }
+        }
+        pointer-event(event) => {
+            if (event.kind == PointerEventKind.down) {
+                root.value = Math.max(0.0, Math.min(100.0,
+                    self.mouse-x / Math.max(self.width, 1px) * 100.0));
+                root.changed(root.value);
+            } else if (event.kind == PointerEventKind.up) {
+                root.committed(root.value);
+            }
+        }
+    }
+}
+
+// ── 单张壁纸卡片 ────────────────────────────────────────────────────────────
+component WallpaperCardUi inherits Rectangle {
+    in property <CardData> data;
+    in property <data-transfer> payload;
+    in property <bool> selected: false;
+    in property <bool> active: false;
+    in property <bool> drag-enabled: true;
+    // 拖影位图与热点偏移（Task 3）：由 MainWindow 下传（Rust 按缩略图区逻辑尺寸生成）。
+    in property <image> drag-ghost;
+    in property <int> drag-ghost-offset-x: 0;
+    in property <int> drag-ghost-offset-y: 0;
+    in property <length> card-w: 160px;
+    in property <length> card-h: 134px;
+    // 键盘焦点（Tab / 方向键）：独立焦点环，不与选中态冲突。
+    in property <bool> kb-focused: false;
+    // 是否为当前拖拽源（播放 ghost 时源卡片降透明度，避免重复绘制）。
+    in property <bool> dragging: false;
+    // 邻居让位动画：外部写入目标位移（in），内部私有属性做插值（animate 只能作用于非 in 属性）。
+    in property <length> slot-target-x: 0px;
+    in property <length> slot-target-y: 0px;
+    property <length> slot-dx: root.slot-target-x;
+    property <length> slot-dy: root.slot-target-y;
+    // 网格几何（卡片自持定位，使 slot-dx/dy 可被组件内部读取）。
+    in property <length> grid-gap: 12px;
+    in property <length> grid-pad: 8px;
+
+    callback clicked(string);
+    callback set-wallpaper(string);
+    callback delete-requested(string);
+    callback preview-requested(string);
+    callback drag-ended();
+    callback drag-started(string, length, length);
+
+    x: root.grid-pad + root.data.col * (root.card-w + root.grid-gap) + root.slot-dx;
+    y: root.grid-pad + root.data.row * (root.card-h + root.grid-gap) + root.slot-dy;
+    width: root.card-w;
+    height: root.card-h;
+    background: #0f3460;
+    border-radius: Theme.radius-lg;
+    border-width: (root.selected || root.kb-focused) ? 2px : 0px;
+    border-color: root.kb-focused ? #ffd54f : Theme.accent;
+    opacity: root.dragging ? 0.35 : 1;
+    clip: true;
+
+    // 邻居让位：仅当 slot-dx/dy 因拖拽悬停变化时插值（初始值与静态态恒为 0，不触发动画）。
+    animate slot-dx { duration: 120ms; easing: ease-out; }
+    animate slot-dy { duration: 120ms; easing: ease-out; }
+
+    // 拖拽源：覆盖整卡。视觉内容与各类 TouchArea 都作为其**子元素**，
+    // 这样"点击不触发拖拽、拖拽仍能启动"（DragArea 的按压跟踪发生在过滤阶段）。
+    drag := DragArea {
+        width: 100%;
+        height: 100%;
+        enabled: root.drag-enabled;
+        data: root.payload;
+        allow-copy: true;
+        // 幽灵副本：跟随光标的圆角半透明拖影（由 Rust 按缩略图区逻辑尺寸生成，见 Task 3）。
+        drag-image: root.drag-ghost;
+        drag-image-offset-x: root.drag-ghost-offset-x;
+        drag-image-offset-y: root.drag-ghost-offset-y;
+        drag-finished(action) => { root.drag-ended(); }
+
+        // Slint 1.18 的 DragArea 没有 drag-started 回调，只能监听 dragging 由 false→true 触发。
+        // 传出的逻辑尺寸即缩略图区尺寸（拖影位图按此像素尺寸生成）。
+        changed dragging => {
+            if (self.dragging) {
+                root.drag-started(root.data.id, root.card-w, root.card-h - 40px);
+            }
+        }
+
+        // 缩略图区
+        Rectangle {
+            x: 0;
+            y: 0;
+            width: parent.width;
+            height: root.card-h - 40px;
+            background: Theme.panel;
+            clip: true;
+
+            if (root.data.state == 0) : Image {
+                width: 100%;
+                height: 100%;
+                image-fit: cover;
+                source: root.data.thumb;
+            }
+
+            if (root.data.state == 1) : Text {
+                width: 100%;
+                height: 100%;
+                text: "网页壁纸";
+                color: Theme.text-dim;
+                font-size: 12px;
+                horizontal-alignment: center;
+                vertical-alignment: center;
+            }
+
+            if (root.data.state == 2) : Text {
+                width: 100%;
+                height: 100%;
+                text: "源文件缺失";
+                color: #ef9a9a;
+                font-size: 12px;
+                horizontal-alignment: center;
+                vertical-alignment: center;
+            }
+
+            // 生成失败 / 视频无缩略图：内联矢量类型图标（Task 7.4）。
+            if (root.data.state == 3) : TypeGlyph {
+                kind-index: root.data.kind-index;
+            }
+
+            TypeBadge {
+                x: 6px;
+                y: 6px;
+                kind-index: root.data.kind-index;
+                label: root.data.kind-index == 0 ? "图片"
+                    : root.data.kind-index == 1 ? "视频"
+                    : root.data.kind-index == 2 ? "GIF"
+                    : "网页";
+            }
+
+            // 当前壁纸角标
+            if (root.active) : Rectangle {
+                x: parent.width - 42px;
+                y: 6px;
+                width: 36px;
+                height: 17px;
+                background: Theme.accent;
+                border-radius: Theme.radius-sm;
+                Text {
+                    text: "当前";
+                    color: #08243a;
+                    font-size: 10px;
+                    horizontal-alignment: center;
+                    vertical-alignment: center;
+                    width: 100%;
+                    height: 100%;
+                }
+            }
+        }
+
+        // 名称
+        Text {
+            x: 8px;
+            y: root.card-h - 40px;
+            width: parent.width - 16px;
+            height: 18px;
+            text: root.data.name;
+            color: #e0e0e0;
+            font-size: 11px;
+            vertical-alignment: center;
+            overflow: elide;
+        }
+
+        // 卡片主体点击区（选中）。声明在操作条之前，故操作条命中优先。
+        body := TouchArea {
+            width: 100%;
+            height: 100%;
+            clicked => { root.clicked(root.data.id); }
+        }
+
+        // 操作条（设为壁纸 / 预览 / 删除）：居中排布，左右内边距对称（Task 7.6）。
+        Rectangle {
+            x: 0;
+            y: root.card-h - 22px;
+            width: parent.width;
+            height: 22px;
+            background: #0b2748;
+
+            HorizontalLayout {
+                width: 100%;
+                height: 100%;
+                // 3×58 + 2×6 = 186 ≤ 200，左右各留 7px 且对称。
+                spacing: 6px;
+                alignment: center;
+                cross-axis-alignment: center;
+
+                CardActionButton {
+                    label: "设为壁纸";
+                    clicked => { root.set-wallpaper(root.data.id); }
+                }
+                CardActionButton {
+                    label: "预览";
+                    clicked => { root.preview-requested(root.data.id); }
+                }
+                CardActionButton {
+                    label: "删除";
+                    danger: true;
+                    clicked => { root.delete-requested(root.data.id); }
+                }
+            }
+        }
+    }
+}
+
+// ── 设置面板分段标题 / 子标签 / 空态提示（Task 6 / 7 面板专用）───────────────
+component SectionTitle inherits Text {
+    height: 24px;
+    color: Theme.accent;
+    font-size: 12px;
+    font-weight: 700;
+    vertical-alignment: center;
+}
+
+component SubLabel inherits Text {
+    height: 18px;
+    color: Theme.text-secondary;
+    font-size: 11px;
+    vertical-alignment: center;
+}
+
+component PanelHint inherits Text {
+    height: 20px;
+    color: Theme.text-dim;
+    font-size: 11px;
+    vertical-alignment: center;
+    overflow: elide;
+}
+
+// ── 关于面板「项目仓库」链接（点击在默认浏览器打开仓库）───────────────────────
+// 链接样式：区别色 + 下划线 + 手型光标。Slint 1.18 的 `Text` 无 `underline` 属性，
+// 故用 1px 横线模拟下划线。`horizontal-stretch: 0` 让布局按文本固有宽度分配，
+// 使命中区贴合文本而非铺满整行。
+component RepoLink inherits Rectangle {
+    callback clicked();
+
+    width: link-text.preferred-width;
+    preferred-width: link-text.preferred-width;
+    height: 22px;
+    horizontal-stretch: 0;
+    background: transparent;
+
+    link-text := Text {
+        text: "项目仓库";
+        color: Theme.accent;
+        font-size: 11px;
+        vertical-alignment: center;
+    }
+    Rectangle {
+        x: 0;
+        y: parent.height - 4px;
+        width: link-text.preferred-width;
+        height: 1px;
+        background: Theme.accent;
+    }
+    TouchArea {
+        mouse-cursor: pointer;
+        clicked => { root.clicked(); }
+    }
+}
+
+// ── 主窗口 ──────────────────────────────────────────────────────────────────
+export component MainWindow inherits Window {
+    title: "镜星壁纸";
+    // 窗口尺寸（Task 7.2）：初始尺寸用 `preferred-*`，最小尺寸用 `min-*`。
+    // 取舍说明：Slint 1.18 不允许在 `Window` 上同时写 `width` 与 `min-width`
+    // （编译器报 "Cannot specify both 'width' and 'min-width'"）；且显式 `width`/`height`
+    // 会把 min==max 双双写死，令窗口不可缩放。改用 preferred-* + min-* 后：
+    //   - winit 以组件 preferred 尺寸创建窗口（960×640）；
+    //   - `Window` 元素的 `min-*` 进入 `root_constraints`，经 `layout_constraints()`
+    //     传到 `set_min_inner_size`，窗口管理器据此阻止缩小到 720×480 以下。
+    preferred-width: 960px;
+    preferred-height: 640px;
+    min-width: 720px;
+    min-height: 480px;
+    background: #1a1a2e;
+    // 初始焦点交给根 FocusScope：其 capture-key-pressed 覆盖全部子元素（Task 9.7.2 / 9.7.3）。
+    forward-focus: kb-root;
+
+    // ── 状态仓投影（由 Rust 侧每次状态变更后写回）────────────────────────────
+    in property <bool> connected: false;
+    in property <int> item-count: 0;
+    in property <int> display-count: 0;
+    in property <string> config-summary: "（未加载）";
+    in property <string> rotation-summary: "（未加载）";
+    in property <string> playback-summary: "（未知）";
+    in property <string> last-event: "（等待事件）";
+    // 桌面（WorkerW）状态：由 `desktop-status-changed` 事件 / 轮询结果写回（Task 9.7.1）。
+    in property <bool> desktop-ok: true;
+
+    // ── 网格投影 ────────────────────────────────────────────────────────────
+    in property <[CardData]> cards: [];
+    in property <int> visible-count: 0;     // 过滤后展示数（虚拟化窗口的总数）
+    in property <bool> search-active: false;
+    // `in-out`：搜索框 `text <=> root.search-keyword` 需要双向；Slint 中的 `in` 属性不可在组件内被赋值。
+    in-out property <string> search-keyword: "";
+    in property <bool> loading: true;
+    in property <length> card-w: 200px;
+    in property <length> card-h: 152px;
+    in property <length> grid-gap: 12px;
+    in property <length> grid-pad: 8px;
+    in property <int> column-count: 4;
+    // 列数兜底（0/负 → 1），避免骨架屏等取模/除算除零；实际值由 `apply_geometry` 写入。
+    property <int> effective-columns: root.column-count > 0 ? root.column-count : 1;
+    in property <length> content-height: 0px;
+
+    // ── 交互态 ──────────────────────────────────────────────────────────────
+    in property <bool> drag-enabled: true;
+    in property <int> drop-index: -1;
+    in property <string> selected-id: "";
+    in property <string> active-id: "";
+    in property <string> pending-delete-id: "";
+    // 键盘焦点所在的卡片（过滤后序列索引；-1 表示无）。由 Rust 依据按键推进。
+    in-out property <int> kb-focus-index: -1;
+    // Rust 计算出的"把焦点卡滚动进可见区"的目标 content-y；变化时驱动 Flickable。
+    in property <length> scroll-target: 0px;
+    // 当前拖拽源在过滤序列中的位置（-1 表示无拖拽）；用于邻居让位。
+    in property <int> drag-source-index: -1;
+    // 拖影位图与热点偏移（Task 3，由 Rust 生成并写回；空 image 时不绘制 overlay）。
+    in-out property <image> drag-ghost;
+    in-out property <int> drag-ghost-offset-x: 0;
+    in-out property <int> drag-ghost-offset-y: 0;
+    // 系统文件拖入悬停态（由原生拖放目标写回）；用于高亮网格区。
+    in property <bool> file-drag-over: false;
+    // `in-out`：Toast 自动消隐定时器会在组件内部把它清空，`in` 属性不允许组件内赋值。
+    in-out property <string> toast-text: "";
+    // Toast 级别：0=info 1=success 2=warning 3=error（与 `settings::TOAST_*` 一致）。
+    in property <int> toast-level: 0;
+
+    // ── 设置面板投影（Task 6 / Task 7，由 Rust 写回）─────────────────────────
+    in property <bool> settings-open: false;
+    // 显示
+    in property <int> display-index: 0;
+    in property <[OptionItem]> display-options: [];
+    // 非 per_monitor 排列下「目标显示器」选择无意义 → 置灰。
+    in property <bool> display-dropdown-enabled: true;
+    in property <int> scaling-index: 0;
+    in property <[OptionItem]> scaling-options: [];
+    in property <int> arrangement-index: 0;
+    in property <[OptionItem]> arrangement-options: [];
+    in property <int> fullscreen-index: 0;
+    in property <[OptionItem]> fullscreen-options: [];
+    // 播放
+    in property <bool> pause-enabled: false;
+    in property <string> pause-label: "暂停";
+    in property <bool> prev-enabled: false;
+    in property <bool> next-enabled: false;
+    // `in-out`：滑块拖动直接写回该归一化位置（0..1）。
+    in-out property <float> volume-pos: 0.8;
+    in property <int> volume-percent: 80;
+    in property <bool> muted: false;
+    in-out property <float> speed-pos: 0.2;
+    in property <string> speed-text: "1.00x";
+    in property <bool> audio-controls-enabled: true;
+    // 系统
+    in property <bool> auto-start: false;
+    in property <bool> pause-on-battery: false;
+    in property <bool> interaction-mode: false;
+    // 轮换
+    in property <bool> rotation-enabled: false;
+    in property <bool> rotation-on-boot: false;
+    in property <int> rotation-interval: 30;
+    in-out property <string> rotation-interval-text: "30";
+    in property <int> rotation-order-index: 0;
+    in property <string> rotation-order-hint: "";
+    in property <[OptionItem]> order-options: [];
+    // 壁纸池 / 单元
+    in property <[PoolRow]> pool-rows: [];
+    in property <[OptionItem]> pool-options: [];
+    in property <[MemberRow]> member-rows: [];
+    in property <[MemberRow]> available-rows: [];
+    in property <bool> has-editing-pool: false;
+    in property <string> editing-pool-id: "";
+    in-out property <string> editing-pool-name: "";
+    in property <string> pending-delete-pool-id: "";
+    in property <[UnitRow]> unit-rows: [];
+    // 关于
+    in property <string> about-version: "MirrorStar Wallpaper";
+
+    // ── 下拉浮层状态（单例）───────────────────────────────────────────────────
+    // 由任意 `Dropdown` 的 `open-requested` 经 `dd-toggle` 写入；根级浮层据此绘制展开列表
+    // （不参与 `VerticalLayout` 布局），故展开不会推挤其后的设置项。
+    in-out property <bool> dd-open: false;
+    in-out property <int> dd-id: 0;
+    in-out property <length> dd-x: 0px;
+    in-out property <length> dd-y: 0px;
+    in-out property <length> dd-w: 0px;
+    in-out property <int> dd-index: 0;
+    in-out property <[OptionItem]> dd-options: [];
+
+    // ── 预览弹窗投影（Task 8，全部由 Rust 写回）─────────────────────────────
+    // `preview-id` 非空即显示覆盖层；kind 与 `preview::KIND_*` 一一对应。
+    in property <string> preview-id: "";
+    in property <string> preview-title: "";
+    in property <int> preview-kind: 0;
+    in property <string> preview-note: "";
+    // 图片预览图像 / GIF 当前帧（关闭时 Rust 显式清空，释放软件渲染器常驻位图）。
+    in property <image> preview-image;
+    in property <image> preview-frame;
+    // 网页创建中（驱动轮询定时器）/ GIF 播放中（驱动逐帧定时器）。
+    in property <bool> preview-pending: false;
+    in property <bool> preview-gif-playing: false;
+    // 预览播放控制状态（Task 2，由 Rust 后台线程回投 / 或由 GIF 定时器驱动）。
+    in property <bool> preview-playing: false;
+    in property <float> preview-dur: 0;
+    in property <float> preview-progress: 0;
+    in property <string> preview-pos-text: "0:00";
+    in property <string> preview-dur-text: "0:00";
+    // 播放倍速：`preview-speed-index` 为 `preview-speed-steps` 的下标（默认 1 = 1×）。
+    in-out property <int> preview-speed-index: 1;
+    property <[float]> preview-speed-steps: [0.5, 1.0, 1.25, 1.5, 2.0];
+    property <[string]> preview-speed-labels: ["0.5×", "1×", "1.25×", "1.5×", "2×"];
+    // 预览音量（0..100，mpv 标度）/ 静音（Task 3，由 Rust 种子化并回写）。
+    in-out property <float> preview-volume: 50;
+    in-out property <bool> preview-muted: false;
+    // 预览全屏态（Task 3/8，由 Rust 写入）：真·系统全屏，铺满整屏（含任务栏）。
+    in property <bool> preview-fullscreen: false;
+    // 全屏控制条显示态（Task 9，由 Rust 轮询光标写入）：仅全屏时生效。
+    in property <bool> preview-chrome-visible: true;
+
+    // 弹窗几何：既用于布局，也作为向 Rust 暴露「预览内容区逻辑坐标」的来源，
+    // 使 Rust 能把 mpv / WebView2 子窗口精确叠加到该区域上（× scale_factor 得物理矩形）。
+    // 全屏态铺满整窗（0 边距），默认态为 min() 限幅；dlg-x/dlg-y 居中公式随之自适应。
+    property <length> dlg-w: root.preview-fullscreen ? root.width : min(920px, root.width - 80px);
+    property <length> dlg-h: root.preview-fullscreen ? root.height : min(640px, root.height - 80px);
+    property <length> dlg-x: root.preview-fullscreen ? 0px : (root.width - root.dlg-w) / 2;
+    property <length> dlg-y: root.preview-fullscreen ? 0px : (root.height - root.dlg-h) / 2;
+    // 预览控制条高度：视频 44px / GIF 40px / 图片与网页 0（行为不变）。视频原生子窗口
+    // 只覆盖缩小后的内容区，控制条位于其下方故不被遮挡。
+    property <length> controls-h: root.preview-kind == 1 ? 44px : (root.preview-kind == 2 ? 40px : 0px);
+    // chrome 隐藏态（Task 9）：全屏且控制条自动隐藏时，内容铺满整屏、不占位控制条。
+    property <bool> chrome-hidden: root.preview-fullscreen && !root.preview-chrome-visible;
+    out property <length> preview-x: root.dlg-x + (root.chrome-hidden ? 0px : 12px);
+    out property <length> preview-y: root.dlg-y + (root.chrome-hidden ? 0px : 58px);
+    out property <length> preview-w: root.dlg-w - (root.chrome-hidden ? 0px : 24px);
+    out property <length> preview-h: root.dlg-h - (root.chrome-hidden ? 0px : (104px + root.controls-h));
+    // 控制条高度投影给 Rust：用于几何守卫（宿主子窗口底边不得侵入控制条区）。
+    out property <length> preview-controls-h: root.chrome-hidden ? 0px : root.controls-h;
+
+    // 拖拽负载构造：Slint 中 `data-transfer` 不透明，只能由宿主（Rust）构造，
+    // 且在属性绑定中调用故须为 pure。
+    pure callback to-transfer(string) -> data-transfer;
+
+    // ── 交互回调（由 Rust 实现）──────────────────────────────────────────────
+    callback viewport-changed(length, length);
+    // 网格可用宽度变化：Rust 据此重算列数（Task 4.2）。
+    callback grid-width-changed(length);
+    // 桌面（WorkerW）状态轮询 tick（`ok:false` 后由 2s 定时器驱动，Task 9.7.1）。
+    callback desktop-poll-tick();
+    callback search-changed(string);
+    callback select-card(string);
+    callback set-as-wallpaper(string);
+    callback request-delete(string);
+    callback confirm-delete(string);
+    callback cancel-delete();
+    callback request-preview(string);
+    callback add-requested();
+    // 预览弹窗（Task 8）：关闭 / 网页创建轮询 / GIF 逐帧 / 尺寸变化重排。
+    callback preview-closed();
+    callback preview-poll-tick();
+    callback preview-gif-tick();
+    callback preview-geometry-changed();
+    // 播放控制（Task 2）：切换播放/暂停；seek 参数为 0..1 比例。
+    callback preview-toggle-play();
+    callback preview-seek(float);
+    // 播放倍速（Task 2）：参数为倍速数值，Rust 写入 mpv `speed`。
+    callback preview-set-speed(float);
+    // 预览音量/静音（Task 3）：set 为拖动中实时下发，commit 为释放后持久化。
+    callback preview-set-volume(float);
+    callback preview-commit-volume(float);
+    callback preview-toggle-mute();
+    // 预览全屏 / 退出全屏切换（Task 3/8）。
+    callback preview-toggle-fullscreen();
+    // 全屏控制条自动隐藏轮询 tick（Task 9）。
+    callback preview-chrome-tick();
+    // 坐标来自 `DropEvent.position`（Slint 的 `Point`，分量为 `length`），故用 `length`。
+    callback drag-insert-index(data-transfer, length, length);
+    callback drag-commit(data-transfer, int);
+    callback drag-ended();
+    callback drag-started(string, length, length);
+    // 键盘动作分发（Task 9.7.2 / 9.7.3）：返回 true 表示已处理并消费该按键。
+    // action ∈ {left, right, up, down, next, prev, activate, delete, dismiss}。
+    callback key-command(string) -> bool;
+
+    // ── 设置面板回调（Task 6 / Task 7，由 Rust 实现）─────────────────────────
+    callback settings-toggled();
+    callback display-selected(int);
+    callback scaling-selected(int);
+    callback arrangement-selected(int);
+    callback fullscreen-selected(int);
+    callback pause-toggled();
+    callback prev-requested();
+    callback next-requested();
+    callback volume-committed(float);
+    callback mute-toggled(bool);
+    callback speed-committed(float);
+    // 播放速度 −/+ 微调：参数为速度增量（如 ±0.01），Rust 侧 clamp 后写回。
+    callback speed-stepped(float);
+    callback auto-start-toggled(bool);
+    callback pause-on-battery-toggled(bool);
+    callback interaction-mode-toggled(bool);
+    callback rotation-enabled-toggled(bool);
+    callback rotation-on-boot-toggled(bool);
+    callback rotation-interval-step(int);
+    callback rotation-interval-submitted(string);
+    callback order-selected(int);
+    callback pool-create-requested();
+    callback pool-select(string);
+    callback pool-move(string, int);
+    callback pool-delete-requested(string);
+    callback pool-delete-confirmed(string);
+    callback pool-delete-cancelled();
+    callback pool-rename(string);
+    callback pool-member-move(string, int);
+    callback pool-member-remove(string);
+    callback pool-member-add(string);
+    callback unit-pool-selected(string, int);
+    callback unit-enabled-toggled(string, bool);
+    // 关于面板：在默认浏览器打开项目仓库。
+    callback open-repo();
+
+    // ── 下拉浮层（单例）：展开 / 收起与选择回派，纯 UI 内部回调）────────────────
+    // id 约定：1=目标显示器、2=缩放模式、3=多屏排列、4=全屏时处置、5=采样算法、
+    // 100+i=「单元配置」第 i 行单元的激活壁纸池下拉（位于 `for` 循环内，按行号区分身份）。
+    callback dd-toggle(id: int, x: length, y: length, w: length, index: int);
+    callback dd-choose(id: int, index: int);
+
+    dd-toggle(id, x, y, w, index) => {
+        // 再次点击同一下拉头部 → 收起；否则写入几何与数据、展开。
+        if (root.dd-open && root.dd-id == id) {
+            root.dd-open = false;
+        } else {
+            root.dd-id = id;
+            root.dd-x = x;
+            root.dd-y = y;
+            root.dd-w = w;
+            root.dd-index = index;
+            root.dd-options = [];
+            if (id == 1) { root.dd-options = root.display-options; }
+            if (id == 2) { root.dd-options = root.scaling-options; }
+            if (id == 3) { root.dd-options = root.arrangement-options; }
+            if (id == 4) { root.dd-options = root.fullscreen-options; }
+            if (id == 5) { root.dd-options = root.order-options; }
+            if (id >= 100) { root.dd-options = root.pool-options; }
+            root.dd-open = true;
+        }
+    }
+
+    dd-choose(id, index) => {
+        // 选择即收起，再按身份回派到既有 `selected` 回调（Rust 写回链路不变）。
+        root.dd-open = false;
+        if (id == 1) { root.display-selected(index); }
+        if (id == 2) { root.scaling-selected(index); }
+        if (id == 3) { root.arrangement-selected(index); }
+        if (id == 4) { root.fullscreen-selected(index); }
+        if (id == 5) { root.order-selected(index); }
+        if (id >= 100) { root.unit-pool-selected(root.unit-rows[id - 100].key, index); }
+    }
+
+    // 防抖到期（合并窗口见下方 Timer 注释）。
+    callback playback-refresh-tick();
+    callback rotated-toast-tick();
+
+    // Toast 自动消隐
+    Timer {
+        interval: 3s;
+        running: root.toast-text != "";
+        triggered => { root.toast-text = ""; }
+    }
+
+    // 播放状态刷新 / 轮换提示的**合并窗口**（Task 6.3 / 7.4）。
+    //
+    // Slint 的 `Timer` 不会因 `token` 递增而重启，故这是"事件到达后 150ms 合并触发"语义
+    // （连续事件最多每 150ms 汇成一次），而非严格的 trailing debounce；对本场景足够且实现简单。
+    // Rust 侧收到事件时 `token += 1`，这里归零并回调，避免同一轮换风暴反复查询 / 弹窗。
+    in-out property <int> playback-refresh-token: 0;
+    Timer {
+        interval: 150ms;
+        running: root.playback-refresh-token > 0;
+        triggered => {
+            root.playback-refresh-token = 0;
+            root.playback-refresh-tick();
+        }
+    }
+    in-out property <int> rotated-toast-token: 0;
+    Timer {
+        interval: 150ms;
+        running: root.rotated-toast-token > 0;
+        triggered => {
+            root.rotated-toast-token = 0;
+            root.rotated-toast-tick();
+        }
+    }
+
+    // 网页创建轮询（WebView2 异步状态机推进，见 `preview::web`）。
+    Timer {
+        interval: 50ms;
+        running: root.preview-pending;
+        triggered => { root.preview-poll-tick(); }
+    }
+    // 桌面（WorkerW）状态轮询：`ok:false` 后每 2s 一次，30s 超时由 Rust 侧判定（Task 9.7.1）。
+    in-out property <bool> desktop-polling: false;
+    Timer {
+        interval: 2s;
+        running: root.desktop-polling;
+        triggered => { root.desktop-poll-tick(); }
+    }
+    // GIF 逐帧推进（固定 30ms tick，帧自身延时由 Rust 侧单调时钟判定）。
+    Timer {
+        interval: 30ms;
+        running: root.preview-gif-playing;
+        triggered => { root.preview-gif-tick(); }
+    }
+
+    // 窗口尺寸 / DPI 变化导致弹窗重排时，通知 Rust 重排原生子窗口。
+    // dlg-w/h 被 920/640 上限锁定而仅位置变化时，宽度/高度不变、x/y 变化，
+    // 故位置也需监听，否则子窗口停在旧位置产生偏移。
+    changed dlg-w => { root.preview-geometry-changed(); }
+    changed dlg-h => { root.preview-geometry-changed(); }
+    changed dlg-x => { root.preview-geometry-changed(); }
+    changed dlg-y => { root.preview-geometry-changed(); }
+
+    // 跨屏 DPI 兜底重排：winit 在 WM_DPICHANGED 下保持**逻辑尺寸**不变（物理尺寸随比例
+    // 缩放），故 root.width/height 与 dlg-* 均不变化、上面的 changed 不会触发。预览打开
+    // 期间按固定周期重排一次；Rust 侧 `sync_geometry` 幂等（同物理矩形直接短路），不会造成
+    // 重复 `SetWindowPos`。
+    Timer {
+        interval: 250ms;
+        running: root.preview-id != "";
+        triggered => { root.preview-geometry-changed(); }
+    }
+
+    // 全屏控制条自动隐藏（Task 9）：仅全屏时按固定周期轮询，由 Rust 判断光标是否静止。
+    Timer {
+        interval: 100ms;
+        running: root.preview-id != "" && root.preview-fullscreen;
+        triggered => { root.preview-chrome-tick(); }
+    }
+
+    // 键盘焦点滚动：写 Flickable 的 content-y 把焦点卡带入可见区（Task 9.7.2）。
+    changed scroll-target => { flick.content-y = root.scroll-target; }
+
+    // 按键 → 动作名（无映射返回空串）。Slint 特殊键常量与 key_codes 一一对应。
+    pure function key-action(text: string) -> string {
+        if (text == Key.Tab) { return "next"; }
+        if (text == Key.Backtab) { return "prev"; }
+        if (text == Key.LeftArrow) { return "left"; }
+        if (text == Key.RightArrow) { return "right"; }
+        if (text == Key.UpArrow) { return "up"; }
+        if (text == Key.DownArrow) { return "down"; }
+        if (text == Key.Return || text == Key.Space) { return "activate"; }
+        if (text == Key.Delete) { return "delete"; }
+        if (text == "m" || text == "M") { return "mute"; }
+        if (text == Key.Escape) { return "dismiss"; }
+        return "";
+    }
+
+    // 预览态允许转发给 key-command 的动作白名单。
+    // 刻意不含 up/down/next/prev/delete：避免在预览打开时误操作网格焦点或删除壁纸。
+    pure function preview-forwardable(action: string) -> bool {
+        return action == "activate" || action == "mute" || action == "left" || action == "right";
+    }
+
+    // 邻居让位：拖拽源与插入位之间卡片的线性位置位移（-1/0/+1）。仅拖拽期间非零。
+    pure function let-way-shift(p: int) -> int {
+        if (root.drag-source-index < 0 || root.drop-index < 0) { return 0; }
+        if (p == root.drag-source-index) { return 0; }
+        if (root.drag-source-index < root.drop-index) {
+            return (p > root.drag-source-index && p <= root.drop-index) ? -1 : 0;
+        }
+        return (p >= root.drop-index && p < root.drag-source-index) ? 1 : 0;
+    }
+
+    // ── 全局键盘捕获（Task 9.7.2 / 9.7.3）──────────────────────────────────
+    // 包裹全部内容：capture 阶段自 Window 向下调用，根 FocusScope 恒为所有元素的祖先，
+    // 故任何时刻按键都会先经过此处理。
+    kb-root := FocusScope {
+        capture-key-pressed(event) => {
+            // 预览打开：Esc 关闭；Tab/Backtab 陷阱在弹窗内；白名单动作转发；其余交回原生子窗口。
+            if (root.preview-id != "") {
+                if (event.text == Key.Escape) {
+                    root.key-command("dismiss");
+                    return accept;
+                }
+                if (event.text == Key.Tab || event.text == Key.Backtab) {
+                    return accept;
+                }
+                if (!root.preview-forwardable(root.key-action(event.text))) {
+                    return reject;
+                }
+                return root.key-command(root.key-action(event.text)) ? accept : reject;
+            }
+            // 下拉浮层展开时，Esc 先收起浮层（不关闭设置面板）。
+            if (root.dd-open) {
+                if (event.text == Key.Escape) {
+                    root.dd-open = false;
+                    return accept;
+                }
+            }
+            // 设置面板打开或搜索框聚焦：交回原生处理（输入字符 / Tab / 方向键属面板与输入框）。
+            if (root.settings-open || search-input.has-focus) {
+                return reject;
+            }
+            if (root.key-action(event.text) == "") {
+                return reject;
+            }
+            return root.key-command(root.key-action(event.text)) ? accept : reject;
+        }
+
+    VerticalLayout {
+        padding: 0px;
+        spacing: 0px;
+
+        // ── 顶栏 ────────────────────────────────────────────────────────────
+        // 可收缩布局（Task 7.2）：左侧信息按序排布、右侧元素右对齐；最小尺寸（720px）下不重叠。
+        Rectangle {
+            height: Theme.topbar-height;
+            background: Theme.panel;
+
+            HorizontalLayout {
+                width: 100%;
+                height: 100%;
+                padding-left: 16px;
+                padding-right: 16px;
+                spacing: 12px;
+                cross-axis-alignment: center;
+
+                Text {
+                    text: "镜星壁纸";
+                    color: Theme.accent;
+                    font-size: 17px;
+                    font-weight: 700;
+                    horizontal-stretch: 0;
+                    vertical-alignment: center;
+                }
+
+                Text {
+                    text: root.connected ? "已连接" : "未连接";
+                    color: root.connected ? #66bb6a : #ef5350;
+                    font-size: 12px;
+                    horizontal-stretch: 0;
+                    vertical-alignment: center;
+                }
+
+                // 搜索框（可伸缩：优先吃掉多余空间，空间不足时收缩到 min-width）
+                Rectangle {
+                    height: 30px;
+                    min-width: 120px;
+                    preferred-width: 250px;
+                    horizontal-stretch: 1;
+                    background: Theme.bg-deep;
+                    border-radius: Theme.radius-md;
+                    border-width: 1px;
+                    border-color: root.search-active ? Theme.accent : Theme.border;
+
+                    if (root.search-keyword == "") : Text {
+                        x: 10px;
+                        y: 0;
+                        height: parent.height;
+                        text: "搜索壁纸名称…";
+                        color: Theme.text-muted;
+                        font-size: 12px;
+                        vertical-alignment: center;
+                    }
+
+                    search-input := TextInput {
+                        x: 8px;
+                        y: 0;
+                        width: parent.width - 16px;
+                        height: parent.height;
+                        single-line: true;
+                        color: Theme.text-input;
+                        font-size: 12px;
+                        vertical-alignment: center;
+                        text <=> root.search-keyword;
+                        edited => { root.search-changed(self.text); }
+                    }
+                }
+
+                // 添加按钮
+                Rectangle {
+                    width: 80px;
+                    height: 30px;
+                    horizontal-stretch: 0;
+                    border-radius: Theme.radius-md;
+                    background: add-hover.pressed ? Theme.button-pressed
+                        : add-hover.has-hover ? Theme.button-hover
+                        : Theme.button-prominent;
+
+                    add-hover := TouchArea {
+                        clicked => { root.add-requested(); }
+                    }
+
+                    Text {
+                        text: "＋ 添加";
+                        color: Theme.button-text;
+                        font-size: 12px;
+                        horizontal-alignment: center;
+                        vertical-alignment: center;
+                        width: 100%;
+                        height: 100%;
+                    }
+                }
+
+                Text {
+                    min-width: 0px;
+                    preferred-width: 170px;
+                    horizontal-stretch: 0;
+                    text: root.search-active
+                        ? "匹配 \{root.visible-count} / \{root.item-count}"
+                        : "壁纸 \{root.item-count} ｜ 显示 \{root.display-count}";
+                    color: #a0a0a0;
+                    font-size: 12px;
+                    vertical-alignment: center;
+                    overflow: elide;
+                }
+
+                // 弹性占位：把右侧元素推到最右，保证窗口变窄时左右两侧不重叠。
+                Rectangle {
+                    horizontal-stretch: 1;
+                }
+
+                Text {
+                    min-width: 0px;
+                    preferred-width: 202px;
+                    horizontal-stretch: 0;
+                    text: root.last-event;
+                    color: Theme.text-secondary;
+                    font-size: 11px;
+                    vertical-alignment: center;
+                    horizontal-alignment: right;
+                    overflow: elide;
+                }
+
+                // 设置面板开关（Task 6）：矢量齿轮 / 关闭图标切换右侧面板。
+                Rectangle {
+                    width: 32px;
+                    height: 32px;
+                    horizontal-stretch: 0;
+                    border-radius: Theme.radius-md;
+                    background: gear-hover.pressed ? Theme.button-pressed
+                        : gear-hover.has-hover ? Theme.button-hover
+                        : Theme.button-prominent;
+                    border-width: 1px;
+                    border-color: root.settings-open ? Theme.accent : Theme.border;
+
+                    gear-hover := TouchArea {
+                        clicked => { root.settings-toggled(); }
+                    }
+
+                    if (root.settings-open) : CloseIcon {
+                        x: (parent.width - self.width) / 2;
+                        y: (parent.height - self.height) / 2;
+                        icon-color: Theme.button-text;
+                    }
+                    if (!root.settings-open) : GearIcon {
+                        x: (parent.width - self.width) / 2;
+                        y: (parent.height - self.height) / 2;
+                        icon-color: Theme.button-text;
+                    }
+                }
+            }
+        }
+
+        // ── 网格区 + 停靠设置侧栏（Task 6）：并排布局，侧栏开合驱动网格宽度重算 ──
+        HorizontalLayout {
+            width: 100%;
+            vertical-stretch: 1;
+            spacing: 0px;
+
+        // ── 网格区 ──────────────────────────────────────────────────────────
+        grid-area := Rectangle {
+            horizontal-stretch: 1;
+            clip: true;
+
+            // 滚动指示计算（Task 7.3）：内容未溢出时不显示；指示条为只读覆盖层。
+            property <length> max-scroll: Math.max(0px, flick.content-height - flick.height);
+            property <bool> scrollable: self.max-scroll > 0.5px;
+            // 取 `content-y` 的绝对值得正滚动量（兼容其正负号约定），再除以最大滚动量并夹到 [0,1]。
+            property <float> scroll-progress: Math.max(0.0, Math.min(1.0,
+                (flick.content-y < 0px ? -flick.content-y : flick.content-y) / Math.max(self.max-scroll, 1px)));
+            property <length> thumb-height: Math.max(24px,
+                self.height * (flick.height / Math.max(flick.content-height, 1px)));
+
+            flick := Flickable {
+                x: 0;
+                y: 0;
+                width: parent.width;
+                height: parent.height;
+                content-width: self.width;
+                content-height: root.content-height;
+                interactive: true;
+
+                // 滚动时把视口偏移与高度交回 Rust 重算窗口；高度变化（首次布局/改尺寸）同样上报。
+                // `content-y` 即旧版 `viewport-y`（1.18 起更名，语义为内容坐标系下的视口纵偏移）。
+                changed content-y => {
+                    root.viewport-changed(self.content-y, self.height);
+                }
+                changed height => {
+                    root.viewport-changed(self.content-y, self.height);
+                }
+                changed width => {
+                    root.grid-width-changed(self.width);
+                }
+
+                Rectangle {
+                    width: parent.width;
+                    height: root.content-height;
+
+                    for card[i] in root.cards : WallpaperCardUi {
+                        card-w: root.card-w;
+                        card-h: root.card-h;
+                        grid-gap: root.grid-gap;
+                        grid-pad: root.grid-pad;
+                        // 邻居让位分量：拖拽源与插入位之间的卡片平移一个槽位（仅拖拽期间非零）。
+                        slot-target-x: (Math.mod(card.pos + root.let-way-shift(card.pos), root.effective-columns) - Math.mod(card.pos, root.effective-columns)) * (root.card-w + root.grid-gap);
+                        slot-target-y: (Math.floor((card.pos + root.let-way-shift(card.pos)) / root.effective-columns) - Math.floor(card.pos / root.effective-columns)) * (root.card-h + root.grid-gap);
+                        data: card;
+                        payload: root.to-transfer(card.id);
+                        selected: root.selected-id == card.id;
+                        active: root.active-id == card.id;
+                        kb-focused: root.kb-focus-index == card.pos;
+                        dragging: root.drag-source-index == card.pos;
+                        drag-enabled: root.drag-enabled;
+                        drag-ghost: root.drag-ghost;
+                        drag-ghost-offset-x: root.drag-ghost-offset-x;
+                        drag-ghost-offset-y: root.drag-ghost-offset-y;
+                        clicked(id) => { root.select-card(id); }
+                        set-wallpaper(id) => { root.set-as-wallpaper(id); }
+                        delete-requested(id) => { root.request-delete(id); }
+                        preview-requested(id) => { root.request-preview(id); }
+                        drag-ended() => { root.drag-ended(); }
+                        drag-started(id, gw, gh) => { root.drag-started(id, gw, gh); }
+                    }
+
+                    // 拖拽插入指示线（插入位 k 表示"插到原第 k 项之前"，见 dnd::insert_index）
+                    Rectangle {
+                        visible: root.drop-index >= 0;
+                        x: root.grid-pad
+                            + Math.mod(root.drop-index, root.effective-columns) * (root.card-w + root.grid-gap)
+                            - root.grid-gap / 2;
+                        y: root.grid-pad
+                            + Math.floor(root.drop-index / root.effective-columns) * (root.card-h + root.grid-gap);
+                        width: 3px;
+                        height: root.card-h;
+                        background: Theme.accent;
+                        border-radius: 2px;
+                    }
+                }
+            }
+
+            // 细滚动指示条（Task 7.3）：纯绘制 Rectangle，不接收指针事件，绝不拦截滚动/拖拽。
+            if (grid-area.scrollable) : Rectangle {
+                x: parent.width - 6px;
+                y: (parent.height - grid-area.thumb-height) * grid-area.scroll-progress;
+                width: 4px;
+                height: grid-area.thumb-height;
+                border-radius: 2px;
+                background: Theme.accent;
+                opacity: 0.5;
+            }
+
+            // 骨架屏（加载中）
+            if (root.loading && root.visible-count == 0) : Rectangle {
+                x: 0;
+                y: 0;
+                width: parent.width;
+                height: parent.height;
+                background: transparent;
+
+                for i in 8 : Rectangle {
+                    x: root.grid-pad + Math.mod(i, root.effective-columns) * (root.card-w + root.grid-gap);
+                    y: root.grid-pad + Math.floor(i / root.effective-columns) * (root.card-h + root.grid-gap);
+                    width: root.card-w;
+                    height: root.card-h;
+                    background: Theme.panel;
+                    border-radius: Theme.radius-lg;
+                }
+            }
+
+            // 空态
+            if (!root.loading && root.visible-count == 0) : Text {
+                width: 100%;
+                height: 100%;
+                text: root.search-active ? "未找到匹配的壁纸" : "拖拽图片到此处添加壁纸";
+                color: #808080;
+                font-size: 14px;
+                horizontal-alignment: center;
+                vertical-alignment: center;
+            }
+
+            // 拖拽放置目标：覆盖整个视口（局部坐标即视口坐标，Rust 侧再加 `content-y` 折算）。
+            // 置于 Flickable 之后，命中检测时先于下层卡片；Wheel/Pressed 会穿透回 Flickable。
+            dropzone := DropArea {
+                x: 0;
+                y: 0;
+                width: parent.width;
+                height: parent.height;
+                enabled: root.drag-enabled;
+                can-drop(event) => {
+                    root.drag-insert-index(event.data, event.position.x, event.position.y);
+                    DragAction.copy
+                }
+                dropped(event) => {
+                    root.drag-commit(event.data, root.drop-index);
+                    return event.proposed-action;
+                }
+            }
+
+            // 系统文件拖入悬停高亮（Task 9.7.4）：由原生拖放目标写回 `file-drag-over`。
+            if (root.file-drag-over) : Rectangle {
+                x: 2px;
+                y: 2px;
+                width: parent.width - 4px;
+                height: parent.height - 4px;
+                background: #1400b0ff;
+                border-width: 2px;
+                border-color: Theme.accent;
+                border-radius: Theme.radius-lg;
+
+                Text {
+                    width: 100%;
+                    height: 100%;
+                    text: "松开以添加壁纸";
+                    color: Theme.accent;
+                    font-size: 15px;
+                    horizontal-alignment: center;
+                    vertical-alignment: center;
+                }
+            }
+
+            // Toast（批量添加结果 / 事件提示）：按级别着色（Task 6.3 / 7.4）。
+            if (root.toast-text != "") : Rectangle {
+                x: 0;
+                y: parent.height - 34px;
+                width: parent.width;
+                height: 34px;
+                background: root.toast-level == 3 ? #3a1414
+                    : root.toast-level == 2 ? #3a300f
+                    : root.toast-level == 1 ? #12351f
+                    : #101020;
+                Text {
+                    x: 16px;
+                    y: 0;
+                    width: parent.width - 32px;
+                    height: 34px;
+                    text: root.toast-text;
+                    color: root.toast-level == 3 ? #ffb4b4
+                        : root.toast-level == 2 ? #ffe08a
+                        : root.toast-level == 1 ? #8ee6b0
+                        : Theme.text-light;
+                    font-size: 12px;
+                    vertical-alignment: center;
+                    horizontal-alignment: center;
+                    overflow: elide;
+                }
+            }
+
+        }
+
+        // ── 停靠设置侧栏（Task 6 / Task 7）：布局内常驻，收纳时宽度归零 ──
+        settings-panel := Rectangle {
+            horizontal-stretch: 0;
+            width: root.settings-open ? 320px : 0px;
+            animate width { duration: 120ms; easing: ease-in-out; }
+            clip: true;
+            background: #1a1a2e;
+
+            // 左缘 1px 竖直分隔线：随 clip 在收纳（宽度 0）时自然消失。
+            Rectangle {
+                x: 0;
+                y: 0;
+                width: 1px;
+                height: 100%;
+                background: Theme.border;
+            }
+
+            // 面板内容：收纳（宽度 0）时不参与布局，避免负宽。
+            if (root.settings-open) : Rectangle {
+                x: 1px;
+                y: 1px;
+                width: Math.max(0px, parent.width - 2px);
+                height: Math.max(0px, parent.height - 2px);
+                background: transparent;
+
+                // 吞掉落在面板上的点击，避免穿透到下方网格（Flickable 已在其上层）。
+                TouchArea {
+                    width: 100%;
+                    height: 100%;
+                }
+
+        settings-flick := Flickable {
+            x: 1px;
+            y: 1px;
+            width: Math.max(0px, parent.width - 2px);
+            height: Math.max(0px, parent.height - 2px);
+            content-width: self.width;
+            content-height: panel-body.height;
+            interactive: true;
+            // 滚动设置面板时收起浮层，避免浮层与触发行脱离。
+            changed content-y => { root.dd-open = false; }
+
+            panel-body := Rectangle {
+                width: Math.max(0px, settings-flick.width);
+                height: panel-layout.preferred-height + 24px;
+                background: transparent;
+
+                panel-layout := VerticalLayout {
+                    x: 12px;
+                    y: 12px;
+                    width: Math.max(0px, parent.width - 24px);
+                    spacing: 10px;
+
+                    // ── 显示 ──
+                    SectionTitle { text: "显示"; }
+                    Dropdown {
+                        id: 1;
+                        label: "目标显示器";
+                        options: root.display-options;
+                        current-index: root.display-index;
+                        enabled: root.display-dropdown-enabled;
+                        expanded: root.dd-open && root.dd-id == 1;
+                        open-requested(x, y, w, idx) => { root.dd-toggle(1, x, y, w, idx); }
+                    }
+                    Dropdown {
+                        id: 2;
+                        label: "缩放模式";
+                        options: root.scaling-options;
+                        current-index: root.scaling-index;
+                        expanded: root.dd-open && root.dd-id == 2;
+                        open-requested(x, y, w, idx) => { root.dd-toggle(2, x, y, w, idx); }
+                    }
+                    Dropdown {
+                        id: 3;
+                        label: "多屏排列";
+                        options: root.arrangement-options;
+                        current-index: root.arrangement-index;
+                        expanded: root.dd-open && root.dd-id == 3;
+                        open-requested(x, y, w, idx) => { root.dd-toggle(3, x, y, w, idx); }
+                    }
+                    Dropdown {
+                        id: 4;
+                        label: "全屏时处置";
+                        options: root.fullscreen-options;
+                        current-index: root.fullscreen-index;
+                        expanded: root.dd-open && root.dd-id == 4;
+                        open-requested(x, y, w, idx) => { root.dd-toggle(4, x, y, w, idx); }
+                    }
+
+                    // ── 播放 ──
+                    SectionTitle { text: "播放"; }
+                    HorizontalLayout {
+                        height: 28px;
+                        spacing: 8px;
+                        cross-axis-alignment: center;
+
+                        PanelButton {
+                            preferred-width: 84px;
+                            label: "上一张";
+                            enabled: root.prev-enabled;
+                            clicked => { root.prev-requested(); }
+                        }
+                        PanelButton {
+                            horizontal-stretch: 1;
+                            label: root.pause-label;
+                            enabled: root.pause-enabled;
+                            prominent: true;
+                            clicked => { root.pause-toggled(); }
+                        }
+                        PanelButton {
+                            preferred-width: 84px;
+                            label: "下一张";
+                            enabled: root.next-enabled;
+                            clicked => { root.next-requested(); }
+                        }
+                    }
+                    VolumeRow {
+                        label: "播放音量";
+                        value-text: "\{root.volume-percent}%";
+                        enabled: root.audio-controls-enabled;
+                        muted: root.muted;
+                        value <=> root.volume-pos;
+                        committed(v) => { root.volume-committed(v); }
+                        mute-toggled(v) => { root.mute-toggled(v); }
+                    }
+                    SpeedRow {
+                        label: "播放速度";
+                        value-text: root.speed-text;
+                        value <=> root.speed-pos;
+                        committed(v) => { root.speed-committed(v); }
+                        stepped(d) => { root.speed-stepped(d); }
+                    }
+
+                    // ── 系统 ──
+                    SectionTitle { text: "系统"; }
+                    ToggleSwitch {
+                        label: "开机自启";
+                        checked: root.auto-start;
+                        toggled(v) => { root.auto-start-toggled(v); }
+                    }
+                    ToggleSwitch {
+                        label: "电池供电时暂停";
+                        checked: root.pause-on-battery;
+                        toggled(v) => { root.pause-on-battery-toggled(v); }
+                    }
+                    ToggleSwitch {
+                        label: "鼠标交互模式";
+                        checked: root.interaction-mode;
+                        toggled(v) => { root.interaction-mode-toggled(v); }
+                    }
+
+                    // ── 轮换 ──
+                    SectionTitle { text: "轮换"; }
+                    ToggleSwitch {
+                        label: "启用壁纸轮换";
+                        checked: root.rotation-enabled;
+                        toggled(v) => { root.rotation-enabled-toggled(v); }
+                    }
+                    ToggleSwitch {
+                        label: "开机时换一张";
+                        checked: root.rotation-on-boot;
+                        toggled(v) => { root.rotation-on-boot-toggled(v); }
+                    }
+                    NumberStepper {
+                        label: "轮换间隔（分钟）";
+                        value: root.rotation-interval;
+                        min-value: 1;
+                        max-value: 1440;
+                        text <=> root.rotation-interval-text;
+                        step(d) => { root.rotation-interval-step(d); }
+                        submitted(s) => { root.rotation-interval-submitted(s); }
+                    }
+                    Dropdown {
+                        id: 5;
+                        label: "切换顺序";
+                        options: root.order-options;
+                        current-index: root.rotation-order-index;
+                        expanded: root.dd-open && root.dd-id == 5;
+                        open-requested(x, y, w, idx) => { root.dd-toggle(5, x, y, w, idx); }
+                    }
+                    PanelHint { text: root.rotation-order-hint; }
+
+                    // ── 壁纸池 ──
+                    SectionTitle { text: "壁纸池"; }
+                    Rectangle {
+                        height: 26px;
+                        background: transparent;
+
+                        PanelButton {
+                            x: 0; y: 1px; width: 120px; height: 24px;
+                            label: "＋ 新建壁纸池";
+                            prominent: true;
+                            clicked => { root.pool-create-requested(); }
+                        }
+                    }
+
+                    for pool in root.pool-rows : PoolRowUi {
+                        data: pool;
+                        editing: root.editing-pool-id == pool.id;
+                        confirming: root.pending-delete-pool-id == pool.id;
+                        select(id) => { root.pool-select(id); }
+                        move-up(id) => { root.pool-move(id, -1); }
+                        move-down(id) => { root.pool-move(id, 1); }
+                        request-delete(id) => { root.pool-delete-requested(id); }
+                        confirm-delete(id) => { root.pool-delete-confirmed(id); }
+                        cancel-delete() => { root.pool-delete-cancelled(); }
+                    }
+                    if (root.pool-rows.length == 0) : PanelHint { text: "尚无壁纸池"; }
+
+                    // 编辑区：重命名 + 成员排序/移除 + 从库中添加（Task 7.2）。
+                    if (root.has-editing-pool) : Rectangle {
+                        height: edit-body.preferred-height;
+                        background: Theme.bg-deep;
+                        border-radius: Theme.radius-md;
+                        border-width: 1px;
+                        border-color: Theme.border;
+
+                        edit-body := VerticalLayout {
+                            padding: 8px;
+                            spacing: 6px;
+
+                            SubLabel { text: "池名称"; }
+                            Rectangle {
+                                height: 26px;
+                                background: Theme.panel;
+                                border-radius: Theme.radius-sm;
+
+                                TextInput {
+                                    x: 6px; y: 0;
+                                    width: parent.width - 92px;
+                                    height: parent.height;
+                                    single-line: true;
+                                    color: Theme.text-input;
+                                    font-size: 12px;
+                                    vertical-alignment: center;
+                                    text <=> root.editing-pool-name;
+                                    accepted => { root.pool-rename(self.text); }
+                                }
+                                PanelButton {
+                                    x: parent.width - 80px; y: 1px;
+                                    width: 74px; height: 24px;
+                                    label: "保存名称";
+                                    prominent: true;
+                                    clicked => { root.pool-rename(root.editing-pool-name); }
+                                }
+                            }
+
+                            SubLabel { text: "成员（可排序 / 移除）"; }
+                            for m in root.member-rows : MemberRowUi {
+                                data: m;
+                                removable: true;
+                                move-up(id) => { root.pool-member-move(id, -1); }
+                                move-down(id) => { root.pool-member-move(id, 1); }
+                                remove(id) => { root.pool-member-remove(id); }
+                            }
+                            if (root.member-rows.length == 0) : PanelHint { text: "该池暂无成员"; }
+
+                            SubLabel { text: "可添加壁纸"; }
+                            for a in root.available-rows : MemberRowUi {
+                                data: a;
+                                removable: false;
+                                add(id) => { root.pool-member-add(id); }
+                            }
+                            if (root.available-rows.length == 0) : PanelHint { text: "没有可添加的壁纸"; }
+                        }
+                    }
+
+                    // ── 单元配置（Task 7.3）──
+                    SectionTitle { text: "单元配置"; }
+                    if (root.unit-rows.length == 0) : PanelHint { text: "当前排列无可用调度单元"; }
+                    for unit[i] in root.unit-rows : UnitRowUi {
+                        data: unit;
+                        pool-options: root.pool-options;
+                        dd-id: 100 + i;
+                        dd-expanded: root.dd-open && root.dd-id == 100 + i;
+                        dd-open-requested(id, x, y, w, idx) => { root.dd-toggle(id, x, y, w, idx); }
+                        enabled-toggled(key, v) => { root.unit-enabled-toggled(key, v); }
+                    }
+
+                    // ── 关于 ──
+                    SectionTitle { text: "关于"; }
+                    PanelHint { text: root.about-version; }
+                    PanelHint { text: "镜星壁纸 · 原生设置面板"; }
+                    RepoLink { clicked => { root.open-repo(); } }
+                }
+            }
+        }
+
+        // 设置面板细滚动指示条（Task 7.3）：位于 Flickable 之外的只读覆盖层（不随内容滚动），
+        // 内容未溢出时不显示；纯绘制 Rectangle，不接收指针事件。
+        if (settings-flick.content-height > settings-flick.height) : Rectangle {
+            x: Math.max(0px, parent.width - 5px);
+            y: 1px + (settings-flick.height - self.height) * Math.max(0.0, Math.min(1.0,
+                (settings-flick.content-y < 0px ? -settings-flick.content-y : settings-flick.content-y)
+                    / Math.max(settings-flick.content-height - settings-flick.height, 1px)));
+            width: 3px;
+            height: Math.max(24px,
+                settings-flick.height * (settings-flick.height / Math.max(settings-flick.content-height, 1px)));
+            border-radius: 2px;
+            background: Theme.accent;
+            opacity: 0.5;
+        }
+        }
+        }
+        }
+
+        // ── 状态栏 ──────────────────────────────────────────────────────────
+        Rectangle {
+            height: 34px;
+            background: #101020;
+
+            Text {
+                x: 16px;
+                y: 0;
+                width: parent.width - 32px;
+                height: 34px;
+                text: "桌面：\{root.desktop-ok ? "正常" : "异常（正在尝试恢复）"}　配置：\{root.config-summary}　轮换：\{root.rotation-summary}　播放：\{root.playback-summary}";
+                color: root.desktop-ok ? #808080 : #ef9a9a;
+                font-size: 11px;
+                vertical-alignment: center;
+                overflow: elide;
+            }
+        }
+    }
+
+    // ── 预览弹窗（Task 8）：居中覆盖层 ────────────────────────────────────────
+    // 视频 / 网页的实际画面由 Rust 创建的**原生子窗口**叠加在本覆盖层的内容区之上
+    // （Win32 子窗口恒在父窗口绘制之上）；图片 / GIF 由 Slint 直接渲染。
+    if (root.preview-id != "") : Rectangle {
+        x: 0;
+        y: 0;
+        width: root.width;
+        height: root.height;
+        background: root.preview-fullscreen ? transparent : #99000000;
+
+        // 遮罩：点击空白处关闭，同时吞掉下层网格交互。
+        preview-dismiss := TouchArea {
+            width: 100%;
+            height: 100%;
+            clicked => { root.preview-closed(); }
+        }
+
+        Rectangle {
+            x: root.dlg-x;
+            y: root.dlg-y;
+            width: root.dlg-w;
+            height: root.dlg-h;
+            background: Theme.panel;
+            border-radius: root.preview-fullscreen ? 0px : 10px;
+            border-width: root.preview-fullscreen ? 0px : 1px;
+            border-color: #2b4a7a;
+            clip: true;
+
+            // 面板背景吞掉点击（避免点到面板空白即关闭）。
+            panel-catch := TouchArea {
+                width: 100%;
+                height: 100%;
+            }
+
+            Text {
+                x: 16px;
+                y: 0;
+                width: parent.width - 100px;
+                height: 46px;
+                text: root.preview-title;
+                color: Theme.text-strong;
+                font-size: 14px;
+                font-weight: 700;
+                vertical-alignment: center;
+                overflow: elide;
+                visible: root.preview-chrome-visible || !root.preview-fullscreen;
+            }
+
+            // 全屏 / 退出全屏（Task 7）：右上角、关闭按钮左侧，对所有预览类型可见。
+            PreviewIconButton {
+                x: parent.width - 44px - 34px;
+                y: 9px;
+                fullscreen: root.preview-fullscreen;
+                visible: root.preview-chrome-visible || !root.preview-fullscreen;
+                clicked => { root.preview-toggle-fullscreen(); }
+            }
+
+            Rectangle {
+                x: parent.width - 44px;
+                y: 9px;
+                width: 30px;
+                height: 28px;
+                border-radius: Theme.radius-md;
+                background: close-hover.has-hover ? Theme.danger : Theme.button-bg;
+                visible: root.preview-chrome-visible || !root.preview-fullscreen;
+                close-hover := TouchArea {
+                    clicked => { root.preview-closed(); }
+                }
+                CloseIcon {
+                    x: 8px;
+                    y: 7px;
+                    icon-color: Theme.text-strong;
+                }
+            }
+
+            // 内容区：与 Rust 暴露的 preview-x/y/w/h 严格对齐（原生子窗口叠加于此）。
+            Rectangle {
+                x: root.preview-x - root.dlg-x;
+                y: root.preview-y - root.dlg-y;
+                width: root.preview-w;
+                height: root.preview-h;
+                background: #0b0f19;
+                clip: true;
+
+                if (root.preview-kind == 0) : Image {
+                    width: 100%;
+                    height: 100%;
+                    image-fit: contain;
+                    source: root.preview-image;
+                }
+                if (root.preview-kind == 2) : Image {
+                    width: 100%;
+                    height: 100%;
+                    image-fit: contain;
+                    source: root.preview-frame;
+                }
+                // 视频 / 网页：原生子窗口覆盖此区，仅在其未就绪时显示轻量占位（Task 7.6）。
+                if (root.preview-kind == 1 || root.preview-kind == 3) : Rectangle {
+                    width: 100%;
+                    height: 100%;
+                    background: transparent;
+
+                    VerticalLayout {
+                        alignment: center;
+                        cross-axis-alignment: center;
+                        spacing: 10px;
+
+                        if (root.preview-kind == 1) : TypeGlyph {
+                            kind-index: 1;
+                            width: 48px;
+                            height: 40px;
+                        }
+
+                        Text {
+                            text: root.preview-kind == 3 ? "正在创建网页预览…" : "正在加载视频预览…";
+                            color: Theme.text-dim;
+                            font-size: 13px;
+                            horizontal-alignment: center;
+                        }
+                    }
+                }
+            }
+
+            // 控制条（Task 2/10）：位于内容区正下方、铺满弹窗宽度。视频原生子窗口只覆盖
+            // preview-h（已扣除 controls-h），故不被遮挡。图片/网页 controls-h=0 时整体隐藏。
+            Rectangle {
+                x: 0;
+                y: root.preview-y - root.dlg-y + root.preview-h;
+                width: parent.width;
+                height: root.controls-h;
+                // 不透明底：不依赖悬停即可辨，且压住下方内容，避免"看不到控制条"。
+                background: Theme.panel;
+                visible: root.controls-h > 0px && !root.chrome-hidden;
+
+                // 播放态：视频看 preview-playing，GIF 看 preview-gif-playing。
+                property <bool> controls-playing: root.preview-kind == 1
+                    ? root.preview-playing
+                    : root.preview-gif-playing;
+
+                // 顶部 1px 分隔线：与内容区（原生子窗口）划清边界。
+                Rectangle {
+                    x: 0;
+                    y: 0;
+                    width: 100%;
+                    height: 1px;
+                    background: Theme.border;
+                }
+
+                HorizontalLayout {
+                    padding-left: 6px;
+                    padding-right: 6px;
+                    spacing: 8px;
+                    cross-axis-alignment: center;
+
+                    PreviewPlayButton {
+                        playing: controls-playing;
+                        clicked => { root.preview-toggle-play(); }
+                    }
+
+                    // 仅视频显示时间 / 进度条（GIF 只留播放按钮）。
+                    if (root.preview-kind == 1) : Text {
+                        text: root.preview-pos-text;
+                        color: Theme.text-secondary;
+                        font-size: 11px;
+                        width: 36px;
+                        horizontal-alignment: center;
+                        vertical-alignment: center;
+                    }
+
+                    if (root.preview-kind == 1) : Rectangle {
+                        horizontal-stretch: 1;
+                        height: 20px;
+                        background: transparent;
+
+                        // 轨道（高对比中性色，保证 progress==0 时仍清晰可辨）
+                        Rectangle {
+                            x: 0;
+                            y: (parent.height - 8px) / 2;
+                            width: parent.width;
+                            height: 8px;
+                            border-radius: 4px;
+                            background: Theme.text-muted;
+                        }
+                        // 已播放填充
+                        Rectangle {
+                            x: 0;
+                            y: (parent.height - 8px) / 2;
+                            width: parent.width * root.preview-progress;
+                            height: 8px;
+                            border-radius: 4px;
+                            background: Theme.accent;
+                        }
+                        // 拖柄：随进度水平移动，始终落在 [0, width-12px] 内
+                        Rectangle {
+                            x: root.preview-progress * (parent.width - 12px);
+                            y: (parent.height - 12px) / 2;
+                            width: 12px;
+                            height: 12px;
+                            border-radius: 6px;
+                            background: Theme.accent;
+                        }
+                        // 命中区：拖动 / 释放都按比例 seek（命中区高于视觉轨道，便于点击）。
+                        seek-hit := TouchArea {
+                            width: 100%;
+                            height: 100%;
+                            moved => {
+                                root.preview-seek(Math.max(0.0, Math.min(1.0,
+                                    self.mouse-x / Math.max(self.width, 1px))));
+                            }
+                            clicked => {
+                                root.preview-seek(Math.max(0.0, Math.min(1.0,
+                                    self.mouse-x / Math.max(self.width, 1px))));
+                            }
+                        }
+                    }
+
+                    if (root.preview-kind == 1) : Text {
+                        text: root.preview-dur-text;
+                        color: Theme.text-secondary;
+                        font-size: 11px;
+                        width: 36px;
+                        horizontal-alignment: center;
+                        vertical-alignment: center;
+                    }
+
+                    // 速度按钮（仅视频）：循环切换 0.5× / 1× / 1.25× / 1.5× / 2×。
+                    if (root.preview-kind == 1) : PreviewSpeedButton {
+                        label: root.preview-speed-labels[root.preview-speed-index];
+                        clicked => {
+                            root.preview-speed-index = root.preview-speed-index >= 4
+                                ? 0
+                                : root.preview-speed-index + 1;
+                            root.preview-set-speed(root.preview-speed-steps[root.preview-speed-index]);
+                        }
+                    }
+
+                    // 静音按钮 / 音量滑块（仅视频，Task 3）。
+                    if (root.preview-kind == 1) : SpeakerIconButton {
+                        muted: root.preview-muted;
+                        clicked => { root.preview-toggle-mute(); }
+                    }
+                    if (root.preview-kind == 1) : PreviewVolumeSlider {
+                        value <=> root.preview-volume;
+                        changed(v) => { root.preview-set-volume(v); }
+                        committed(v) => { root.preview-commit-volume(v); }
+                    }
+                }
+            }
+
+            Text {
+                x: 16px;
+                y: parent.height - 34px;
+                width: parent.width - 32px;
+                height: 24px;
+                text: root.preview-note;
+                color: Theme.text-secondary;
+                font-size: 11px;
+                vertical-alignment: center;
+                overflow: elide;
+                visible: !root.preview-fullscreen;
+            }
+        }
+    }
+    // 下拉浮层（单例）：声明在 VerticalLayout 之后以获得绝对定位与最上层绘制；不使用 PopupWindow。
+    if (root.dd-open) : Rectangle {
+        x: 0;
+        y: 0;
+        width: root.width;
+        height: root.height;
+        background: transparent;
+
+        // 全窗透明点击层：先声明（在列表之下），负责「点浮层外收起」并吞掉该次点击、不穿透到下层控件。
+        dd-dismiss := TouchArea {
+            width: 100%;
+            height: 100%;
+            clicked => { root.dd-open = false; }
+        }
+
+        // 列表本体：后声明 → 绘制在点击层之上，命中优先。
+        DropdownList {
+            x: root.dd-x;
+            y: root.dd-y;
+            width: root.dd-w;
+            options: root.dd-options;
+            current-index: root.dd-index;
+            chosen(i) => { root.dd-choose(root.dd-id, i); }
+        }
+    }
+    // 删除确认浮层（Task 7）：移出网格区，作为 kb-root 末位子节点覆盖整窗，不被侧栏裁切。
+    if (root.pending-delete-id != "") : Rectangle {
+        x: 0;
+        y: 0;
+        width: root.width;
+        height: root.height;
+        background: #80000000;
+
+        dismiss := TouchArea {
+            width: 100%;
+            height: 100%;
+            clicked => { root.cancel-delete(); }
+        }
+
+        Rectangle {
+            x: (root.width - 320px) / 2;
+            y: (root.height - 160px) / 2;
+            width: 320px;
+            height: 160px;
+            background: Theme.panel;
+            border-radius: 10px;
+            border-width: 1px;
+            border-color: #2b4a7a;
+
+            Text {
+                x: 0;
+                y: 22px;
+                width: parent.width;
+                height: 26px;
+                text: "删除壁纸";
+                color: Theme.text-strong;
+                font-size: 15px;
+                font-weight: 700;
+                horizontal-alignment: center;
+            }
+            Text {
+                x: 20px;
+                y: 56px;
+                width: parent.width - 40px;
+                height: 44px;
+                text: "将从库中移除该壁纸并删除源文件，此操作不可撤销。";
+                color: #a9bcd8;
+                font-size: 12px;
+                horizontal-alignment: center;
+                vertical-alignment: center;
+                wrap: word-wrap;
+            }
+
+            Rectangle {
+                x: 44px;
+                y: 112px;
+                width: 104px;
+                height: 32px;
+                border-radius: Theme.radius-md;
+                background: cancel-hover.has-hover ? Theme.button-hover-subtle : Theme.button-bg;
+                cancel-hover := TouchArea {
+                    clicked => { root.cancel-delete(); }
+                }
+                Text {
+                    text: "取消";
+                    color: Theme.text-strong;
+                    font-size: 12px;
+                    horizontal-alignment: center;
+                    vertical-alignment: center;
+                    width: 100%;
+                    height: 100%;
+                }
+            }
+            Rectangle {
+                x: parent.width - 148px;
+                y: 112px;
+                width: 104px;
+                height: 32px;
+                border-radius: Theme.radius-md;
+                background: confirm-hover.has-hover ? Theme.danger : #7f2b2b;
+                confirm-hover := TouchArea {
+                    clicked => { root.confirm-delete(root.pending-delete-id); }
+                }
+                Text {
+                    text: "删除";
+                    color: #ffe9e9;
+                    font-size: 12px;
+                    horizontal-alignment: center;
+                    vertical-alignment: center;
+                    width: 100%;
+                    height: 100%;
+                }
+            }
+        }
+    }
+    } // kb-root FocusScope
+}

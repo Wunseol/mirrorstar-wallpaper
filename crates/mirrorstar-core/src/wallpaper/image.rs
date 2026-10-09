@@ -1,3 +1,4 @@
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Arc, OnceLock, RwLock};
 
@@ -81,6 +82,11 @@ struct ImageWindowData {
     render: ImageRenderData,
     /// 缓存的 GDI 对象（首次 WM_PAINT 时初始化）
     gdi_cache: Option<GdiCache>,
+    /// 首帧绘制完成标志（原子交换阶段 B 就绪判定用）。
+    ///
+    /// 由壁纸线程在首次 WM_PAINT 实际绘制成功后置 true；渲染器侧的克隆副本由
+    /// `poll_first_frame_ready` 读取。窗口数据销毁后克隆仍被渲染器持有，不会悬垂。
+    first_frame_ready: Arc<AtomicBool>,
 }
 
 /// 静态图片壁纸渲染器
@@ -117,6 +123,11 @@ pub struct ImageRenderer {
     /// W-003 修复：display_id 共享变量（create_pause_sender 中设置，壁纸线程中读取）
     /// 使用 OnceLock 保证只写一次，壁纸线程在 Resume 失败时读取此值通知前端
     display_id_lock: Arc<std::sync::OnceLock<String>>,
+    /// 首帧绘制完成标志（false → 首次 WM_PAINT 后 true）。
+    ///
+    /// 原子交换（DR-33）阶段 B 由 `poll_first_frame_ready` 读取，确保换槽前新窗首帧
+    /// 已绘制并可见；非原子交换路径（普通 set_wallpaper）不等待该标志，行为不变。
+    first_frame_ready: Arc<AtomicBool>,
 }
 
 // SAFETY: ImageRenderer 的所有窗口操作都在专用线程上执行。
@@ -134,6 +145,7 @@ impl ImageRenderer {
             pre_shared_state: None,
             pre_state_changed: None,
             display_id_lock: Arc::new(std::sync::OnceLock::new()),
+            first_frame_ready: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -155,6 +167,8 @@ impl ImageRenderer {
         // 初始化 shared_state.state = Playing（与 play() 成功后 set_state(Playing) 一致）
         shared_state.write().unwrap().state = WallpaperState::Playing;
         let display_id_lock = self.display_id_lock.clone();
+        // 首帧绘制完成标志：渲染器持有主副本，克隆传给壁纸线程供 WM_PAINT 置位
+        let first_frame_ready = self.first_frame_ready.clone();
         // Clone for the wallpaper thread closure; originals retained for self.pre_*
         // Arc::clone 与 broadcast::Sender::clone 均为廉价引用计数递增
         let thread_shared_state = shared_state.clone();
@@ -172,6 +186,7 @@ impl ImageRenderer {
                     thread_shared_state,
                     thread_state_changed,
                     display_id_lock,
+                    first_frame_ready,
                 );
             })
             .map_err(|e| {
@@ -358,13 +373,25 @@ impl WallpaperRenderer for ImageRenderer {
         self.base.set_pause_sender(Some(sender.clone()));
         Some(sender)
     }
+
+    /// 首帧就绪判定（原子交换 DR-33 阶段 B）：等待首次 WM_PAINT 实际绘制完成。
+    ///
+    /// 图片像素在 play() 中同步加载完成，但 WM_PAINT 由窗口线程消息循环异步处理；
+    /// 若直接返回 true，commit 换槽可能在新窗尚未绘制时销毁旧窗，露出未绘制窗口帧
+    /// （闪屏）。覆写为轮询壁纸线程置位的首帧绘制标志。
+    fn poll_first_frame_ready(&mut self) -> Result<bool, crate::MirrorStarError> {
+        Ok(self.first_frame_ready.load(Ordering::SeqCst))
+    }
 }
 
 // ── Wallpaper Thread ─────────────────────────────────────────────────────────
 
 /// 该缩放模式是否允许小图升采样（Fill/Fit/Stretch 升采样，Center/Tile 保持原尺寸）
 fn is_upscale_mode(mode: ScalingMode) -> bool {
-    matches!(mode, ScalingMode::Fill | ScalingMode::Fit | ScalingMode::Stretch)
+    matches!(
+        mode,
+        ScalingMode::Fill | ScalingMode::Fit | ScalingMode::Stretch
+    )
 }
 
 /// 加载图片并按清晰度优先策略缩放到屏幕分辨率
@@ -501,6 +528,7 @@ fn wallpaper_thread(
     shared_state: Arc<RwLock<RendererState>>,
     state_changed: tokio::sync::broadcast::Sender<String>,
     display_id_lock: Arc<std::sync::OnceLock<String>>,
+    first_frame_ready: Arc<AtomicBool>,
 ) {
     // Step 1: 创建窗口（先创建窗口，图片稍后异步加载）
     let class_name = register_window_class();
@@ -544,6 +572,7 @@ fn wallpaper_thread(
     let window_data = Box::new(ImageWindowData {
         render: *pixel_data,
         gdi_cache: None,
+        first_frame_ready: first_frame_ready.clone(),
     });
     let data_ptr = Box::into_raw(window_data);
     unsafe {
@@ -814,6 +843,10 @@ unsafe extern "system" fn wallpaper_wnd_proc(
                 }
             }
 
+            // 首次绘制完成后置位首帧就绪标志（原子交换阶段 B 据此换槽）。
+            // 置位后不再重置：非原子交换路径不读取，原子交换仅等待一次。
+            data.first_frame_ready.store(true, Ordering::SeqCst);
+
             let _ = EndPaint(hwnd, &ps);
             LRESULT(0)
         }
@@ -839,8 +872,8 @@ unsafe extern "system" fn wallpaper_wnd_proc(
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use super::super::SCREEN_SIZE_TEST_MUTEX;
+    use super::*;
 
     #[test]
     fn test_load_valid_small_image() {
@@ -855,7 +888,8 @@ mod tests {
         let path = img_path.to_str().unwrap();
 
         // v15.0（clarity-first-upscale）：Center 模式保持原始尺寸，避免小图被升采样
-        let data = load_and_downsample_image(path, ScalingMode::Center).expect("有效图片应加载成功");
+        let data =
+            load_and_downsample_image(path, ScalingMode::Center).expect("有效图片应加载成功");
         assert_eq!(data.img_w, 10);
         assert_eq!(data.img_h, 10);
         assert_eq!(data.pixels.as_ref().unwrap().len(), 10 * 10 * 4);
@@ -1087,13 +1121,9 @@ mod tests {
     fn save_test_image(w: u32, h: u32, color: [u8; 4], name: &str) -> (String, tempfile::TempDir) {
         let dir = tempfile::tempdir().unwrap();
         let img_path = dir.path().join(name);
-        image::DynamicImage::ImageRgba8(image::RgbaImage::from_pixel(
-            w,
-            h,
-            image::Rgba(color),
-        ))
-        .save(&img_path)
-        .unwrap();
+        image::DynamicImage::ImageRgba8(image::RgbaImage::from_pixel(w, h, image::Rgba(color)))
+            .save(&img_path)
+            .unwrap();
         (img_path.to_str().unwrap().to_string(), dir)
     }
 
@@ -1118,8 +1148,8 @@ mod tests {
         super::super::set_screen_size_for_test(3840, 2160);
 
         let (path, _dir) = save_test_image(3840, 2160, [255, 0, 0, 255], "4k.png");
-        let data = load_and_downsample_image(&path, ScalingMode::Fill)
-            .expect("4K 图在 4K 屏上应加载成功");
+        let data =
+            load_and_downsample_image(&path, ScalingMode::Fill).expect("4K 图在 4K 屏上应加载成功");
         assert_eq!(data.img_w, 3840, "4K 图 + 4K 屏不应降采样，宽度应为 3840");
         assert_eq!(data.img_h, 2160, "4K 图 + 4K 屏不应降采样，高度应为 2160");
 
@@ -1148,8 +1178,8 @@ mod tests {
         super::super::set_screen_size_for_test(3840, 2160);
 
         let (path, _dir) = save_test_image(7680, 4320, [0, 255, 0, 255], "8k.png");
-        let data = load_and_downsample_image(&path, ScalingMode::Fill)
-            .expect("8K 图在 4K 屏上应加载成功");
+        let data =
+            load_and_downsample_image(&path, ScalingMode::Fill).expect("8K 图在 4K 屏上应加载成功");
         assert_eq!(data.img_w, 3840, "8K 图 + 4K 屏应降采样到宽 3840");
         assert_eq!(data.img_h, 2160, "8K 图 + 4K 屏应降采样到高 2160");
 
@@ -1163,8 +1193,8 @@ mod tests {
         super::super::set_screen_size_for_test(7680, 4320);
 
         let (path, _dir) = save_test_image(7680, 4320, [0, 255, 0, 255], "8k.png");
-        let data = load_and_downsample_image(&path, ScalingMode::Fill)
-            .expect("8K 图在 8K 屏上应加载成功");
+        let data =
+            load_and_downsample_image(&path, ScalingMode::Fill).expect("8K 图在 8K 屏上应加载成功");
         assert_eq!(data.img_w, 7680, "8K 图 + 8K 屏不应降采样，宽度应为 7680");
         assert_eq!(data.img_h, 4320, "8K 图 + 8K 屏不应降采样，高度应为 4320");
 
@@ -1181,7 +1211,10 @@ mod tests {
         let data = load_and_downsample_image(&path, ScalingMode::Fill)
             .expect("12000×3375 全景图应加载成功");
         assert_eq!(data.img_w, 7680, "全景图降采样后宽度应为 7680（上限）");
-        assert_eq!(data.img_h, 2160, "全景图降采样后高度应为 2160（等比 round）");
+        assert_eq!(
+            data.img_h, 2160,
+            "全景图降采样后高度应为 2160（等比 round）"
+        );
 
         super::super::invalidate_screen_size_cache();
     }
@@ -1228,8 +1261,8 @@ mod tests {
 
         let (path, _dir) = save_gradient_image(1920, 1080, "small_gradient.png");
         for mode in [ScalingMode::Center, ScalingMode::Tile] {
-            let data = load_and_downsample_image(&path, mode)
-                .expect("Center/Tile 模式小图应加载成功");
+            let data =
+                load_and_downsample_image(&path, mode).expect("Center/Tile 模式小图应加载成功");
             assert_eq!(data.img_w, 1920, "{:?} 模式应保持原始宽度 1920", mode);
             assert_eq!(data.img_h, 1080, "{:?} 模式应保持原始高度 1080", mode);
         }
@@ -1248,8 +1281,14 @@ mod tests {
         let (path, _dir) = save_gradient_image(10, 10, "tiny_gradient.png");
         let data = load_and_downsample_image(&path, ScalingMode::Fill)
             .expect("10×10 极小图在 Fill 模式下应加载成功");
-        assert_eq!(data.img_w, 10, "极小图放大比例 >2x 应跳过升采样，保持原宽 10");
-        assert_eq!(data.img_h, 10, "极小图放大比例 >2x 应跳过升采样，保持原高 10");
+        assert_eq!(
+            data.img_w, 10,
+            "极小图放大比例 >2x 应跳过升采样，保持原宽 10"
+        );
+        assert_eq!(
+            data.img_h, 10,
+            "极小图放大比例 >2x 应跳过升采样，保持原高 10"
+        );
 
         super::super::invalidate_screen_size_cache();
     }
@@ -1273,7 +1312,10 @@ mod tests {
         assert_eq!(data.img_w, 2240, "Fill 升采样后宽度应为 2240（scale=1.6）");
         assert_eq!(data.img_h, 1440, "Fill 升采样后高度应为 1440（scale=1.6）");
         // 输出尺寸应大于原始小图
-        assert!(data.img_w > 1400 && data.img_h > 900, "升采样后应大于原图 1400×900");
+        assert!(
+            data.img_w > 1400 && data.img_h > 900,
+            "升采样后应大于原图 1400×900"
+        );
 
         // 像素应为 RGBA 格式（每像素 4 字节）
         let pixels = data.pixels.as_ref().unwrap();
@@ -1299,7 +1341,10 @@ mod tests {
     fn test_is_upscale_mode() {
         assert!(is_upscale_mode(ScalingMode::Fill), "Fill 应允许升采样");
         assert!(is_upscale_mode(ScalingMode::Fit), "Fit 应允许升采样");
-        assert!(is_upscale_mode(ScalingMode::Stretch), "Stretch 应允许升采样");
+        assert!(
+            is_upscale_mode(ScalingMode::Stretch),
+            "Stretch 应允许升采样"
+        );
         assert!(!is_upscale_mode(ScalingMode::Center), "Center 应保持原尺寸");
         assert!(!is_upscale_mode(ScalingMode::Tile), "Tile 应保持原尺寸");
     }

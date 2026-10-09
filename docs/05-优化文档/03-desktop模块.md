@@ -208,6 +208,154 @@ desktop 模块经过 v3.0→v3.5 共 5 轮修复（D01-D12），事务回滚契�
 - `npx vitest run`：208 passed / 0 failed
 - `npm run lint` + `npm run typecheck`：零错误
 
+## 5. 纯净壁纸模式：窗口摘出与回嵌契约
+
+> 实现来源：`crates/mirrorstar-core/src/desktop/mod.rs`（`detach_for_pure_mode` / `reattach_after_pure_mode`）+ `crates/mirrorstar-core/src/pure_mode/mod.rs`（`lift_wallpaper_window`）。
+
+### 5.1 两个新原语的契约
+
+纯净壁纸模式需要把"正在播放的壁纸窗口"从 WorkerW 层**临时摘出**并置顶全屏覆盖桌面（含图标与任务栏），退出后再嵌回。desktop 层为此新增两个方法，Win32 操作与几何全部复用既有原语 / 算法，零新增布局代码（**视频显示器例外**：架构 D1 后视频不再搬动原窗口，改由临时顶层覆盖渲染器呈现，见 [5.5](#55-退出回嵌的防呈现冻结契约架构-d1)）：
+
+| 方法 | 行为 | 调用方 |
+|---|---|---|
+| `detach_for_pure_mode(display_id)` | 读当前矩形 → `lift_wallpaper_window`（`SetParent(hwnd, None)` 摘出 + `SetWindowPos(HWND_TOPMOST, 原矩形, SWP_NOACTIVATE \| SWP_SHOWWINDOW \| SWP_FRAMECHANGED)` + `InvalidateRect`）→ **移除 `active_wallpapers` 条目** → 返回摘出的 `HWND` | `WallpaperEngine::enter_pure_mode` |
+| `reattach_after_pure_mode(display_id, hwnd, arrangement)` | 委托现有 `embed_wallpaper`：重新查找 WorkerW 并重新写回 `active_wallpapers` 条目；**成功后再补一次 `InvalidateRect(hwnd, None, false)`** 保险重绘（失败仅 `warn`，见 5.4） | `WallpaperEngine::exit_pure_mode` / `rollback_pure_mode_enter` |
+
+契约细节：
+
+- **不隐藏窗口**：摘出后窗口必须保持可见以继续出画，故 `detach_for_pure_mode` **不**调用 `ShowWindow(SW_HIDE)`。
+- **保持当前屏幕矩形（零 resize）**：`lift_wallpaper_window` 先 `GetWindowRect` 读当前屏幕矩形，再 `SetParent(hwnd, None)`，随后原样复用该矩形置顶（宽高不做任何调整）——规避 mpv D3D11 输出在"重父化 + resize"时重配置。
+- **不抢前台**：只做"重定父级 + 设置 `HWND_TOPMOST`"，置顶带 `SWP_NOACTIVATE`；窗口在嵌入阶段已由 `remove_from_taskbar` 设置 `WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW`，因此置顶后不会成为前台窗口、不进 Alt+Tab。
+- **失败语义**：`active_wallpapers` 无该 `display_id` → 返回 `Err`；`IsWindow(hwnd)` 为假（窗口已消失）→ 移除条目并返回 `Err`；`lift_wallpaper_window` 失败 → **保留条目**并返回 `Err`（见下条"半摘出恢复"）。
+- **失败语义新增项：半摘出恢复（A5）**：`lift_wallpaper_window` 的失败可能发生在 `SetParent(None)` **之后**（如 `SetWindowPos` 失败）——此时窗口已脱离 WorkerW 成为普通顶层窗口，即**"半摘出"状态**（若不恢复会漂浮在桌面层遮挡图标，而引擎回滚只处理已计入 `lifted` 的窗口，覆盖不到本次失败窗口）。失败后 `detach_for_pure_mode` 先做 **best-effort 恢复**：若 `is_child_of_workerw` 为假（确认已脱离）→ 用进入时的 `arrangement` 经 `embed_wallpaper` 嵌回；嵌回仍失败 → 对有效句柄 `ShowWindow(SW_HIDE)` 隐藏兜底并记录 `error!`。恢复为 best-effort，**不改返回值**：随后仍**保留 `active_wallpapers` 条目并返回原 `Err`**（进入回滚语义不变）。未脱离（失败发生在 `GetWindowRect` / `SetParent` 阶段）则窗口仍在 WorkerW 内，无需恢复。
+- **回嵌失败不由本层兜底**：`reattach_after_pure_mode` 复用 `embed_wallpaper`，**失败时由调用方（引擎）按降级语义隐藏窗口**——即本方法自身**不隐藏、不销毁**窗口（隐藏兜底属于引擎侧的失败处理契约，见 `docs/05-优化文档/04-wallpaper模块.md` 的"嵌回失败的隐藏降级"）。
+
+### 5.2 为什么必须移除 `active_wallpapers` 条目
+
+`active_wallpapers` 是"当前已嵌入 WorkerW 的壁纸窗口"注册表，被 `check_and_reinitialize` / `ensure_workerw_ready` 的重初始化循环与 `workerw_check` 任务作为"需要重新嵌入的窗口集合"消费。若摘出后**保留**条目，Explorer 重启或 WorkerW 兜底轮询触发重新初始化时会遍历该表，把**已摘出、已置顶**的窗口再次 `SetParent` 回新 WorkerW——置顶效果被撤销、纯净模式被破坏（且摘出后窗口坐标语义已变，重新嵌入结果不可预期）。因此：
+
+- 摘出成功即移除条目 → 重初始化循环不再触达该窗口 → 置顶状态保持（配套：收到 `TaskbarCreated` 广播时由输入钩子线程调用 `pure_mode::assert_topmost_all()` 重断言 Z 序，防任务栏抢 Z 序）。
+- 条目的回写只发生在退出（或进入失败回滚）时，由 `embed_wallpaper` 重新查找新 WorkerW 后写回（Explorer 重启后自动使用新句柄）。
+
+> 本节只适用于**走摘出路径**的显示器。**视频显示器例外**（架构 D1，见 [5.5](#55-退出回嵌的防呈现冻结契约架构-d1)）：原窗口从不摘出，其 `active_wallpapers` 条目**全程保留**，因此重初始化循环会照常维护它（这正是期望行为——它仍嵌在 WorkerW 中）。
+
+### 5.3 与 `remove_wallpaper` 的语义差异
+
+| 维度 | `remove_wallpaper` | `detach_for_pure_mode` |
+|---|---|---|
+| 目的 | 彻底移除某显示器壁纸（销毁前的分离） | 纯净壁纸模式临时摘出，稍后回嵌 |
+| `SetParent(hwnd, None)` | 是 | 是（在 `lift_wallpaper_window` 内） |
+| 置顶 | 否（分离后为普通顶层窗口） | 是（`HWND_TOPMOST`，保持原矩形） |
+| `ShowWindow(SW_HIDE)` | **是**（D-005：分离后立即隐藏，防残留可见顶层窗口） | **否**（窗口须继续可见出画） |
+| `active_wallpapers` 条目 | 移除 | 移除（见 5.2） |
+| 窗口所有权 | 调用方负责 `DestroyWindow`，本方法只分离 + 隐藏 | 窗口**不销毁**，退出时由 `embed_wallpaper` 嵌回 |
+| `SetParent` 失败时条目 | 保留条目并返回 `Err` | 保留条目并返回 `Err`：lift 失败（含半摘出）先做 best-effort 恢复（嵌回 / 隐藏兜底），随后仍保留条目并返回 `Err` |
+
+> **文档断言 → 代码位置**：A5 半摘出恢复函数 `recover_half_detached_window` 定义于 `crates/mirrorstar-core/src/desktop/mod.rs` 中 `detach_for_pure_mode` 与 `is_workerw_valid` 之间。
+
+### 5.4 退出编排中的渲染器存活校验与回嵌保险重绘
+
+退出纯净壁纸模式时，除"回嵌窗口"外还需保证"带回桌面的画面是活的"：mpv 视频输出偶发在 `--loop-file` 循环点停滞（"最后一帧 drain 未完成"，`time-pos` 钉在最后一帧），原退出编排只回嵌窗口、**从不校验渲染器是否真的在播放**，会把冻结"带"到退出之后。为此退出编排（`src-tauri/src/platform/pure_mode.rs::exit_orchestration`）在回嵌之后新增一步视频渲染器存活校验 + 自愈：
+
+| 步骤 | 动作 | 顺序理由 |
+|---|---|---|
+| ① | `exit_pure_mode()` 回嵌 WorkerW | 必须在卸载输入钩子之前（否则出现"无钩子但壁纸仍置顶"的窗口） |
+| ② | 卸载输入钩子 | — |
+| ③ | **取消托盘勾选（`set_checked(false)`）** | 回嵌 + 卸载钩子完成后模式已实际退出；**提前**同步使用户可见态尽早一致，且后续存活校验 / 自愈（可能持续数秒）失败也不影响勾选态 |
+| ④ | 补跑全屏 / 电源判定 | 纠正模式期间冻结的状态漂移 |
+| ⑤ | **`liveness_check_and_heal(&app)`（含暂停短路）** | 放在 ④ 之后：补跑判定可能按用户配置（`fullscreen_action`）终止壁纸，先判定再校验，避免"刚自愈又被终止"；放在 ⑥ 之前：保证退出完成时画面是活的。校验前先读 `pause_reasons_snapshot()`，**非空即跳过**（与看护任务一致，符合 D6"用户主动暂停 ⇒ 永不判定停滞、永不自愈"） |
+| ⑥ | 唤醒轮换调度器重算 deadline | 模式期间排期被抑制，退出后需重新计算 |
+
+`liveness_check_and_heal` 的判定与自愈语义（采样窗口、1ms 停滞判据、`terminate()` + `revive_terminated()` 自愈）与 core 侧契约详见 [`04-wallpaper模块.md`](./04-wallpaper模块.md) 的"渲染器存活探针与停滞自愈契约"；本节只记录其在退出编排中的**位置与顺序**。校验 / 自愈失败仅 `warn`，不阻断 ⑥。
+
+进入侧（`enter_orchestration`）等待在途退出的窗口由 3s 提升到 **≈10s**（`EXIT_WAIT_TRIES = 200`，50ms × 200），以覆盖"退出含存活校验与自愈"的时长，避免用户在退出尾段点击「进入」被误拒；超时仍拒绝进入并保持未勾选。配套地，`MIRRORSTAR_TEST_PURE_MODE` 测试钩子的退出等待窗口同步由 10s 提升到 **20s**，避免自愈场景下钩子误报超时、中止后续轮次。
+
+与本节窗口契约直接相关的一处配套改动：`reattach_after_pure_mode` 在 `embed_wallpaper(...)` **成功之后**追加一次 `InvalidateRect(hwnd, None, false)` 保险重绘（失败仅 `warn`）。它与进入路径 `pure_mode::lift_wallpaper_window` 末尾的保险重绘**同源**，用于消除"重嵌完成但客户区仍显示旧内容"的观感风险。
+
+> 覆盖边界：以上存活校验与自愈只覆盖**时钟层停滞**（`time-pos` 不再前进，详见 [`04-wallpaper模块.md`](./04-wallpaper模块.md) 的"渲染器存活探针与停滞自愈契约"）；**呈现层冻结**（时钟前进、画面定格）不在其覆盖范围，改由 5.5 的架构 D1 规避。
+
+### 5.5 退出回嵌的防呈现冻结契约（架构 D1）
+
+> 来源：spec `fix-pure-mode-exit-presentation-freeze`（2026-09-30）。本节记录"退出纯净壁纸后视频画面定格"这一失效模式的根因、已证伪路径与最终修复契约；它与此前"循环点时钟停滞"（见 5.4 与 [`04-wallpaper模块.md`](./04-wallpaper模块.md) 的"渲染器存活探针与停滞自愈契约"）是**两种不同的失效模式**。
+
+**现象与根因（2026-09-30 实测）**：退出纯净壁纸后视频**画面定格**（停在最后一帧不再刷新），但**播放时钟继续前进**——该次会话 mpv 全程只收到 `loadfile` 与 `quit` 两条命令（**从未收到 `pause`**）；退出编排的存活校验（≈0.57s，两次 500ms 采样）与常驻 5s 看护均**判定"时钟前进"、未触发自愈**。故失效点在**呈现层**：把正在播放的 D3D11（bitblt 呈现）视频窗口"摘出 WorkerW 并置顶"后，**本会话的 WorkerW 子层不再产出可呈现帧**；而同一窗口在**顶层**呈现正常（置顶期间画面哈希持续变化）。即"**时钟前进 + 画面定格 = 呈现冻结**"，与"循环点时钟钉住"不同。
+
+**已证伪路径（保留结论，避免重复踩坑）**：
+
+| 类别 | 手段 | 结果 |
+|---|---|---|
+| ① 窗口级解冻 / 预防 | IPC `pause=yes→no`、1px 位移复原（`SWP_NOSIZE\|NOZORDER\|NOACTIVATE`）、显式 `WM_SIZE`（原尺寸）、`ShowWindow(SW_HIDE)→SW_SHOW`、1px 真 resize 复原 | 既**不能解冻**也不能**预防**（退出后 ~0.5s 内施加同样无效） |
+| ② 退出侧"重建渲染器" | 销毁旧渲染器 → 新建并嵌入 WorkerW → `loadfile` | 产出**全黑**：运行期新建并嵌入 WorkerW 的 mpv 窗口不再出画，`PrintWindow(PW_RENDERFULLCONTENT)` 像素哈希恒为 `d7489c5f…` |
+| ③ 唤醒探针（7 项） | "跳过回嵌"、WorkerW / Progman 层 `RedrawWindow(RDW_*)`、`DwmFlush`、完整重嵌循环、WorkerW 内提层、尺寸扰动等 | **全部无效**（含完整重嵌循环 `SetParent(None)→SetParent(workerw)` 成功但画面不变） |
+
+结论：进入侧"摘出并置顶"**毒化本会话 WorkerW 子层**，窗口级手段已用尽。
+
+**最终契约（架构 D1）**：**视频显示器在进入纯净壁纸模式时不再搬动原窗口**（不 `detach_for_pure_mode`、不 `SetParent` / `SetWindowPos` / `ShowWindow`），改为新建**"临时顶层覆盖渲染器"**：
+
+1. `construct_renderer(...)`（内部 `VideoRenderer::new` + `play()`；配置快照复用无副作用的 `renderer_config()`）；
+2. `hwnd()` 取句柄 → `make_borderless(hwnd)`（失败仅 `warn` 继续）+ `remove_from_taskbar(hwnd)`（均与 `embed_wallpaper` Step 1 同源）；
+3. `VideoRenderer::disable_auto_window_resize()`（经 mpv IPC `set_property("auto-window-resize","no")`，best-effort；见下"覆盖窗全屏尺寸契约"）；
+4. `crate::pure_mode::lift_window_to_rect` 置顶全屏（**请求** 1920×1080、无边框；尺寸须由上一条保证，非 mpv 自适配的天然结果）；
+5. `after_embed()` 从头 `loadfile`（与 boot"窗口稳定嵌入后 loadfile"语义一致）。
+
+该临时渲染器登记进既有 `pure_mode_temp`。退出**仅 `pure_mode_temp.drain(..)` 销毁覆盖窗**（原窗口显露、继续播放；原 mpv **从不重启**）。原窗口的 `wallpapers` / `wallpaper_sources` / `wallpaper_mode` / `active_wallpapers` / `pause_senders` 条目**全程不变**。GDI(Image/Gif) / Web / Native 路径不变（仍走摘出置顶 + 回嵌）。每个视频覆盖步骤失败即 best-effort `terminate()` 该临时渲染器并放弃本显示器覆盖（`error!`），**不回滚整个进入流程**，原窗口不受影响。
+
+**覆盖窗全屏尺寸契约**：mpv 默认 `auto-window-resize=yes`，会在 `loadfile` 载入视频时按**工作区**尺寸（例：1920×1040，任务栏占 40px）与视频宽高比（16:9）自适配窗口，覆写 `lift_window_to_rect` 请求的 1920×1080——实测覆盖窗被改成 **1848×1040 @ (36,20)**。因此视频覆盖分支必须在 `lift_window_to_rect` **之前**、且**早于 `after_embed()`（即早于 `loadfile`）**调用 `VideoRenderer::disable_auto_window_resize()`（经 mpv IPC `set_property("auto-window-resize","no")`）；**在 `loadfile` 之后再设置无效**（实测）。该调用为 **best-effort**：IPC 不可用仅 `warn`，不阻断覆盖流程。
+
+> 决策依据（实测对照）：`keepaspect-window=no` 无效；`keepaspect=no` 会拉伸（禁用）；运行时 `set_property geometry` 会破坏正确状态（禁用）；启动参数 `--auto-window-resize=no` 亦有效但影响面更大——最终选用"仅覆盖窗经 IPC 设置"以隔离影响（boot / 轮换路径与全局 mpv 启动参数均未改动）。
+
+**已知限制**：
+
+- 模式内**双解码**：原窗口（WorkerW 内继续播放）与覆盖窗口同时解码同一视频；
+- 进入时多约 **0.3–0.5s** 构建覆盖窗口；
+- 运行时不检测"呈现冻结"（存活探针只看时钟，成本高的截图级检测不做）。
+
+**验证结论（D1 后，可引用）**：单轮与三轮回归均通过——模式内覆盖窗稳定 **1920×1080 @ (0,0)**、无边框（`style=0x14000000`，`WS_CAPTION` / `WS_SYSMENU` 已清）、非黑且在动（连续 5 帧互异）；退出后原窗非黑且在动、原 mpv 进程**从未重启**；0 自愈误报、0 失败；进程健康（mpv=1、wp-proc=0、无孤儿）。
+
+### 5.6 进入编排中的托盘溢出浮出窗关闭（"隐藏栏"残留）
+
+> 来源：spec `fix-tray-overflow-flyout-on-pure-mode`（2026-09-30）。实机复现：**打开托盘"隐藏栏"（溢出浮出窗）→ 右键本应用托盘图标 → 点击「纯净壁纸」**，进入模式后浮出窗仍停留在屏幕上，破坏"桌面被壁纸完全覆盖"的沉浸目标。修复入口：`src-tauri/src/platform/pure_mode.rs`（`dismiss_tray_overflow_flyout()` + `enter_orchestration` 中的调用点）。
+
+**根因**：溢出浮出窗由 Explorer 拥有，正常依靠"失去激活 / 用户点击别处"自动关闭；而纯净壁纸模式的进入编排**刻意不抢前台**（D1 契约，见 [5.5](#55-退出回嵌的防呈现冻结契约架构-d1) 与 5.1 的"不抢前台"条目：只做摘出 + `HWND_TOPMOST` + `SWP_NOACTIVATE`，壁纸窗口带 `WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW`，覆盖窗同样 `NOACTIVATE`）。菜单点选后**没有任何窗口接管激活** ⇒ 浮出窗收不到关闭信号 ⇒ 残留并叠在壁纸之上。
+
+**进入编排步骤表**（`enter_orchestration`，新增步骤为 ④b）：
+
+| 步骤 | 动作 | 顺序理由 |
+|---|---|---|
+| ① | 进入互斥守卫（`ENTER_IN_PROGRESS`） | 并发进入（快速双击托盘）只允许一个真正执行 |
+| ② | 幂等守卫（进程级标志已置位则跳过） | 模式运行中 / 正在进入时重复点击直接返回 |
+| ③ | 串行化等待在途退出编排落位 | 必须先等旧捕获线程 join 完成再安装新钩子（跨代复位约束 A2） |
+| ④ | 安装输入捕获钩子（`pure_mode_input::install`） | 失败即拒绝进入（避免"进得去出不来"） |
+| ④b | **关闭托盘溢出浮出窗（best-effort）** | 必须在 ⑤ 置顶**之前**：浮出窗一旦被壁纸覆盖就无法再被用户点掉；且此时进入前置校验均已通过，失败不影响既有回滚语义 |
+| ⑤ | 引擎进入（`enter_pure_mode`：视频走临时顶层覆盖渲染器，其余路径走摘出置顶） | 失败回滚 ④ 的钩子并保持未勾选 |
+| ⑥ | 存句柄（先 take 旧句柄再 shutdown；存储前复核模式活跃） | 保证槽位唯一、钩子线程不泄漏、不被在途退出"漏卸" |
+| ⑦ | 启动退出监听任务 | 一轮 install 只服务一次退出 |
+| ⑧ | 置托盘勾选 | 用户可见态最后一致 |
+
+**手段与语义（best-effort）**：
+
+1. `EnumWindows` 枚举顶层窗口，按**类名精确匹配**（`const` 常量，便于契约测试引用）：
+
+   | 常量 | 类名 | 覆盖平台 |
+   |---|---|---|
+   | `TRAY_OVERFLOW_CLASS_WIN11` | `TopLevelWindowForOverflowXamlIsland` | Win11（XAML island 承载） |
+   | `TRAY_OVERFLOW_CLASS_LEGACY` | `NotifyIconOverflowWindow` | Win10 及部分旧版（经典窗口） |
+
+   只处理**当前可见**（`IsWindowVisible`）的命中窗口；无命中时零等待直接返回（隐藏栏未打开的常见路径无额外开销）。
+
+2. 先 `PostMessageW(hwnd, WM_CLOSE)`：走 Explorer 的正常关闭流程，避免留下"窗口仍在、只是被隐藏"的残留态；
+3. 对**每个命中窗口**约 **120ms** 后复核 `IsWindowVisible`，仍可见则 `ShowWindow(hwnd, SW_HIDE)` 兜底；
+4. 枚举失败 / 投递失败 / 兜底后仍可见，均只记日志（`info` 记录所用手段、`warn` 记录未生效），**不阻断进入**；不抢前台、不模拟键鼠输入、不触碰主托盘与任务栏。
+
+调用点经 `spawn_blocking` 执行（helper 的等待时长随命中窗口数线性增长——逐个命中窗口各约 120ms；无命中则零等待），不阻塞异步运行时线程。与"抢前台"方案的差异：本方案只针对**溢出浮出窗**做定向关闭，主托盘菜单与任务栏均为 Explorer 正常状态，无需任何激活权转移。
+
+**实机验证结论（2026-09-30，Windows 10 专业版 22H2 / build 19045）**：
+
+- **类名取证**：在"隐藏栏打开"状态枚举顶层窗口，实取证类名为 `NotifyIconOverflowWindow`（与 Win10- 预期一致；Win11 常量一并保留以适配新系统）。
+- **真实浮出窗**：隐藏栏打开时经测试钩子进入，日志记录 `INFO … 托盘溢出浮出窗已关闭（WM_CLOSE 生效） class=NotifyIconOverflowWindow`，枚举确认该窗口随即不可见。
+- **伪造浮出窗**（`NotifyIconOverflowWindow` 类名的可见顶层窗口）：进入编排完成后该窗口被销毁（枚举不到），日志含同一条命中记录。
+- **回归**：`MIRRORSTAR_TEST_PURE_MODE=3` 三轮往返全部完成（3/3），0 失败、0 自愈误报；退出后对 mpv 窗口 `PrintWindow` 连续 5 帧采样指纹**互异**（画面在动）、窗口为 1920×1080 全屏可见。
+
 ## 6. 优化机会与交集汇总
 
 ### 6.1 v4.0 仍可关注的渐进优化方向

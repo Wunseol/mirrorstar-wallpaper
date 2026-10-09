@@ -387,7 +387,7 @@ MirrorStar 的暂停通过以下方式实现：
 | 壁纸类型 | 暂停方式 | 说明 |
 |----------|----------|------|
 | 视频（mpv.exe） | MpvIpcClient 发送 pause 命令 | mpv 原生 JSON IPC，mpv 自行暂停解码 |
-| 网页（wp-proc.exe） | WpProcIpcClient 发送 pause 命令 | wp-proc 自定义协议，子进程暂停渲染 |
+| 网页（壳 `--wp-proc` 模式） | WpProcIpcClient 发送 pause 命令 | wp-proc 自定义协议，子进程暂停渲染 |
 | GIF | PauseSender → 渲染线程停止 WM_TIMER | 主进程内线程，释放帧数据 |
 | 图片（WorkerW） | PauseSender → 渲染线程停止 | 主进程内线程，释放像素数据 |
 | 图片（Native） | 空操作（no-op） | 系统直接渲染，无需控制 |

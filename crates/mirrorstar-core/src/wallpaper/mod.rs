@@ -299,7 +299,6 @@ pub enum WallpaperState {
     Playing,
     Paused,
     Terminated,
-    Error,
 }
 
 /// 壁纸缩放模式
@@ -630,6 +629,26 @@ impl std::ops::Not for PauseReason {
     }
 }
 
+/// 视频渲染器存活探针快照（判定"应为播放的视频壁纸时钟是否在前进"）。
+///
+/// 之所以独立为"快照"而非直接暴露 mpv 客户端：`liveness_probe` 被 engine 与
+/// src-tauri 看护层在锁外周期性调用，只应读取一组不可变的属性值（一次查询即冻结），
+/// 判定逻辑（两次采样比较）则收敛为纯函数 [`video_playback_stalled`]，便于单元测试
+/// 覆盖而不依赖真实 mpv / 桌面会话。
+///
+/// [`video_playback_stalled`]: crate::wallpaper::video::video_playback_stalled
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct LivenessProbe {
+    /// mpv `time-pos`（秒）
+    pub time_pos: f64,
+    /// mpv `pause` 属性（true = 用户/程序显式暂停）
+    pub paused: bool,
+    /// mpv `idle-active`（true = 空闲，未加载任何文件）
+    pub idle_active: bool,
+    /// mpv `eof-reached`（仅供诊断，不参与停滞判定）
+    pub eof_reached: bool,
+}
+
 /// 壁纸渲染器 trait，定义壁纸生命周期管理接口
 ///
 /// # 设计目标（v41-W-017）
@@ -717,12 +736,29 @@ pub trait WallpaperRenderer: Send {
         Ok(())
     }
 
+    /// 禁止渲染器在载入内容时按工作区自适配窗口尺寸（默认 no-op）。
+    ///
+    /// 仅 `VideoRenderer` 覆写：mpv 的 `auto-window-resize`（默认 yes）会在载入视频时
+    /// 按工作区（任务栏占高）与视频宽高比自适配窗口，覆写应用设定的几何。纯净壁纸模式的
+    /// **临时顶层覆盖窗**须严格保持显示器矩形（如 1920x1080），故在置顶前调用本方法。
+    ///
+    /// **须早于 [`Self::after_embed`]（loadfile）调用**：该属性在载入内容前生效，载入后
+    /// 设置不再影响本次适配。常规 WorkerW 壁纸不受影响（尺寸由 `embed_wallpaper` 的
+    /// SetWindowPos 决定），故仅纯净模式覆盖窗调用。默认实现 `Ok(())`（其它类型无此需求）。
+    fn disable_auto_window_resize(&mut self) -> Result<(), crate::MirrorStarError> {
+        Ok(())
+    }
+
     /// 查询待换槽的新渲染器是否已就绪首帧（默认实现 = 立即就绪）。
     ///
     /// 由"原子交换"（DR-33，`crates/mirrorstar-core/src/wallpaper/manager.rs`
     /// 的 `commit_atomic_swap`）在锁外调用，用于决定何时才能 `terminate` 旧壁纸。
     ///
-    /// - **图片 / GIF / 网页**：无"嵌入后首帧延迟"，默认实现直接返回 `true`。
+    /// - **图片 / GIF**：已覆写为等待首次 WM_PAINT 绘制完成标志（`image.rs` /
+    ///   `gif.rs` 的 `first_frame_ready`），确保换槽前新窗首帧已绘制并可见。
+    /// - **网页**：暂用默认实现立即返回 `true`——wp-proc 的 WebView2 内容渲染异步，
+    ///   尚无"内容已渲染"信号上报主进程（已知限制，见
+    ///   `audit-rotation-switch-smoothness-zero-frame` spec 审计结论）。
     /// - **视频（mpv）**：`after_embed` 通过 IPC `loadfile` 加载文件（fire-and-forget，
     ///   不保证首帧已渲染），须覆写本方法轮询 mpv 至 `width>0 且 idle-active=false`
     ///   才返回 `true`，确保 terminate 旧时新窗已显示首帧、瞬时无黑屏。
@@ -731,6 +767,20 @@ pub trait WallpaperRenderer: Send {
     /// 新渲染器；旧壁纸原地保持，零回滚。
     fn poll_first_frame_ready(&mut self) -> Result<bool, crate::MirrorStarError> {
         Ok(true)
+    }
+
+    /// 查询渲染器存活探针（默认 `None` = 该类型不支持/无需判定）。
+    ///
+    /// 仅 `VideoRenderer`（mpv 子进程）覆写：返回 `time-pos` / `pause` /
+    /// `idle-active` / `eof-reached` 快照，供上层判定"应为播放的视频壁纸
+    /// 时钟是否在前进"并对停滞项自愈。图片 / GIF / 网页渲染器保持默认
+    /// `None`（零副作用、零阻塞）。
+    ///
+    /// 之所以设为默认 `None` 而非要求各渲染器实现：只有"有独立播放时钟、
+    /// 可能因输出停滞而画面冻结"的视频才需要该判定；图片等静态壁纸的
+    /// "时钟不前进"是预期行为，若统一参与判定会产生误检与无谓的 IPC 查询。
+    fn liveness_probe(&mut self) -> Option<LivenessProbe> {
+        None
     }
 }
 

@@ -5,14 +5,12 @@
 //! （C-006 修复，跨 Rust 版本稳定），便于去重。
 //!
 //! - Image/Gif 类型：直接读取图像文件生成缩略图（`generate_thumbnail`）
-//! - Video 类型：通过 ffmpeg CLI 抽取首帧并直接作为缩略图（v5.0 跳过 re-encode，
-//!   `generate_video_thumbnail` 直接 rename 临时帧文件）
+//! - Video 类型：使用随包分发的 mpv（`--vo=image` 抽帧）抽取首帧
 //! - Web 类型：无源文件，由命令层直接跳过缩略图生成
 
-use std::io::BufWriter;
-use std::path::Path;
+use std::io::{BufWriter, Write};
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::OnceLock;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use image::codecs::jpeg::JpegEncoder;
@@ -20,29 +18,40 @@ use image::{GenericImageView, ImageEncoder, ImageFormat};
 
 use crate::MirrorStarError;
 
-/// v41-C-007 修复：临时帧文件 RAII 守卫
+/// 视频缩略图临时输出目录 RAII 守卫（mpv 后端）
 ///
-/// 确保函数退出时清理临时帧文件，即使 ffmpeg 抽帧或图像解码失败（`?` 传播错误）。
-/// drop 时调用 `std::fs::remove_file` 清理文件（best-effort：文件不存在或删除失败
-/// 均忽略，不传播错误）。
-///
-/// 临时帧文件由 ffmpeg 创建（`generate_video_thumbnail` 调用 ffmpeg 抽帧生成），
-/// 守卫仅负责清理，不负责创建。守卫的 `path` 字段借用调用方持有的路径引用，
-/// 因此守卫的生命周期不能超出调用方作用域（`'a` 约束）。
-struct TmpFrameGuard<'a> {
-    path: &'a Path,
+/// mpv 的 `--vo=image` 会把抽出的帧写入 `--vo-image-outdir` 指定的目录
+/// （默认文件名 `00000001.jpg`）。该目录为本次调用专用的临时目录，需在函数
+/// 退出时（成功 / 失败 / `?` 提前返回）清理，避免残留堆积。守卫持有目录
+/// `PathBuf`（拥有所有权），drop 时 best-effort 递归删除。
+struct TmpDirGuard {
+    path: PathBuf,
 }
 
-impl<'a> TmpFrameGuard<'a> {
-    fn new(path: &'a Path) -> Self {
+impl TmpDirGuard {
+    fn new(path: PathBuf) -> Self {
         Self { path }
     }
 }
 
-impl<'a> Drop for TmpFrameGuard<'a> {
+impl Drop for TmpDirGuard {
     fn drop(&mut self) {
-        // best-effort：文件不存在或删除失败均忽略
-        let _ = std::fs::remove_file(self.path);
+        // best-effort：目录不存在或删除失败均忽略
+        let _ = std::fs::remove_dir_all(&self.path);
+    }
+}
+
+/// 缩略图原子落盘的临时文件 RAII 守卫
+///
+/// 持有同目录唯一临时文件路径，drop 时 best-effort 删除。用于保证
+/// `generate_thumbnail_from_image_file` 中任何 `?` 提前返回都会清理临时文件；
+/// rename 成功后临时文件已不存在，drop 时 `remove_file` 找不到文件也无害。
+struct TmpFileGuard(PathBuf);
+
+impl Drop for TmpFileGuard {
+    fn drop(&mut self) {
+        // best-effort：文件已被 rename 走或删除失败均忽略
+        let _ = std::fs::remove_file(&self.0);
     }
 }
 
@@ -107,8 +116,8 @@ pub fn generate_thumbnail(
 
 /// C-006 修复：将路径字节编码为**固定长度**十六进制 hash（64-bit FNV-1a，16 位 hex）
 ///
-/// 跨 Rust 版本稳定的路径编码方式，用于生成缩略图文件名（C-006）与视频缩略图
-/// 临时帧文件名（C-007）。同一路径在**同一平台**上稳定生成相同 hash；跨平台可能
+/// 跨 Rust 版本稳定的路径编码方式，用于生成缩略图文件名（C-006）与 mpv 抽帧
+/// 临时目录命名（C-007）。同一路径在**同一平台**上稳定生成相同 hash；跨平台可能
 /// 不同（可接受，缩略图缓存不跨平台共享）。
 ///
 /// # 为什么用 hash 而非逐字节 hex（os error 123 修复）
@@ -156,39 +165,56 @@ fn thumbnail_name_from_path(source_path: &Path) -> String {
     format!("thumb_{}.jpg", path_to_hex(source_path))
 }
 
-/// C-007 修复：生成视频缩略图临时帧文件名
+/// 返回源文件对应的缓存缩略图**绝对路径**
 ///
-/// 文件名格式：`_tmp_frame_{path_hex}_{counter}_{nanos}.jpg`
-/// - `path_hex`：源视频路径字节的 hex 编码（与 `thumbnail_name_from_path` 一致，
-///   跨 Rust 版本稳定，便于排查临时文件来源）
-/// - `counter`：进程内全局 `AtomicU64` 计数器，每次调用单调递增，保证进程内唯一
+/// 路径为 `data_root()/thumbnails/{thumbnail_name_from_path}`，即
+/// `data_root()/thumbnails/thumb_{path_hex}.jpg`。该路径与
+/// [`generate_thumbnail`] / [`generate_video_thumbnail`] 实际写入的路径完全一致
+/// （同一源路径 → 同一缓存文件），因此调用方可用它探测缓存是否存在。
+///
+/// 由于路径基于 [`crate::config::manager::data_root`]（内部含平台默认值与 fallback），
+/// 任意组件无需读取配置字段即可定位缓存文件。
+///
+/// # 参数
+///
+/// - `file_path`: 源文件路径
+///
+/// # 返回
+///
+/// - `file_path` 为空字符串时返回 `None`
+/// - 否则返回缓存缩略图的绝对路径（不保证文件已存在）
+pub fn thumbnail_cache_path(file_path: &str) -> Option<PathBuf> {
+    if file_path.is_empty() {
+        return None;
+    }
+    Some(
+        crate::config::manager::data_root()
+            .join("thumbnails")
+            .join(thumbnail_name_from_path(Path::new(file_path))),
+    )
+}
+
+/// C-007 修复：mpv 抽帧临时目录命名的并发唯一性计数器
+///
+/// mpv 后端每次调用会创建唯一临时输出目录
+/// `_mpv_tmp_{path_hex}_{counter}_{nanos}`：
+/// - `path_hex`：源视频路径字节的 hex 编码（见 [`path_to_hex`]，跨 Rust 版本稳定，
+///   便于排查临时目录来源）
+/// - `counter`：进程内全局 `AtomicU64` 计数器（本静态量），每次调用单调递增，
+///   保证进程内唯一
 /// - `nanos`：`SystemTime::now()` 自 UNIX_EPOCH 起的纳秒数，跨进程区分
 ///
 /// # 并发安全
 ///
-/// 修复前（C-007 Finding）：临时帧文件名仅基于源路径哈希，同一视频并发调用
-/// 会使用相同路径，导致 ffmpeg 抽帧竞争文件。C-007 修复追加纳秒时间戳。
+/// 修复前（C-007 Finding）：临时输出目录名仅基于源路径哈希，同一视频并发调用
+/// 会使用相同目录，导致 mpv 抽帧互相覆盖。C-007 修复追加纳秒时间戳。
 ///
 /// v41-C-006 修复：`SystemTime::now().as_nanos()` 在某些 Windows 系统上分辨率
-/// 仅 100ns，同线程快速连续调用可能产生相同时间戳，导致文件名冲突。现追加进程内
+/// 仅 100ns，同线程快速连续调用可能产生相同时间戳，导致目录名冲突。现追加进程内
 /// 全局 `AtomicU64` 计数器组合时间戳，保证进程内单调唯一（即使时间戳分辨率不足，
 /// 计数器仍单调递增）。计数器与时间戳组合后，跨进程通过时间戳区分，进程内通过
-/// 计数器区分，全场景下文件名唯一。
+/// 计数器区分，全场景下目录名唯一。
 static TMP_FRAME_COUNTER: AtomicU64 = AtomicU64::new(0);
-
-fn tmp_frame_name_from_path(source_path: &Path) -> String {
-    let counter = TMP_FRAME_COUNTER.fetch_add(1, Ordering::Relaxed);
-    let nanos = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_nanos();
-    format!(
-        "_tmp_frame_{}_{}_{}.jpg",
-        path_to_hex(source_path),
-        counter,
-        nanos
-    )
-}
 
 /// 从已解码的图像文件生成缩略图（内部复用函数）
 ///
@@ -244,7 +270,11 @@ fn generate_thumbnail_from_image_file(
     limits.max_image_width = Some(MAX_IMAGE_DIMENSION);
     limits.max_image_height = Some(MAX_IMAGE_DIMENSION);
     limits.max_alloc = Some(MAX_DECODED_PIXEL_BUFFER_SIZE);
-    let mut reader = image::ImageReader::open(image_file_path)?;
+    // 内容嗅探优先、扩展名兜底：`ImageReader::open` 默认按扩展名推断格式，遇到
+    // misnamed 文件（如 JPEG 内容却命名为 .png）会选错解码器而失败。调用
+    // `with_guessed_format` 先按文件魔数嗅探内容格式，仅在无法识别时回退扩展名，
+    // 与壁纸渲染路径（wallpaper/image.rs）保持一致。
+    let mut reader = image::ImageReader::open(image_file_path)?.with_guessed_format()?;
     reader.limits(limits);
     let img = reader.decode()?;
     let (orig_w, orig_h) = img.dimensions();
@@ -284,11 +314,40 @@ fn generate_thumbnail_from_image_file(
     let thumb_name = thumbnail_name_from_path(Path::new(source_file_path_for_hash));
     let thumb_path = thumbnail_dir.join(&thumb_name);
 
+    // 原子落盘：先写同目录唯一临时文件，再 rename 替换最终文件。
+    //
+    // 理由：壳进程（添加壁纸）与 UI 进程（可见卡片按需生成）可能并发为同一源文件
+    // 生成同一张确定性缩略图，直接 `File::create` 会让读者读到撕裂的半成品。
+    // 临时文件与目标放在同一目录（同卷），`rename` 才具原子性。
+    // Windows 上 `rename` 到已存在目标会失败，故失败时先删除目标再 rename
+    // （幂等替换；并发两个生产者内容相同，允许后者覆盖）。
+    let tmp_path = thumbnail_dir.join(format!(
+        ".{}.{}.{}.tmp",
+        thumb_name,
+        std::process::id(),
+        TMP_FRAME_COUNTER.fetch_add(1, Ordering::Relaxed)
+    ));
+    // RAII 守卫：任何 `?` 提前返回都会清理临时文件。rename 成功后临时文件已被移走，
+    // Drop 时 remove_file 找不到文件也无害。
+    let _tmp_guard = TmpFileGuard(tmp_path.clone());
+
     // 使用 JPEG 编码器显式控制质量（image crate 默认 save_with_quality 不可用）
-    let file = std::fs::File::create(&thumb_path)?;
+    let file = std::fs::File::create(&tmp_path)?;
     let mut writer = BufWriter::new(file);
     let encoder = JpegEncoder::new_with_quality(&mut writer, JPEG_QUALITY);
     encoder.write_image(rgb.as_raw(), new_w, new_h, image::ExtendedColorType::Rgb8)?;
+    writer.flush()?;
+    // flush 仅把缓冲刷入 OS，再 sync_all 确保数据落盘后才 rename（换出后读者立即读到完整内容）。
+    let file = writer
+        .into_inner()
+        .map_err(|e| MirrorStarError::Io(e.into_error()))?;
+    file.sync_all()?;
+
+    // 原子替换：优先直接 rename；Windows 目标已存在时失败则先删后 rename。
+    if std::fs::rename(&tmp_path, &thumb_path).is_err() {
+        let _ = std::fs::remove_file(&thumb_path);
+        std::fs::rename(&tmp_path, &thumb_path)?;
+    }
 
     tracing::debug!(
         source_path = source_file_path_for_hash,
@@ -303,70 +362,16 @@ fn generate_thumbnail_from_image_file(
     Ok(thumb_name)
 }
 
-// v5.0 C-PERF-001: 缓存 ffmpeg 可用性探测结果（进程生命周期内不变）
-static FFMPEG_AVAILABLE: OnceLock<bool> = OnceLock::new();
-
-/// 检测系统是否安装 ffmpeg 可执行文件（PATH 查找）
+/// C04 修复：转义 CLI 输入路径，防止参数注入
 ///
-/// 通过执行 `ffmpeg -version` 探测：进程启动成功且退出码为 0 即视为可用。
-/// 调用方据此决定 Video 缩略图生成路径（可用 → 抽帧生成；不可用 → 降级跳过）。
-///
-/// # 阻塞警告（C05 修复）
-///
-/// **本函数为同步阻塞调用**：通过 `std::process::Command::output()` 等待子进程
-/// 退出，期间阻塞当前线程。子进程启动 + 输出采集通常耗时 50-200ms（含进程
-/// 创建、PATH 查找、ffmpeg 自身初始化），但最坏情况下可能更长（如系统负载高、
-/// 杀毒软件扫描、网络路径上的 ffmpeg）。
-///
-/// **禁止在 tokio async 上下文直接调用**，否则会阻塞 tokio worker 线程，
-/// 拖慢整个异步运行时（包括其他无关的 future 调度）。在 async 上下文中必须
-/// 通过 [`tokio::task::spawn_blocking`] 包裹调用：
-///
-/// ```ignore
-/// let available = tokio::task::spawn_blocking(is_ffmpeg_available)
-///     .await
-///     .unwrap_or(false);
-/// ```
-///
-/// 当前已知的调用方（`src-tauri/src/commands/wallpaper.rs` 的 `add_wallpaper`
-/// 与 `regenerate_thumbnails`）均在 `tokio::task::spawn_blocking` 闭包内调用，
-/// 符合本契约。
-///
-/// v5.0 C-PERF-001: 使用 OnceLock 缓存首次探测结果。ffmpeg 是否安装在整个进程
-/// 生命周期内不变，原先 `regenerate_thumbnails` 循环对每个视频壁纸重复探测
-///（50 个视频 ≈ 5 秒纯浪费），现仅首次调用启动 ffmpeg 子进程，后续直接返回缓存值。
-pub fn is_ffmpeg_available() -> bool {
-    *FFMPEG_AVAILABLE.get_or_init(|| {
-        match std::process::Command::new("ffmpeg")
-            .arg("-version")
-            .output()
-        {
-            Ok(output) => output.status.success(),
-            // C-014: NotFound 静默返回 false（PATH 无 ffmpeg 是常态）
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => false,
-            // C-014: 非 NotFound（如 PermissionDenied / Other）记录 warn 日志，
-            // 便于排查"ffmpeg 已安装但 is_ffmpeg_available 仍返回 false"的异常场景
-            Err(e) => {
-                tracing::warn!(
-                    error = ?e,
-                    "ffmpeg 检测失败（非 NotFound，可能是权限问题）"
-                );
-                false
-            }
-        }
-    })
-}
-
-/// C04 修复：转义 ffmpeg 输入路径，防止参数注入
-///
-/// 若 `file_path` 以 `-` 开头（如 `-secret.mp4`），ffmpeg 会将其误解析为
+/// 若 `file_path` 以 `-` 开头（如 `-secret.mp4`），CLI 参数解析会将其误解析为
 /// 命令行选项而非输入文件路径。通过在路径前加 `./` 前缀（仅当路径以 `-`
-/// 开头时），使 ffmpeg 将其识别为相对路径文件名而非选项。
+/// 开头时），使 CLI 将其识别为相对路径文件名而非选项。
 ///
 /// 绝对路径（Windows `C:\...` / `\\server\...`，Unix `/...`）不会以 `-`
 /// 开头，无需处理；包含子目录的相对路径（如 `data/-foo.mp4`）整体不以 `-`
-/// 开头，ffmpeg 也不会误解析。仅需处理"裸文件名以 `-` 开头"的场景。
-fn escape_ffmpeg_input(file_path: &str) -> String {
+/// 开头，也不会被误解析。仅需处理"裸文件名以 `-` 开头"的场景。
+fn escape_cli_input(file_path: &str) -> String {
     if file_path.starts_with('-') {
         format!("./{}", file_path)
     } else {
@@ -394,46 +399,152 @@ fn check_decoded_pixel_buffer_size(width: u32, height: u32) -> Result<(), Mirror
     Ok(())
 }
 
-/// 为 Video 类型壁纸生成缩略图（通过 ffmpeg CLI 抽取首帧）
+/// 解析随应用分发的 mpv 可执行文件路径
 ///
-/// 调用 `ffmpeg -ss 0.1 -i <input> -frames:v 1 -vf scale=320:180:force_original_aspect_ratio=decrease -q:v 2 -y <tmp.jpg>`
-/// 抽取首帧到临时文件。ffmpeg 已通过 `-vf scale=...` 缩放至目标尺寸并以 JPEG 质量 2
-///（≈ 85）输出，因此直接将临时帧文件 rename 为最终缩略图，跳过 image crate 的
-/// decode + re-encode 周期（v5.0 C-PERF-004，节省 5-15ms/视频）。
+/// 复用子进程渲染器的路径解析逻辑（应用目录 → 仓库根回溯 → PATH）。
+fn resolve_mpv_executable() -> PathBuf {
+    crate::wallpaper::subprocess_base::SubprocessRendererBase::find_bundled_executable(
+        Some("mpv"),
+        "mpv.exe",
+        "mpv",
+    )
+}
+
+/// 在 mpv 输出目录中查找抽出的帧文件
+///
+/// 优先返回 mpv 默认命名的 `00000001.jpg`；若不存在则回退返回目录内任意 `*.jpg`
+/// （按文件名排序取第一个），兼容不同 mpv 版本的命名差异。
+fn find_mpv_frame(dir: &Path) -> Option<PathBuf> {
+    let preferred = dir.join("00000001.jpg");
+    if preferred.exists() {
+        return Some(preferred);
+    }
+
+    let mut candidates: Vec<PathBuf> = std::fs::read_dir(dir)
+        .ok()?
+        .filter_map(|entry| entry.ok())
+        .map(|entry| entry.path())
+        .filter(|path| {
+            path.extension()
+                .map(|ext| ext.eq_ignore_ascii_case("jpg"))
+                .unwrap_or(false)
+        })
+        .collect();
+    candidates.sort();
+    candidates.into_iter().next()
+}
+
+/// 使用随包 mpv 抽取视频首帧生成缩略图（唯一后端实现）
+///
+/// 作为视频缩略图的唯一后端，调用
+/// `mpv --no-config --no-audio --frames=1 --vo=image --vo-image-format=jpg
+/// --vo-image-outdir=<tmp_dir> --start=0.1 -- <input>`，由 mpv 的 `image` 视频输出
+/// 将首帧写为 JPEG（默认 `00000001.jpg`），再把抽出的帧交给
+/// [`generate_thumbnail_from_image_file`] 做解码/缩放/编码，产出 `thumb_{path_hex}.jpg`。
+///
+/// 每次调用使用唯一的临时输出目录（`_mpv_tmp_{path_hex}_{counter}_{nanos}`），
+/// 避免壳后台与 UI 按需生成并发时互相覆盖；临时目录由 [`TmpDirGuard`] RAII 守卫在
+/// 所有返回路径（成功 / 失败 / `?` 提前返回）自动清理。
 ///
 /// # 参数
 /// - `file_path`: 源视频文件路径
 /// - `thumbnail_dir`: 缩略图输出目录
 ///
-/// # 返回
-/// 成功时返回缩略图文件名（`thumb_{hex}.jpg`），文件名基于**原始视频路径**的 hex
-/// 编码（C-006 修复，跨 Rust 版本稳定），因此同一视频重复生成会覆盖而非堆积。
+/// # 错误
+/// - mpv 调用失败（非零退出码 / IO 错误）→ `MirrorStarError::ImageDecode`（含 stderr 摘要）
+/// - mpv 未产出帧文件 → `MirrorStarError::ImageDecode`
+/// - 帧文件解码/缩放/落盘失败 → 透传 `generate_thumbnail_from_image_file` 的错误
+fn generate_video_thumbnail_via_mpv(
+    file_path: &str,
+    thumbnail_dir: &Path,
+) -> Result<String, MirrorStarError> {
+    // 显式创建缩略图目录（mpv 会自行创建 outdir，但此处更稳妥；同时保证被测函数
+    // 独立调用时目录就绪）。
+    std::fs::create_dir_all(thumbnail_dir)?;
+
+    let mpv_exe = resolve_mpv_executable();
+
+    // 本次调用唯一的临时输出目录，避免并发互相覆盖（counter + nanos，见
+    // TMP_FRAME_COUNTER 的并发唯一性说明）。
+    let counter = TMP_FRAME_COUNTER.fetch_add(1, Ordering::Relaxed);
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    let tmp_dir = thumbnail_dir.join(format!(
+        "_mpv_tmp_{}_{}_{}",
+        path_to_hex(Path::new(file_path)),
+        counter,
+        nanos
+    ));
+    std::fs::create_dir_all(&tmp_dir)?;
+
+    // RAII 守卫：无论成功/失败/`?` 提前返回，临时目录都会被 best-effort 清理。
+    let _dir_guard = TmpDirGuard::new(tmp_dir.clone());
+
+    // 路径转义：以 `-` 开头的源路径加 `./` 前缀，防止被误解析为 CLI 选项。
+    let safe_input = escape_cli_input(file_path);
+
+    let output = std::process::Command::new(&mpv_exe)
+        .arg("--no-config")
+        .arg("--no-audio")
+        .arg("--frames=1")
+        .arg("--vo=image")
+        .arg("--vo-image-format=jpg")
+        .arg(format!("--vo-image-outdir={}", tmp_dir.display()))
+        .arg("--start=0.1")
+        // `--` 隔离后续参数，防止源路径被误解析为 mpv 选项
+        .arg("--")
+        .arg(&safe_input)
+        .output()
+        .map_err(|e| {
+            MirrorStarError::ImageDecode(format!(
+                "调用 mpv 抽帧失败（{}）: {}",
+                mpv_exe.display(),
+                e
+            ))
+        })?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(MirrorStarError::ImageDecode(format!(
+            "mpv 抽帧失败 (exit {}): {}",
+            output.status.code().unwrap_or(-1),
+            stderr.chars().take(500).collect::<String>()
+        )));
+    }
+
+    let frame_path = find_mpv_frame(&tmp_dir).ok_or_else(|| {
+        MirrorStarError::ImageDecode(format!(
+            "mpv 未产出帧文件（输出目录 {} 下无 00000001.jpg / *.jpg）",
+            tmp_dir.display()
+        ))
+    })?;
+
+    // 复用统一解码/缩放/编码逻辑，产出 thumb_{path_hex}.jpg。
+    generate_thumbnail_from_image_file(&frame_path, file_path, thumbnail_dir)
+}
+
+/// 为 Video 类型壁纸生成缩略图
+///
+/// 保留对外签名与返回语义不变。内部始终使用随包 mpv 后端
+/// [`generate_video_thumbnail_via_mpv`] 抽取视频首帧。
 ///
 /// # 错误
-/// - ffmpeg 调用失败（非零退出码/IO 错误）→ `MirrorStarError::ImageDecode`
-/// - 临时帧文件 rename/copy 到最终路径失败 → `MirrorStarError::ImageDecode`
-/// - C-013：`file_path` 含 `://`（非本地路径，可能为 ffmpeg 协议注入）→ `MirrorStarError::InvalidPath`
-///
-/// # 临时文件清理
-/// 抽帧产生的临时文件 `_tmp_frame_{path_hex}_{counter}_{nanos}.jpg`（基于源路径 hex
-/// 编码 + 进程内全局计数器 + 纳秒时间戳，C-007 / v41-C-006 修复，确保并发唯一）
-/// 会在函数返回前删除（无论成功或失败）。
-///
-/// v41-C-007 修复：临时帧文件的清理由 [`TmpFrameGuard`] RAII 守卫负责，
-/// 在函数任何路径退出（包括 `?` 传播错误、ffmpeg 失败、rename/copy 失败）时自动
-/// 触发 `remove_file`，避免手动清理遗漏导致临时文件残留。
+/// - C-013：`file_path` 含 `://`（非本地路径，可能触发协议注入）→ `MirrorStarError::InvalidPath`
+/// - mpv 后端失败 → `MirrorStarError::ImageDecode`
 ///
 /// # C-013 路径本地化校验
-/// 拒绝含 `://` 的路径（如 `http://...` / `concat:...`）以防 ffmpeg 协议注入。
-/// ffmpeg `-i` 参数支持 `concat:` / `http://` / `pipe:` 等协议前缀，若 `file_path`
+/// 拒绝含 `://` 的路径（如 `http://...` / `concat:...`）以防协议注入。
+/// CLI 输入支持 `concat:` / `http://` / `pipe:` 等协议前缀，若 `file_path`
 /// 来自不可信来源（如配置文件 / 前端输入），可能被构造为协议 URL 触发非预期
 /// 行为（如远程拉流、拼接多个文件）。入口处直接拒绝含 `://` 的路径，确保
-/// 仅本地文件路径进入 ffmpeg 命令行。
+/// 仅本地文件路径进入后端命令行。
 pub fn generate_video_thumbnail(
     file_path: &str,
     thumbnail_dir: &Path,
 ) -> Result<String, MirrorStarError> {
-    // C-013: 拒绝含 '://' 的路径以防 ffmpeg 协议注入（concat:/http:// 等）
+    // C-013: 拒绝含 '://' 的路径以防协议注入（concat:/http:// 等）
     if file_path.contains("://") {
         return Err(MirrorStarError::InvalidPath {
             reason: format!(
@@ -445,81 +556,7 @@ pub fn generate_video_thumbnail(
 
     std::fs::create_dir_all(thumbnail_dir)?;
 
-    // C-007 修复：临时帧文件名基于源路径 hex + 纳秒时间戳，确保并发唯一。
-    // 同一视频并发调用 generate_video_thumbnail 时，路径 hex 相同但时间戳不同，
-    // 避免多个 ffmpeg 进程竞争同一临时文件。
-    let tmp_frame = thumbnail_dir.join(tmp_frame_name_from_path(Path::new(file_path)));
-
-    // v41-C-007 修复：创建 RAII 守卫，确保函数退出时（无论成功或失败）清理临时帧文件。
-    // 守卫的 drop 会调用 `remove_file`（best-effort），替代原先分散在多处的手动清理。
-    // 即使后续 ffmpeg 调用失败或 `?` 提前传播错误，守卫仍会自动触发清理。
-    let _guard = TmpFrameGuard::new(&tmp_frame);
-
-    // C04 修复：防止 ffmpeg 参数注入（详见 `escape_ffmpeg_input` 文档）
-    let safe_input = escape_ffmpeg_input(file_path);
-
-    // ffmpeg 抽帧：-ss 0.1 跳过可能黑屏的首帧，scale 保持宽高比缩放至 320x180 内
-    let output = std::process::Command::new("ffmpeg")
-        .arg("-ss")
-        .arg("0.1")
-        .arg("-i")
-        .arg(&safe_input)
-        .arg("-frames:v")
-        .arg("1")
-        .arg("-vf")
-        .arg("scale=320:180:force_original_aspect_ratio=decrease")
-        .arg("-q:v")
-        // v5.0 C-PERF-004: JPEG 质量 2 ≈ 质量 85，与原 JpegEncoder 一致；
-        // ffmpeg 已输出缩放后的 JPEG，下游直接 rename 无需 re-encode
-        .arg("2")
-        .arg("-y") // 覆盖输出
-        .arg(&tmp_frame)
-        .output()
-        .map_err(|e| MirrorStarError::ImageDecode(format!("调用 ffmpeg 失败: {}", e)))?;
-
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        // v41-C-007: 不再需要手动清理 tmp_frame，_guard 在函数返回时自动 drop 清理
-        return Err(MirrorStarError::ImageDecode(format!(
-            "ffmpeg 抽帧失败 (exit {}): {}",
-            output.status.code().unwrap_or(-1),
-            stderr.chars().take(500).collect::<String>()
-        )));
-    }
-
-    // v5.0 C-PERF-004: ffmpeg 已通过 `-vf scale=...` 缩放至目标尺寸并以 JPEG 质量 2
-    // 输出 tmp_frame，无需再经 image crate decode + re-encode。直接 rename 为最终
-    // 缩略图路径，节省 5-15ms/视频。
-    //
-    // 文件名基于原始视频路径 hex 编码（与原 generate_thumbnail_from_image_file 内部
-    // 调用 thumbnail_name_from_path 一致），保证同一视频重复生成覆盖而非堆积。
-    let final_thumb_name = thumbnail_name_from_path(Path::new(file_path));
-    let final_thumb_path = thumbnail_dir.join(&final_thumb_name);
-
-    // tmp_frame 与 final_thumb_path 同在 thumbnail_dir 内（同盘符），rename 通常成功；
-    // Windows 跨盘符场景下 rename 会失败，fallback 到 copy + remove。
-    // 错误路径下 _guard 自动 drop 清理 tmp_frame；成功路径下 rename 消费原文件
-    //（copy 成功后手动 remove），_guard 的 drop 为 best-effort no-op。
-    if let Err(e) = std::fs::rename(&tmp_frame, &final_thumb_path) {
-        // rename 失败（如跨盘符），fallback 到 copy + remove
-        if let Err(copy_e) = std::fs::copy(&tmp_frame, &final_thumb_path) {
-            // copy 也失败：返回错误，_guard 在函数退出时自动清理 tmp_frame
-            return Err(MirrorStarError::ImageDecode(format!(
-                "缩略图文件落盘失败: rename={}, copy={}",
-                e, copy_e
-            )));
-        }
-        // copy 成功：手动删除 tmp_frame（_guard 也会 best-effort 清理，此处显式删除）
-        let _ = std::fs::remove_file(&tmp_frame);
-    }
-
-    tracing::debug!(
-        source_path = file_path,
-        thumb_path = %final_thumb_path.display(),
-        "视频缩略图已生成（跳过 re-encode）"
-    );
-
-    Ok(final_thumb_name)
+    generate_video_thumbnail_via_mpv(file_path, thumbnail_dir)
 }
 
 /// 探测图片格式并返回对应的 image crate `ImageFormat`
@@ -810,9 +847,13 @@ mod tests {
 
     #[test]
     fn generate_thumbnail_returns_image_decode_for_misnamed_png() {
-        // 背景：拖动静态壁纸进主窗口时，部分 .png 源文件实际不是合法 PNG
-        // （可能是 WebP/AVIF 改名或损坏）。image crate 的 ImageReader 按内容嗅探
-        // 识别格式，非 PNG 魔数（0x89 50 4E 47）的内容解码失败 → ImageDecode。
+        // 背景：拖动静态壁纸进主窗口时，部分 .png 源文件实际内容并非合法图像
+        // （如损坏文件，或文件头既不匹配 PNG 魔数 0x89 50 4E 47，也不匹配任何其它
+        // 已知图像格式）。解码路径现为「内容嗅探优先、扩展名兜底」：先按文件魔数
+        // 嗅探格式，无法识别时回退按扩展名（.png）选择解码器。本例是纯垃圾字节
+        // （非任何已知魔数），回退为 PNG 解码器后仍失败 → ImageDecode。
+        // （真正的 misnamed 文件如 JPEG 内容却命名 .png 会被内容嗅探正确识别并成功，
+        // 见 generate_thumbnail_succeeds_for_jpeg_content_named_png。）
         // 命令层据此错误码回退为直接用源文件路径作缩略图，因此这里必须断言返回
         // 的是 ImageDecode 而非 Io（文件打不开）等其它变体。
         let dir = std::env::temp_dir().join("mirrorstar_thumbnail_test_misnamed_png");
@@ -834,6 +875,37 @@ mod tests {
             "伪 PNG 文件应返回 ImageDecode 错误，实际: {:?}",
             err
         );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn generate_thumbnail_succeeds_for_jpeg_content_named_png() {
+        // 回归：misnamed 文件——内容为合法 JPEG（文件头 FF D8 FF ...），扩展名却是 .png。
+        // 修复前 ImageReader::open 按扩展名选 PNG 解码器 → "Invalid PNG signature" 失败。
+        // 修复后内容嗅探优先识别为 JPEG，正确解码并生成缩略图。
+        let dir = std::env::temp_dir().join(format!(
+            "mirrorstar_thumbnail_test_misnamed_jpeg_{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        // 用 JPEG 编码内容，但文件名以 .png 结尾
+        let src_path = dir.join("actually_jpeg.png");
+        let img = image::DynamicImage::new_rgb8(200, 120);
+        img.save_with_format(&src_path, ImageFormat::Jpeg).unwrap();
+
+        let thumb_dir = dir.join("thumbnails");
+        let result = generate_thumbnail(src_path.to_str().unwrap(), &thumb_dir);
+        assert!(
+            result.is_ok(),
+            "JPEG 内容名为 .png 的 misnamed 文件应成功生成缩略图: {:?}",
+            result.err()
+        );
+        let thumb_name = result.unwrap();
+        let thumb_path = thumb_dir.join(&thumb_name);
+        assert!(thumb_path.exists(), "缩略图文件应存在");
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -872,40 +944,37 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    // ── C04 修复：ffmpeg 参数注入防护 ────────────────────────────────────────
+    // ── C04 修复：CLI 参数注入防护 ──────────────────────────────────────────
 
     #[test]
-    fn escape_ffmpeg_input_prepends_dot_slash_for_dash_prefix() {
+    fn escape_cli_input_prepends_dot_slash_for_dash_prefix() {
         // 以 `-` 开头的路径应加 `./` 前缀
-        assert_eq!(escape_ffmpeg_input("-secret.mp4"), "./-secret.mp4");
-        assert_eq!(escape_ffmpeg_input("--weird.mp4"), "./--weird.mp4");
-        assert_eq!(escape_ffmpeg_input("-x"), "./-x");
+        assert_eq!(escape_cli_input("-secret.mp4"), "./-secret.mp4");
+        assert_eq!(escape_cli_input("--weird.mp4"), "./--weird.mp4");
+        assert_eq!(escape_cli_input("-x"), "./-x");
     }
 
     #[test]
-    fn escape_ffmpeg_input_keeps_normal_paths_unchanged() {
+    fn escape_cli_input_keeps_normal_paths_unchanged() {
         // 普通相对路径不应被修改
-        assert_eq!(escape_ffmpeg_input("video.mp4"), "video.mp4");
-        assert_eq!(escape_ffmpeg_input("data/video.mp4"), "data/video.mp4");
-        assert_eq!(
-            escape_ffmpeg_input("foo/bar/-dash.mp4"),
-            "foo/bar/-dash.mp4"
-        );
+        assert_eq!(escape_cli_input("video.mp4"), "video.mp4");
+        assert_eq!(escape_cli_input("data/video.mp4"), "data/video.mp4");
+        assert_eq!(escape_cli_input("foo/bar/-dash.mp4"), "foo/bar/-dash.mp4");
     }
 
     #[test]
-    fn escape_ffmpeg_input_keeps_absolute_paths_unchanged() {
+    fn escape_cli_input_keeps_absolute_paths_unchanged() {
         // 绝对路径不以 `-` 开头，不应被修改
         assert_eq!(
-            escape_ffmpeg_input("C:\\Users\\test\\video.mp4"),
+            escape_cli_input("C:\\Users\\test\\video.mp4"),
             "C:\\Users\\test\\video.mp4"
         );
         assert_eq!(
-            escape_ffmpeg_input("/home/test/video.mp4"),
+            escape_cli_input("/home/test/video.mp4"),
             "/home/test/video.mp4"
         );
         assert_eq!(
-            escape_ffmpeg_input("\\\\server\\share\\video.mp4"),
+            escape_cli_input("\\\\server\\share\\video.mp4"),
             "\\\\server\\share\\video.mp4"
         );
     }
@@ -1112,302 +1181,224 @@ mod tests {
         );
     }
 
-    // ── C-007 修复：视频缩略图临时文件名唯一性 ──────────────────────────────
-    //
-    // 验证 `tmp_frame_name_from_path` 在路径 hex 编码基础上追加纳秒时间戳，
-    // 确保同一视频并发调用 `generate_video_thumbnail` 时使用不同的临时帧文件名，
-    // 避免多个 ffmpeg 进程竞争同一临时文件。
+    // ── v5.3 修复：mpv 后端 / 临时目录清理 ───────────────────────────────────
 
-    #[test]
-    fn c007_video_thumbnail_temp_name_unique_per_call() {
-        // C-007 Scenario: 同一视频并发调用应使用不同临时帧文件名
-        //
-        // v41-C-006 修复后文件名格式：`_tmp_frame_{path_hex}_{counter}_{nanos}.jpg`
-        // - path_hex：路径 hex 编码（同一视频路径相同）
-        // - counter：进程内全局 AtomicU64 计数器（每次调用单调递增）
-        // - nanos：SystemTime::now() 纳秒时间戳（每次调用不同）
-        //
-        // 连续两次调用 tmp_frame_name_from_path，即使路径相同，counter 也不同，
-        // 因此文件名应不同。这是 C-007 + v41-C-006 修复的核心保证：并发调用互不干扰。
-        let path = Path::new("/wallpapers/foo.mp4");
-        let name1 = tmp_frame_name_from_path(path);
-        let name2 = tmp_frame_name_from_path(path);
+    /// mpv 后端 lavfi 测试输入（无需真实视频文件即可端到端验证抽帧）
+    const MPV_LAVFI_INPUT: &str = "av://lavfi:testsrc=duration=2:size=640x360:rate=10";
 
-        // 核心断言：两次调用生成不同文件名（counter 单调递增）
-        assert_ne!(
-            name1, name2,
-            "C-007: 同一路径连续两次调用应生成不同临时文件名（实际 name1={}, name2={}）",
-            name1, name2
-        );
-
-        // 文件名格式校验：_tmp_frame_{hex}_{counter}_{nanos}.jpg
-        assert!(
-            name1.starts_with("_tmp_frame_") && name1.ends_with(".jpg"),
-            "C-007: 临时帧文件名格式应为 _tmp_frame_{{hex}}_{{counter}}_{{nanos}}.jpg，实际: {}",
-            name1
-        );
-        assert!(
-            name2.starts_with("_tmp_frame_") && name2.ends_with(".jpg"),
-            "C-007: 临时帧文件名格式应为 _tmp_frame_{{hex}}_{{counter}}_{{nanos}}.jpg，实际: {}",
-            name2
-        );
-
-        // 两次文件名的 path_hex 前缀部分应相同（同一视频路径）
-        // v41-C-006 格式：`_tmp_frame_{path_hex}_{counter}_{nanos}.jpg`
-        // 截取 `_tmp_frame_` 之后、`.jpg` 之前的部分，按 `_` 分割取首段作为 path_hex
-        // （path_hex 是 hex 编码，不含下划线）
-        let prefix = "_tmp_frame_";
-        let suffix = ".jpg";
-        let body1 = &name1[prefix.len()..name1.len() - suffix.len()];
-        let body2 = &name2[prefix.len()..name2.len() - suffix.len()];
-        // body 应至少包含两个下划线分隔符（path_hex_counter_nanos）
-        assert!(
-            body1.matches('_').count() >= 2 && body2.matches('_').count() >= 2,
-            "C-007: 临时帧文件名应包含 path_hex/counter/nanos 之间的下划线分隔符，\
-             实际 name1={}, name2={}",
-            name1,
-            name2
-        );
-        // 取第一个下划线之前的部分作为 path_hex 比较
-        // （counter / nanos 均为十进制数字，不含下划线）
-        let path_hex1 = &body1[..body1.find('_').unwrap()];
-        let path_hex2 = &body2[..body2.find('_').unwrap()];
-        assert_eq!(
-            path_hex1, path_hex2,
-            "C-007: 同一视频路径的 hex 编码应相同（实际 {} vs {}）",
-            path_hex1, path_hex2
-        );
-
-        // path_hex 应与 path_to_hex 的输出一致（与 C-006 编码方式一致）
-        let expected_hex = path_to_hex(path);
-        assert_eq!(
-            path_hex1, &expected_hex,
-            "C-007: path_hex 应与 path_to_hex 输出一致（实际 {} vs 期望 {}）",
-            path_hex1, expected_hex
-        );
-    }
-
-    #[test]
-    fn c007_video_thumbnail_temp_name_different_for_different_paths() {
-        // C-007 补充：不同视频路径应生成不同 path_hex 部分（继承自 C-006）
-        let path_a = Path::new("/wallpapers/foo.mp4");
-        let path_b = Path::new("/wallpapers/bar.mp4");
-        let name_a = tmp_frame_name_from_path(path_a);
-        let name_b = tmp_frame_name_from_path(path_b);
-        assert_ne!(
-            name_a, name_b,
-            "不同路径应生成不同临时文件名（{} vs {}）",
-            name_a, name_b
-        );
-    }
-
-    // ── v41-C-006 修复：tmp_frame_name_from_path 进程内全局唯一性 ────────────
-    //
-    // v4.0 回归：`SystemTime::now().as_nanos()` 在某些 Windows 系统上分辨率仅 100ns，
-    // 同线程快速连续调用可能产生相同时间戳。修复后追加进程内全局 AtomicU64 计数器，
-    // 保证进程内单调唯一。本测试用 8 线程各生成 100 个名字，断言全部唯一。
-
-    #[test]
-    fn v41_c006_tmp_frame_name_unique_across_threads() {
-        // v41-C-006: 8 线程各生成 100 个名字，全部应唯一
-        // 即使部分线程的 SystemTime::now() 返回相同纳秒（在某些 Windows 系统上
-        // 分辨率仅 100ns），AtomicU64 计数器仍保证每次调用递增，因此文件名唯一。
-        use std::sync::{Arc, Mutex};
-        const THREAD_COUNT: usize = 8;
-        const NAMES_PER_THREAD: usize = 100;
-
-        let path = Path::new("/wallpapers/v41_c006_test.mp4");
-        let all_names: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
-        let mut handles = Vec::new();
-
-        for _ in 0..THREAD_COUNT {
-            let path = path.to_path_buf();
-            let all_names = Arc::clone(&all_names);
-            handles.push(std::thread::spawn(move || {
-                let mut local = Vec::with_capacity(NAMES_PER_THREAD);
-                for _ in 0..NAMES_PER_THREAD {
-                    local.push(tmp_frame_name_from_path(&path));
-                }
-                all_names.lock().unwrap().extend(local);
-            }));
-        }
-
-        for h in handles {
-            h.join().expect("worker thread panicked");
-        }
-
-        let all_names = all_names.lock().unwrap();
-        let total = THREAD_COUNT * NAMES_PER_THREAD;
-        assert_eq!(all_names.len(), total);
-
-        // 用 HashSet 检测重复
-        let unique: std::collections::HashSet<&String> = all_names.iter().collect();
-        assert_eq!(
-            unique.len(),
-            total,
-            "v41-C-006: 8 线程 x 100 名字应全部唯一（共 {}），但仅有 {} 个唯一值",
-            total,
-            unique.len()
-        );
-
-        // 文件名格式校验：所有名字应匹配 `_tmp_frame_{hex}_{counter}_{nanos}.jpg`
-        for name in all_names.iter() {
-            assert!(
-                name.starts_with("_tmp_frame_") && name.ends_with(".jpg"),
-                "v41-C-006: 文件名格式错误: {}",
-                name
-            );
-        }
-    }
-
-    #[test]
-    fn v41_c006_tmp_frame_name_counter_monotonic() {
-        // v41-C-006: 同一线程连续调用，counter 部分应单调递增
-        // 验证 AtomicU64 计数器的单调性（即使时间戳分辨率不足，counter 仍保证唯一）
-        let path = Path::new("/wallpapers/v41_c006_monotonic.mp4");
-        let names: Vec<String> = (0..10).map(|_| tmp_frame_name_from_path(path)).collect();
-
-        // 解析每个文件名的 counter 部分（`_tmp_frame_{hex}_{counter}_{nanos}.jpg`）
-        let prefix = "_tmp_frame_";
-        let suffix = ".jpg";
-        let counters: Vec<u64> = names
-            .iter()
-            .map(|name| {
-                let body = &name[prefix.len()..name.len() - suffix.len()];
-                // body = `{hex}_{counter}_{nanos}`，按 `_` 分割取第二段
-                let parts: Vec<&str> = body.splitn(3, '_').collect();
-                assert_eq!(parts.len(), 3, "v41-C-006: 文件名应包含 3 段: {}", name);
-                parts[1].parse::<u64>().expect("counter 应为数字")
+    /// 检测 `dir` 下是否存在 `_mpv_tmp_*` 残留目录
+    fn has_mpv_tmp_residue(dir: &Path) -> bool {
+        std::fs::read_dir(dir)
+            .map(|rd| {
+                rd.filter_map(|e| e.ok())
+                    .any(|e| e.file_name().to_string_lossy().starts_with("_mpv_tmp_"))
             })
-            .collect();
-
-        // counter 应严格单调递增
-        for i in 1..counters.len() {
-            assert!(
-                counters[i] > counters[i - 1],
-                "v41-C-006: counter[{}] ({}) 应大于 counter[{}] ({})",
-                i,
-                counters[i],
-                i - 1,
-                counters[i - 1]
-            );
-        }
+            .unwrap_or(false)
     }
 
-    // ── v41-C-007 修复：TmpFrameGuard RAII 守卫 ──────────────────────────────
-    //
-    // v41-C-007：临时帧文件的清理由 RAII 守卫负责，确保函数退出时（无论成功或失败）
-    // 自动清理临时文件。本测试验证守卫的 Drop 行为：drop 时删除文件。
-
     #[test]
-    fn v41_c007_tmp_frame_guard_drops_file() {
-        // v41-C-007: 守卫 drop 时应删除文件
-        let dir = std::env::temp_dir().join(format!(
-            "mirrorstar_v41_c007_guard_{}",
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
+    fn generate_video_thumbnail_rejects_protocol_path() {
+        // C-013：含 '://' 的路径应被入口拒绝（InvalidPath）
+        let dir = std::env::temp_dir().join("mirrorstar_thumbnail_test_protocol");
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
 
-        // 创建一个临时文件作为守卫的目标
-        let tmp_file = dir.join("tmp_frame.jpg");
-        std::fs::write(&tmp_file, b"fake frame content").unwrap();
-        assert!(tmp_file.exists(), "测试前置：临时文件应存在");
-
-        // 创建守卫，超出作用域时 drop 应删除文件
-        {
-            let _guard = TmpFrameGuard::new(&tmp_file);
-        } // _guard 在此 drop
-
-        // 核心断言：守卫 drop 后文件应被删除
+        let result = generate_video_thumbnail("http://x/a.mp4", &dir);
         assert!(
-            !tmp_file.exists(),
-            "v41-C-007: 守卫 drop 后临时文件应被删除"
-        );
-
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn v41_c007_tmp_frame_guard_drop_silent_on_nonexistent_file() {
-        // v41-C-007: 守卫 drop 时若文件不存在（如 ffmpeg 未创建），
-        // remove_file 应静默失败（best-effort），不传播错误。
-        let dir = std::env::temp_dir().join(format!(
-            "mirrorstar_v41_c007_guard_nonexistent_{}",
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-
-        let nonexistent = dir.join("does_not_exist.jpg");
-        assert!(!nonexistent.exists(), "测试前置：文件不应存在");
-
-        // 创建守卫，drop 时尝试删除不存在的文件，应不 panic
-        {
-            let _guard = TmpFrameGuard::new(&nonexistent);
-        } // _guard drop，remove_file 失败但被 `let _ =` 静默
-
-        // 验证：文件仍不存在（删除失败不影响状态）
-        assert!(!nonexistent.exists(), "文件应仍不存在");
-
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn v41_c007_tmp_frame_cleaned_on_decode_failure() {
-        // v41-C-007 行为级测试：构造解码失败场景（生成损坏的临时帧文件，
-        // 使 generate_thumbnail_from_image_file 解码失败），
-        // 验证守卫在错误传播时自动清理临时帧文件。
-        //
-        // 由于 generate_video_thumbnail 依赖 ffmpeg（测试环境可能无 ffmpeg），
-        // 本测试直接构造一个损坏的"临时帧文件"并调用 generate_thumbnail_from_image_file
-        // 模拟解码失败路径，验证守卫 Drop 后文件被清理。
-        //
-        // 等价验证：直接构造 TmpFrameGuard + 调用 generate_thumbnail_from_image_file
-        //（解码失败 → 函数返回 Err → 守卫超出作用域 drop → 文件被清理）。
-        let dir = std::env::temp_dir().join(format!(
-            "mirrorstar_v41_c007_decode_fail_{}",
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-
-        // 创建损坏的"临时帧文件"（非图片内容，使 image::decode 失败）
-        let tmp_frame = dir.join("_tmp_frame_corrupted.jpg");
-        std::fs::write(&tmp_frame, b"this is not a valid image").unwrap();
-        assert!(tmp_frame.exists(), "测试前置：临时帧文件应存在");
-
-        // 模拟 generate_video_thumbnail 中 generate_thumbnail_from_image_file 失败后的
-        // 守卫清理行为：守卫在函数退出时（包括 `?` 传播错误）自动 drop 清理文件。
-        let result: Result<String, MirrorStarError> = {
-            let _guard = TmpFrameGuard::new(&tmp_frame);
-            // 模拟解码失败：调用 generate_thumbnail_from_image_file 解码损坏文件
-            let r = generate_thumbnail_from_image_file(&tmp_frame, "/fake/video.mp4", &dir);
-            // 模拟 `?` 传播错误：r 是 Err，函数返回，_guard drop 清理文件
-            r
-        };
-
-        // 解码应失败（损坏的图片文件）
-        assert!(
-            result.is_err(),
-            "v41-C-007: 损坏的临时帧文件解码应失败，实际: {:?}",
+            matches!(result, Err(MirrorStarError::InvalidPath { .. })),
+            "含 '://' 的路径应返回 InvalidPath，实际: {:?}",
             result
         );
 
-        // 核心断言：守卫在错误传播时自动清理了临时帧文件
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn mpv_backend_generates_and_decodes_thumbnail() {
+        // 能力探测：未随包分发/未找到 mpv 时跳过（测试仍通过）
+        if !resolve_mpv_executable().exists() {
+            eprintln!("跳过：未找到随包 mpv");
+            return;
+        }
+
+        let dir = std::env::temp_dir().join("mirrorstar_thumbnail_test_mpv");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let thumb_dir = dir.join("thumbnails");
+
+        let result = generate_video_thumbnail_via_mpv(MPV_LAVFI_INPUT, &thumb_dir);
+        let thumb_name = result.expect("mpv 后端应能为 lavfi 输入生成缩略图");
         assert!(
-            !tmp_frame.exists(),
-            "v41-C-007: 解码失败后临时帧文件应被守卫自动清理"
+            thumb_name.starts_with("thumb_"),
+            "文件名应以 thumb_ 开头: {}",
+            thumb_name
         );
+        assert!(
+            thumb_name.ends_with(".jpg"),
+            "文件名应以 .jpg 结尾: {}",
+            thumb_name
+        );
+
+        let thumb_path = thumb_dir.join(&thumb_name);
+        assert!(thumb_path.exists(), "缩略图文件应存在");
+
+        let img = image::open(&thumb_path).expect("缩略图应可被 image::open 解码");
+        let (w, h) = img.dimensions();
+        assert!(w <= THUMB_MAX_W, "宽度 {} 应 <= {}", w, THUMB_MAX_W);
+        assert!(h <= THUMB_MAX_H, "高度 {} 应 <= {}", h, THUMB_MAX_H);
+
+        // 临时目录应已被清理（无 _mpv_tmp_* 残留）
+        assert!(
+            !has_mpv_tmp_residue(&thumb_dir),
+            "mpv 临时目录应被清理，不应有 _mpv_tmp_* 残留"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn mpv_backend_cleans_temp_dir_on_failure() {
+        // 失败路径（不存在的输入）也应清理临时目录
+        if !resolve_mpv_executable().exists() {
+            eprintln!("跳过：未找到随包 mpv");
+            return;
+        }
+
+        let dir = std::env::temp_dir().join("mirrorstar_thumbnail_test_mpv_fail");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let thumb_dir = dir.join("thumbnails");
+        std::fs::create_dir_all(&thumb_dir).unwrap();
+
+        let result = generate_video_thumbnail_via_mpv(
+            &dir.join("definitely_absent.mp4").to_string_lossy(),
+            &thumb_dir,
+        );
+        assert!(result.is_err(), "不存在的输入应返回错误");
+        assert!(
+            !has_mpv_tmp_residue(&thumb_dir),
+            "失败路径下 mpv 临时目录也应被清理"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn v53_tmp_dir_guard_removes_dir_on_drop() {
+        // TmpDirGuard 在 drop 时应递归删除整个临时目录
+        let dir = std::env::temp_dir().join(format!(
+            "mirrorstar_v53_tmpdir_guard_{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let nested = dir.join("_mpv_tmp_nested");
+        std::fs::create_dir_all(&nested).unwrap();
+        std::fs::write(nested.join("00000001.jpg"), b"frame").unwrap();
+        assert!(nested.exists(), "测试前置：临时目录应存在");
+
+        {
+            let _guard = TmpDirGuard::new(nested.clone());
+        } // _guard 在此 drop
+
+        assert!(
+            !nested.exists(),
+            "v5.3: TmpDirGuard drop 后临时目录应被删除"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ── thumbnail_cache_path ──────────────────────────────────────────────────
+
+    #[test]
+    fn thumbnail_cache_path_stable_for_same_path() {
+        let p1 = thumbnail_cache_path("/wallpapers/foo.jpg");
+        let p2 = thumbnail_cache_path("/wallpapers/foo.jpg");
+        assert!(p1.is_some(), "非空路径应返回 Some");
+        assert_eq!(p1, p2, "同一路径两次调用应返回相同缓存路径");
+    }
+
+    #[test]
+    fn thumbnail_cache_path_differs_for_different_paths() {
+        let p1 = thumbnail_cache_path("/wallpapers/foo.jpg").unwrap();
+        let p2 = thumbnail_cache_path("/wallpapers/bar.jpg").unwrap();
+        assert_ne!(p1, p2, "不同路径应返回不同缓存路径");
+    }
+
+    #[test]
+    fn thumbnail_cache_path_none_for_empty() {
+        assert_eq!(thumbnail_cache_path(""), None, "空字符串应返回 None");
+    }
+
+    #[test]
+    fn thumbnail_cache_path_filename_format() {
+        let p = thumbnail_cache_path("/wallpapers/foo.jpg").unwrap();
+        let name = p.file_name().unwrap().to_str().unwrap();
+        assert!(
+            name.starts_with("thumb_"),
+            "文件名应以 thumb_ 开头: {}",
+            name
+        );
+        assert!(name.ends_with(".jpg"), "文件名应以 .jpg 结尾: {}", name);
+        let hex = &name["thumb_".len()..name.len() - ".jpg".len()];
+        assert_eq!(hex.len(), 16, "hex 部分应为 16 位，实际: {}", hex);
+        assert!(
+            hex.chars().all(|c| c.is_ascii_hexdigit()),
+            "hex 部分应全部为合法 hex 字符，实际: {}",
+            hex
+        );
+    }
+
+    #[test]
+    fn thumbnail_cache_path_parent_is_thumbnails() {
+        let p = thumbnail_cache_path("/wallpapers/foo.jpg").unwrap();
+        assert_eq!(
+            p.parent().unwrap().file_name().unwrap().to_str().unwrap(),
+            "thumbnails",
+            "父目录应以 thumbnails 结尾，实际: {}",
+            p.display()
+        );
+    }
+
+    // ── 原子落盘 ──────────────────────────────────────────────────────────────
+
+    #[test]
+    fn generate_thumbnail_atomic_write_is_decodable_and_leaves_no_tmp() {
+        let dir = std::env::temp_dir().join("mirrorstar_thumbnail_test_atomic");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        // 生成一张真实小图（640x360，会被缩放）
+        let src_path = dir.join("src.png");
+        let img = image::DynamicImage::new_rgb8(640, 360);
+        img.save_with_format(&src_path, ImageFormat::Png).unwrap();
+
+        let thumb_dir = dir.join("thumbnails");
+        let name1 = generate_thumbnail(src_path.to_str().unwrap(), &thumb_dir).unwrap();
+        // 第二次调用触发「目标已存在」的覆盖分支（Windows 需先删后 rename）
+        let name2 = generate_thumbnail(src_path.to_str().unwrap(), &thumb_dir).unwrap();
+        assert_eq!(name1, name2, "同一源文件两次生成的文件名应一致");
+
+        let thumb_path = thumb_dir.join(&name2);
+        assert!(thumb_path.exists(), "最终缩略图文件应存在");
+        let decoded = image::open(&thumb_path).expect("最终缩略图应可正常解码");
+        let (w, h) = decoded.dimensions();
+        assert!(
+            w <= THUMB_MAX_W && h <= THUMB_MAX_H,
+            "缩略图尺寸应在 320x180 内，实际 {}x{}",
+            w,
+            h
+        );
+
+        // 目录内不应有 .tmp 残留
+        let has_tmp = std::fs::read_dir(&thumb_dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .any(|e| e.file_name().to_string_lossy().ends_with(".tmp"));
+        assert!(!has_tmp, "缩略图目录内不应有 .tmp 残留文件");
 
         let _ = std::fs::remove_dir_all(&dir);
     }

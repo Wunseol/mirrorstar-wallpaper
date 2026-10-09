@@ -118,6 +118,11 @@ struct GifWindowData {
     fps: crate::perf::FramePerfTracker,
     /// v17 性能埋点：后台全量解码开始时间，`handle_frames_loaded` 读取计算耗时。
     decode_start: Option<std::time::Instant>,
+    /// 首帧绘制完成标志（原子交换阶段 B 就绪判定用）。
+    ///
+    /// 由壁纸线程在首次 WM_PAINT 实际绘制成功后置 true；渲染器侧的克隆副本由
+    /// `poll_first_frame_ready` 读取。窗口数据销毁后克隆仍被渲染器持有，不会悬垂。
+    first_frame_ready: Arc<AtomicBool>,
 }
 
 /// GIF 壁纸渲染器
@@ -182,6 +187,11 @@ pub struct GifRenderer {
     /// W-003 修复：display_id 共享变量（create_pause_sender 中设置，壁纸线程中读取）
     /// 使用 OnceLock 保证只写一次，壁纸线程在 Resume 失败时读取此值通知前端
     display_id_lock: Arc<std::sync::OnceLock<String>>,
+    /// 首帧绘制完成标志（false → 首次 WM_PAINT 后 true）。
+    ///
+    /// 原子交换（DR-33）阶段 B 由 `poll_first_frame_ready` 读取，确保换槽前新窗首帧
+    /// 已绘制并可见；非原子交换路径（普通 set_wallpaper）不等待该标志，行为不变。
+    first_frame_ready: Arc<AtomicBool>,
 }
 
 // SAFETY: GifRenderer 的所有窗口操作都在专用线程上执行。
@@ -220,6 +230,7 @@ impl GifRenderer {
             pre_shared_state: None,
             pre_state_changed: None,
             display_id_lock: Arc::new(std::sync::OnceLock::new()),
+            first_frame_ready: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -245,6 +256,8 @@ impl GifRenderer {
         // 初始化 shared_state.state = Playing（与 play() 成功后 set_state(Playing) 一致）
         shared_state.write().unwrap().state = WallpaperState::Playing;
         let display_id_lock = self.display_id_lock.clone();
+        // 首帧绘制完成标志：渲染器持有主副本，克隆传给壁纸线程供 WM_PAINT 置位
+        let first_frame_ready = self.first_frame_ready.clone();
         // Clone for the wallpaper thread closure; originals retained for self.pre_*
         // Arc::clone 与 broadcast::Sender::clone 均为廉价引用计数递增
         let thread_shared_state = shared_state.clone();
@@ -266,6 +279,7 @@ impl GifRenderer {
                     thread_shared_state,
                     thread_state_changed,
                     display_id_lock,
+                    first_frame_ready,
                 );
             })
             .map_err(|e| {
@@ -469,6 +483,15 @@ impl WallpaperRenderer for GifRenderer {
         self.base.set_pause_sender(Some(sender.clone()));
         Some(sender)
     }
+
+    /// 首帧就绪判定（原子交换 DR-33 阶段 B）：等待首次 WM_PAINT 实际绘制完成。
+    ///
+    /// GIF 首帧在 play() 中同步解码完成，但 WM_PAINT 由窗口线程消息循环异步处理；
+    /// 若直接返回 true，commit 换槽可能在新窗尚未绘制时销毁旧窗，露出未绘制窗口帧
+    /// （闪屏）。覆写为轮询壁纸线程置位的首帧绘制标志。
+    fn poll_first_frame_ready(&mut self) -> Result<bool, crate::MirrorStarError> {
+        Ok(self.first_frame_ready.load(Ordering::SeqCst))
+    }
 }
 
 // ── Wallpaper Thread ─────────────────────────────────────────────────────────
@@ -501,6 +524,7 @@ fn gif_wallpaper_thread(
     shared_state: Arc<RwLock<RendererState>>,
     state_changed: tokio::sync::broadcast::Sender<String>,
     display_id_lock: Arc<std::sync::OnceLock<String>>,
+    first_frame_ready: Arc<AtomicBool>,
 ) {
     // Step 1: 解码 GIF 首帧（快速显示）
     let first_frame = match decode_gif_first_frame(&gif_path) {
@@ -558,6 +582,7 @@ fn gif_wallpaper_thread(
         prefetch_worker_tx: None,
         fps: crate::perf::FramePerfTracker::new("gif", 60, expected_delay_ms),
         decode_start: None,
+        first_frame_ready: first_frame_ready.clone(),
     });
 
     // Step 2: 在此线程上创建窗口
@@ -896,7 +921,7 @@ unsafe fn handle_frames_loaded(
 
             // v8-C: 应用流式帧缓存窗口，仅保留当前帧 ± STREAMING_WINDOW_HALF 帧
             // 的像素数据，其余帧 pixels 清空（保留元数据）。活跃内存从全量帧降至
-            // ~3 帧。WM_TIMER 推进到空像素帧时通过 decode_gif_frame_at 按需恢复。
+            // ~3 帧。WM_TIMER 推进到空像素帧时通过 decode_single_frame_with_cursor 按需恢复。
             render.apply_streaming_window();
 
             // v17 性能埋点：解码耗时 + 帧内存估算 + 进程内存
@@ -984,7 +1009,7 @@ unsafe fn handle_frames_prefetched(
         // prefetch_in_progress 已清除，下次 WM_TIMER 会再次 spawn 预取 →
         // 再次空结果 → 无限循环 + CPU 100% + 显示冻结。
         //
-        // 修复：sync-decode 当前帧作为兜底（decode_gif_frame_at 不应用 8MB
+        // 修复：sync-decode 当前帧作为兜底（decode_single_frame_with_cursor 不应用 8MB
         // 跳过，可处理 4K 帧），与 v10-C "仅当前帧同步解码" 的原始意图一致。
         // 成功则触发重绘；失败则保持空像素（WM_PAINT 守卫跳过绘制保持上一帧）。
         let current = data.render.current_frame;
@@ -1356,6 +1381,10 @@ unsafe extern "system" fn gif_wnd_proc(
                 data.render.scaling_mode,
             );
             data.fps.record_paint(paint_start.elapsed());
+
+            // 首帧绘制完成后置位首帧就绪标志（原子交换阶段 B 据此换槽）。
+            // 置位后不再重置：非原子交换路径不读取，原子交换仅等待一次。
+            data.first_frame_ready.store(true, Ordering::SeqCst);
 
             let _ = EndPaint(hwnd, &ps);
             LRESULT(0)

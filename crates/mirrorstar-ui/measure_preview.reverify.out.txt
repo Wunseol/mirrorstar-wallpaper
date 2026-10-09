@@ -1,0 +1,118 @@
+﻿powershell.exe : [mirrorstar-ui] 握手成功：壳=preview-harness 协议v1 能力=0x000f
+At line:15 char:1131
++ ... pgrep\bin'; powershell.exe -NoProfile -ExecutionPolicy Bypass -File c ...
++                 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    + CategoryInfo          : NotSpecified: ([mirrorstar-ui]... 协议v1 能力=0x000f:String) [], RemoteException
+    + FullyQualifiedErrorId : NativeCommandError
+ 
+UI hello: {"type":"hello","protocol_version":1,"capabilities":15,"client":"mirrorstar-ui"}
+answered: get_arrangement,get_auto_start_status,get_config,get_displays,get_rotation_config,get_unit_states,get_wallpapers,list_pools
+[mirrorstar-ui] 视频首帧生成失败：C:\Dev\DevWorkspace\mirrorstar-wallpaper\wallpaper\【哲风壁纸】Kuroha作品-动漫线稿.mp4 — 图片解码失败: 调用 ffmpeg
+ 失败: program not found
+[mirrorstar-ui] 已撤销 winit 默认 OLE 放置目标
+[mirrorstar-ui] 原生文件拖入已就绪（OLE IDropTarget，支持悬停高亮；HWND=0x6e0504）
+window hwnd: 7210244
+screenshot: C:\Users\w\AppData\Local\Temp\mirrorstar-ui-preview\shot_00_idle.png
+screenshot: C:\Users\w\AppData\Local\Temp\mirrorstar-ui-preview\shot_1_open_Image.png
+screenshot: C:\Users\w\AppData\Local\Temp\mirrorstar-ui-preview\shot_1_closed_Image.png
+=== Image ===
+
+
+Kind       : Image
+BeforePriv : 6.3
+BeforeWS   : 20.2
+OpenPriv   : 8.9
+OpenWS     : 23.1
+ClosedPriv : 6.3
+ClosedWS   : 20.4
+MpvBefore  : 0
+MpvOpen    : 0
+MpvClosed  : 0
+Wv2Before  : 0
+Wv2Open    : 0
+Wv2Closed  : 0
+
+
+
+
+[mirrorstar-ui] 视频预览已启动 pid=5940
+screenshot: C:\Users\w\AppData\Local\Temp\mirrorstar-ui-preview\shot_2_open_Video.png
+screenshot: C:\Users\w\AppData\Local\Temp\mirrorstar-ui-preview\shot_2_closed_Video.png
+=== Video ===
+
+
+Kind       : Video
+BeforePriv : 6.3
+BeforeWS   : 20.4
+OpenPriv   : 6.3
+OpenWS     : 20.7
+ClosedPriv : 6.3
+ClosedWS   : 20.7
+MpvBefore  : 0
+MpvOpen    : 1
+MpvClosed  : 0
+Wv2Before  : 0
+Wv2Open    : 0
+Wv2Closed  : 0
+
+
+
+
+[mirrorstar-ui] GIF 预览已启动：C:\Users\w\AppData\Local\Temp\mirrorstar-ui-preview\preview_anim.gif（首帧延时 120ms）
+screenshot: C:\Users\w\AppData\Local\Temp\mirrorstar-ui-preview\shot_3_open_Gif.png
+screenshot: C:\Users\w\AppData\Local\Temp\mirrorstar-ui-preview\shot_3_closed_Gif.png
+=== Gif ===
+
+
+Kind       : Gif
+BeforePriv : 6.3
+BeforeWS   : 20.7
+OpenPriv   : 7
+OpenWS     : 21.4
+ClosedPriv : 6.5
+ClosedWS   : 20.9
+MpvBefore  : 0
+MpvOpen    : 0
+MpvClosed  : 0
+Wv2Before  : 0
+Wv2Open    : 0
+Wv2Closed  : 0
+
+
+
+
+[mirrorstar-ui] 网页预览已就绪
+screenshot: C:\Users\w\AppData\Local\Temp\mirrorstar-ui-preview\shot_4_open_Web.png
+screenshot: C:\Users\w\AppData\Local\Temp\mirrorstar-ui-preview\shot_4_closed_Web.png
+=== Web ===
+
+
+Kind       : Web
+BeforePriv : 6.5
+BeforeWS   : 20.9
+OpenPriv   : 7.4
+OpenWS     : 25.9
+ClosedPriv : 7.4
+ClosedWS   : 25.8
+MpvBefore  : 0
+MpvOpen    : 0
+MpvClosed  : 0
+Wv2Before  : 0
+Wv2Open    : 6
+Wv2Closed  : 0
+
+
+
+
+leftover mpv+webview2 after kill: 0
+===== SUMMARY =====
+
+Kind  BeforePriv BeforeWS OpenPriv OpenWS ClosedPriv ClosedWS MpvBefore MpvOpen MpvClosed
+----  ---------- -------- -------- ------ ---------- -------- --------- ------- ---------
+Image        6.3     20.2      8.9   23.1        6.3     20.4         0       0         0
+Video        6.3     20.4      6.3   20.7        6.3     20.7         0       1         0
+Gif          6.3     20.7        7   21.4        6.5     20.9         0       0         0
+Web          6.5     20.9      7.4   25.9        7.4     25.8         0       0         0
+
+
+

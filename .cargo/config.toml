@@ -12,3 +12,18 @@
 
 [net]
 git-fetch-with-cli = true
+
+# 让 Windows 构建的所有产物（含 `cargo test` 生成的可执行文件）声明依赖
+# Common-Controls v6（crates.io 的 windows/webview2 绑定会链接 comctl32.dll 的
+# `TaskDialogIndirect`，该符号仅存在于 v6，v6 须经 app manifest 激活）。
+#
+# 生产 exe 已由 tauri-build 自动嵌入 manifest，无需此 flag；但 cargo 生成的
+# 测试 exe 不会嵌入 → Windows 回退加载 System32 的老版 comctl32 5.82（无
+# TaskDialogIndirect）→ 启动即 `0xC0000139`（入口点未找到）崩溃。
+#
+# 通过统一注入 /MANIFESTDEPENDENCY 修复：MSVC 链接器把该依赖合并进默认 manifest。
+# 仅对 windows 目标生效（linux/mac CI 不受影响）；MSVC 专属（本仓库仅在 MSVC 工具链构建）。
+[target.'cfg(windows)']
+rustflags = [
+  "-C", "link-arg=/MANIFESTDEPENDENCY:type='win32' name='Microsoft.Windows.Common-Controls' version='6.0.0.0' processorArchitecture='*' publicKeyToken='6595b64144ccf1df' language='*'",
+]

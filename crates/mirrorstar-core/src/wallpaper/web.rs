@@ -1,3 +1,4 @@
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
 use windows::Win32::Foundation::HWND;
@@ -11,10 +12,55 @@ use crate::wallpaper::{
     ScalingMode, WallpaperRenderer, WallpaperState,
 };
 
+/// 某个 wp-proc 实例的 WebView2 UserDataFolder 路径（**路径约定的唯一来源**）。
+///
+/// 返回 `data_root()/webview2-cache/<pid>/`。该约定被两处消费，集中在此定义避免
+/// 拼接逻辑重复后漂移：
+/// - **子进程**（壳 exe 的 `--wp-proc` 模式）：作为 `CreateCoreWebView2EnvironmentWithOptions`
+///   的 UserDataFolder（每实例独立，多显示器并发时互不干扰）；
+/// - **父进程** `WebRenderer`：在该实例退出后回收对应子目录（见
+///   [`cleanup_wp_proc_user_data_folder`]），避免同一会话内每切换一次 Web 壁纸就
+///   残留约 2MB 缓存、长会话累积到数百 MB。
+///
+/// 子目录名安全性：PID 仅由十进制数字构成（`[0-9]`），天然满足文件名安全要求。
+pub fn wp_proc_user_data_folder(pid: u32) -> PathBuf {
+    crate::config::data_root()
+        .join("webview2-cache")
+        .join(pid.to_string())
+}
+
+/// 回收某个 wp-proc 实例的 WebView2 UserDataFolder（**尽力而为、幂等**）。
+///
+/// 由 `WebRenderer::terminate()`（进程确认退出后）与 `Drop`（兜底）调用。语义：
+/// - 目录不存在 → 静默返回（重复调用、进程从未创建过 UDF 均属正常）；
+/// - 删除失败（如 msedgewebview2 子进程仍在收尾、文件被占用）→ 仅 `warn`，
+///   不向上传播错误：残留目录由下次应用启动的清理兜底（`cleanup_webview2_cache`）。
+fn cleanup_wp_proc_user_data_folder(pid: u32) {
+    let dir = wp_proc_user_data_folder(pid);
+    match std::fs::remove_dir_all(&dir) {
+        Ok(()) => tracing::debug!(dir = %dir.display(), "已回收 wp-proc WebView2 UserDataFolder"),
+        // 目录不存在（未创建过 / 已被回收）→ 幂等静默返回
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => tracing::warn!(
+            error = %e,
+            dir = %dir.display(),
+            "回收 wp-proc WebView2 UserDataFolder 失败（msedgewebview2 可能仍在收尾）"
+        ),
+    }
+}
+
 /// 网页壁纸渲染器（代理层）
 ///
-/// 通过启动 mirrorstar-wp-proc 子进程实现 WebView2 渲染，
+/// 通过以 `--wp-proc` 模式启动当前壳 exe（`mirrorstar-wallpaper.exe`）作为独立子进程实现
+/// WebView2 渲染（**同一 exe、双入口**，仍是独立进程，崩溃隔离不变），
 /// 主进程通过 IPC 控制子进程，实现崩溃隔离和内存优化。
+///
+/// # 交互语义（重要）
+/// - 网页壁纸是**纯展示**：仅在最底层桌面窗口（WorkerW 之上）渲染 WebView2 内容，
+///   作为桌面壁纸背景显示，不接收任何用户点击/输入。
+/// - 鼠标**穿透**（click-through）：壁纸窗口不捕获鼠标，点击会穿透到其下方的桌面
+///   或桌面图标/已打开的普通应用窗口。此穿透行为是壁纸的既定语义，**不应改动**。
+/// - 所有控制（切换/暂停/音量等）通过主进程 IPC 下发，与网页内容无交互反馈。
 pub struct WebRenderer {
     /// 公共子进程基类（ProcessManager + 状态 + 窗口句柄 + 缩放模式 + 管道名 + pause_sender）
     base: SubprocessRendererBase,
@@ -45,9 +91,24 @@ impl WebRenderer {
         }
     }
 
-    /// 查找 wp-proc 可执行文件路径
+    /// 返回 wp-proc 子进程可执行文件路径。
+    ///
+    /// 采用「同一 exe、双入口」方案：wp-proc 由当前壳 exe（`mirrorstar-wallpaper.exe`）
+    /// 以 `--wp-proc` 模式运行，故正常路径即当前 exe 路径。
     fn find_wp_proc() -> std::path::PathBuf {
-        SubprocessRendererBase::find_bundled_executable(None, "mirrorstar-wp-proc.exe", "wp-proc")
+        match std::env::current_exe() {
+            Ok(path) => path,
+            Err(e) => {
+                // `current_exe` 在 Windows 上几乎不会失败；失败时以 argv[0]（同样指向本 exe）
+                // 兜底。不得回退到 `mirrorstar-wp-proc.exe`——该独立产物已不再产出，
+                // 命中磁盘残留的旧 exe 会因其 clap 不认 `--wp-proc` 而导致启动失败。
+                tracing::warn!(error = %e, "获取当前 exe 路径失败，回退到 argv[0]");
+                std::env::args_os()
+                    .next()
+                    .map(std::path::PathBuf::from)
+                    .unwrap_or_else(|| std::path::PathBuf::from("mirrorstar-wallpaper.exe"))
+            }
+        }
     }
 
     /// 构建 wp-proc 启动参数
@@ -58,10 +119,15 @@ impl WebRenderer {
 
         let rect = format!("0,0,{},{}", screen_w, screen_h);
 
+        // 「同一 exe、双入口」分派标记：置于参数列表首位（紧跟 argv[0] 之后），
+        // 壳 exe 入口据此进入 wp-proc 模式并移除该标记，其余参数语义完全不变。
+        // 单独占一个独立 argv 元素，不参与 `--key value` 配对。
+        //
         // W-009 修复：使用分离 argv（`--key` 与值作为两个独立元素），而非 `--key=value`
         // 拼接形式。避免 `source` 等用户可控值以 `--` 开头时被 wp-proc 解析器拆分为独立
         // 参数（参数注入）。clap 原生支持 `--key value` 分离 argv 形式。
-        vec![
+        let mut args = vec![
+            "--wp-proc".to_string(),
             "--source".to_string(),
             self.source.clone(),
             "--pipe-name".to_string(),
@@ -70,17 +136,17 @@ impl WebRenderer {
             self.title.clone(),
             "--rect".to_string(),
             rect,
-        ]
-    }
+        ];
 
-    /// 导航到新 URL（仅网页壁纸有效）
-    pub fn navigate(&mut self, url: &str) {
-        let mut ipc = self.ipc.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some(ref mut ipc) = *ipc {
-            if let Err(e) = ipc.navigate(url) {
-                tracing::error!(error = %e, "网页导航失败");
-            }
+        // 测试观察通道（仅测试）：MIRRORSTAR_WP_CDP_PORT 环境变量存在时追加 --cdp-port，
+        // 使壁纸 webview 暴露 CDP 端口供模拟人类操作测试做 DOM 断言。
+        // 生产环境不设置该变量即不影响任何行为。
+        if let Ok(port) = std::env::var("MIRRORSTAR_WP_CDP_PORT") {
+            args.push("--cdp-port".to_string());
+            args.push(port);
         }
+
+        args
     }
 }
 
@@ -143,6 +209,15 @@ impl WallpaperRenderer for WebRenderer {
         let mut ipc = self.ipc.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(ref mut ipc) = *ipc {
             ipc.resume()?;
+            // M3: resume 后重放当前音量（未静音时）——与 pause 线程 Resume 分支一致，
+            // 避免暂停期间音量状态丢失。已静音时跳过（SetVolume 脚本会解除静音）。
+            if let Some(sender) = &self.base.pause_sender {
+                if !sender.is_muted() {
+                    if let Err(e) = ipc.set_volume(sender.volume()) {
+                        tracing::error!(error = %e, "网页恢复后重发音量失败");
+                    }
+                }
+            }
         } else {
             tracing::warn!("IPC 未连接，恢复命令未实际下发");
         }
@@ -151,6 +226,14 @@ impl WallpaperRenderer for WebRenderer {
         Ok(())
     }
 
+    /// 设置窗口位置和大小。
+    ///
+    /// 实现细节：把几何经 IPC `set_position` 下发到 wp-proc 子进程，使 Web 壁纸窗口
+    /// 跟随目标矩形重排。
+    ///
+    /// 注（多屏排列即时生效，Task 5）：引擎不再提供"遍历所有渲染器原地重定位"的
+    /// 通道；排列变更改由调度器按新布局重建渲染器承担，显示器几何变化由渲染器重建 /
+    /// 重新嵌入路径承载。本方法保留为渲染器接口的一部分，作为需要直接同步几何时的入口。
     fn set_position(
         &mut self,
         x: i32,
@@ -186,7 +269,17 @@ impl WallpaperRenderer for WebRenderer {
         }
 
         // 2. 停止进程（会等待退出，超时后强制终止）
+        //    回收 WebView2 UserDataFolder 必须在子进程退出后进行，而 stop_process 会
+        //    清空 ProcessManager 的 pid，故先保存 pid 再停止。
+        let pid = self.base.process_pid();
         self.base.stop_process()?;
+
+        // 2.1 进程已确认退出 → 回收本实例的 WebView2 UserDataFolder（尽力而为、幂等）。
+        //     在"资源变为垃圾"的准确时刻回收，由拥有生命周期的组件负责；
+        //     src-tauri 的启动清理仅作崩溃残留兜底。
+        if let Some(pid) = pid {
+            cleanup_wp_proc_user_data_folder(pid);
+        }
 
         // 3. 断开 IPC
         {
@@ -257,10 +350,23 @@ impl WallpaperRenderer for WebRenderer {
                             state_sender.notify_state_changed(&display_id);
                         }
                         PauseCommand::Resume => {
+                            // M3: resume 后重发当前音量（未静音时）——子进程 Resume 脚本
+                            // 会重放音量（dataset._lastVolume + 进程侧兜底），父进程再显式
+                            // 重发一次作为双保险。SetVolume 脚本会解除静音，故已静音时跳过
+                            // 重发，避免破坏静音态。
+                            let (volume, muted) = {
+                                let s = shared_state.read().unwrap_or_else(|e| e.into_inner());
+                                (s.volume, s.pre_mute_volume.is_some())
+                            };
                             let mut ipc_guard = ipc.lock().unwrap_or_else(|e| e.into_inner());
                             if let Some(ref mut ipc) = *ipc_guard {
                                 if let Err(e) = ipc.resume() {
                                     tracing::error!(error = %e, "网页恢复失败");
+                                }
+                                if !muted {
+                                    if let Err(e) = ipc.set_volume(volume) {
+                                        tracing::error!(error = %e, "网页恢复后重发音量失败");
+                                    }
                                 }
                             }
                             drop(ipc_guard);
@@ -271,8 +377,31 @@ impl WallpaperRenderer for WebRenderer {
                             // 通知 Tauri 层 emit wallpaper-state-changed 事件
                             state_sender.notify_state_changed(&display_id);
                         }
-                        PauseCommand::SetVolume(_) | PauseCommand::ToggleMute => {
-                            // 网页壁纸无音频控制，忽略
+                        PauseCommand::SetVolume(volume) => {
+                            // 音量钳制到 0.0 ~ 1.0 后经 IPC 下发，由子进程注入 JS
+                            // 同时设置网页 media 元素 volume 并解除静音。
+                            let volume = volume.clamp(0.0, 1.0);
+                            {
+                                let mut g = ipc.lock().unwrap_or_else(|e| e.into_inner());
+                                if let Some(ref mut ipc) = *g {
+                                    if let Err(e) = ipc.set_volume(volume) {
+                                        tracing::error!(error = %e, "网页设置音量失败");
+                                    }
+                                }
+                            }
+                            // 同步共享音量状态，使 Tauri 层/界面反映最新值
+                            shared_state
+                                .write()
+                                .unwrap_or_else(|e| e.into_inner())
+                                .volume = volume;
+                        }
+                        PauseCommand::ToggleMute => {
+                            let mut g = ipc.lock().unwrap_or_else(|e| e.into_inner());
+                            if let Some(ref mut ipc) = *g {
+                                if let Err(e) = ipc.toggle_mute() {
+                                    tracing::error!(error = %e, "网页切换静音失败");
+                                }
+                            }
                         }
                     }
                 }
@@ -356,6 +485,14 @@ impl Drop for WebRenderer {
                 tracing::warn!(error = %e, "WebRenderer drop 时 terminate 失败");
             }
         }
+        // 兜底回收本实例的 WebView2 UserDataFolder：
+        // - terminate() 正常完成时 pid 已被 stop_process 清空 → 此处 no-op（已回收）；
+        // - terminate() 未走到回收（如 stop_process 失败提前返回、或状态已是
+        //   Terminated 而未再走 terminate）时 pid 仍存活 → 此处回收。
+        // 清理本身幂等（目录不存在时静默返回），故重复调用无副作用。
+        if let Some(pid) = self.base.process_pid() {
+            cleanup_wp_proc_user_data_folder(pid);
+        }
         tracing::debug!("WebRenderer 已清理");
     }
 }
@@ -366,6 +503,78 @@ mod tests {
     use crate::wallpaper::OwnedProcHandle;
     use windows::Win32::Foundation::{CloseHandle, WAIT_EVENT};
     use windows::Win32::System::Threading::{CreateEventW, SetEvent, WaitForSingleObject};
+
+    // ========== R1 修复测试：WebView2 UserDataFolder 路径单源 + 回收幂等 ==========
+
+    /// R1：`wp_proc_user_data_folder(pid)` 返回 `data_root()/webview2-cache/<pid>`，
+    /// 且 pid 参与拼接（不同 pid → 不同目录）。
+    ///
+    /// 该函数是子进程（创建 UDF）与父进程（退出后回收）共用的**唯一**路径来源，
+    /// 断言其形状可防止任一侧再引入独立拼接而漂移。
+    #[test]
+    fn r1_wp_proc_user_data_folder_is_data_root_webview2_cache_pid() {
+        let path = wp_proc_user_data_folder(1234);
+
+        // 与 data_root() 下的约定路径逐段相等（单源约定）
+        assert_eq!(
+            path,
+            crate::config::data_root()
+                .join("webview2-cache")
+                .join("1234"),
+            "R1: 路径应为 data_root()/webview2-cache/<pid>"
+        );
+        // 以 webview2-cache/<pid> 结尾（父目录名 + pid 子目录名）
+        assert!(
+            path.ends_with(PathBuf::from("webview2-cache").join("1234")),
+            "R1: 路径应以 webview2-cache/<pid> 结尾，实际: {}",
+            path.display()
+        );
+        assert_eq!(
+            path.file_name().and_then(|s| s.to_str()),
+            Some("1234"),
+            "R1: 末段应为 pid 字符串"
+        );
+        assert_eq!(
+            path.parent()
+                .and_then(|p| p.file_name())
+                .and_then(|s| s.to_str()),
+            Some("webview2-cache"),
+            "R1: 倒数第二段应为 webview2-cache"
+        );
+
+        // pid 参与拼接：不同 pid 得到不同目录（多显示器并发实例互不干扰的前提）
+        assert_ne!(
+            wp_proc_user_data_folder(1234),
+            wp_proc_user_data_folder(5678),
+            "R1: 不同 pid 应映射到不同子目录"
+        );
+    }
+
+    /// R1：回收函数幂等——对不存在路径调用不 panic、不返回 Err，且能真正删除目录。
+    ///
+    /// 清理在 `terminate()` 与 `Drop` 两处调用，必须对"目录不存在/已被回收"的
+    /// 重复调用安全。此处用不会与真实 wp-proc 冲突的 pid（`u32::MAX - 3`）造目录，
+    /// 验证：不存在时静默 → 存在时被删除 → 再次调用仍静默。
+    #[test]
+    fn r1_cleanup_wp_proc_user_data_folder_is_idempotent() {
+        let pid = u32::MAX - 3;
+        let dir = wp_proc_user_data_folder(pid);
+
+        // 前置：确保目录不存在，先对不存在路径调用一次（应静默返回）
+        let _ = std::fs::remove_dir_all(&dir);
+        cleanup_wp_proc_user_data_folder(pid);
+        assert!(!dir.exists(), "R1: 前置清理后目录不应存在");
+
+        // 造出目录与文件后回收 → 目录（含内容）被删除
+        std::fs::create_dir_all(&dir).expect("R1: 创建测试 UDF 目录应成功");
+        std::fs::write(dir.join("Cache.bin"), b"cache").expect("R1: 写入测试文件应成功");
+        cleanup_wp_proc_user_data_folder(pid);
+        assert!(!dir.exists(), "R1: 回收后目录应被删除（含其内容）");
+
+        // 幂等：路径已不存在时再次调用不 panic、无副作用
+        cleanup_wp_proc_user_data_folder(pid);
+        assert!(!dir.exists(), "R1: 重复回收应为 no-op");
+    }
 
     // ========== 修复测试：OwnedProcHandle RAII 行为 ==========
 

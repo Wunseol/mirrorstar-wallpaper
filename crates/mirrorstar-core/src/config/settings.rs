@@ -23,9 +23,11 @@
 //! `validate`）。未来新增的子 config 应遵循同一策略；如需引入"硬校验失败"语义，
 //! 应使用独立的 `Result` 返回类型方法（如 `validate_strict`），避免破坏既有契约。
 
+use std::collections::BTreeMap;
+
 use serde::{Deserialize, Serialize};
 
-use crate::wallpaper::GifMemoryStrategy;
+use crate::wallpaper::{GifMemoryStrategy, ScalingMode};
 
 /// 应用配置
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -33,7 +35,9 @@ pub struct AppConfig {
     /// 多屏排列（顶层布局策略，DR-2 / 多屏排列布局域）：per_monitor | all_same | span。
     /// 独立于轮换调度，属于"显示器布局策略"层；旧版 `[rotation] arrangement` 由
     /// [`AppConfig::migrate_legacy_arrangement`] 自动迁移。
-    #[serde(default)]
+    ///
+    /// 采用宽松反序列化：未知取值回退默认（`per_monitor`）并 warn，不使整份配置失败。
+    #[serde(default, deserialize_with = "de_arrangement_lenient")]
     pub arrangement: Arrangement,
     #[serde(default)]
     pub general: GeneralConfig,
@@ -47,6 +51,9 @@ pub struct AppConfig {
     pub gif: GifConfig,
     #[serde(default)]
     pub rotation: RotationConfig,
+    /// 缩放模式（按显示器记忆）
+    #[serde(default)]
+    pub scaling: ScalingConfig,
 }
 
 impl AppConfig {
@@ -71,13 +78,23 @@ impl AppConfig {
     ///
     /// 旧配置中 `rotation.arrangement` 经 `RotationConfig::arrangement_legacy`
     /// 反序列化进入本结构；此处将其提升为顶层字段并清空 legacy（`skip_serializing`
-    /// 保证保存时旧键不再写出）。顶层显式设置的值**优先于** legacy（仅当顶层为
-    /// 默认值时回退 legacy，避免覆盖用户新配置）。返回是否发生迁移。
-    pub fn migrate_legacy_arrangement(&mut self) -> bool {
+    /// 保证保存时旧键不再写出）。
+    ///
+    /// `explicit` 表示顶层 `arrangement` 键是否**显式出现在配置文件文本中**：
+    /// 显式出现时顶层值优先（**即使它恰好等于 [`Arrangement::default`]** 也不被
+    /// legacy 覆盖）；未显式出现时才采用 legacy。无论是否采用，legacy 键都会被清除。
+    /// 返回是否发生迁移流程（存在 legacy 键即为 `true`）。
+    pub fn migrate_legacy_arrangement(&mut self, explicit: bool) -> bool {
         let Some(legacy) = self.rotation.arrangement_legacy else {
             return false;
         };
-        if self.arrangement == Arrangement::default() {
+        if explicit {
+            tracing::warn!(
+                arrangement = ?self.arrangement,
+                legacy = ?legacy,
+                "顶层 arrangement 已显式配置，忽略旧版 [rotation] arrangement"
+            );
+        } else {
             self.arrangement = legacy;
             tracing::warn!(
                 arrangement = ?self.arrangement,
@@ -86,6 +103,29 @@ impl AppConfig {
         }
         self.rotation.arrangement_legacy = None;
         true
+    }
+
+    /// 一次性迁移：默认切换顺序由 `shuffle_bag` 改为 `sequential`。
+    ///
+    /// 旧配置在磁盘上持久化了 `order = "shuffle_bag"`，仅改 `Order` 的 `Default`
+    /// 不会影响这些安装。迁移标记未置位时先置位；若取值仍为 `ShuffleBag`，改写为
+    /// `Sequential` 并 warn。已置位时不做任何改写（尊重用户后续的手动选择）。
+    ///
+    /// 返回是否发生了取值改写。迁移是幂等的：若本次只在内存中生效而未落盘，
+    /// 下次启动会以同样结果重新求值（无需调用方额外补偿）；应用自身写回配置时
+    /// （`ConfigManager::update_config`）会置位标记并落盘，此后不再改写。
+    pub fn migrate_order_default(&mut self) -> bool {
+        if self.rotation.order_default_migrated {
+            return false;
+        }
+        self.rotation.order_default_migrated = true;
+        if self.rotation.order == Order::ShuffleBag {
+            self.rotation.order = Order::Sequential;
+            tracing::warn!("检测到旧版默认切换顺序 shuffle_bag，已迁移为 sequential（顺序循环）");
+            true
+        } else {
+            false
+        }
     }
 }
 
@@ -122,6 +162,12 @@ pub struct AudioConfig {
     /// 是否静音
     #[serde(default)]
     pub muted: bool,
+    /// 预览音量 (0.0 ~ 1.0)，默认 0.5（中等音量）
+    #[serde(default = "default_preview_volume")]
+    pub preview_volume: f32,
+    /// 预览静音
+    #[serde(default)]
+    pub preview_muted: bool,
 }
 
 impl Default for AudioConfig {
@@ -129,6 +175,8 @@ impl Default for AudioConfig {
         Self {
             volume: 0.8,
             muted: false,
+            preview_volume: 0.5,
+            preview_muted: false,
         }
     }
 }
@@ -151,11 +199,35 @@ impl AudioConfig {
             tracing::warn!(volume = self.volume, "AudioConfig.volume > 1，clamp 到 1.0");
             self.volume = 1.0;
         }
+
+        if self.preview_volume.is_nan() {
+            tracing::warn!(
+                preview_volume = self.preview_volume,
+                "AudioConfig.preview_volume 为 NaN，回退到默认 0.5"
+            );
+            self.preview_volume = default_preview_volume();
+        } else if self.preview_volume < 0.0 {
+            tracing::warn!(
+                preview_volume = self.preview_volume,
+                "AudioConfig.preview_volume < 0，clamp 到 0.0"
+            );
+            self.preview_volume = 0.0;
+        } else if self.preview_volume > 1.0 {
+            tracing::warn!(
+                preview_volume = self.preview_volume,
+                "AudioConfig.preview_volume > 1，clamp 到 1.0"
+            );
+            self.preview_volume = 1.0;
+        }
     }
 }
 
 fn default_volume() -> f32 {
     0.8
+}
+
+fn default_preview_volume() -> f32 {
+    0.5
 }
 
 /// 全屏时壁纸处置策略
@@ -177,7 +249,9 @@ pub enum FullscreenAction {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PauseConfig {
     /// 全屏时处置策略（默认终止）
-    #[serde(default)]
+    ///
+    /// 采用宽松反序列化：未知取值回退默认（`terminate`）并 warn，不使整份配置失败。
+    #[serde(default, deserialize_with = "de_fullscreen_action_lenient")]
     pub fullscreen_action: FullscreenAction,
     /// 电池供电时暂停
     #[serde(default)]
@@ -196,9 +270,9 @@ impl Default for PauseConfig {
 /// 壁纸排列方式（三值编排，DR-2 / 设计 §4.4）
 ///
 /// - `PerMonitor`：每屏一个调度单元，1 屏 = 1 次 apply，N 渲染器。
-/// - `AllSame`：全体员工一个调度单元，1 张壁纸 → 每屏各 apply 一次（顺序执行），N 渲染器；
-///   换图窗口期各屏瞬时新/旧混杂为已知接受项（DR-39）。
-/// - `Span`：全体员工一个调度单元，1 个跨屏渲染器贯通虚拟桌面，1 次 apply。
+/// - `AllSame`：将全部显示器视为整体（单一调度单元），1 张壁纸 → 每屏各 apply 一次
+///   （顺序执行），N 渲染器；换图窗口期各屏瞬时新/旧混杂为已知接受项（DR-39）。
+/// - `Span`：将全部显示器视为整体（单一调度单元），1 个跨屏渲染器贯通虚拟桌面，1 次 apply。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub enum Arrangement {
     /// 每个显示器独立壁纸
@@ -213,6 +287,88 @@ pub enum Arrangement {
     Span,
 }
 
+/// 缩放模式配置（按显示器记忆）
+///
+/// 以「显示器 id → 缩放模式」映射持久化每屏缩放模式；特殊键 `"all"` 表示
+/// 「全部显示器 / 新显示器兜底」。`BTreeMap` 保证序列化顺序稳定。
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ScalingConfig {
+    /// display_id → 缩放模式；特殊键 "all" 表示「全部显示器 / 新显示器兜底」。
+    ///
+    /// 映射值采用宽松反序列化：未知缩放模式回退默认（`fill`）并 warn，不使整份配置失败。
+    #[serde(default, deserialize_with = "de_scaling_modes_lenient")]
+    pub modes: BTreeMap<String, ScalingMode>,
+}
+
+// ── UI 可编辑枚举的宽松反序列化 ────────────────────────────────────────────
+//
+// 配置文件可被用户手动编辑，单个未知枚举值不应导致整份 `AppConfig` 反序列化失败
+// （见 requirements「配置加载容错」）。以下 `de_*_lenient` 在解析失败时回退该字段
+// 默认值并记录 warn，不影响同文件其它字段的解析。
+//
+// 注意：不改动 `Arrangement` / `FullscreenAction` / `ScalingMode` 自身的 derive——
+// 它们还被命令参数等其它路径使用，全局放宽会改变别处语义。
+
+/// 宽松反序列化 [`Arrangement`]：未知取值回退默认（`per_monitor`）。
+fn de_arrangement_lenient<'de, D>(deserializer: D) -> Result<Arrangement, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    match Arrangement::deserialize(deserializer) {
+        Ok(value) => Ok(value),
+        Err(e) => {
+            tracing::warn!(error = %e, "arrangement 取值未知，已回退默认 per_monitor");
+            Ok(Arrangement::default())
+        }
+    }
+}
+
+/// 宽松反序列化 [`FullscreenAction`]：未知取值回退默认（`terminate`）。
+fn de_fullscreen_action_lenient<'de, D>(deserializer: D) -> Result<FullscreenAction, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    match FullscreenAction::deserialize(deserializer) {
+        Ok(value) => Ok(value),
+        Err(e) => {
+            tracing::warn!(error = %e, "fullscreen_action 取值未知，已回退默认 terminate");
+            Ok(FullscreenAction::default())
+        }
+    }
+}
+
+/// 宽松反序列化 [`ScalingConfig::modes`] 的映射值。
+///
+/// 逐项解析每个显示器的缩放模式，单项解析失败（未知取值或非字符串）时回退默认
+/// （`fill`），不影响同一映射内其它显示器条目。
+fn de_scaling_modes_lenient<'de, D>(
+    deserializer: D,
+) -> Result<BTreeMap<String, ScalingMode>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let raw = BTreeMap::<String, LenientScalingMode>::deserialize(deserializer)?;
+    Ok(raw.into_iter().map(|(k, v)| (k, v.0)).collect())
+}
+
+/// [`ScalingMode`] 的宽松反序列化包装，供 [`de_scaling_modes_lenient`] 逐项使用。
+struct LenientScalingMode(ScalingMode);
+
+impl<'de> Deserialize<'de> for LenientScalingMode {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        match ScalingMode::deserialize(deserializer) {
+            Ok(mode) => Ok(LenientScalingMode(mode)),
+            Err(e) => {
+                tracing::warn!(error = %e, "scaling.modes 存在未知缩放模式，已回退默认 fill");
+                Ok(LenientScalingMode(ScalingMode::default()))
+            }
+        }
+    }
+}
+
 /// 采样算法（DR-4，设计 §7）
 ///
 /// - `Sequential`：顺序循环，游览标追随用户自定义池顺序，id 锚定（DR-5）。
@@ -222,9 +378,9 @@ pub enum Arrangement {
 #[serde(rename_all = "snake_case")]
 pub enum Order {
     /// 顺序循环
+    #[default]
     Sequential,
     /// 洗牌袋
-    #[default]
     ShuffleBag,
     /// 纯随机
     PseudoRandom,
@@ -395,6 +551,11 @@ pub struct RotationConfig {
     /// 采样算法：sequential | shuffle_bag | pseudo_random（DR-4）
     #[serde(default)]
     pub order: Order,
+    /// 一次性迁移标记：默认切换顺序由 `shuffle_bag` 改为 `sequential` 时置位，
+    /// 保证旧配置只被迁移一次——用户之后手动选择「随机（不重复）」不会被下次
+    /// 启动再次覆盖（见 [`AppConfig::migrate_order_default`]）。
+    #[serde(default)]
+    pub order_default_migrated: bool,
     /// 兼容旧版配置（v0.7.0 前）：旧 `[rotation] arrangement` 键在反序列化时进入此
     /// 字段，由 [`AppConfig::migrate_legacy_arrangement`] 迁移到顶层后清空；
     /// `skip_serializing` 保证保存时旧键不再写出。
@@ -419,6 +580,7 @@ impl Default for RotationConfig {
             on_boot: false,
             interval_minutes: DEFAULT_INTERVAL_MINUTES,
             order: Order::default(),
+            order_default_migrated: false,
             arrangement_legacy: None,
         }
     }
@@ -512,6 +674,7 @@ mod tests {
             audio: AudioConfig {
                 volume: 0.5,
                 muted: true,
+                ..AudioConfig::default()
             },
             pause: PauseConfig {
                 fullscreen_action: FullscreenAction::None,
@@ -527,6 +690,7 @@ mod tests {
                 balanced_keep_frames: 10,
                 ..GifConfig::default()
             },
+            scaling: ScalingConfig::default(),
         };
 
         let toml_str = toml::to_string_pretty(&config).expect("serialize config");
@@ -643,6 +807,7 @@ arrangement = "span"
             audio: AudioConfig {
                 volume: 1.5,
                 muted: false,
+                ..AudioConfig::default()
             },
             ..AppConfig::default()
         };
@@ -660,6 +825,7 @@ arrangement = "span"
             audio: AudioConfig {
                 volume: -0.5,
                 muted: false,
+                ..AudioConfig::default()
             },
             ..AppConfig::default()
         };
@@ -677,6 +843,7 @@ arrangement = "span"
             audio: AudioConfig {
                 volume: f32::NAN,
                 muted: false,
+                ..AudioConfig::default()
             },
             ..AppConfig::default()
         };
@@ -696,6 +863,7 @@ arrangement = "span"
                 audio: AudioConfig {
                     volume: v,
                     muted: false,
+                    ..AudioConfig::default()
                 },
                 ..AppConfig::default()
             };
@@ -707,6 +875,77 @@ arrangement = "span"
                 config.audio.volume
             );
         }
+    }
+
+    #[test]
+    fn audio_preview_defaults_to_half_volume_unmuted() {
+        let audio = AudioConfig::default();
+        assert!(
+            (audio.preview_volume - 0.5).abs() < f32::EPSILON,
+            "preview_volume 默认 0.5，实际 {}",
+            audio.preview_volume
+        );
+        assert!(!audio.preview_muted, "preview_muted 默认 false");
+    }
+
+    #[test]
+    fn validate_clamps_audio_preview_volume_out_of_range_and_nan() {
+        // < 0 → 0.0
+        let mut config = AppConfig {
+            audio: AudioConfig {
+                preview_volume: -0.5,
+                ..AudioConfig::default()
+            },
+            ..AppConfig::default()
+        };
+        config.validate();
+        assert!((config.audio.preview_volume - 0.0).abs() < f32::EPSILON);
+        // > 1 → 1.0
+        let mut config = AppConfig {
+            audio: AudioConfig {
+                preview_volume: 1.5,
+                ..AudioConfig::default()
+            },
+            ..AppConfig::default()
+        };
+        config.validate();
+        assert!((config.audio.preview_volume - 1.0).abs() < f32::EPSILON);
+        // NaN → 默认 0.5
+        let mut config = AppConfig {
+            audio: AudioConfig {
+                preview_volume: f32::NAN,
+                ..AudioConfig::default()
+            },
+            ..AppConfig::default()
+        };
+        config.validate();
+        assert!(
+            (config.audio.preview_volume - default_preview_volume()).abs() < f32::EPSILON,
+            "NaN preview_volume 应回退到默认 0.5，实际 {}",
+            config.audio.preview_volume
+        );
+        // 合法值不变
+        let mut config = AppConfig {
+            audio: AudioConfig {
+                preview_volume: 0.3,
+                ..AudioConfig::default()
+            },
+            ..AppConfig::default()
+        };
+        config.validate();
+        assert!((config.audio.preview_volume - 0.3).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn audio_preview_fields_fallback_when_absent_in_json() {
+        // 旧 JSON 缺 preview_* 字段时应取默认（0.5 / false）。
+        let config: AppConfig = serde_json::from_str("{}").expect("deserialize legacy json");
+        assert!(
+            (config.audio.preview_volume - 0.5).abs() < f32::EPSILON,
+            "缺字段时 preview_volume 应取默认 0.5，实际 {}",
+            config.audio.preview_volume
+        );
+        assert!(!config.audio.preview_muted);
     }
 
     #[test]
@@ -923,7 +1162,16 @@ balanced_keep_frames = 0
         assert!(!config.enabled, "enabled 默认 false（DR-37，避免开箱即动）");
         assert!(!config.on_boot, "on_boot 默认 false");
         assert_eq!(config.interval_minutes, 30, "interval 默认 30 分钟");
-        assert_eq!(config.order, Order::ShuffleBag, "order 默认 shuffle_bag");
+        assert_eq!(
+            config.order,
+            Order::Sequential,
+            "order 默认 sequential（顺序循环）"
+        );
+        assert_eq!(
+            Order::default(),
+            Order::Sequential,
+            "Order::default 应为 sequential"
+        );
         assert_eq!(
             config.arrangement_legacy, None,
             "arrangement 已提升为顶层，RotationConfig 不再持有（legacy 仅旧配置迁移用）"
@@ -963,6 +1211,7 @@ balanced_keep_frames = 0
                 on_boot: true,
                 interval_minutes: 60,
                 order: Order::Sequential,
+                order_default_migrated: true,
                 arrangement_legacy: None,
             },
             ..AppConfig::default()
@@ -1023,13 +1272,18 @@ arrangement = "span"
             Some(Arrangement::Span),
             "旧键应进入 legacy 兼容字段"
         );
-        assert!(config.migrate_legacy_arrangement(), "应发生迁移");
+        // 配置文本中顶层无 arrangement 键 → explicit = false，采用 legacy
+        assert!(config.migrate_legacy_arrangement(false), "应发生迁移");
         assert_eq!(config.arrangement, Arrangement::Span, "迁移后顶层为 span");
         assert_eq!(config.rotation.arrangement_legacy, None, "legacy 已清空");
         // 序列化后旧键消失（skip_serializing + 迁移清空）：重新解析确认无 legacy 残留
         let out = toml::to_string_pretty(&config).expect("serialize");
         let reparsed: AppConfig = toml::from_str(&out).expect("reparse");
-        assert_eq!(reparsed.arrangement, Arrangement::Span, "顶层 arrangement 保留");
+        assert_eq!(
+            reparsed.arrangement,
+            Arrangement::Span,
+            "顶层 arrangement 保留"
+        );
         assert_eq!(
             reparsed.rotation.arrangement_legacy, None,
             "保存后旧键 [rotation] arrangement 应被清理"
@@ -1046,8 +1300,200 @@ arrangement = "all_same"
 arrangement = "span"
 "#;
         let mut config: AppConfig = toml::from_str(toml_str).expect("mixed config parses");
-        assert!(config.migrate_legacy_arrangement(), "legacy 存在即触发迁移流程");
+        // 顶层 arrangement 键显式出现 → explicit = true
+        assert!(
+            config.migrate_legacy_arrangement(true),
+            "legacy 存在即触发迁移流程"
+        );
         assert_eq!(config.arrangement, Arrangement::AllSame, "顶层显式值优先");
         assert_eq!(config.rotation.arrangement_legacy, None, "legacy 已清空");
+    }
+
+    #[test]
+    fn explicit_default_arrangement_not_overridden_by_legacy() {
+        // 顶层显式写入默认值 per_monitor + 旧键 span：显式值优先（即使等于默认值），
+        // 不被 legacy 覆盖，且旧键被清除。
+        let toml_str = r#"
+arrangement = "per_monitor"
+
+[rotation]
+arrangement = "span"
+"#;
+        let mut config: AppConfig = toml::from_str(toml_str).expect("mixed config parses");
+        assert_eq!(
+            config.arrangement,
+            Arrangement::PerMonitor,
+            "顶层显式值解析"
+        );
+        assert!(
+            config.migrate_legacy_arrangement(true),
+            "legacy 存在即触发迁移流程"
+        );
+        assert_eq!(
+            config.arrangement,
+            Arrangement::PerMonitor,
+            "顶层显式 per_monitor（= 默认值）不应被 legacy span 覆盖"
+        );
+        assert_eq!(config.rotation.arrangement_legacy, None, "legacy 已清空");
+    }
+
+    // ── 默认切换顺序一次性迁移（shuffle_bag → sequential）────────────────────
+
+    #[test]
+    fn migrate_order_default_rewrites_legacy_shuffle_bag() {
+        // 旧配置：order = shuffle_bag 且未迁移 → 改写为 sequential 并置位标记
+        let mut config = AppConfig {
+            rotation: RotationConfig {
+                order: Order::ShuffleBag,
+                order_default_migrated: false,
+                ..RotationConfig::default()
+            },
+            ..AppConfig::default()
+        };
+        assert!(config.migrate_order_default(), "旧 shuffle_bag 应发生改写");
+        assert_eq!(
+            config.rotation.order,
+            Order::Sequential,
+            "已迁移为 sequential"
+        );
+        assert!(config.rotation.order_default_migrated, "迁移后标记应置位");
+    }
+
+    #[test]
+    fn migrate_order_default_skips_when_already_migrated() {
+        // 已置位：尊重用户后续手动选择，不再改写
+        let mut config = AppConfig {
+            rotation: RotationConfig {
+                order: Order::ShuffleBag,
+                order_default_migrated: true,
+                ..RotationConfig::default()
+            },
+            ..AppConfig::default()
+        };
+        assert!(!config.migrate_order_default(), "已迁移不应再次改写");
+        assert_eq!(
+            config.rotation.order,
+            Order::ShuffleBag,
+            "已置位时保留用户手动选择"
+        );
+        assert!(config.rotation.order_default_migrated, "标记保持置位");
+    }
+
+    #[test]
+    fn migrate_order_default_keeps_sequential_and_marks() {
+        // 非 shuffle_bag 取值：不改写，但标记仍置位（后续不再处理）
+        let mut config = AppConfig {
+            rotation: RotationConfig {
+                order: Order::Sequential,
+                order_default_migrated: false,
+                ..RotationConfig::default()
+            },
+            ..AppConfig::default()
+        };
+        assert!(!config.migrate_order_default(), "sequential 无需改写");
+        assert_eq!(config.rotation.order, Order::Sequential, "取值保持不变");
+        assert!(config.rotation.order_default_migrated, "标记应置位");
+    }
+
+    #[test]
+    fn rotation_config_missing_order_default_migrated_key_defaults_false() {
+        // 旧配置缺 order_default_migrated 键 → 反序列化得到 false
+        let toml_str = r#"
+[rotation]
+enabled = true
+order = "shuffle_bag"
+"#;
+        let config: AppConfig = toml::from_str(toml_str).expect("legacy config parses");
+        assert!(
+            !config.rotation.order_default_migrated,
+            "缺省键应反序列化为 false"
+        );
+        assert_eq!(
+            config.rotation.order,
+            Order::ShuffleBag,
+            "order 保留磁盘取值"
+        );
+    }
+
+    // ── [scaling] 缩放模式配置段（Task 1）────────────────────────────────────
+
+    #[test]
+    fn scaling_config_toml_roundtrip() {
+        let mut modes = BTreeMap::new();
+        modes.insert("all".to_string(), ScalingMode::Fill);
+        modes.insert("DISPLAY1".to_string(), ScalingMode::Tile);
+        modes.insert("DISPLAY2".to_string(), ScalingMode::Fit);
+        let config = AppConfig {
+            scaling: ScalingConfig {
+                modes: modes.clone(),
+            },
+            ..AppConfig::default()
+        };
+        let toml_str = toml::to_string_pretty(&config).expect("serialize config");
+        let deserialized: AppConfig = toml::from_str(&toml_str).expect("deserialize config");
+        assert_eq!(
+            deserialized.scaling.modes, modes,
+            "[scaling] modes 应 TOML round-trip"
+        );
+    }
+
+    #[test]
+    fn scaling_config_absent_yields_empty_modes() {
+        // 旧配置无 [scaling] 段：加载后 modes 为空映射
+        let config: AppConfig = toml::from_str("[general]\n").expect("legacy config parses");
+        assert!(
+            config.scaling.modes.is_empty(),
+            "无 [scaling] 段时 modes 应为空映射"
+        );
+    }
+
+    #[test]
+    fn unknown_enum_values_fall_back_keep_other_fields() {
+        // 未知枚举值应容错回退该字段默认，不影响同文件其它字段
+        let toml_str = r#"
+arrangement = "diagonal"
+
+[pause]
+fullscreen_action = "explode"
+
+[audio]
+volume = 0.42
+
+[rotation]
+interval_minutes = 45
+
+[scaling]
+modes = { DISPLAY1 = "tile", DISPLAY2 = "spiral" }
+"#;
+        let config: AppConfig =
+            toml::from_str(toml_str).expect("未知枚举值不得导致整份配置反序列化失败");
+        assert_eq!(
+            config.arrangement,
+            Arrangement::default(),
+            "未知 arrangement 回退默认 per_monitor"
+        );
+        assert_eq!(
+            config.pause.fullscreen_action,
+            FullscreenAction::default(),
+            "未知 fullscreen_action 回退默认 terminate"
+        );
+        assert!(
+            (config.audio.volume - 0.42).abs() < f32::EPSILON,
+            "audio.volume 应保留配置值"
+        );
+        assert_eq!(
+            config.rotation.interval_minutes, 45,
+            "rotation.interval_minutes 应保留配置值"
+        );
+        assert_eq!(
+            config.scaling.modes.get("DISPLAY1"),
+            Some(&ScalingMode::Tile),
+            "合法缩放模式应保留"
+        );
+        assert_eq!(
+            config.scaling.modes.get("DISPLAY2"),
+            Some(&ScalingMode::Fill),
+            "未知缩放模式回退默认 fill"
+        );
     }
 }

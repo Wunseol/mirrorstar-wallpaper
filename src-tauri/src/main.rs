@@ -53,6 +53,23 @@ fn ensure_single_instance() -> bool {
 }
 
 fn main() {
+    // 同一 exe、双入口：命令行含 `--wp-proc` 时进入网页壁纸子进程模式。
+    //
+    // 该判断必须在 `ensure_single_instance()` 之前：wp-proc 是主壳 spawn 的独立子进程，
+    // 不能参与主实例的单实例互斥体检测，也不得初始化 Tauri/托盘。
+    let mut args: Vec<std::ffi::OsString> = std::env::args_os().collect();
+    if let Some(pos) = args.iter().position(|a| a.to_str() == Some("--wp-proc")) {
+        // 仅移除第一个 `--wp-proc` 分派标记：argv[0]（exe 路径）及其余参数保持不变。
+        args.remove(pos);
+        if let Err(e) = mirrorstar_wp_proc::run_with_argv(args) {
+            // windows_subsystem="windows" 下不分配控制台，故该输出仅在带控制台运行时可见；
+            // 关键行为是退出码 1，父进程据此检测子进程死亡。
+            eprintln!("mirrorstar-wp-proc 退出: {}", e);
+            std::process::exit(1);
+        }
+        return;
+    }
+
     if !ensure_single_instance() {
         return;
     }

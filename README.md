@@ -44,36 +44,37 @@
 - **播放控制**：暂停 / 恢复 / 音量 / 静音 / 播放速度
 - **子进程隔离**：视频与网页壁纸运行在独立子进程，单个壁纸崩溃不影响主程序与其他壁纸
 - **壁纸轮换**：定时轮换 + 采样算法（顺序循环 / 洗牌袋 / 纯随机）+ 轮换池
-- **其他**：开机自启、缩略图管理、鼠标交互模式、托盘驻留（主窗口延迟创建，降低驻留资源占用）
+- **纯净壁纸模式**：托盘一键进入，壁纸置顶全屏覆盖图标 / 任务栏，任意键/鼠标点击退出（Win+L 会退出模式而非锁屏；模式内暂停轮换与自动暂停）
+- **其他**：开机自启、缩略图管理、鼠标交互模式、托盘驻留（主窗口由独立 UI 子进程按需启动，空闲超时自动退出，降低驻留资源占用）
 
 ## 技术栈
 
 | 层 | 技术 |
 |---|---|
-| 前端 | TypeScript 5.5 + Vite 5.4 + Vitest 2.1.9（无前端框架） |
-| 应用层 | Tauri v2.11 + Rust 1.80（edition 2021） |
+| UI | Slint 1.18（原生窗口，绑定软件渲染，独立子进程 `mirrorstar-ui.exe`） |
+| 应用层 | Tauri v2.11 + Rust 1.80（edition 2021，仅作壳：托盘 / 壁纸引擎 / 调度 / UI 子进程管理） |
 | 核心 | `mirrorstar-core`（Rust workspace 成员） |
-| 子进程 | `mirrorstar-wp-proc`（视频 / 网页壁纸隔离） |
-| 渲染 | windows-rs 0.58 + WebView2 + mpv.exe |
+| 子进程 | `mirrorstar-ui`（主窗口 UI）、壳进程 `--wp-proc` 模式（网页壁纸隔离）、`mpv.exe`（视频播放） |
+| 渲染 | windows-rs 0.58 + WebView2（仅网页壁纸/预览）+ mpv.exe |
 | 配置 | TOML + serde |
 | 日志 | tracing 系列 |
-| IPC | Windows 命名管道（自研两套协议） |
-| 资源加载 | 自定义 `wpfile://` URI 协议（含路径 scope 校验） |
+| IPC | 壳↔UI 子进程：`ui_proto` NDJSON over stdio；壳↔mpv/wp-proc：Windows 命名管道（自研两套协议） |
+
+> 主窗口已由 Tauri 内嵌 WebView2 改为**独立原生 UI 子进程**（Slint）；壳不再创建任何 WebView2 主窗口，仅保留托盘、壁纸引擎、轮换调度、命令桥与 UI 子进程管理。
 
 ## 项目结构
 
-Rust workspace 三个成员：`src-tauri` / `mirrorstar-core` / `mirrorstar-wp-proc`。
+Rust workspace 四个成员：`src-tauri` / `mirrorstar-core` / `mirrorstar-ui` / `mirrorstar-wp-proc`。
 
 ```
 mirrorstar-wallpaper/
-├── src/                      # 前端源码（TypeScript + Vite）
-├── src-tauri/                # Tauri 应用主体（Rust）
+├── src-tauri/                # Tauri 壳（Rust）：托盘 / 壁纸引擎 / 调度 / 命令桥 / UI 子进程管理
 ├── crates/
 │   ├── mirrorstar-core/      # 核心逻辑（workspace 成员）
-│   └── mirrorstar-wp-proc/   # 壁纸子进程（视频/网页隔离）
+│   ├── mirrorstar-ui/        # 原生 UI 子进程（Slint，独立二进制 mirrorstar-ui.exe）
+│   └── mirrorstar-wp-proc/   # 网页壁纸逻辑库（WebView2 隔离，由壳 --wp-proc 模式复用）
 ├── docs/                     # 项目文档（入口：docs/index.md）
 ├── .github/                  # CI/CD 工作流与依赖升级配置
-├── package.json              # 前端依赖与脚本
 └── Cargo.lock                # Rust 依赖锁定（已提交入库）
 ```
 
@@ -88,9 +89,10 @@ mirrorstar-wallpaper/
 #### 环境要求
 
 - Windows 10 / 11
-- Node.js 18+（LTS）
 - Rust 1.80+
-- WebView2 Runtime（Windows 11 已内置）
+- WebView2 Runtime（Windows 11 已内置；仅网页壁纸与网页预览需要，主窗口不再依赖）
+
+> 不再需要 Node.js / npm：项目已无前端构建产物，主窗口为原生 Slint UI。
 
 #### 构建与运行
 
@@ -99,13 +101,8 @@ mirrorstar-wallpaper/
 git clone <repo-url>
 cd mirrorstar-wallpaper
 
-# 安装前端依赖（基于 lockfile 保证可复现）
-npm ci
-
-# 开发模式
-npm run tauri:dev   # 先构建 mirrorstar-wp-proc 子进程，再启动 Tauri 应用
-
-# 若只想单独运行 Tauri（同样在 Windows 下）
+# 开发模式（build.rs 会以隔离的 CARGO_TARGET_DIR 单独构建
+# mirrorstar-ui 并复制到 target/release/；wp-proc 已作为库编入壳）
 cargo tauri dev
 ```
 
@@ -113,16 +110,12 @@ cargo tauri dev
 
 | 用途 | 命令 |
 |---|---|
-| 前端 dev（Vite） | `npm run dev` |
-| 应用开发模式 | `npm run tauri:dev` |
-| 前端构建 | `npm run build` |
+| 应用开发模式 | `cargo tauri dev` |
 | 完整应用构建 | `cargo tauri build` |
-| 前端测试 + 覆盖率 | `npm run test` |
 | Rust 测试 | `cargo test --workspace` |
-| 代码规范（ESLint） | `npm run lint` |
-| 类型检查（TypeScript） | `npm run typecheck` |
-| 代码格式化（Prettier） | `npm run format` |
 | Rust Clippy 静态检查 | `cargo clippy --workspace` |
+| 格式检查 | `cargo fmt --all --check` |
+| 依赖安全审计 | `cargo audit` |
 
 #### 构建产物维护
 
@@ -132,7 +125,7 @@ cargo tauri dev
 cargo clean   # 删除整个 target/，下次构建自动复现
 ```
 
-> 仅 `target/` 可安全删除；`mpv/`（视频壁纸运行时播放器，在 `.gitignore` 中，按指引单独下载解压）与 `node_modules/`（前端依赖）需保留。
+> 仅 `target/` 可安全删除；`mpv/`（视频壁纸运行时播放器，在 `.gitignore` 中，按指引单独下载解压）需保留。
 
 ### 数据存放位置（便携版）
 
@@ -144,7 +137,7 @@ cargo clean   # 删除整个 target/，下次构建自动复现
 - **切换类型**：视频 / GIF / 网页 / 图片四种类型可按需自由切换。
 - **全屏自动暂停**：进入全屏应用的窗口时，壁纸会依据事件自动暂停播放，退出全屏后自动恢复；电池供电时也可选择暂停以避免额外耗电。
 - **播放控制**：支持暂停 / 恢复 / 音量 / 静音 / 播放速度等控制。
-- **托盘驻留**：应用默认驻留系统托盘，主窗口按需延迟创建，负载更轻。
+- **托盘驻留**：应用默认驻留系统托盘；主窗口由独立 UI 子进程按需启动，窗口隐藏超时（默认 300s）后自动退出回收内存，再次打开时可重新拉起，负载更轻。
 
 ## 文档入口
 
@@ -171,10 +164,9 @@ cargo clean   # 删除整个 target/，下次构建自动复现
 
 1. 阅读 [docs/index.md](./docs/index.md) 及相关目录文档，理解架构与规范。
 2. 确保以下门槛全部通过，零警告：
-   - `npm run lint`
-   - `npm run test`
    - `cargo test --workspace`
-   - `cargo clippy`（零警告）
+   - `cargo clippy --workspace --all-targets -- -D warnings`
+   - `cargo fmt --all --check`
 
 ## 许可证
 

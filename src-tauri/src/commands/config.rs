@@ -28,7 +28,7 @@ use crate::state::AppState;
 // - **`config_save_mutex: Arc<std::sync::Mutex<()>>`**：串行化 config.toml 落盘
 //   （`maybe_save_config` / `flush` / 周期性 config 保存）
 // - **`library_save_mutex: Arc<std::sync::Mutex<()>>`**：串行化 wallpapers.toml 落盘
-//   （`save_library` / `batch_update_thumbnails` / 周期性 library 保存）
+//   （`save_library` / 周期性 library 保存）
 // - 两者写入不同文件，无数据一致性冲突，故拆分为独立锁，
 //   避免 thumbnail 批量更新等密集 library 落盘阻塞前端 config 修改的 `maybe_save_config`
 // - **锁中毒处理**：`unwrap_or_else(|e| e.into_inner())` 静默恢复（持有锁的线程
@@ -59,7 +59,11 @@ pub fn get_config(state: State<'_, AppState>) -> Result<AppConfig, MirrorStarErr
 /// "锁忙跳过"导致的静默不同步窗口（try_lock 语义下跳过永无补齐路径，且
 /// `update_arrangement` 相同值短路会使后续相同变更不再触发同步）。
 pub(crate) async fn sync_arrangement_to_engine(state: &AppState, arrangement: Arrangement) {
-    state.wallpaper_engine.lock().await.set_arrangement(arrangement);
+    state
+        .wallpaper_engine
+        .lock()
+        .await
+        .set_arrangement(arrangement);
     state.scheduler.wake.notify_waiters();
 }
 
@@ -199,6 +203,13 @@ pub async fn update_config(
     // （多屏排列布局域：引擎同步不再挂在轮换 reconcile 上）。
     let arrangement_changed = state.config_manager.get_config().arrangement != config.arrangement;
     state.config_manager.update_config(config)?;
+    // 配置为缩放的持久化真相源：更新后重新种入 `[scaling].modes`，使前端写入 / 手工
+    // 编辑后的缩放变更即时进入引擎（此前仅启动时种入一次，须重启才生效）。
+    // 仅持 engine 锁，符合 state.rs「engine → desktop」的锁顺序约定。
+    {
+        let mut engine = state.wallpaper_engine.lock().await;
+        engine.seed_scaling_modes(&state.config_manager.get_config().scaling.modes);
+    }
     if arrangement_changed {
         sync_arrangement_to_engine(&state, state.config_manager.get_config().arrangement).await;
     }

@@ -1,0 +1,49 @@
+﻿UI hello: {"type":"hello","protocol_version":1,"capabilities":15,"client":"mirrorstar-ui"}
+answered: get_arrangement,get_auto_start_status,get_config,get_displays,get_rotation_config,get_unit_states,get_wallpaper_state,get_wallpapers,list_pools
+window hwnd: 7144708
+foreground == ui window: True
+
+===== CHILD LOG TAIL =====
+[mirrorstar-ui] 握手成功：壳=keyboard-smoke 协议v1 能力=0x000f
+[mirrorstar-ui] 已撤销 winit 默认 OLE 放置目标
+[mirrorstar-ui] 原生文件拖入已就绪（OLE IDropTarget，支持悬停高亮；HWND=0x6d0504）
+[mirrorstar-ui] GIF 预览已启动：C:\Users\w\AppData\Local\Temp\mirrorstar-ui-smoke\card0.gif（首帧延时 100ms）
+
+
+===== AUTOMATED CHECKS =====
+
+Check                                         Result Detail                                                            
+-----                                         ------ ------                                                            
+window focused for key injection              PASS   GetForegroundWindow()==ui window                                  
+process alive through key sequence            PASS   alive before teardown                                             
+window still exists and visible               PASS   hwnd=7144708                                                      
+ENTER on focused card opened a preview        PASS   stderr contains '[mirrorstar-ui] GIF'                             
+all 7 screenshots captured                    PASS   shots dir: C:\Users\w\AppData\Local\Temp\mirrorstar-ui-smoke\shots
+TAB moved focus (frame changed)               PASS   00 != 01                                                          
+ENTER opened preview (frame changed)          PASS   01 != 02                                                          
+ESC closed preview (frame restored)           PASS   01 == 03                                                          
+ARROWS moved focus (frame changed)            PASS   03 != 04                                                          
+DELETE opened confirm overlay (frame changed) PASS   04 != 05                                                          
+ESC cancelled confirm (frame restored)        PASS   04 == 06                                                          
+
+
+
+===== MANUAL CHECKLIST (not automatable here) =====
+Screenshots (open each and eyeball): C:\Users\w\AppData\Local\Temp\mirrorstar-ui-smoke\shots
+  01_after_tab.png           : focused card shows a yellow (#ffd54f) 2px focus ring
+  02_after_enter_preview.png : preview overlay is on screen
+  03_after_esc.png           : preview closed; focus ring still on the same card
+  04_after_arrows.png        : focus ring moved right/right/down/left/up (and scrolled into view if needed)
+  05_after_delete.png        : delete confirmation overlay is on screen
+  06_after_esc_cancel.png    : confirmation dismissed, nothing deleted
+Drag-in hover + drag ghost + neighbour let-way CANNOT be automated here:
+  a real OLE drag needs an IDataObject drag source; keybd_event/mouse_event cannot
+  synthesise it. Manual steps:
+    1) drag a local image/video file from Explorer over the grid -> overlay
+       'drop to add wallpaper' highlight (#4fc3f7 border) must appear; it must clear
+       when the cursor leaves the window without dropping.
+    2) drag a card within the grid -> a drag ghost follows the cursor, the source card
+       fades (opacity 0.35), and neighbours slide aside to open the drop slot.
+    3) release -> the order updates; release outside -> cards snap back.
+
+RESULT: all automated checks PASSED (visual + drag items are MANUAL)

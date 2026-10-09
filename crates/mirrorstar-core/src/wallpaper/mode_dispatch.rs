@@ -144,34 +144,6 @@ impl WallpaperEngine {
             }
         }
 
-        // WorkerW 模式：校验文件路径（Web 类型支持 URL）
-        match wallpaper_type {
-            WallpaperType::Image => {
-                if !matches!(source, WallpaperSource::File(_)) {
-                    return Err(MirrorStarError::DesktopIntegration(
-                        "静态图片壁纸仅支持本地文件".to_string(),
-                    ));
-                }
-            }
-            WallpaperType::Video => {
-                if !matches!(source, WallpaperSource::File(_)) {
-                    return Err(MirrorStarError::DesktopIntegration(
-                        "视频壁纸仅支持本地文件".to_string(),
-                    ));
-                }
-            }
-            WallpaperType::Gif => {
-                if !matches!(source, WallpaperSource::File(_)) {
-                    return Err(MirrorStarError::DesktopIntegration(
-                        "GIF 壁纸仅支持本地文件".to_string(),
-                    ));
-                }
-            }
-            WallpaperType::Web => {
-                // Web 类型支持 File 和 Url，无需校验
-            }
-        }
-
         if let WallpaperSource::File(path) = source {
             tracing::info!(path = %path, ?wallpaper_type, "准备加载 WorkerW 壁纸");
         } else if let WallpaperSource::Url(url) = source {
@@ -189,8 +161,14 @@ impl WallpaperEngine {
             pending.clear_native,
         )?;
 
-        // W04: 阶段 3 — 嵌入并注册（在锁内）
-        self.complete_set_wallpaper(renderer, display_id, source, wallpaper_type)?;
+        // W04: 阶段 3 — 嵌入并注册（在锁内）；旧 Native 壁纸延迟到嵌入后清除
+        self.complete_set_wallpaper(
+            renderer,
+            display_id,
+            source,
+            wallpaper_type,
+            pending.defer_clear_native,
+        )?;
 
         Ok(())
     }

@@ -1,11 +1,16 @@
 //! IPC 命令处理：handle_command 各分支
-use windows::core::HSTRING;
+use std::collections::VecDeque;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Mutex;
+
+use windows::core::{Interface, HSTRING};
 use windows::Win32::Foundation::{BOOL, HWND, RECT};
 use windows::Win32::System::WinRT::EventRegistrationToken;
 use windows::Win32::UI::WindowsAndMessaging::*;
 
 use webview2_com::Microsoft::Web::WebView2::Win32::{
-    ICoreWebView2, ICoreWebView2Controller, ICoreWebView2NavigationCompletedEventArgs,
+    ICoreWebView2, ICoreWebView2Controller, ICoreWebView2Controller3,
+    ICoreWebView2NavigationCompletedEventArgs, COREWEBVIEW2_BOUNDS_MODE_USE_RASTERIZATION_SCALE,
 };
 use webview2_com::{ExecuteScriptCompletedHandler, NavigationCompletedEventHandler};
 
@@ -62,7 +67,7 @@ impl Drop for NavigationCompletedHandlerGuard<'_> {
     }
 }
 
-/// 导航到指定 URL（Play 与 Navigate 共享逻辑）。
+/// 导航到指定 URL（Play 命令的处理逻辑）。
 ///
 /// WP03: controller 现为非 Option（create_webview 失败时子进程已退出）。
 /// 调用方保证传入有效的 controller，无需 None 检查。
@@ -77,6 +82,11 @@ fn navigate_to_url(
     controller: &ICoreWebView2Controller,
     source: &str,
 ) -> Result<(), MirrorStarError> {
+    // M2: RAII guard 标记导航进行中——此窗口内到达的控制命令（Pause/Resume/
+    // SetVolume/ToggleMute）由 run_control_command 入队，导航完成后统一 flush 执行，
+    // 避免对旧页面注入脚本。guard 在函数任何返回路径上 Drop 时清除标记。
+    let _nav_guard = NavigationInProgressGuard::new();
+
     let webview = unsafe { controller.CoreWebView2() }.map_err(corewebview2_error)?;
     let url = build_url(source)?;
 
@@ -147,6 +157,17 @@ fn navigate_to_url(
     unsafe {
         let _ = webview.remove_NavigationCompleted(token);
     }
+    // M2: 导航结束（无论成败，标记由 _nav_guard Drop 清除）。成功后 flush 待执行的
+    // 控制命令（导航完成后再注入脚本，保证作用于新页面）；失败则清空队列（旧页面的
+    // 控制命令不再有意义）。
+    if wait_result.is_ok() {
+        flush_pending_control_commands(controller);
+    } else {
+        let mut queue = PENDING_CONTROL_COMMANDS
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        queue.clear();
+    }
     wait_result?
 }
 
@@ -170,6 +191,11 @@ fn navigate_to_url(
 /// WP05: CoreWebView2() 失败时返回 Error（与 navigate_to_url 一致）。
 /// W-006: 用 wait_with_pump_timeout 替代 wait_for_async_operation，
 /// 避免外部函数内部 GetMessageA 无限阻塞导致子进程挂起。
+///
+/// L2: 本函数**单线程不可重入**——命令经 cmd_rx + 主消息循环串行处理（FIFO），
+/// 主循环在 execute_script_and_report 阻塞期间不会处理新命令；M2 队列
+/// （PENDING_CONTROL_COMMANDS）在导航期间额外串行化控制命令，杜绝并发调用
+/// ExecuteScript 的交错。无需额外互斥。
 fn execute_script_and_report(
     controller: &ICoreWebView2Controller,
     script: &str,
@@ -187,6 +213,8 @@ fn execute_script_and_report(
     let (op_cn, op_label): (&'static str, &'static str) = match op_name {
         "Pause" => ("暂停", "ExecuteScript(Pause)"),
         "Resume" => ("恢复", "ExecuteScript(Resume)"),
+        "SetVolume" => ("设置音量", "ExecuteScript(SetVolume)"),
+        "ToggleMute" => ("切换静音", "ExecuteScript(ToggleMute)"),
         // 不应触达的兜底（避免未来扩展时漏 match）
         _ => (op_name, "ExecuteScript(Unknown)"),
     };
@@ -220,7 +248,9 @@ fn execute_script_and_report(
         }
         Err(e) => {
             tracing::warn!(error = ?e, "Web 壁纸{}命令已发送但 JS 注入失败", op_cn);
-            return error_response(request_id, format!("{}: {}", err_prefix, e));
+            // e 已包含 "{op_name} JS injection failed: <原因>" 前缀（上方 map_err/Err 分支构造），
+            // 此处直接透传，避免重复拼接前缀。
+            return error_response(request_id, e.to_string());
         }
     }
     ok_response(request_id)
@@ -259,6 +289,152 @@ pub(crate) fn build_post_message_failed_response(request_id: u64) -> String {
         r#"{{"request_id":{},"status":"error","error":"PostMessageW failed"}}{}"#,
         request_id, '\n'
     )
+}
+
+/// 构建设置音量的 JS 脚本（SetVolume 分支用）。
+///
+/// 将音量钳制到 0.0 ~ 1.0（HTMLMediaElement.volume 合法域），设置所有 `video`/`audio`
+/// 元素的 volume，同时解除 muted 并同步静音态 dataset，供 ToggleMute 保持一致。
+/// M3: 额外写入 `dataset._lastVolume`，供 Resume 脚本重放音量（页面侧音量持久化）。
+fn build_set_volume_script(volume: f32) -> String {
+    let clamped = volume.clamp(0.0, 1.0);
+    format!(
+        r#"document.querySelectorAll('video, audio').forEach(m => {{ m.volume = {}; m.muted = false; m.dataset._muted = 'false'; m.dataset._lastVolume = {}; }});"#,
+        clamped, clamped
+    )
+}
+
+/// 构建 Resume 的 JS 脚本（M3）：播放已暂停的媒体元素，并重放当前音量。
+///
+/// 音量恢复双保险：
+/// 1. 页面 `dataset._lastVolume`（由 build_set_volume_script 写入）优先；
+/// 2. `fallback_volume`（进程侧 LAST_SET_VOLUME）兜底——覆盖页面重载
+///    （如 H2 Reload）后 dataset 丢失的场景。
+fn build_resume_script(fallback_volume: Option<f32>) -> String {
+    let fallback = match fallback_volume {
+        Some(v) => v.clamp(0.0, 1.0),
+        // 无已知音量时回退到 1.0（HTMLMediaElement.volume 默认值）
+        None => 1.0,
+    };
+    format!(
+        r#"document.querySelectorAll('video, audio').forEach(m => {{ if (m.dataset._paused) m.play(); delete m.dataset._paused; m.volume = (m.dataset._lastVolume !== undefined) ? m.dataset._lastVolume : {}; }});"#,
+        fallback
+    )
+}
+
+// ── M2/M3: 控制命令可靠执行（导航完成后执行 / 排队 / 串行化）────────────────
+
+/// 控制类命令（Pause/Resume/SetVolume/ToggleMute）的排队载荷。
+///
+/// 命令经 IPC 下发后由 cmd_rx 串行到达主循环（FIFO），再经本队列按到达顺序执行，
+/// 满足"命令序号单调"的串行化要求。Resume 在 flush/执行时重建音量恢复脚本，
+/// 从页面 dataset（_lastVolume）与进程侧 LAST_SET_VOLUME 兜底恢复音量（M3）。
+#[derive(Debug)]
+enum PendingControlCommand {
+    /// 暂停：暂停所有媒体元素
+    Pause,
+    /// 恢复：播放 + 重放当前音量（M3）
+    Resume,
+    /// 设置音量（0.0 ~ 1.0）
+    SetVolume(f32),
+    /// 切换静音
+    ToggleMute,
+}
+
+/// 导航进行中标记（M2）：`navigate_to_url` 执行期间置 true，结束后置 false。
+/// 控制类命令在导航进行中先入队（run_control_command），导航完成后由
+/// [`flush_pending_control_commands`] 统一执行，避免对旧页面注入脚本。
+static NAVIGATION_IN_PROGRESS: AtomicBool = AtomicBool::new(false);
+
+/// M2: 导航进行中标记的 RAII guard——任何返回路径（成功 / 失败 / `?` 提前返回）
+/// 都会在 Drop 时清除标记，避免导航异常退出后标记残留导致控制命令永久排队。
+struct NavigationInProgressGuard;
+
+impl NavigationInProgressGuard {
+    fn new() -> Self {
+        NAVIGATION_IN_PROGRESS.store(true, Ordering::SeqCst);
+        Self
+    }
+}
+
+impl Drop for NavigationInProgressGuard {
+    fn drop(&mut self) {
+        NAVIGATION_IN_PROGRESS.store(false, Ordering::SeqCst);
+    }
+}
+
+/// 导航进行中暂存的控制命令队列（FIFO，M2）。
+/// 入队序即命令到达序（父进程 IPC 命令经 cmd_rx 串行送达），flush 时按序执行。
+static PENDING_CONTROL_COMMANDS: Mutex<VecDeque<PendingControlCommand>> =
+    Mutex::new(VecDeque::new());
+
+/// M3: 进程侧最近一次 SetVolume 命令的音量（0.0 ~ 1.0）。
+/// Resume 时从该值重建音量恢复脚本兜底，覆盖页面重载（dataset 丢失）场景。
+static LAST_SET_VOLUME: Mutex<Option<f32>> = Mutex::new(None);
+
+/// 执行控制类命令（M2）：导航进行中先入队并立即返回 Ok；导航完成后立即执行。
+///
+/// 排队路径立即返回 Ok：命令未丢，只是延迟到导航完成后统一执行，父进程无需感知延迟。
+fn run_control_command(
+    controller: &ICoreWebView2Controller,
+    request_id: u64,
+    cmd: PendingControlCommand,
+) -> WpProcResponse {
+    if NAVIGATION_IN_PROGRESS.load(Ordering::SeqCst) {
+        // 导航进行中：入队，导航完成后由 flush_pending_control_commands 统一执行。
+        PENDING_CONTROL_COMMANDS
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push_back(cmd);
+        tracing::debug!("导航进行中，控制命令入队（导航完成后统一执行）");
+        return ok_response(request_id);
+    }
+    execute_control_command(controller, request_id, cmd)
+}
+
+/// 立即执行一条控制命令（导航已完成；排队命令 flush 时逐条调用）。
+fn execute_control_command(
+    controller: &ICoreWebView2Controller,
+    request_id: u64,
+    cmd: PendingControlCommand,
+) -> WpProcResponse {
+    let (script, op_name) = match cmd {
+        PendingControlCommand::Pause => (
+            r#"document.querySelectorAll('video, audio').forEach(m => { m.pause(); m.dataset._paused = 'true'; });"#
+                .to_string(),
+            "Pause",
+        ),
+        PendingControlCommand::Resume => {
+            // M3: resume 时重放当前音量（页面 dataset._lastVolume 优先，进程侧
+            // LAST_SET_VOLUME 兜底），避免暂停期间音量状态丢失。
+            let fallback = *LAST_SET_VOLUME.lock().unwrap_or_else(|e| e.into_inner());
+            (build_resume_script(fallback), "Resume")
+        }
+        PendingControlCommand::SetVolume(volume) => {
+            // M3: 记录进程侧最近音量，供后续 Resume 兜底恢复。
+            *LAST_SET_VOLUME.lock().unwrap_or_else(|e| e.into_inner()) = Some(volume);
+            (build_set_volume_script(volume), "SetVolume")
+        }
+        PendingControlCommand::ToggleMute => (
+            r#"document.querySelectorAll('video, audio').forEach(m => { m.muted = !(m.dataset._muted === 'true'); m.dataset._muted = m.muted ? 'true' : 'false'; });"#
+                .to_string(),
+            "ToggleMute",
+        ),
+    };
+    execute_script_and_report(controller, &script, op_name, request_id)
+}
+
+/// 导航完成后统一执行排队中的控制命令（M2，FIFO 按到达顺序执行）。
+///
+/// 排队路径已向父进程返回 Ok（命令"已接收"），此处逐条执行并丢弃响应——
+/// 命令未丢、已按到达顺序生效即可，无需再回传响应。
+fn flush_pending_control_commands(controller: &ICoreWebView2Controller) {
+    let mut queue = PENDING_CONTROL_COMMANDS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    while let Some(cmd) = queue.pop_front() {
+        let _ = execute_control_command(controller, 0, cmd);
+    }
 }
 
 /// 处理 IPC 命令，返回响应。
@@ -336,6 +512,20 @@ pub(crate) fn handle_command(
                     tracing::warn!(error = %e, "GetClientRect 失败");
                     return error_response(request_id, format!("GetClientRect 失败: {}", e));
                 }
+                // M1: 显式设置 BoundsMode 为 USE_RASTERIZATION_SCALE（逻辑像素），确保
+                // SetBounds 的 RECT 按逻辑像素解释，与 SetWindowPos 的物理像素坐标语义
+                // 对齐，避免高分屏/DPI 缩放下 WebView2 边界错位。ICoreWebView2Controller3
+                // 为尽力而为：cast/设置失败仅 warn，不阻断位置同步（回退到默认 RAW_PIXELS）。
+                if let Ok(controller3) = controller.cast::<ICoreWebView2Controller3>() {
+                    // 外层 unsafe 块已覆盖 SetBoundsMode 的 unsafe 调用（COM 方法），无需内层嵌套
+                    if let Err(e) =
+                        controller3.SetBoundsMode(COREWEBVIEW2_BOUNDS_MODE_USE_RASTERIZATION_SCALE)
+                    {
+                        tracing::warn!(error = %e, "SetBoundsMode 失败（使用默认 RAW_PIXELS）");
+                    }
+                } else {
+                    tracing::warn!("cast 到 ICoreWebView2Controller3 失败，跳过 BoundsMode 设置");
+                }
                 if let Err(e) = controller.SetBounds(rect) {
                     tracing::warn!(error = %e, "SetBounds 失败");
                     return error_response(request_id, format!("SetBounds 失败: {}", e));
@@ -343,24 +533,26 @@ pub(crate) fn handle_command(
             }
             ok_response(request_id)
         }
-        WpProcCommand::Navigate { url, .. } => match navigate_to_url(controller, &url) {
-            Ok(()) => ok_response(request_id),
-            Err(e) => error_response(request_id, e.to_string()),
-        },
         // WP-001: Pause/Resume 共用 execute_script_and_report，差异点（JS 脚本、
         // 日志动词、错误前缀）通过 script/op_name 参数化。错误响应格式保持不变。
-        WpProcCommand::Pause { .. } => execute_script_and_report(
+        // M2: 控制类命令统一走 run_control_command——导航进行中先入队（导航完成后
+        // 统一执行，避免对旧页面注入脚本），非导航期立即执行；FIFO 串行化保证
+        // 命令序号单调。M3: Resume 脚本重放当前音量（dataset._lastVolume + 进程侧
+        // LAST_SET_VOLUME 兜底）。
+        WpProcCommand::Pause { .. } => {
+            run_control_command(controller, request_id, PendingControlCommand::Pause)
+        }
+        WpProcCommand::Resume { .. } => {
+            run_control_command(controller, request_id, PendingControlCommand::Resume)
+        }
+        WpProcCommand::SetVolume { volume, .. } => run_control_command(
             controller,
-            r#"document.querySelectorAll('video, audio').forEach(m => { m.pause(); m.dataset._paused = 'true'; });"#,
-            "Pause",
             request_id,
+            PendingControlCommand::SetVolume(volume),
         ),
-        WpProcCommand::Resume { .. } => execute_script_and_report(
-            controller,
-            r#"document.querySelectorAll('video, audio').forEach(m => { if(m.dataset._paused) m.play(); delete m.dataset._paused; });"#,
-            "Resume",
-            request_id,
-        ),
+        WpProcCommand::ToggleMute { .. } => {
+            run_control_command(controller, request_id, PendingControlCommand::ToggleMute)
+        }
     }
 }
 #[cfg(test)]
@@ -536,7 +728,7 @@ mod tests {
     // WP03: handle_command 接收 &ICoreWebView2Controller（非 Option），
     // ICoreWebView2Controller 无法在单元测试中构造。仅 Terminate 命令不触碰
     // controller 方法，可安全通过 handle_command 进行完整 JSON 往返测试。
-    // 其他命令（Play/Navigate/Pause/Resume/SetPosition）的 JSON 往返需依赖
+    // 其他命令（Play/Pause/Resume/SetPosition）的 JSON 往返需依赖
     // 集成测试（真实 WebView2 环境）。
     //
     // 以下 serde 测试（不调用 handle_command）验证 JSON 格式契约：
@@ -1140,6 +1332,194 @@ mod tests {
             err.contains("test reason"),
             "错误消息应包含原始原因，实际: {}",
             err
+        );
+    }
+
+    // -- SetVolume/ToggleMute JS 脚本构造测试 ----------------------------------
+    // 注意：handle_command 的 SetVolume/ToggleMute 分支会调用 controller.CoreWebView2()
+    // （无法在纯单元测试中构造），故仅测试纯函数 build_set_volume_script 的脚本契约。
+
+    #[test]
+    fn build_set_volume_script_uses_escaped_braces_and_clamped_volume() {
+        let script = build_set_volume_script(0.75);
+        // 模板中的 {{ 应渲染为单个 {，JS 为 foreach 回调：
+        assert!(script.contains("forEach(m => { m.volume ="));
+
+        // 钳制到 0.0 ~ 1.0：超范围值应被 clamp，且移入合法域后写入 JS。
+        let high = build_set_volume_script(1.5);
+        assert!(high.contains("m.volume = 1"));
+        let low = build_set_volume_script(-0.5);
+        assert!(low.contains("m.volume = 0"));
+
+        // M3: 脚本应写入 dataset._lastVolume（供 Resume 重放音量）
+        assert!(
+            script.contains("_lastVolume"),
+            "SetVolume 脚本应写入 dataset._lastVolume"
+        );
+    }
+
+    #[test]
+    fn toggle_mute_script_semantics_present_in_source() {
+        // 通过源码静态检查确保 ToggleMute 分支使用基于 dataset 的状态翻转（而非无条件取反），
+        // 这样多次切换时保持一致，不会退回初始 muted 状态。
+        let source = include_str!("command.rs");
+        assert!(
+            source.contains("_muted"),
+            "ToggleMute JS 应基于 dataset._muted 状态翻转"
+        );
+        assert!(
+            source.contains("SetVolume"),
+            "handle_command 应包含 SetVolume 分支"
+        );
+        assert!(
+            source.contains("ToggleMute"),
+            "handle_command 应包含 ToggleMute 分支"
+        );
+        assert!(
+            source.contains("build_set_volume_script"),
+            "SetVolume 分支应复用 build_set_volume_script"
+        );
+    }
+
+    // ── M2: 控制命令导航中排队（不丢、FIFO、串行化）测试 ───────────────────
+    //
+    // 导航进行中（NAVIGATION_IN_PROGRESS=true）时，run_control_command 将命令入队并
+    // 立即返回 Ok，不触碰 controller——因此可安全使用 dangling controller（test_controller）
+    // 验证"未就绪不丢（排队待导航完成）"与"命令序号单调（入队序 = 到达序）"。
+
+    #[test]
+    fn m2_navigation_in_progress_queues_commands_fifo() {
+        let hwnd = test_hwnd();
+        let controller = test_controller();
+
+        // 模拟导航进行中：控制命令应入队且立即返回 Ok（不触碰 controller）
+        NAVIGATION_IN_PROGRESS.store(true, Ordering::SeqCst);
+
+        let r1 = handle_command(WpProcCommand::Pause { request_id: 1 }, &hwnd, &controller);
+        assert_eq!(r1.request_id, 1);
+        assert_eq!(r1.status, ResponseStatus::Ok, "导航中排队应立即返回 Ok");
+
+        let r2 = handle_command(
+            WpProcCommand::SetVolume {
+                request_id: 2,
+                volume: 0.4,
+            },
+            &hwnd,
+            &controller,
+        );
+        assert_eq!(r2.request_id, 2);
+        assert_eq!(r2.status, ResponseStatus::Ok);
+
+        let r3 = handle_command(
+            WpProcCommand::ToggleMute { request_id: 3 },
+            &hwnd,
+            &controller,
+        );
+        assert_eq!(r3.request_id, 3);
+        assert_eq!(r3.status, ResponseStatus::Ok);
+
+        // 队列按到达顺序保存（FIFO = 命令序号单调）
+        let mut queue = PENDING_CONTROL_COMMANDS
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        assert!(matches!(
+            queue.pop_front(),
+            Some(PendingControlCommand::Pause)
+        ));
+        assert!(matches!(
+            queue.pop_front(),
+            Some(PendingControlCommand::SetVolume(v)) if v == 0.4
+        ));
+        assert!(matches!(
+            queue.pop_front(),
+            Some(PendingControlCommand::ToggleMute)
+        ));
+        assert!(queue.is_empty(), "队列应已全部取出（命令未丢）");
+
+        NAVIGATION_IN_PROGRESS.store(false, Ordering::SeqCst);
+    }
+
+    /// M2: 验证排队命令在导航完成后按 FIFO 顺序执行（串行化/单调序号保证）。
+    ///
+    /// flush 依赖真实 WebView2（execute_script_and_report 会调用 controller），
+    /// 此处通过直接操纵队列验证"按到达顺序逐条执行"的不变量（与 flush 内部
+    /// pop_front 循环一致），真实 flush 路径需集成测试（真实 WebView2 环境）。
+    #[test]
+    fn m2_pending_queue_fifo_order_preserved() {
+        let mut queue = PENDING_CONTROL_COMMANDS
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        queue.clear();
+        // 模拟导航中到达的命令（到达序 = 命令序号单调）
+        queue.push_back(PendingControlCommand::Pause);
+        queue.push_back(PendingControlCommand::SetVolume(0.7));
+        queue.push_back(PendingControlCommand::Resume);
+
+        // 与 flush_pending_control_commands 一致的逐条 pop_front 执行序
+        let mut order = Vec::new();
+        while let Some(cmd) = queue.pop_front() {
+            order.push(cmd);
+        }
+        assert!(matches!(order[0], PendingControlCommand::Pause));
+        assert!(matches!(order[1], PendingControlCommand::SetVolume(v) if v == 0.7));
+        assert!(matches!(order[2], PendingControlCommand::Resume));
+        assert!(queue.is_empty(), "flush 后队列应清空");
+    }
+
+    // ── M3: Resume 音量恢复脚本测试 ──────────────────────────────────────
+
+    #[test]
+    fn m3_resume_script_replays_volume() {
+        // 有兜底音量：脚本应嵌入兜底值并优先读取 dataset._lastVolume
+        let script = build_resume_script(Some(0.7));
+        assert!(
+            script.contains("_lastVolume"),
+            "Resume 脚本应读取 dataset._lastVolume"
+        );
+        assert!(script.contains("0.7"), "Resume 脚本应嵌入兜底音量 0.7");
+        // 保留原有 resume 语义：仅播放已暂停的媒体
+        assert!(script.contains("if (m.dataset._paused) m.play()"));
+
+        // 无兜底音量：回退到 1.0（HTMLMediaElement.volume 默认值）
+        let no_fallback = build_resume_script(None);
+        assert!(no_fallback.contains(": 1"), "无兜底音量时应回退到 1.0");
+    }
+
+    // ── M1/M2/M3: 源码静态检查（真实 WebView2 路径需集成测试）─────────────
+
+    #[test]
+    fn m1_set_position_sets_bounds_mode_before_bounds() {
+        // SetPosition 分支应在 SetBounds 之前显式设置 BoundsMode（源码顺序检查）。
+        let source = include_str!("command.rs");
+        assert!(
+            source.contains("COREWEBVIEW2_BOUNDS_MODE_USE_RASTERIZATION_SCALE"),
+            "SetPosition 应使用 USE_RASTERIZATION_SCALE（逻辑像素）"
+        );
+        assert!(source.contains("SetBoundsMode"), "应调用 SetBoundsMode");
+        let set_bounds_mode_pos = source.find("SetBoundsMode").expect("应存在 SetBoundsMode");
+        let set_bounds_pos = source.find("SetBounds(").expect("应存在 SetBounds 调用");
+        assert!(
+            set_bounds_mode_pos < set_bounds_pos,
+            "SetBoundsMode 应先于 SetBounds 设置（源码顺序）"
+        );
+    }
+
+    #[test]
+    fn m2_m3_control_reliability_present_in_source() {
+        // 静态检查 M2/M3 关键机制已注入（真实执行路径需集成测试）。
+        let source = include_str!("command.rs");
+        assert!(
+            source.contains("NAVIGATION_IN_PROGRESS"),
+            "应存在导航中标记"
+        );
+        assert!(
+            source.contains("flush_pending_control_commands"),
+            "导航完成后应 flush 排队命令"
+        );
+        assert!(source.contains("LAST_SET_VOLUME"), "应存在进程侧音量兜底");
+        assert!(
+            source.contains("build_resume_script"),
+            "Resume 应使用音量恢复脚本"
         );
     }
 }

@@ -233,7 +233,11 @@ impl SubprocessRendererBase {
             // SAFETY: SetPropW 仅向 hwh 关联一个整型标记属性，hwh 由 Window 查找流程
             // 校验有效（非空、非 invalid）。字符串常量以 NUL 结尾，PCWSTR 读取有效。
             unsafe {
-                let _ = SetPropW(hwh, WALLPAPER_WINDOW_PROP, HANDLE(1 as *mut core::ffi::c_void));
+                let _ = SetPropW(
+                    hwh,
+                    WALLPAPER_WINDOW_PROP,
+                    HANDLE(1 as *mut core::ffi::c_void),
+                );
             }
         }
     }
@@ -290,7 +294,7 @@ impl SubprocessRendererBase {
     /// 在应用目录下查找捆绑的可执行文件，回退到 PATH 查找
     ///
     /// - `subdir`：可执行文件所在的子目录（如 `"mpv"`），`None` 表示直接位于 exe 同目录
-    /// - `filename`：可执行文件名（如 `"mpv.exe"` 或 `"mirrorstar-wp-proc.exe"`）
+    /// - `filename`：可执行文件名（如 `"mpv.exe"`）
     /// - `log_name`：用于日志显示的名称
     pub fn find_bundled_executable(
         subdir: Option<&str>,

@@ -30,7 +30,8 @@ jobs:
           echo "Release secrets verified."
         shell: bash
 
-  # 复用 checks.yml 工作流（B-TD-005）：rust-checks + frontend-checks 与 CI 完全一致
+  # 复用 checks.yml 工作流（B-TD-005）：rust-checks 与 CI 完全一致
+  # （frontend-checks 已随主窗口原生 UI 重构移除，构建不再依赖 npm 前端）
   # 包含 ignored tests（continue-on-error: true），release 质量门与 CI 对齐（B-TD-027）
   checks:
     needs: verify-secrets
@@ -44,12 +45,6 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Setup Node.js 20
-        uses: actions/setup-node@v4
-        with:
-          node-version: '20'
-          cache: 'npm'
-
       - name: Setup Rust stable
         uses: dtolnay/rust-toolchain@stable
         with:
@@ -58,8 +53,12 @@ jobs:
       - name: Cache cargo
         uses: Swatinem/rust-cache@v2
 
-      - name: Build wp-proc resource
-        run: cargo build -p mirrorstar-wp-proc --release
+      # 主窗口已改为原生 UI 子进程，构建不再依赖 npm 前端。
+      # tauri-action 在未指定 tauriScript 时默认走 `npm|pnpm|yarn|bun tauri`
+      # （项目本地 JS CLI），本项目无前端依赖；故显式安装 Rust 版 CLI 并指定
+      # tauriScript=cargo tauri，彻底摆脱 Node/npm。
+      - name: Install Tauri CLI
+        run: cargo install tauri-cli --version "^2.11" --locked
 
       # 提供 mpv 运行时（打包 src-tauri 前）：tauri_build::try_build 编译期校验 `../mpv/mpv.exe`，
       # 且 mpv/ 在 .gitignore（~123MB 超入库限制）。固定 release + SHA256 双保险下载，仅解出 mpv.exe。
@@ -96,9 +95,6 @@ jobs:
           Copy-Item $exe $target
           Write-Host "mpv.exe provisioned: $((Get-Item $target).Length) bytes"
 
-      - name: Install frontend dependencies
-        run: npm ci
-
       - name: Build Tauri app
         uses: tauri-apps/tauri-action@v0
         env:
@@ -106,6 +102,7 @@ jobs:
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
         with:
+          tauriScript: cargo tauri
           tagName: ${{ github.ref_name }}
           releaseName: 'MirrorStar Wallpaper ${{ github.ref_name }}'
           releaseDraft: true

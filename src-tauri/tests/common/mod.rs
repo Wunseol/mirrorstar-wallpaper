@@ -18,9 +18,6 @@ use mirrorstar_core::{DesktopIntegrator, VolumeControl, WallpaperEngine};
 use windows::Win32::Foundation::{HWND, RPC_E_CHANGED_MODE};
 use windows::Win32::System::Com::{CoInitializeEx, COINIT_APARTMENTTHREADED};
 
-/// 共享的位置快照句柄：用于 update_positions 测试跨线程读取 set_position 调用参数 (x, y, w, h)
-type SharedPosition = Arc<Mutex<Option<(i32, i32, i32, i32)>>>;
-
 /// Mock 渲染器，用于测试 WallpaperEngine 的状态管理
 ///
 /// `hwnd()` 返回 `None` 以跳过 WorkerW 嵌入逻辑，使 `embed_and_register_renderer`
@@ -33,9 +30,6 @@ pub struct MockRenderer {
     pause_sender: Option<PauseSender>,
     /// 保持 pause channel 接收端存活，防止 sender.send() 失败
     _rx: Option<tokio::sync::mpsc::UnboundedReceiver<PauseCommand>>,
-    /// 最近一次 set_position 调用的参数快照（用于 update_positions 测试）
-    /// 通过 Arc<Mutex> 共享给测试，使渲染器嵌入 engine 后仍可读取
-    last_position: SharedPosition,
     /// 最近一次 set_interaction_mode 调用的参数快照（用于 set_interaction_mode 命令测试）
     last_interaction_mode: Arc<Mutex<Option<bool>>>,
     /// 最近一次 set_mouse_passthrough 调用的参数快照（用于 set_interaction_mode 命令测试）
@@ -49,18 +43,9 @@ impl MockRenderer {
             state: WallpaperState::Initializing,
             pause_sender: Some(sender),
             _rx: Some(rx),
-            last_position: Arc::new(Mutex::new(None)),
             last_interaction_mode: Arc::new(Mutex::new(None)),
             last_mouse_passthrough: Arc::new(Mutex::new(None)),
         }
-    }
-
-    /// 返回最近一次 set_position 调用参数的共享句柄
-    ///
-    /// 测试在嵌入 engine 前调用以获取 Arc 克隆，渲染器被 engine 持有后仍可读取
-    /// 该句柄验证 update_positions 是否真正调用了 set_position。
-    pub fn last_position_handle(&self) -> SharedPosition {
-        Arc::clone(&self.last_position)
     }
 
     /// 返回最近一次 set_interaction_mode 调用参数的共享句柄
@@ -98,12 +83,11 @@ impl WallpaperRenderer for MockRenderer {
     }
     fn set_position(
         &mut self,
-        x: i32,
-        y: i32,
-        w: i32,
-        h: i32,
+        _x: i32,
+        _y: i32,
+        _w: i32,
+        _h: i32,
     ) -> Result<(), mirrorstar_core::MirrorStarError> {
-        *self.last_position.lock().unwrap() = Some((x, y, w, h));
         Ok(())
     }
     fn terminate(&mut self) -> Result<(), mirrorstar_core::MirrorStarError> {

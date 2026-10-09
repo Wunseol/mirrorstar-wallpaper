@@ -1,6 +1,7 @@
 use std::collections::HashSet;
 
-use mirrorstar_core::{ConfigManager, ScalingMode, WallpaperSource};
+use mirrorstar_core::layout::ALL_UNIT_KEY;
+use mirrorstar_core::{Arrangement, ConfigManager, ScalingMode, WallpaperSource};
 use tauri::{Emitter, State};
 
 use crate::state::AppState;
@@ -160,14 +161,15 @@ struct GifOversizedPayload<'a> {
 ///
 /// T03: 已统一用于 pause_wallpaper / resume_wallpaper / set_volume / toggle_mute /
 /// get_wallpaper_state / set_scaling_mode / set_speed 全部 7 个快速路径命令。
+///
+/// `fix-manual-wallpaper-display-id`：本函数改为 core
+/// `WallpaperEngine::resolve_display_id` 的薄封装（单一真相源），回退链新增
+/// 「主显示器真实 id」一环；无活跃壁纸时不再直接返回空串，而是回退到主屏。
 pub fn resolve_display_id(
     display_id: Option<String>,
     engine: &mirrorstar_core::WallpaperEngine,
 ) -> String {
-    display_id
-        .filter(|s| !s.is_empty())
-        .or_else(|| engine.first_active_display_id().map(|s| s.to_string()))
-        .unwrap_or_default()
+    engine.resolve_display_id(display_id)
 }
 
 /// COM 初始化的 RAII guard（drop 时配对调用 CoUninitialize）
@@ -503,6 +505,20 @@ pub fn get_wallpapers(
     Ok(state.config_manager.get_wallpapers())
 }
 
+/// 按新顺序重排壁纸库列表并落盘（`ids` 必须是当前壁纸 id 集合的完全重排）。
+///
+/// 壁纸库顺序变化会改变隐式"全部"池的 Sequential 采样顺序（DR-5），故唤醒
+/// 调度器失效重建采样器（与 `update_pool` 的 DR-23 唤醒一致）。
+#[tauri::command]
+pub fn reorder_wallpapers(
+    state: State<'_, AppState>,
+    ids: Vec<String>,
+) -> Result<(), mirrorstar_core::MirrorStarError> {
+    state.config_manager.reorder_wallpapers(ids)?;
+    state.scheduler.wake.notify_waiters();
+    Ok(())
+}
+
 #[tauri::command]
 pub async fn add_wallpaper(
     app: tauri::AppHandle,
@@ -533,9 +549,8 @@ pub async fn add_wallpaper(
     // 复用校验阶段已获取的 metadata，不再重复调用 tokio::fs::metadata。
     let file_size = metadata.len();
 
-    // B01: 收紧 asset scope（仅 $APPDATA/mirrorstar/**/* 可通过 asset:// 协议访问）后，
-    // 外部文件必须先复制到 data_dir 下 $APPDATA/mirrorstar/wallpapers/{id}/{filename}，
-    // 否则前端通过 convertFileSrc 加载时会因 scope 限制失败。
+    // 外部文件统一复制进托管库 $APPDATA/mirrorstar/wallpapers/{id}/{filename}，
+    // 使壁纸库自包含（源文件被移动 / 删除后已管理条目仍可用）。
     // 若源文件已在 data_dir 下（例如用户重新添加已管理的文件），跳过复制避免重复占用空间。
     let file_path = {
         let data_dir = ConfigManager::data_dir()?;
@@ -603,7 +618,7 @@ pub async fn add_wallpaper(
     // ST-014: 保存 JoinHandle 到全局 THUMBNAIL_TASK，shutdown 时 take + 5s 超时等待，
     // 避免 update_thumbnail 被截断导致 wallpaper entry 的 thumbnail 字段保持为空。
     // 详见 docs/05-优化文档/06-src-tauri应用层.md ST-014。
-    // 扩展为支持 Video 类型（通过 ffmpeg 抽帧），
+    // 扩展为支持 Video 类型（通过随包 mpv 抽帧），
     // 失败时 emit `wallpaper-thumbnail-failed` 事件通知前端展示降级占位图。
     if matches!(
         wallpaper_type,
@@ -632,18 +647,11 @@ pub async fn add_wallpaper(
                         )
                     }
                     mirrorstar_core::config::WallpaperType::Video => {
-                        if mirrorstar_core::config::is_ffmpeg_available() {
-                            mirrorstar_core::config::generate_video_thumbnail(
-                                &file_path_clone,
-                                &thumbnail_dir_clone,
-                            )
-                        } else {
-                            tracing::info!(
-                                path = %file_path_clone,
-                                "ffmpeg 不可用，跳过 Video 缩略图生成（预期降级）"
-                            );
-                            return; // 早期返回，不 emit 失败事件（属预期降级，非错误）
-                        }
+                        // 使用随包分发的 mpv（--vo=image 抽帧）生成视频首帧缩略图。
+                        mirrorstar_core::config::generate_video_thumbnail(
+                            &file_path_clone,
+                            &thumbnail_dir_clone,
+                        )
                     }
                     mirrorstar_core::config::WallpaperType::Web => {
                         unreachable!("Web 已在外层 matches! 过滤，不应进入缩略图生成块")
@@ -651,7 +659,7 @@ pub async fn add_wallpaper(
                 };
                 match result {
                     Ok(thumb_name) => {
-                        // Store the full absolute path so frontend can use convertFileSrc
+                        // 存储完整绝对路径，供原生 UI 与缩略图流水线按本地路径直接读取
                         let full_path = thumbnail_dir_clone.join(&thumb_name);
                         let full_path_str = full_path.to_string_lossy().to_string();
                         if let Err(e) =
@@ -822,6 +830,23 @@ pub async fn remove_wallpaper(
                     tracing::warn!(error = %e, path = %entry.thumbnail, "删除缩略图失败（配置已移除）");
                 }
             }
+            // 清理由 file_path 确定性推导的缩略图缓存（UI 按需生成的缓存不会写入配置字段，
+            // 仅凭 entry.thumbnail 无法清理，会留孤儿）。与 entry.thumbnail 相同时跳过，避免重复删除。
+            if let Some(cache_path) =
+                mirrorstar_core::config::thumbnail_cache_path(&entry.file_path)
+            {
+                let cache_path = cache_path.to_string_lossy().into_owned();
+                if cache_path != entry.thumbnail
+                    && validate_path_within_data_dir(&cache_path).await.is_ok()
+                {
+                    if let Err(e) = tokio::fs::remove_file(&cache_path).await {
+                        // NotFound 属预期（缓存可能本就不存在），不记日志避免噪声。
+                        if e.kind() != std::io::ErrorKind::NotFound {
+                            tracing::warn!(error = %e, path = %cache_path, "删除缩略图缓存失败（配置已移除）");
+                        }
+                    }
+                }
+            }
             // 删除 wallpapers/{id} 空目录（精确构造路径，勿从 file_path 推断父目录，
             // 因源文件可能原本就在 data_dir 内而非 uuid 子目录下）。
             // 仅删除空目录，非空（目录非空错误）或不存在（NotFound）时静默忽略。
@@ -842,6 +867,15 @@ pub async fn remove_wallpaper(
         tracing::warn!(error = %e, "emit wallpaper-removed 失败：前端 UI 可能不刷新");
     }
     Ok(())
+}
+
+/// 显示器 id → 调度单元 key（多屏排列布局域 DR-2）：`PerMonitor` 每屏一个单元
+/// （key = 显示器 id）；`AllSame` / `Span` 只有一个全局单元 [`ALL_UNIT_KEY`]（`"all"`）。
+fn unit_key_for_display(arrangement: Arrangement, display_id: &str) -> String {
+    match arrangement {
+        Arrangement::PerMonitor => display_id.to_string(),
+        Arrangement::AllSame | Arrangement::Span => ALL_UNIT_KEY.to_string(),
+    }
 }
 
 #[tauri::command]
@@ -866,14 +900,102 @@ pub async fn set_wallpaper(
     // SEC-001: 从 config 读取后重新校验路径，防配置篡改指向任意文件
     validate_wallpaper_file_path(&entry.file_path).await?;
 
-    let display = display_id.or(entry.display_id.clone()).unwrap_or_default();
+    // 特殊键 "all"：对全部活跃显示器逐个设置（广播语义，`all_same` / `span` 排列下
+    // UI 传 `"all"`）。目标取活跃显示器；无活跃显示器时回退到单一默认解析，
+    // 保持"首次在跨屏排列下设为壁纸"的既有行为（避免静默 no-op）。
+    // 逐个串行执行：每个显示器独立 acquire「设置中」guard，单个失败记录 warn 并继续，
+    // 最终返回首错（与 `set_scaling_mode_for_all` 的失败语义一致）。
+    if display_id.as_deref() == Some("all") {
+        let mut targets = {
+            let engine = state.wallpaper_engine.lock().await;
+            let mut ids = engine.active_display_ids();
+            if ids.is_empty() {
+                let fallback = engine.resolve_display_id(entry.display_id.clone());
+                if !fallback.is_empty() {
+                    ids.push(fallback);
+                }
+            }
+            ids
+        };
+        targets.sort();
+        targets.dedup();
+
+        // 编排在循环外读一次即可（Arrangement 为 Copy，循环内复用，避免反复取 config 锁）。
+        let arrangement = state.config_manager.get_config().arrangement;
+
+        let mut first_err: Option<mirrorstar_core::MirrorStarError> = None;
+        for target in targets {
+            match set_wallpaper_inner(&app, &state, &entry, target.clone(), scaling_mode).await {
+                Ok(()) => {
+                    // 手动设壁纸只经渲染引擎、不经过调度器采样；成功后回写单元状态，
+                    // 使后续「下一张」以用户实际看到的壁纸为锚点（DR-5 / DR-23）。
+                    state.scheduler.note_manual_set(
+                        &unit_key_for_display(arrangement, &target),
+                        &wallpaper_id,
+                    );
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        display_id = %target,
+                        error = %e,
+                        "广播设为壁纸对单个显示器失败，继续处理其余显示器"
+                    );
+                    if first_err.is_none() {
+                        first_err = Some(e);
+                    }
+                }
+            }
+        }
+        return match first_err {
+            Some(e) => Err(e),
+            None => Ok(()),
+        };
+    }
+
+    // 统一 display-id 解析（单一真相源）：命令参数优先、其次条目记录、否则回退活跃/主屏。
+    // 必须在 DisplaySettingGuard::acquire 之前完成，保证 guard 与后续流程使用同一真实键，
+    // 避免手动路径落在空串键上导致旧壁纸不关闭（fix-manual-wallpaper-display-id）。
+    // 缩放记忆的读取下沉到 `set_wallpaper_inner`（在该显示器对应的 engine 锁内读取）。
+    let display = {
+        let engine = state.wallpaper_engine.lock().await;
+        engine.resolve_display_id(display_id.or(entry.display_id.clone()))
+    };
+    match set_wallpaper_inner(&app, &state, &entry, display.clone(), scaling_mode).await {
+        Ok(()) => {
+            // 手动设壁纸只经渲染引擎、不经过调度器采样；成功后回写单元状态，
+            // 使后续「下一张」以用户实际看到的壁纸为锚点（DR-5 / DR-23）。
+            let arrangement = state.config_manager.get_config().arrangement;
+            state
+                .scheduler
+                .note_manual_set(&unit_key_for_display(arrangement, &display), &wallpaper_id);
+            Ok(())
+        }
+        Err(e) => Err(e),
+    }
+}
+
+/// `set_wallpaper` 的单显示器执行体：解析缩放记忆 + 获取「设置中」标志 + 三阶段应用。
+///
+/// 由 [`set_wallpaper`] 的单显示器路径与 `"all"` 广播路径共享，保证两条路径行为一致。
+async fn set_wallpaper_inner(
+    app: &tauri::AppHandle,
+    state: &State<'_, AppState>,
+    entry: &mirrorstar_core::config::WallpaperEntry,
+    display: String,
+    scaling_mode: Option<ScalingMode>,
+) -> Result<(), mirrorstar_core::MirrorStarError> {
+    // 显式传入优先；缺省时沿用该显示器已记忆的缩放模式（配置种子化 /
+    // 运行时 set_scaling_mode 写入），避免网格「设为壁纸」静默重置为默认 Fill。
+    // 仅当记忆也为空（scaling_mode_for 回退 default）时才落到 Fill。
+    let scaling_mode = {
+        let engine = state.wallpaper_engine.lock().await;
+        scaling_mode.unwrap_or_else(|| engine.scaling_mode_for(&display))
+    };
     // T15：获取 per-display "设置中" 标志，防止并发 set_wallpaper 同一 display 时
     // WorkerW 3 阶段流程竞态导致渲染器进程泄漏。guard 在函数返回时 Drop 自动移除标志。
     let _setting_guard = DisplaySettingGuard::acquire(display.clone())?;
     let source = WallpaperSource::File(entry.file_path.clone());
     let wp_type = entry.wallpaper_type;
-    // 优先使用命令参数；未提供时回退到默认值（配置暂无 scaling_mode 字段）
-    let scaling_mode = scaling_mode.unwrap_or_default();
 
     // 判断是否为原生壁纸模式
     let is_native = mirrorstar_core::wallpaper::manager::determine_wallpaper_mode(&source, wp_type)
@@ -1005,6 +1127,22 @@ pub async fn pause_wallpaper(
     // T03: 与 set_volume / set_speed 等命令统一使用 resolve_display_id，
     // display_id 为 None 或空串时回退到 first_active_display_id，
     // 确保前端传 None 时 pause 能正确定位到当前活跃壁纸所在的显示器。
+    //
+    // 特殊键 "all"：对全部活跃显示器逐个暂停（广播语义）。被忽略（无 pause_sender）
+    // 的显示器逐个 emit 状态兜底，语义与下方单显示器分支一致。
+    if display_id.as_deref() == Some("all") {
+        let ignored = {
+            let engine = state.wallpaper_engine.lock().await;
+            engine.broadcast_pause_fast()?
+        };
+        for display in ignored {
+            if let Err(e) = app.emit("wallpaper-state-changed", display) {
+                tracing::warn!(error = %e, "emit wallpaper-state-changed 失败：前端 UI 可能不刷新");
+            }
+        }
+        return Ok(());
+    }
+
     let (has_sender, display) = {
         let engine = state.wallpaper_engine.lock().await;
         let display = resolve_display_id(display_id, &engine);
@@ -1035,6 +1173,22 @@ pub async fn resume_wallpaper(
     //
     // T03: 与 pause_wallpaper 及其他快速路径命令统一使用 resolve_display_id，
     // display_id 为 None 或空串时回退到 first_active_display_id。
+    //
+    // 特殊键 "all"：对全部活跃显示器逐个恢复（广播语义）；被忽略（无 pause_sender）
+    // 的显示器逐个 emit 状态兜底，语义与下方单显示器分支一致。
+    if display_id.as_deref() == Some("all") {
+        let ignored = {
+            let engine = state.wallpaper_engine.lock().await;
+            engine.broadcast_resume_fast()?
+        };
+        for display in ignored {
+            if let Err(e) = app.emit("wallpaper-state-changed", display) {
+                tracing::warn!(error = %e, "emit wallpaper-state-changed 失败：前端 UI 可能不刷新");
+            }
+        }
+        return Ok(());
+    }
+
     let (has_sender, display) = {
         let engine = state.wallpaper_engine.lock().await;
         let display = resolve_display_id(display_id, &engine);
@@ -1061,6 +1215,10 @@ pub async fn set_volume(
     validate_volume(volume)?;
     // 获取 engine 锁后调用快速路径方法（原生壁纸无 sender 时返回 Ok）
     let engine = state.wallpaper_engine.lock().await;
+    // 特殊键 "all"：对全部活跃显示器逐个设置音量（广播语义）。
+    if display_id.as_deref() == Some("all") {
+        return engine.broadcast_set_volume_fast(volume);
+    }
     // FE-001: display_id 为 None 或空串时回退到第一个活跃壁纸的 display_id
     let display = resolve_display_id(display_id, &engine);
     engine.set_volume_fast(&display, volume)
@@ -1076,6 +1234,11 @@ pub async fn toggle_mute(
     //   Some(b) → 返回 b（新静音状态）
     //   None    → 返回 false（无活跃壁纸/sender，中性响应，保持前端兼容）
     let engine = state.wallpaper_engine.lock().await;
+    // 特殊键 "all"：对全部活跃显示器逐个切换静音（广播语义）。
+    if display_id.as_deref() == Some("all") {
+        let result = engine.broadcast_toggle_mute_fast()?;
+        return Ok(result.unwrap_or(false));
+    }
     // FE-001: display_id 为 None 或空串时回退到第一个活跃壁纸的 display_id
     let display = resolve_display_id(display_id, &engine);
     let result = engine.toggle_mute_fast(&display)?;
@@ -1101,6 +1264,13 @@ pub async fn set_scaling_mode(
     mode: ScalingMode,
 ) -> Result<(), mirrorstar_core::MirrorStarError> {
     let mut engine = state.wallpaper_engine.lock().await;
+
+    // 特殊键 "all"：对全部活跃显示器逐个应用缩放模式（广播语义）。
+    // 失败语义「记首错但继续」的选择理由见
+    // `WallpaperEngine::set_scaling_mode_for_all`。
+    if display_id.as_deref() == Some("all") {
+        return engine.set_scaling_mode_for_all(mode);
+    }
 
     // FE-001: display_id 为 None 或空串时回退到第一个活跃壁纸的 display_id
     let display = resolve_display_id(display_id, &engine);
@@ -1169,320 +1339,6 @@ pub fn parse_scaling_mode(mode: &str) -> Result<ScalingMode, mirrorstar_core::Mi
     }
 }
 
-/// `regenerate_thumbnails` 命令的返回结果
-///
-/// 用于批量重新生成缺失缩略图，
-/// `total` = 实际尝试处理数（排除 Web 类型与 ffmpeg 不可用时的 Video 类型），
-/// `success + failed == total`。
-#[derive(serde::Serialize)]
-pub struct RegenerateResult {
-    pub total: usize,
-    pub success: usize,
-    pub failed: usize,
-}
-
-/// `wallpaper-regenerate-progress` 事件 payload（ST-009）
-///
-/// 在 `regenerate_thumbnails` 循环中每完成一项 emit 一次，
-/// 供前端显示进度条。派生 `Clone` 是因为 Tauri v2 的 `Emitter::emit` 要求
-/// `S: Serialize + Clone`。
-#[derive(serde::Serialize, Clone)]
-struct RegenerateProgressPayload {
-    processed: usize,
-    success: usize,
-    failed: usize,
-    total: usize,
-}
-
-/// 批量重新生成缺失缩略图
-///
-/// 扫描壁纸库中 `thumbnail` 字段为空的条目，按类型分派生成缩略图：
-/// - Image/Gif → `generate_thumbnail`
-/// - Video → `generate_video_thumbnail`（ffmpeg 不可用时跳过）
-/// - Web → 跳过（无源文件）
-///
-/// 成功时 emit `wallpaper-updated`，失败时 emit `wallpaper-thumbnail-failed`。
-/// ST-009: 每完成一项 emit `wallpaper-regenerate-progress` 事件供前端显示进度条。
-/// 整个生成过程在 `spawn_blocking` 中同步执行，避免阻塞 tokio 异步运行时。
-///
-/// 批量处理流程与进度报告文档化
-///
-/// # 批量处理流程
-///
-/// ## 1. 收集待处理条目
-///
-/// - 读取 `config_manager.get_wallpapers()` 获取壁纸库
-/// - 过滤 `thumbnail.is_empty()` 的条目（仅处理缺失缩略图的）
-/// - 立即释放读锁（克隆后不再持有 config_manager 内部 RwLock）
-/// - 若无待处理条目，提前返回 `RegenerateResult { total: 0, success: 0, failed: 0 }`
-///
-/// ## 2. 准备资源
-///
-/// - 获取 `thumbnail_dir`：`ConfigManager::data_dir()?.join("thumbnails")`
-/// - 克隆 `config_manager` Arc 与 `app_handle` 供 spawn_blocking 闭包使用
-///
-/// ## 3. spawn_blocking 同步执行
-///
-/// 整个生成循环在 `tokio::task::spawn_blocking` 中同步执行：
-/// - **执行环境**：tokio blocking 线程池（不阻塞 async runtime）
-/// - **逐项处理**：遍历 `wallpapers` Vec，按 `wallpaper_type` 分派：
-///   - `Image` / `Gif` → `generate_thumbnail(&file_path, &thumbnail_dir)`
-///   - `Video` → 检查 `is_ffmpeg_available()`，可用时 `generate_video_thumbnail`，
-///     不可用时 `continue` 跳过（不计 success 也不计 failed，预期降级）
-///   - `Web` → `continue` 跳过（无源文件）
-/// - **结果处理**：
-///   - 成功：`config_manager.update_thumbnail(...)` 持久化路径 +
-///     emit `wallpaper-updated` 通知前端刷新 + `success += 1`
-///   - 失败：emit `wallpaper-thumbnail-failed`（含 error 信息）+ `failed += 1`
-///   - `update_thumbnail` 失败：计为 `failed`（缩略图已生成但未持久化路径）
-///
-/// ## 4. 返回结果
-///
-/// - `total = success + failed`（不含 Web 与 ffmpeg 不可用的 Video，这些通过 continue 跳过）
-/// - 保证 `total == success + failed`（前端可据此显示进度）
-///
-/// # 进度报告（事件驱动）
-///
-/// ## `wallpaper-regenerate-progress` 事件（ST-009）
-///
-/// 每完成一项（无论成功/失败）emit 一次，payload 为 `RegenerateProgressPayload`：
-///
-/// ```json
-/// {
-///   "processed": 3,      // 已处理数（success + failed）
-///   "success": 2,        // 成功数
-///   "failed": 1,         // 失败数
-///   "total": 10          // 总待处理数（wallpapers.len()）
-/// }
-/// ```
-///
-/// - **前端使用**：根据 `processed / total` 计算百分比显示进度条，
-///   根据 `success / failed` 显示成功/失败计数
-/// - **emit 频率**：每项一次（非节流），通常每项处理 100ms-2s，
-///   emit 开销可忽略（前端事件处理 <1ms）
-/// - **emit 失败处理**：仅记录 warn 日志，不影响后续处理
-///
-/// ## `wallpaper-updated` 事件
-///
-/// 每个缩略图成功生成后 emit，前端据此刷新对应壁纸条目的预览图
-///
-/// ## `wallpaper-thumbnail-failed` 事件
-///
-/// 每个缩略图生成失败时 emit，payload 含 `file_path` 与 `error`，
-/// 前端可据此展示降级占位图或错误提示
-///
-/// # 并发与性能
-///
-/// - **串行处理**：当前实现为串行（for 循环逐项处理），不并行
-///   - 理由：缩略图生成是 CPU/IO 密集型，并行会争抢 CPU 与磁盘 IO，
-///     实际总耗时可能更长（且增加内存峰值）
-///   - 如需并行：可用 `rayon::par_iter` 替换 for 循环，但需评估 ffmpeg
-///     并发调用的稳定性
-/// - **典型耗时**：
-///   - Image/Gif：~50-100ms/项
-///   - Video：~500ms-2s/项（取决于视频长度与 ffmpeg 启动开销）
-///   - 100 项库的批量重生成：~10-60s（视壁纸类型分布）
-/// - **内存占用**：单次仅持有一项的缩略图数据，无内存峰值
-#[tauri::command]
-pub async fn regenerate_thumbnails(
-    app: tauri::AppHandle,
-    state: State<'_, AppState>,
-) -> Result<RegenerateResult, mirrorstar_core::MirrorStarError> {
-    use mirrorstar_core::config::WallpaperType;
-
-    // 收集 thumbnail 为空的条目（克隆后立即释放读锁）
-    let wallpapers: Vec<_> = state
-        .config_manager
-        .get_wallpapers()
-        .into_iter()
-        .filter(|w| w.thumbnail.is_empty())
-        .collect();
-
-    if wallpapers.is_empty() {
-        return Ok(RegenerateResult {
-            total: 0,
-            success: 0,
-            failed: 0,
-        });
-    }
-
-    let thumbnail_dir = ConfigManager::data_dir()?.join("thumbnails");
-    let config_manager = state.config_manager.clone();
-    let app_clone = app.clone();
-
-    let (success, failed) = tokio::task::spawn_blocking(move || -> (usize, usize) {
-        let mut success = 0usize;
-        let mut failed = 0usize;
-        // emit 进度事件节流，避免 100 项库产生 100 次 IPC emit。
-        // 触发条件：每完成 5 项 或 距上次 emit >= 200ms，循环结束后再 emit 一次
-        // 确保 100% 进度送达前端（详见循环末尾）。
-        const EMIT_BATCH_SIZE: usize = 5;
-        const EMIT_INTERVAL_MS: u128 = 200;
-        let mut last_emit_at = std::time::Instant::now();
-        let mut last_emit_processed: usize = 0;
-        let total = wallpapers.len();
-        // 循环内仅生成缩略图文件并收集 (file_path, thumbnail_path)，
-        // 循环结束后调用 batch_update_thumbnails 单次落盘，避免 N 次 save_library。
-        let mut updates: Vec<(String, String)> = Vec::with_capacity(wallpapers.len());
-        for wp in &wallpapers {
-            let result = match wp.wallpaper_type {
-                WallpaperType::Image | WallpaperType::Gif => {
-                    mirrorstar_core::config::generate_thumbnail(&wp.file_path, &thumbnail_dir)
-                }
-                WallpaperType::Video => {
-                    if mirrorstar_core::config::is_ffmpeg_available() {
-                        mirrorstar_core::config::generate_video_thumbnail(
-                            &wp.file_path,
-                            &thumbnail_dir,
-                        )
-                    } else {
-                        tracing::info!(
-                            path = %wp.file_path,
-                            "ffmpeg 不可用，跳过 Video 缩略图重生成"
-                        );
-                        continue; // 不计 success 也不计 failed（预期降级）
-                    }
-                }
-                WallpaperType::Web => continue, // Web 无源文件，跳过
-            };
-            match result {
-                Ok(thumb_name) => {
-                    let full_path = thumbnail_dir.join(&thumb_name);
-                    let full_path_str = full_path.to_string_lossy().to_string();
-                    // 收集更新，循环结束后批量持久化
-                    updates.push((wp.file_path.clone(), full_path_str));
-                    success += 1;
-                }
-                Err(e) => {
-                    tracing::warn!(error = %e, path = %wp.file_path, "缩略图重生成失败");
-                    // 失败日志打印源文件“头 8 字节 hex”，用于定位 os error 123 这类 IO 错误
-                    log_file_header(&wp.file_path);
-                    // 按失败类型分派（孤儿壁纸条目兜底），语义与 add_wallpaper 一致：
-                    // - SourceMissing：源文件缺失（孤儿条目），warn 日志 + wallpaper-source-missing，
-                    //   **不** emit wallpaper-thumbnail-failed；不计 success（不写回缩略图），计入 failed。
-                    // - DecodeFallback：内容损坏/格式非法（源文件存在），回退源路径作缩略图进 updates。
-                    // - Unrecoverable：其它不可恢复错误，emit 失败弹窗。
-                    match classify_thumbnail_failure(&e, wp.wallpaper_type, &wp.file_path) {
-                        ThumbnailFailureKind::SourceMissing => {
-                            tracing::warn!(
-                                path = %wp.file_path,
-                                "孤儿壁纸条目：源文件缺失，跳过失败弹窗并保留条目（等待用户处理）"
-                            );
-                            if let Err(emit_err) = app_clone.emit(
-                                "wallpaper-source-missing",
-                                SourceMissingPayload {
-                                    id: &wp.id,
-                                    file_path: &wp.file_path,
-                                },
-                            ) {
-                                tracing::warn!(error = %emit_err, "emit wallpaper-source-missing 失败");
-                            }
-                            failed += 1;
-                        }
-                        ThumbnailFailureKind::DecodeFallback => {
-                            // 回退：以源文件路径作为缩略图，收集进 updates 随循环后批量落盘
-                            updates.push((wp.file_path.clone(), wp.file_path.clone()));
-                            success += 1;
-                        }
-                        ThumbnailFailureKind::Unrecoverable => {
-                            if let Err(emit_err) = app_clone.emit(
-                                "wallpaper-thumbnail-failed",
-                                ThumbnailFailedPayload {
-                                    file_path: &wp.file_path,
-                                    error: e.to_string(),
-                                },
-                            ) {
-                                tracing::warn!(error = %emit_err, "emit wallpaper-thumbnail-failed 失败");
-                            }
-                            failed += 1;
-                        }
-                    }
-                }
-            }
-            // ST-009: emit 进度事件供前端显示进度条
-            // 节流策略——每 EMIT_BATCH_SIZE 项或 EMIT_INTERVAL_MS
-            // 间隔 emit 一次，避免 100 项库产生 100 次 IPC emit（每次 0.1-0.5ms）。
-            // 循环结束后再 emit 一次确保 100% 进度送达前端。
-            let processed = success + failed;
-            let now = std::time::Instant::now();
-            let elapsed_ms = now.duration_since(last_emit_at).as_millis();
-            let batch_delta = processed.saturating_sub(last_emit_processed);
-            if batch_delta >= EMIT_BATCH_SIZE || elapsed_ms >= EMIT_INTERVAL_MS {
-                if let Err(e) = app_clone.emit(
-                    "wallpaper-regenerate-progress",
-                    RegenerateProgressPayload {
-                        processed,
-                        success,
-                        failed,
-                        total,
-                    },
-                ) {
-                    tracing::warn!(error = %e, "emit wallpaper-regenerate-progress 失败");
-                }
-                last_emit_at = now;
-                last_emit_processed = processed;
-            }
-        }
-
-        // 循环结束后 emit 最终一次，确保 100% 进度送达前端
-        // （节流策略可能使最后一次迭代未触发 emit，此处兜底）。
-        if let Err(e) = app_clone.emit(
-            "wallpaper-regenerate-progress",
-            RegenerateProgressPayload {
-                processed: success + failed,
-                success,
-                failed,
-                total,
-            },
-        ) {
-            tracing::warn!(error = %e, "emit wallpaper-regenerate-progress（最终）失败");
-        }
-
-        // 批量更新缩略图路径，仅取一次写锁 + 一次 save_library，
-        // 避免 N 次独立 update_thumbnail 产生的 O(N) fsync + 序列化开销。
-        match config_manager.batch_update_thumbnails(&updates) {
-            Ok(updated) => {
-                tracing::info!(
-                    updated,
-                    total = updates.len(),
-                    "regenerate_thumbnails 批量更新完成"
-                );
-                // 批量持久化完成后再 emit wallpaper-updated，确保前端读取到已更新的
-                // 缩略图路径（若在循环内 emit，配置尚未落盘，前端会读到空路径）。
-                // emit 完整 entry 供前端增量更新（替代原空 payload），
-                // 前端据此定向更新单张卡片缩略图，避免全量刷新。
-                let updated_file_paths: HashSet<&str> =
-                    updates.iter().map(|(fp, _)| fp.as_str()).collect();
-                for w in config_manager.get_wallpapers() {
-                    if updated_file_paths.contains(w.file_path.as_str()) {
-                        if let Err(e) = app_clone.emit("wallpaper-updated", w) {
-                            tracing::warn!(error = %e, "emit wallpaper-updated 失败");
-                        }
-                    }
-                }
-            }
-            Err(e) => {
-                tracing::warn!(error = %e, "批量更新缩略图路径失败");
-                // 批量持久化失败：已生成的缩略图无法写回配置，计入 failed
-                failed += success;
-                success = 0;
-            }
-        }
-        (success, failed)
-    })
-    .await
-    .map_err(|e| mirrorstar_core::MirrorStarError::TaskJoin(format!("任务 join 失败: {}", e)))?;
-
-    // total = 实际尝试处理数（Web 与 ffmpeg 不可用的 Video 通过 continue 跳过，
-    // 不计入 total），保证 total == success + failed
-    let total = success + failed;
-    Ok(RegenerateResult {
-        total,
-        success,
-        failed,
-    })
-}
-
 /// v16-C-002：将文件操作 `io::Error` 映射为可操作性更强的 `MirrorStarError`。
 ///
 /// 原实现直接 `format!("{}失败: {}", context, e)` 会拼接英文 OS 错误
@@ -1524,6 +1380,35 @@ fn map_io_error(context: &str, e: std::io::Error) -> mirrorstar_core::MirrorStar
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── unit_key_for_display（显示器 id → 调度单元 key，DR-2 多屏排列布局域）──────
+
+    #[test]
+    fn unit_key_per_monitor_returns_display_id() {
+        // PerMonitor：每屏一个单元，key 即显示器 id。
+        assert_eq!(
+            unit_key_for_display(Arrangement::PerMonitor, "DISPLAY1"),
+            "DISPLAY1".to_string()
+        );
+    }
+
+    #[test]
+    fn unit_key_all_same_returns_global_key() {
+        // AllSame：唯一全局单元 all，忽略显示器 id。
+        assert_eq!(
+            unit_key_for_display(Arrangement::AllSame, "DISPLAY1"),
+            ALL_UNIT_KEY.to_string()
+        );
+    }
+
+    #[test]
+    fn unit_key_span_returns_global_key() {
+        // Span：唯一全局单元 all，忽略显示器 id。
+        assert_eq!(
+            unit_key_for_display(Arrangement::Span, "DISPLAY2"),
+            ALL_UNIT_KEY.to_string()
+        );
+    }
 
     // ── validate_wallpaper_file_path 单元测试（ST-007：非 #[ignore]，CI 可执行） ──
     //
@@ -2000,10 +1885,7 @@ mod tests {
         assert_eq!(parse_scaling_mode("fit").unwrap(), ScalingMode::Fit);
         assert_eq!(parse_scaling_mode("stretch").unwrap(), ScalingMode::Stretch);
         assert_eq!(parse_scaling_mode("center").unwrap(), ScalingMode::Center);
-        assert_eq!(
-            parse_scaling_mode("tile").unwrap(),
-            ScalingMode::Tile
-        );
+        assert_eq!(parse_scaling_mode("tile").unwrap(), ScalingMode::Tile);
     }
 
     #[test]

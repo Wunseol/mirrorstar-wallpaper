@@ -21,7 +21,7 @@ use std::time::{Duration, Instant};
 use fs2::FileExt;
 use serde::{Deserialize, Serialize};
 
-use crate::config::settings::AppConfig;
+use crate::config::settings::{AppConfig, Arrangement};
 use crate::wallpaper::WallpaperType;
 use crate::MirrorStarError;
 
@@ -211,9 +211,6 @@ pub struct DisplayInfo {
     pub is_primary: bool,
     /// DPI（每英寸像素数，默认 96）
     pub dpi: u32,
-    /// 当前壁纸路径（如有）
-    #[serde(default)]
-    pub current_wallpaper: Option<String>,
 }
 
 // ════════════════════════════════════════════════════════════════════════════
@@ -450,8 +447,13 @@ impl ConfigManager {
     /// 到合法范围，不破坏调用方契约（仍返回 `Ok(())`）。
     pub fn update_config(&self, mut config: AppConfig) -> Result<(), MirrorStarError> {
         config.validate();
-        // 多屏排列迁移：兼容旧版 [rotation] arrangement（顶层已显式设置时优先）。
-        config.migrate_legacy_arrangement();
+        // 多屏排列迁移：update_config 接收的是完整 AppConfig（顶层 arrangement 为该
+        // 配置的权威取值，视为"显式设置"），因此传入 explicit = true，不让可能残留的
+        // 旧键 [rotation] arrangement 覆盖调用方给定值；legacy 键无论如何都会被清除。
+        config.migrate_legacy_arrangement(true);
+        // 应用自身写回视为「已迁移世界」：标记置位后，写路径不得再改写用户的
+        // 切换顺序选择（含手动选回的「随机（不重复）」）。
+        config.rotation.order_default_migrated = true;
         {
             let mut cfg = self.config.write().unwrap_or_else(|e| e.into_inner());
             *cfg = config;
@@ -587,13 +589,8 @@ impl ConfigManager {
     pub fn create_pool(
         &self,
         name: Option<String>,
-        mut member_ids: Vec<String>,
+        member_ids: Vec<String>,
     ) -> Result<Pool, MirrorStarError> {
-        // 成员去重（DR-24，保留首次出现顺序）
-        {
-            let mut seen = std::collections::HashSet::with_capacity(member_ids.len());
-            member_ids.retain(|m| seen.insert(m.clone()));
-        }
         let next_num = {
             let lib = self
                 .wallpaper_library
@@ -601,11 +598,12 @@ impl ConfigManager {
                 .unwrap_or_else(|e| e.into_inner());
             lib.pools.len() + 1
         };
-        let pool = Pool {
+        let mut pool = Pool {
             id: uuid::Uuid::new_v4().to_string(),
             name: name.unwrap_or_else(|| format!("池 {}", next_num)),
             member_ids,
         };
+        pool.validate();
         {
             let mut lib = self
                 .wallpaper_library
@@ -626,7 +624,7 @@ impl ConfigManager {
         &self,
         id: &str,
         name: Option<&str>,
-        mut member_ids: Option<Vec<String>>,
+        member_ids: Option<Vec<String>>,
     ) -> Result<Option<Pool>, MirrorStarError> {
         let updated = {
             let mut lib = self
@@ -640,10 +638,9 @@ impl ConfigManager {
             if let Some(n) = name {
                 pool.name = n.to_string();
             }
-            if let Some(ids) = member_ids.take() {
-                let mut seen = std::collections::HashSet::with_capacity(ids.len());
+            if let Some(ids) = member_ids {
                 pool.member_ids = ids;
-                pool.member_ids.retain(|m| seen.insert(m.clone()));
+                pool.validate();
             }
             Some(pool.clone())
         };
@@ -675,6 +672,45 @@ impl ConfigManager {
         Ok(removed)
     }
 
+    /// 按新顺序重排池列表并落盘。`ids` 必须是当前池 id 集合的完全重排
+    ///（集合相等校验），否则返回错误且不落盘。
+    ///
+    /// 校验通过后持写锁按 `ids` 顺序重建 `pools`（保留元素本体，仅重排），
+    /// 再 `mark_library_dirty` + 立即落盘（与 `update_pool` 写路径一致）。
+    /// 当前池集合为空时，空 `ids` 视为合法（直接成功），非空 `ids` 报错。
+    pub fn reorder_pools(&self, ids: Vec<String>) -> Result<(), MirrorStarError> {
+        {
+            let mut lib = self
+                .wallpaper_library
+                .write()
+                .unwrap_or_else(|e| e.into_inner());
+            let current_ids: Vec<String> = lib.pools.iter().map(|p| p.id.clone()).collect();
+            if !is_complete_permutation(&ids, &current_ids) {
+                return Err(MirrorStarError::InvalidArgument {
+                    reason: format!(
+                        "重排池失败：ids 必须是当前池 id 集合的完全重排（当前 {} 个，收到 {} 个）",
+                        current_ids.len(),
+                        ids.len()
+                    ),
+                });
+            }
+            // 按 ids 顺序重建（position + remove 移动元素本体，兼容重复 id）
+            let mut reordered = Vec::with_capacity(ids.len());
+            for id in &ids {
+                let pos = lib
+                    .pools
+                    .iter()
+                    .position(|p| &p.id == id)
+                    .expect("集合校验通过后 id 必然存在");
+                reordered.push(lib.pools.remove(pos));
+            }
+            lib.pools = reordered;
+        }
+        self.mark_library_dirty();
+        self.save_library()?;
+        Ok(())
+    }
+
     // ── 壁纸库写路径 ────────────────────────────────────────────────────────
 
     /// 添加壁纸条目
@@ -682,7 +718,7 @@ impl ConfigManager {
     /// 不校验 ID 唯一性（允许重复 ID），追加到列表末尾后标记 dirty。
     /// v5.0 C-PERF-002: 不再立即落盘，由调用方（Tauri 命令）显式 [`flush_library`](Self::flush_library)
     /// 或周期保存线程兜底。v5.0 C-PERF-003: 在此计算 `normalized_path` 派生字段，
-    /// 供 `update_thumbnail` / `batch_update_thumbnails` 快速查找。
+    /// 供 `update_thumbnail` 快速查找。
     pub fn add_wallpaper(&self, mut entry: WallpaperEntry) -> Result<(), MirrorStarError> {
         // v5.0 C-PERF-003: 计算规范化路径派生字段，供 update_thumbnail 等快速查找
         entry.normalized_path = normalize_path(&entry.file_path);
@@ -731,6 +767,45 @@ impl ConfigManager {
         Ok(removed)
     }
 
+    /// 按新顺序重排壁纸库列表并落盘。`ids` 必须是当前壁纸 id 集合的完全重排
+    ///（集合相等校验），否则返回错误且不落盘。
+    ///
+    /// 校验通过后持写锁按 `ids` 顺序重建 `wallpapers`（保留元素本体，仅重排），
+    /// 再 `mark_library_dirty` + 立即落盘（与 `reorder_pools` 一致）。
+    /// 当前壁纸集合为空时，空 `ids` 视为合法（直接成功），非空 `ids` 报错。
+    pub fn reorder_wallpapers(&self, ids: Vec<String>) -> Result<(), MirrorStarError> {
+        {
+            let mut lib = self
+                .wallpaper_library
+                .write()
+                .unwrap_or_else(|e| e.into_inner());
+            let current_ids: Vec<String> = lib.wallpapers.iter().map(|w| w.id.clone()).collect();
+            if !is_complete_permutation(&ids, &current_ids) {
+                return Err(MirrorStarError::InvalidArgument {
+                    reason: format!(
+                        "重排壁纸失败：ids 必须是当前壁纸 id 集合的完全重排（当前 {} 个，收到 {} 个）",
+                        current_ids.len(),
+                        ids.len()
+                    ),
+                });
+            }
+            // 按 ids 顺序重建（position + remove 移动元素本体，兼容重复 id）
+            let mut reordered = Vec::with_capacity(ids.len());
+            for id in &ids {
+                let pos = lib
+                    .wallpapers
+                    .iter()
+                    .position(|w| &w.id == id)
+                    .expect("集合校验通过后 id 必然存在");
+                reordered.push(lib.wallpapers.remove(pos));
+            }
+            lib.wallpapers = reordered;
+        }
+        self.mark_library_dirty();
+        self.save_library()?;
+        Ok(())
+    }
+
     /// 更新指定文件路径的壁纸缩略图
     ///
     /// 由 `add_wallpaper` 命令在后台生成缩略图后调用。未找到匹配条目时为 no-op。
@@ -766,59 +841,6 @@ impl ConfigManager {
             self.save_library()?;
         }
         Ok(())
-    }
-
-    /// v5.0 A-PERF-003: 批量更新缩略图路径，仅取一次写锁 + 一次 save_library。
-    ///
-    /// 用于 `regenerate_thumbnails` 等批量场景，避免 N 次独立 `update_thumbnail`
-    /// 产生的 O(N) fsync + O(N²) 序列化开销（100 个壁纸在 HDD 上可省 0.5-5s 纯磁盘等待）。
-    ///
-    /// 路径匹配沿用 `update_thumbnail` 的规范化策略（lowercase + 分隔符统一），
-    /// 未找到匹配条目时跳过（不计入返回值）。仅当至少一个条目被更新时才落盘。
-    ///
-    /// # 参数
-    /// - `updates: &[(file_path, thumbnail_path)]`：待更新的 (壁纸文件路径, 缩略图路径) 列表
-    ///
-    /// # 返回
-    /// 成功更新的条目数（未找到的 `file_path` 被跳过）。落盘失败时返回 `Err`。
-    pub fn batch_update_thumbnails(
-        &self,
-        updates: &[(String, String)],
-    ) -> Result<usize, MirrorStarError> {
-        if updates.is_empty() {
-            return Ok(0);
-        }
-        // 全程持有 library_save_mutex，串行化 wallpapers.toml 落盘（与 save_library 一致）
-        let _save_guard = self
-            .library_save_mutex
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        let mut updated_count = 0usize;
-        {
-            let mut lib = self
-                .wallpaper_library
-                .write()
-                .unwrap_or_else(|e| e.into_inner());
-            for (file_path, thumbnail_path) in updates {
-                let normalized = normalize_path(file_path);
-                // v5.0 C-PERF-003: 直接比较 normalized_path 派生字段，
-                // 消除迭代内每次 normalize_path 的堆分配
-                let found = lib
-                    .wallpapers
-                    .iter_mut()
-                    .find(|w| w.normalized_path == normalized);
-                if let Some(entry) = found {
-                    entry.thumbnail = thumbnail_path.clone();
-                    updated_count += 1;
-                }
-            }
-        }
-        if updated_count > 0 {
-            // 复用 save_library 的序列化 + 落盘逻辑；已持有 library_save_mutex，调用内部版本
-            // 避免锁重入（std::sync::Mutex 不可重入，再次获取会死锁）
-            self.save_library_locked()?;
-        }
-        Ok(updated_count)
     }
 
     /// 清理 thumbnails 目录下的 0 字节损坏缩略图文件
@@ -1058,15 +1080,14 @@ impl ConfigManager {
             .library_save_mutex
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        // v5.0 A-PERF-003: 锁获取与落盘逻辑分离，供 batch_update_thumbnails 复用，
-        // 避免其持锁后再次获取 library_save_mutex 导致死锁（Mutex 不可重入）。
+        // v5.0 A-PERF-003: 锁获取与落盘逻辑分离，避免持锁期间执行落盘逻辑时
+        // 再次获取 library_save_mutex 导致死锁（Mutex 不可重入）。
         self.save_library_locked()
     }
 
     /// `save_library` 的内部实现，假设调用方已持有 `library_save_mutex`。
     ///
-    /// 仅供 `save_library` 与 `batch_update_thumbnails` 在持锁后调用，
-    /// 其他写路径应直接调用 `save_library`。
+    /// 仅供 `save_library` 在持锁后调用，其他写路径应直接调用 `save_library`。
     ///
     /// 注：config 路径不需要 `_locked` 版本，因 `flush` / `maybe_save_config` 直接
     /// 持有 `config_save_mutex` 后调用 `save_config_to_file`，无内部辅助函数需求。
@@ -1109,13 +1130,14 @@ impl ConfigManager {
 
     /// 从文件加载应用配置
     ///
-    /// 文件不存在或解析失败时回退到默认配置，避免应用因配置损坏无法启动。
+    /// 文件不存在时回退到默认配置；解析失败时不再整份回退默认，而是 best-effort
+    /// 分区恢复（见 [`recover_config_from_value`]）——能解析的分区用解析值，解析失败
+    /// 的分区用该分区默认值并 warn。仅当整份 TOML 结构本身非法时才回退整份默认配置。
     /// SEC-003：文件大小超过 1MB 上限时返回错误，防止 OOM 攻击。
     ///
-    /// C01 修复：返回值改为 `(AppConfig, Option<ConfigLoadError>)`。解析失败时
-    /// 仍回退到默认配置（保证应用可启动），但同时返回 [`ConfigLoadError`] 以便
-    /// 调用方通过回调通知前端展示告警，避免用户无感知地丢失配置。文件不存在
-    /// 时返回 `(default, None)`（非错误场景，无需告警）。
+    /// C01 修复：返回值改为 `(AppConfig, Option<ConfigLoadError>)`。分区恢复或整份
+    /// 回退时若已丢失配置，返回 [`ConfigLoadError`] 以便调用方通过回调通知前端展示
+    /// 告警；文件不存在时返回 `(default, None)`（非错误场景，无需告警）。
     pub(crate) fn load_config(
         path: &Path,
     ) -> Result<(AppConfig, Option<ConfigLoadError>), MirrorStarError> {
@@ -1126,25 +1148,56 @@ impl ConfigManager {
             Some(c) => c,
         };
 
+        // 判定顶层 `arrangement` 键是否显式出现在配置文本中：显式出现即视为用户意图
+        //（即使其值恰好等于默认 per_monitor），迁移时不被旧键 [rotation] arrangement 覆盖。
+        let explicit_arrangement = match toml::from_str::<toml::Value>(&content) {
+            Ok(doc) => doc.get("arrangement").is_some(),
+            // 文本结构非法时无从判定，交由后续恢复逻辑处理
+            Err(_) => false,
+        };
+
         match toml::from_str::<AppConfig>(&content) {
             Ok(mut config) => {
                 // C02 修复：反序列化后调用 validate()，将越界值 clamp 到合法范围
                 config.validate();
                 // 多屏排列迁移：旧版 [rotation] arrangement 提升为顶层（BREAKING 兼容）
-                config.migrate_legacy_arrangement();
+                config.migrate_legacy_arrangement(explicit_arrangement);
+                // 默认切换顺序一次性迁移：旧版持久化的 shuffle_bag → sequential
+                config.migrate_order_default();
                 Ok((config, None))
             }
             Err(e) => {
-                let msg = format!("{}", e);
-                tracing::warn!(error = %e, path = %path.display(), "配置文件解析失败，使用默认配置");
-                Ok((
-                    AppConfig::default(),
-                    Some(ConfigLoadError {
-                        path: path.to_path_buf(),
-                        kind: ConfigKind::Config,
-                        message: msg,
-                    }),
-                ))
+                tracing::warn!(
+                    error = %e,
+                    path = %path.display(),
+                    "配置文件整体解析失败，尝试按分区恢复"
+                );
+                match recover_config_from_value(&content) {
+                    Some(mut config) => {
+                        // 分区恢复成功：保留可解析分区、仅丢弃脏分区，不视为加载失败；
+                        // 原始错误已由上面的 warn 记录（不丢失原因）。
+                        config.validate();
+                        config.migrate_legacy_arrangement(explicit_arrangement);
+                        // 默认切换顺序一次性迁移（分区恢复分支同样处理）
+                        config.migrate_order_default();
+                        Ok((config, None))
+                    }
+                    None => {
+                        // 整份 TOML 结构本身非法 → 回退默认并返回加载错误
+                        tracing::warn!(
+                            path = %path.display(),
+                            "配置文件结构非法，无法按分区恢复，回退整份默认配置"
+                        );
+                        Ok((
+                            AppConfig::default(),
+                            Some(ConfigLoadError {
+                                path: path.to_path_buf(),
+                                kind: ConfigKind::Config,
+                                message: format!("{}", e),
+                            }),
+                        ))
+                    }
+                }
             }
         }
     }
@@ -1170,7 +1223,7 @@ impl ConfigManager {
         match toml::from_str::<WallpaperLibrary>(&content) {
             Ok(mut lib) => {
                 // v5.0 C-PERF-003: 加载后计算 normalized_path 派生字段，
-                // 供 update_thumbnail / batch_update_thumbnails 快速查找。
+                // 供 update_thumbnail 快速查找。
                 // #[serde(skip)] 反序列化时用 Default::default() 填充为空字符串，此处覆盖。
                 for entry in lib.wallpapers.iter_mut() {
                     entry.normalized_path = normalize_path(&entry.file_path);
@@ -1222,6 +1275,18 @@ impl Drop for ConfigManager {
         // `stop_watching` 定义在 hot_reload.rs，幂等可多次调用。
         self.stop_watching();
     }
+}
+
+/// 校验 `ids` 是否为 `current` 的完全重排（`reorder_pools` / `reorder_wallpapers` 共用）。
+///
+/// 判定规则：长度必须一致，且 `ids` 恰好覆盖 `current` 的 id 集合（集合相等，
+/// 顺序不同算合法重排）。长度不同、缺失、多余均判定为非法。
+fn is_complete_permutation(ids: &[String], current: &[String]) -> bool {
+    if ids.len() != current.len() {
+        return false;
+    }
+    let current_set: std::collections::HashSet<&str> = current.iter().map(|s| s.as_str()).collect();
+    ids.iter().all(|id| current_set.contains(id.as_str()))
 }
 
 // ════════════════════════════════════════════════════════════════════════════
@@ -1296,6 +1361,68 @@ pub(crate) fn save_with_dirty_rollback(
     Ok(())
 }
 
+/// best-effort 分区恢复：从（整体反序列化失败的）TOML 文本中逐段解析配置。
+///
+/// 用于 [`ConfigManager::load_config`] 的解析失败分支：整份 `AppConfig` 反序列化
+/// 失败时，改用 `toml::Value` 逐段解析——顶层 `arrangement` 标量 +
+/// `general` / `audio` / `pause` / `video` / `gif` / `rotation` / `scaling` 各表；
+/// 能解析的分区用解析值，解析失败的分区保留默认值，并 `tracing::warn!` 记录被回退
+/// 的分区。仅当整份 TOML 结构本身非法（无法解析为 `toml::Value` 或非表结构）时返回
+/// `None`，由调用方回退整份默认配置。
+fn recover_config_from_value(content: &str) -> Option<AppConfig> {
+    let doc = toml::from_str::<toml::Value>(content).ok()?;
+    let table = doc.as_table()?;
+
+    let mut config = AppConfig::default();
+    let mut failed: Vec<&'static str> = Vec::new();
+
+    // 顶层 arrangement 标量
+    if let Some(value) = table.get("arrangement") {
+        match value.clone().try_into::<Arrangement>() {
+            Ok(arrangement) => config.arrangement = arrangement,
+            Err(e) => {
+                tracing::warn!(error = %e, "配置分区恢复：顶层 arrangement 解析失败，回退默认");
+                failed.push("arrangement");
+            }
+        }
+    }
+
+    recover_section(table, "general", &mut config.general, &mut failed);
+    recover_section(table, "audio", &mut config.audio, &mut failed);
+    recover_section(table, "pause", &mut config.pause, &mut failed);
+    recover_section(table, "video", &mut config.video, &mut failed);
+    recover_section(table, "gif", &mut config.gif, &mut failed);
+    recover_section(table, "rotation", &mut config.rotation, &mut failed);
+    recover_section(table, "scaling", &mut config.scaling, &mut failed);
+
+    if !failed.is_empty() {
+        tracing::warn!(sections = ?failed, "配置分区恢复：以上分区解析失败已回退默认值");
+    }
+    Some(config)
+}
+
+/// [`recover_config_from_value`] 的分区解析辅助：解析 `table[key]` 到 `target`，
+/// 失败时保留 `target` 默认值并把分区名记入 `failed`。
+fn recover_section<T>(
+    table: &toml::Table,
+    key: &'static str,
+    target: &mut T,
+    failed: &mut Vec<&'static str>,
+) where
+    T: serde::de::DeserializeOwned,
+{
+    let Some(value) = table.get(key) else {
+        return;
+    };
+    match value.clone().try_into::<T>() {
+        Ok(parsed) => *target = parsed,
+        Err(e) => {
+            tracing::warn!(section = key, error = %e, "配置分区恢复：分区解析失败，回退该分区默认值");
+            failed.push(key);
+        }
+    }
+}
+
 /// 读取文件内容为 UTF-8 字符串，带大小上限（SEC-003 / C08：消除 TOCTOU 窗口）
 ///
 /// `load_config` 与 `load_library` 共用的有界读取辅助。原实现先用 `metadata()`
@@ -1352,8 +1479,10 @@ fn read_bounded_utf8_file(path: &Path, max_size: u64) -> Result<Option<String>, 
 ///   在 rename 前显式 sync_all 确保数据刷盘，避免异常退出时缓冲区未刷盘丢数据。
 /// - v41-C-001：写入失败时显式清理可能的部分写入 `.tmp` 文件。
 /// - C07：rename 失败时清理残留的临时文件，避免数据目录累积 `.tmp` 文件。
+///
+/// `playback.rs` 的 `PlaybackStore::save` 复用本实现（不再各自维护重复逻辑）。
 #[allow(clippy::incompatible_msrv)]
-fn atomic_write(path: &Path, content: &str) -> Result<(), MirrorStarError> {
+pub(crate) fn atomic_write(path: &Path, content: &str) -> Result<(), MirrorStarError> {
     let lock_path = path.with_extension("lock");
     let lock_file = std::fs::OpenOptions::new()
         .read(true)
@@ -1703,6 +1832,182 @@ added_at = "1"
             .is_none());
     }
 
+    // ── reorder_pools / reorder_wallpapers（完全重排校验 + 落盘） ────────────
+
+    /// 测试辅助：构造最小 WallpaperEntry（id + 唯一 file_path，便于断言元素本体保留）
+    fn wallpaper_entry(id: &str) -> WallpaperEntry {
+        WallpaperEntry {
+            id: id.to_string(),
+            file_path: format!("/test/{}.mp4", id),
+            wallpaper_type: WallpaperType::Video,
+            display_id: None,
+            added_at: "0".to_string(),
+            thumbnail: String::new(),
+            file_size: 0,
+            metadata: None,
+            groups: Vec::new(),
+            normalized_path: String::new(),
+        }
+    }
+
+    #[test]
+    fn reorder_pools_reorders_and_persists() {
+        let cm = make_temp_config_manager();
+        let p1 = cm.create_pool(Some("A".to_string()), vec![]).unwrap();
+        let p2 = cm.create_pool(Some("B".to_string()), vec![]).unwrap();
+        let p3 = cm.create_pool(Some("C".to_string()), vec![]).unwrap();
+
+        cm.reorder_pools(vec![p3.id.clone(), p1.id.clone(), p2.id.clone()])
+            .expect("合法重排应成功");
+
+        let ids: Vec<String> = cm.list_pools().iter().map(|p| p.id.clone()).collect();
+        assert_eq!(
+            ids,
+            vec![p3.id.clone(), p1.id.clone(), p2.id.clone()],
+            "list_pools 应按新顺序返回"
+        );
+
+        // 重启 round-trip：从磁盘重载验证顺序已持久化
+        let (reloaded, _err) = ConfigManager::load_library(&cm.library_path).unwrap();
+        let reloaded_ids: Vec<String> = reloaded.pools.iter().map(|p| p.id.clone()).collect();
+        assert_eq!(reloaded_ids, ids, "重排顺序应已落盘");
+    }
+
+    #[test]
+    fn reorder_pools_keeps_element_bodies() {
+        let cm = make_temp_config_manager();
+        let p1 = cm
+            .create_pool(Some("原名一".to_string()), vec!["w1".to_string()])
+            .unwrap();
+        let p2 = cm
+            .create_pool(Some("原名二".to_string()), vec!["w2".to_string()])
+            .unwrap();
+
+        cm.reorder_pools(vec![p2.id.clone(), p1.id.clone()])
+            .unwrap();
+
+        let pools = cm.list_pools();
+        assert_eq!(pools[0].id, p2.id);
+        assert_eq!(pools[0].name, "原名二", "元素本体应保留（仅重排）");
+        assert_eq!(pools[0].member_ids, vec!["w2".to_string()]);
+        assert_eq!(pools[1].name, "原名一");
+    }
+
+    #[test]
+    fn reorder_wallpapers_reorders_and_persists() {
+        let cm = make_temp_config_manager();
+        cm.add_wallpaper(wallpaper_entry("w1")).unwrap();
+        cm.add_wallpaper(wallpaper_entry("w2")).unwrap();
+        cm.add_wallpaper(wallpaper_entry("w3")).unwrap();
+
+        cm.reorder_wallpapers(vec!["w3".to_string(), "w1".to_string(), "w2".to_string()])
+            .expect("合法重排应成功");
+
+        let ids: Vec<String> = cm.get_wallpapers().iter().map(|w| w.id.clone()).collect();
+        assert_eq!(
+            ids,
+            vec!["w3".to_string(), "w1".to_string(), "w2".to_string()],
+            "get_wallpapers 应按新顺序返回"
+        );
+
+        // 重启 round-trip：从磁盘重载验证顺序已持久化
+        let (reloaded, _err) = ConfigManager::load_library(&cm.library_path).unwrap();
+        let reloaded_ids: Vec<String> = reloaded.wallpapers.iter().map(|w| w.id.clone()).collect();
+        assert_eq!(reloaded_ids, ids, "重排顺序应已落盘");
+    }
+
+    #[test]
+    fn reorder_wallpapers_keeps_element_bodies() {
+        let cm = make_temp_config_manager();
+        cm.add_wallpaper(wallpaper_entry("w1")).unwrap();
+        cm.add_wallpaper(wallpaper_entry("w2")).unwrap();
+
+        cm.reorder_wallpapers(vec!["w2".to_string(), "w1".to_string()])
+            .unwrap();
+
+        let entries = cm.get_wallpapers();
+        assert_eq!(
+            entries[0].file_path, "/test/w2.mp4",
+            "元素本体应保留（仅重排）"
+        );
+        assert_eq!(entries[1].file_path, "/test/w1.mp4");
+    }
+
+    #[test]
+    fn reorder_pools_rejects_invalid_ids_and_keeps_order() {
+        let cm = make_temp_config_manager();
+        let p1 = cm.create_pool(Some("A".to_string()), vec![]).unwrap();
+        let p2 = cm.create_pool(Some("B".to_string()), vec![]).unwrap();
+        let original_ids: Vec<String> = cm.list_pools().iter().map(|p| p.id.clone()).collect();
+
+        // 缺失：少一个 id
+        let err = cm.reorder_pools(vec![p1.id.clone()]).unwrap_err();
+        match err {
+            MirrorStarError::InvalidArgument { reason } => {
+                assert!(
+                    reason.contains("完全重排"),
+                    "错误消息应说明完全重排要求, got: {}",
+                    reason
+                );
+            }
+            other => panic!("期望 InvalidArgument 变体，实际: {:?}", other),
+        }
+        // 多余：多一个未知 id
+        assert!(cm
+            .reorder_pools(vec![p2.id.clone(), p1.id.clone(), "ghost".to_string()])
+            .is_err());
+        // 长度相同但替换了一个 id（缺失 + 多余）
+        assert!(cm
+            .reorder_pools(vec![p1.id.clone(), "ghost".to_string()])
+            .is_err());
+        // 空 ids（当前非空）
+        assert!(cm.reorder_pools(vec![]).is_err());
+
+        let after_ids: Vec<String> = cm.list_pools().iter().map(|p| p.id.clone()).collect();
+        assert_eq!(after_ids, original_ids, "校验失败不应改动池顺序");
+    }
+
+    #[test]
+    fn reorder_wallpapers_rejects_invalid_ids_and_keeps_order() {
+        let cm = make_temp_config_manager();
+        cm.add_wallpaper(wallpaper_entry("w1")).unwrap();
+        cm.add_wallpaper(wallpaper_entry("w2")).unwrap();
+        let original_ids: Vec<String> = cm.get_wallpapers().iter().map(|w| w.id.clone()).collect();
+
+        // 缺失
+        assert!(cm.reorder_wallpapers(vec!["w1".to_string()]).is_err());
+        // 多余
+        assert!(cm
+            .reorder_wallpapers(vec![
+                "w2".to_string(),
+                "w1".to_string(),
+                "ghost".to_string()
+            ])
+            .is_err());
+        // 长度相同但替换了一个 id
+        assert!(cm
+            .reorder_wallpapers(vec!["w1".to_string(), "ghost".to_string()])
+            .is_err());
+        // 空 ids（当前非空）
+        assert!(cm.reorder_wallpapers(vec![]).is_err());
+
+        let after_ids: Vec<String> = cm.get_wallpapers().iter().map(|w| w.id.clone()).collect();
+        assert_eq!(after_ids, original_ids, "校验失败不应改动壁纸顺序");
+    }
+
+    #[test]
+    fn reorder_empty_library_boundaries() {
+        let cm = make_temp_config_manager();
+        // 空池集合 + 空 ids → 直接成功
+        assert!(cm.reorder_pools(vec![]).is_ok());
+        // 空池集合 + 非空 ids → 报错
+        assert!(cm.reorder_pools(vec!["ghost".to_string()]).is_err());
+        // 空壁纸集合 + 空 ids → 直接成功
+        assert!(cm.reorder_wallpapers(vec![]).is_ok());
+        // 空壁纸集合 + 非空 ids → 报错
+        assert!(cm.reorder_wallpapers(vec!["ghost".to_string()]).is_err());
+    }
+
     // ── DisplayInfo 序列化 ───────────────────────────────────────────────────
 
     #[test]
@@ -1716,7 +2021,6 @@ added_at = "1"
             y: 0,
             is_primary: true,
             dpi: 96,
-            current_wallpaper: None,
         };
 
         let toml_str = toml::to_string_pretty(&info).expect("serialize");
@@ -1736,7 +2040,6 @@ added_at = "1"
             y: 0,
             is_primary: false,
             dpi: 120,
-            current_wallpaper: Some("/path/to/wp.jpg".to_string()),
         };
 
         let json = serde_json::to_string(&info).expect("serialize");
@@ -2458,6 +2761,141 @@ balanced_keep_frames = 0
         );
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ── Task 2：配置迁移与加载容错 ──────────────────────────────────────────
+
+    /// 构造仅含 `config.toml` 的临时目录路径（文件名带纳秒后缀避免冲突）。
+    fn temp_config_path(tag: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "mirrorstar_{}_{}",
+            tag,
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir.join("config.toml")
+    }
+
+    #[test]
+    fn load_config_explicit_arrangement_wins_over_legacy() {
+        // 顶层显式 per_monitor（= 默认值）+ 旧键 span：保留顶层，旧键被清除
+        let path = temp_config_path("explicit_arrangement");
+        std::fs::write(
+            &path,
+            r#"
+arrangement = "per_monitor"
+
+[rotation]
+enabled = true
+arrangement = "span"
+"#,
+        )
+        .unwrap();
+
+        let (config, err) = ConfigManager::load_config(&path).unwrap();
+        assert!(err.is_none(), "合法 TOML 不应返回加载错误");
+        assert_eq!(
+            config.arrangement,
+            Arrangement::PerMonitor,
+            "顶层显式 per_monitor（= 默认值）不应被 legacy span 覆盖"
+        );
+        assert_eq!(
+            config.rotation.arrangement_legacy, None,
+            "旧键 [rotation] arrangement 应被清除"
+        );
+
+        // 落盘后旧键不再写出
+        let out = toml::to_string_pretty(&config).unwrap();
+        let reparsed: AppConfig = toml::from_str(&out).unwrap();
+        assert_eq!(reparsed.rotation.arrangement_legacy, None);
+
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn load_config_unknown_enum_falls_back_only_that_field() {
+        // pause.fullscreen_action = "explode"（未知值）：仅该字段回退默认，
+        // audio / rotation 保持配置值（宽松反序列化使整份配置仍能解析）。
+        let path = temp_config_path("unknown_enum");
+        std::fs::write(
+            &path,
+            r#"
+[pause]
+fullscreen_action = "explode"
+
+[audio]
+volume = 0.42
+
+[rotation]
+enabled = true
+interval_minutes = 45
+"#,
+        )
+        .unwrap();
+
+        let (config, err) = ConfigManager::load_config(&path).unwrap();
+        assert!(err.is_none(), "未知枚举值不应导致整份配置加载失败");
+        assert_eq!(
+            config.pause.fullscreen_action,
+            crate::config::settings::FullscreenAction::default(),
+            "未知 fullscreen_action 应回退默认 terminate"
+        );
+        assert!(
+            (config.audio.volume - 0.42).abs() < f32::EPSILON,
+            "audio.volume 应保持配置值"
+        );
+        assert!(config.rotation.enabled, "rotation.enabled 应保持配置值");
+        assert_eq!(
+            config.rotation.interval_minutes, 45,
+            "rotation.interval_minutes 应保持配置值"
+        );
+
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn load_config_best_effort_recovers_valid_sections() {
+        // 类型错误（volume = "loud"）使整份 AppConfig 反序列化失败 → 分区恢复：
+        // audio 分区回退默认，general / rotation 仍保留，且不返回加载错误。
+        let path = temp_config_path("best_effort");
+        std::fs::write(
+            &path,
+            r#"
+[general]
+minimize_to_tray = false
+
+[audio]
+volume = "loud"
+
+[rotation]
+enabled = true
+interval_minutes = 45
+"#,
+        )
+        .unwrap();
+
+        let (config, err) = ConfigManager::load_config(&path).unwrap();
+        assert!(err.is_none(), "分区恢复成功不应返回加载错误");
+        assert!(
+            !config.general.minimize_to_tray,
+            "general 分区应被恢复（保留 false）"
+        );
+        assert!(
+            (config.audio.volume - crate::config::settings::AudioConfig::default().volume).abs()
+                < f32::EPSILON,
+            "audio 分区脏值应回退该分区默认值"
+        );
+        assert!(config.rotation.enabled, "rotation 分区应被恢复");
+        assert_eq!(
+            config.rotation.interval_minutes, 45,
+            "rotation 分区应被恢复"
+        );
+
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
     }
 
     // ── C-009 修复：update_config 入口校验 ──────────────────────────────────

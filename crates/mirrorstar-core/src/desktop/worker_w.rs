@@ -672,7 +672,6 @@ mod tests {
             y: 0,
             is_primary: false,
             dpi: 96,
-            current_wallpaper: None,
         };
         let workerw_rect = RECT {
             left: -1920,
@@ -701,7 +700,6 @@ mod tests {
             y: 0,
             is_primary: true,
             dpi: 96,
-            current_wallpaper: None,
         };
         let workerw_rect = RECT {
             left: 0,
@@ -726,7 +724,6 @@ mod tests {
             y: 0,
             is_primary: false,
             dpi: 96,
-            current_wallpaper: None,
         };
         let workerw_rect = RECT {
             left: 0,

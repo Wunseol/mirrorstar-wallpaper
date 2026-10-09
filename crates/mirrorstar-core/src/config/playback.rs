@@ -8,15 +8,18 @@
 //! 多实例写入（Web 壁纸 | 常规壁纸可能同时调度）由 fs2 文件锁（`.lock`）串行化（DR-37）。
 
 use std::collections::HashMap;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
-use fs2::FileExt;
 use serde::{Deserialize, Serialize};
 
 use crate::MirrorStarError;
 
 /// `playback.toml` 的 schema 版本（DR-32）。
 pub const PLAYBACK_SCHEMA_VERSION: u32 = 1;
+
+/// 轮换历史栈上限（防无界增长；100 条足够覆盖数小时连点"下一张"场景，
+/// 超出时丢弃栈底最旧条目，见 [`Unit::push_history`]）。
+pub const HISTORY_MAX_LEN: usize = 100;
 
 /// 播放状态（设计 §4.3）。
 ///
@@ -46,9 +49,24 @@ pub struct Unit {
     /// 洗牌袋剩余量（DR-18，袋空重洗）
     #[serde(default)]
     pub bag_remaining: Vec<String>,
+    /// 轮换历史栈（已消费的旧壁纸 id，栈顶最近；支持"上一张"回退，Task 2）
+    #[serde(default)]
+    pub history: Vec<String>,
     /// 单元是否启用（缺失字段回退 true，保证旧/精简配置加载后默认全开）
     #[serde(default = "default_enabled_true")]
     pub enabled: bool,
+}
+
+impl Unit {
+    /// 轮换历史入栈（换图成功生效的单一咽喉处调用）：把旧壁纸 id push 到历史栈顶
+    /// （最近消费在顶，`pop` 即"上一张"），超过 [`HISTORY_MAX_LEN`] 时丢弃栈底最旧
+    /// 条目，防无界增长（Task 2 边界 3/9：prev 消费即 pop 不放回；失败不入栈）。
+    pub fn push_history(&mut self, old_wallpaper_id: &str) {
+        self.history.push(old_wallpaper_id.to_string());
+        if self.history.len() > HISTORY_MAX_LEN {
+            self.history.remove(0);
+        }
+    }
 }
 
 /// `enabled` 字段缺失时的默认值：true（默认全开，与 [`PlaybackState::ensure_unit`] 一致）。
@@ -74,6 +92,7 @@ impl PlaybackState {
             active_pool: None,
             order_cursor: None,
             bag_remaining: Vec::new(),
+            history: Vec::new(),
             enabled: true,
         })
     }
@@ -105,11 +124,6 @@ impl PlaybackStore {
         Self {
             path: dir.into().join("playback.toml"),
         }
-    }
-
-    /// 返回 `playback.toml` 的绝对路径。
-    pub fn path(&self) -> &Path {
-        &self.path
     }
 
     /// 加载播放状态；文件不存在 / 解析失败 / 版本不符时 `tracing::warn!` 并回退默认（DR-32）。
@@ -156,48 +170,8 @@ impl PlaybackStore {
     /// 将播放状态原子写盘（临时文件 + fsync + rename）。失败仅记录 `tracing::warn!`，不 panic（PS1）。
     pub fn save(&self, state: &PlaybackState) -> Result<(), MirrorStarError> {
         let content = toml::to_string_pretty(state)?;
-        atomic_write(&self.path, &content)
+        super::manager::atomic_write(&self.path, &content)
     }
-}
-
-/// 与 `ConfigManager` 一致的原子写：临时文件 → `sync_all` → rename，配合 fs2 文件锁串行化。
-#[allow(clippy::incompatible_msrv)]
-fn atomic_write(path: &Path, content: &str) -> Result<(), MirrorStarError> {
-    let lock_path = path.with_extension("lock");
-    let lock_file = std::fs::OpenOptions::new()
-        .read(true)
-        .write(true)
-        .create(true)
-        .truncate(false)
-        .open(&lock_path)?;
-    lock_file.lock_exclusive()?;
-
-    let temp_path = path.with_extension("tmp");
-    let result = (|| -> Result<(), MirrorStarError> {
-        use std::io::Write;
-        let write_result = (|| -> std::io::Result<()> {
-            let mut file = std::fs::File::create(&temp_path)?;
-            file.write_all(content.as_bytes())?;
-            file.sync_all()?;
-            // 显式 drop 句柄，确保 Windows 上 rename 前文件不被占用
-            drop(file);
-            Ok(())
-        })();
-        if let Err(e) = write_result {
-            let _ = std::fs::remove_file(&temp_path);
-            return Err(e.into());
-        }
-        if let Err(e) = std::fs::rename(&temp_path, path) {
-            let _ = std::fs::remove_file(&temp_path);
-            return Err(e.into());
-        }
-        Ok(())
-    })();
-
-    if let Err(e) = lock_file.unlock() {
-        tracing::warn!(error = %e, "释放文件锁失败");
-    }
-    result
 }
 
 #[cfg(test)]
@@ -336,5 +310,69 @@ active_pool = "p1"
         );
         assert!(loaded.units.is_empty());
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // ── Task 2：轮换历史栈（history 字段 serde 兼容 / 持久化往返 / 上限截断） ──────
+
+    #[test]
+    fn history_missing_field_defaults_to_empty() {
+        // 旧 playback.toml 无 history 字段 → serde(default) 回退空栈（与 order_cursor /
+        // bag_remaining 添加惯例一致，不 bump PLAYBACK_SCHEMA_VERSION）。
+        let (store, dir) = temp_store();
+        let content = r#"
+version = 1
+
+[units.m0]
+key = "m0"
+current_wallpaper_id = "w1"
+active_pool = "p1"
+"#;
+        std::fs::write(&store.path, content).unwrap();
+        let loaded = store.load();
+        assert_eq!(loaded.version, PLAYBACK_SCHEMA_VERSION);
+        let u = &loaded.units["m0"];
+        assert!(u.history.is_empty(), "缺失 history 字段应回退空栈");
+        // 既有字段不受影响
+        assert_eq!(u.current_wallpaper_id.as_deref(), Some("w1"));
+        assert_eq!(u.active_pool.as_deref(), Some("p1"));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn history_roundtrips_persists() {
+        let (store, dir) = temp_store();
+        let mut state = PlaybackState::default();
+        let unit = state.ensure_unit("m0".to_string());
+        unit.current_wallpaper_id = Some("w3".to_string());
+        unit.history = vec!["w2".to_string(), "w1".to_string()];
+
+        store.save(&state).expect("save playback state");
+        let loaded = store.load();
+        let u = &loaded.units["m0"];
+        // 栈顶（最近消费）在末尾，pop 顺序与 push 一致
+        assert_eq!(u.history, vec!["w2".to_string(), "w1".to_string()]);
+        assert_eq!(u.current_wallpaper_id.as_deref(), Some("w3"));
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn push_history_truncates_beyond_limit() {
+        let mut state = PlaybackState::default();
+        let unit = state.ensure_unit("m0".to_string());
+        for i in 0..(HISTORY_MAX_LEN + 5) {
+            unit.push_history(&format!("w{i}"));
+        }
+        assert_eq!(
+            unit.history.len(),
+            HISTORY_MAX_LEN,
+            "超过上限应截断到 HISTORY_MAX_LEN"
+        );
+        // 丢弃栈底（最旧）5 条，保留最近 100 条；栈顶仍为最新
+        assert_eq!(unit.history.first().map(String::as_str), Some("w5"));
+        assert_eq!(
+            unit.history.last().map(|s| s.as_str()),
+            Some(format!("w{}", HISTORY_MAX_LEN + 4).as_str())
+        );
     }
 }

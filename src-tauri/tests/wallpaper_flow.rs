@@ -23,7 +23,7 @@ use common::{create_test_config_manager, create_test_desktop, create_test_engine
 use mirrorstar_core::wallpaper::{
     PauseReason, ScalingMode, WallpaperSource, WallpaperState, WallpaperType,
 };
-use mirrorstar_core::{Arrangement, MirrorStarError};
+use mirrorstar_core::MirrorStarError;
 use mirrorstar_wallpaper_lib::{
     parse_scaling_mode, resolve_display_id, validate_speed, validate_volume,
 };
@@ -443,10 +443,7 @@ fn test_set_scaling_mode_invalid_string_mapping() {
     assert_eq!(parse_scaling_mode("fit").unwrap(), ScalingMode::Fit);
     assert_eq!(parse_scaling_mode("stretch").unwrap(), ScalingMode::Stretch);
     assert_eq!(parse_scaling_mode("center").unwrap(), ScalingMode::Center);
-    assert_eq!(
-        parse_scaling_mode("tile").unwrap(),
-        ScalingMode::Tile
-    );
+    assert_eq!(parse_scaling_mode("tile").unwrap(), ScalingMode::Tile);
 
     // 非法字符串 → InvalidArgument 错误（ST-004: 参数校验错误改用 InvalidArgument 变体）
     let err = parse_scaling_mode("invalid_mode").unwrap_err();
@@ -599,176 +596,6 @@ fn test_shutdown_closes_all_wallpapers() {
 
     assert!(!engine.has_wallpaper(&display0), "shutdown 后不应有壁纸");
     assert!(!engine.has_wallpaper(&display1), "shutdown 后不应有壁纸");
-}
-
-// ── Task 6: C-034 update_positions 多显示器集成测试 ────────────────────────────
-//
-// 对应 `commands/wallpaper.rs` 的 `update_positions` 命令：
-//   pub async fn update_positions(state: State<'_, AppState>) -> Result<(), MirrorStarError>
-// 该命令仅获取 engine 锁后调用 `engine.update_positions()`，无额外参数。
-// `WallpaperEngine::update_positions`（manager.rs:373）内部逻辑：
-//   - Span 模式：对所有壁纸调用 set_position（虚拟桌面坐标，无显示器时回退 0/0/1920/1080）
-//   - PerMonitor 模式：仅对 enumerate_displays() 能匹配的 display_id 调用 set_position
-//   - 始终返回 Ok(())，不存在的 display_id 被安全跳过
-// 因此直接测试 `engine.update_positions()` 即可覆盖命令背后的逻辑。
-// MockRenderer 通过 `last_position_handle()` 暴露 set_position 调用快照（Arc<Mutex> 共享），
-// 渲染器嵌入 engine 后测试仍可读取，用于验证位置是否真正被更新。
-
-/// 单显示器位置更新：Span 模式下注册 1 个壁纸，验证 update_positions 调用了 set_position
-#[ignore = "需 Windows 真机 COM/音频环境"]
-#[test]
-fn test_update_positions_single_display() {
-    let mut engine = match create_test_engine() {
-        Some(e) => e,
-        None => panic!("COM/音频环境不可用：测试辅助返回 None（此测试标记为 #[ignore]，应仅在 Windows 真机环境通过 --ignored 运行）"),
-    };
-    // Span 模式：update_positions 对每个壁纸都调用 set_position（虚拟桌面坐标）
-    engine.set_arrangement(Arrangement::Span);
-
-    let display_id = "monitor_0".to_string();
-    let source = WallpaperSource::File("/test/wallpaper.mp4".to_string());
-
-    // 注册 MockRenderer，并在嵌入前获取 position 共享句柄
-    let renderer = MockRenderer::new();
-    let position_handle = renderer.last_position_handle();
-    engine
-        .embed_and_register_renderer(
-            Box::new(renderer),
-            &display_id,
-            &source,
-            WallpaperType::Video,
-        )
-        .unwrap();
-    assert!(engine.has_wallpaper(&display_id));
-
-    // 调用前：未记录任何位置
-    assert!(
-        position_handle.lock().unwrap().is_none(),
-        "调用 update_positions 前不应有位置记录"
-    );
-
-    // 调用 update_positions（对应 update_positions 命令）
-    let result = engine.update_positions();
-    assert!(result.is_ok(), "update_positions 应返回 Ok");
-
-    // 调用后：Span 模式应已调用 set_position
-    let pos = position_handle.lock().unwrap();
-    assert!(pos.is_some(), "Span 模式应调用 set_position");
-    if let Some((_x, _y, w, h)) = *pos {
-        // Span 模式使用虚拟桌面坐标；无显示器时回退到 (0, 0, 1920, 1080)
-        assert!(w > 0 && h > 0, "宽高应为正数，实际: w={}, h={}", w, h);
-    }
-}
-
-/// 多显示器独立位置更新：Span 模式下注册 2 个壁纸，验证 update_positions 对每个都调用 set_position
-#[ignore = "需 Windows 真机 COM/音频环境"]
-#[test]
-fn test_update_positions_multi_display() {
-    let mut engine = match create_test_engine() {
-        Some(e) => e,
-        None => panic!("COM/音频环境不可用：测试辅助返回 None（此测试标记为 #[ignore]，应仅在 Windows 真机环境通过 --ignored 运行）"),
-    };
-    engine.set_arrangement(Arrangement::Span);
-
-    let display0 = "monitor_0".to_string();
-    let display1 = "monitor_1".to_string();
-    let source0 = WallpaperSource::File("/test/wp0.mp4".to_string());
-    let source1 = WallpaperSource::File("/test/wp1.mp4".to_string());
-
-    // 注册两个 MockRenderer，分别获取 position 共享句柄
-    let renderer0 = MockRenderer::new();
-    let pos0 = renderer0.last_position_handle();
-    let renderer1 = MockRenderer::new();
-    let pos1 = renderer1.last_position_handle();
-
-    engine
-        .embed_and_register_renderer(
-            Box::new(renderer0),
-            &display0,
-            &source0,
-            WallpaperType::Video,
-        )
-        .unwrap();
-    engine
-        .embed_and_register_renderer(
-            Box::new(renderer1),
-            &display1,
-            &source1,
-            WallpaperType::Video,
-        )
-        .unwrap();
-    assert!(engine.has_wallpaper(&display0));
-    assert!(engine.has_wallpaper(&display1));
-
-    // 调用前：两个渲染器都未记录位置
-    assert!(pos0.lock().unwrap().is_none());
-    assert!(pos1.lock().unwrap().is_none());
-
-    // 调用 update_positions
-    let result = engine.update_positions();
-    assert!(result.is_ok(), "update_positions 应返回 Ok");
-
-    // 调用后：两个渲染器都应独立记录到位置（验证遍历所有壁纸并逐一更新）
-    assert!(pos0.lock().unwrap().is_some(), "display0 应被更新位置");
-    assert!(pos1.lock().unwrap().is_some(), "display1 应被更新位置");
-}
-
-/// 不存在的 display_id 错误处理：PerMonitor 模式下注册不匹配的 display_id，
-/// update_positions 应返回 Ok 但不调用 set_position（无匹配显示器，安全跳过）
-#[ignore = "需 Windows 真机 COM/音频环境"]
-#[test]
-fn test_update_positions_invalid_display_id() {
-    let mut engine = match create_test_engine() {
-        Some(e) => e,
-        None => panic!("COM/音频环境不可用：测试辅助返回 None（此测试标记为 #[ignore]，应仅在 Windows 真机环境通过 --ignored 运行）"),
-    };
-    // PerMonitor 模式（默认）：update_positions 仅对 enumerate_displays() 匹配的 display_id 调用 set_position
-    engine.set_arrangement(Arrangement::PerMonitor);
-
-    // 使用不存在的 display_id（不会匹配任何真实显示器）
-    let display_id = "nonexistent_display_xyz".to_string();
-    let source = WallpaperSource::File("/test/wallpaper.mp4".to_string());
-
-    let renderer = MockRenderer::new();
-    let position_handle = renderer.last_position_handle();
-    engine
-        .embed_and_register_renderer(
-            Box::new(renderer),
-            &display_id,
-            &source,
-            WallpaperType::Video,
-        )
-        .unwrap();
-    assert!(engine.has_wallpaper(&display_id));
-
-    // 调用 update_positions：应返回 Ok（不存在的 display_id 安全跳过，不报错）
-    let result = engine.update_positions();
-    assert!(
-        result.is_ok(),
-        "对不存在的 display_id update_positions 应返回 Ok"
-    );
-
-    // PerMonitor 模式下无匹配显示器 → set_position 不应被调用
-    assert!(
-        position_handle.lock().unwrap().is_none(),
-        "不存在的 display_id 不应触发 set_position"
-    );
-}
-
-/// 空映射边界情况：无壁纸时调用 update_positions，应返回 Ok（no-op）
-#[ignore = "需 Windows 真机 COM/音频环境"]
-#[test]
-fn test_update_positions_empty_map() {
-    let mut engine = match create_test_engine() {
-        Some(e) => e,
-        None => panic!("COM/音频环境不可用：测试辅助返回 None（此测试标记为 #[ignore]，应仅在 Windows 真机环境通过 --ignored 运行）"),
-    };
-    // 不注册任何壁纸 → wallpapers 为空 → update_positions 遍历空集合，直接返回 Ok
-    let result = engine.update_positions();
-    assert!(
-        result.is_ok(),
-        "无壁纸时 update_positions 应返回 Ok（no-op）"
-    );
 }
 
 // ── Task 7: C-033 12 个 Tauri 命令单元测试补全 ──────────────────────────────
@@ -1104,23 +931,32 @@ fn test_validate_wallpaper_file_path_relative_rejected() {
 // 对应 finding T03：原 pause_wallpaper / resume_wallpaper 使用 unwrap_or_default()
 // 传入空字符串，与其他 5 个命令行为不一致。修复后统一使用 resolve_display_id。
 
-/// 测试 resolve_display_id(None)：无活跃壁纸时回退到空字符串
+/// 测试 resolve_display_id(None)：无活跃壁纸时回退到主显示器真实 id
 ///
-/// 验证 T03：display_id 为 None 且无活跃壁纸时，resolve_display_id 返回空字符串
-/// （与原 unwrap_or_default() 行为一致，engine 快速路径方法对空串安全返回 Ok/no-op）。
+/// 验证 `fix-manual-wallpaper-display-id`：display_id 为 None 且无活跃壁纸时，
+/// resolve_display_id 先回退 `first_active_display_id`（此处为空），再回退主显示器
+/// 真实 id（`enumerate_displays()` 中 `is_primary` 项）；无显示器时兜底空串。
+/// 这是本次修复的核心：手动路径不再落在空串键上，避免旧壁纸不被关闭。
 #[ignore = "需 Windows 真机 COM/音频环境"]
 #[test]
-fn test_resolve_display_id_none_no_wallpaper_returns_empty() {
+fn test_resolve_display_id_none_no_wallpaper_falls_back_to_primary() {
     let engine = match create_test_engine() {
         Some(e) => e,
         None => panic!("COM/音频环境不可用：测试辅助返回 None（此测试标记为 #[ignore]，应仅在 Windows 真机环境通过 --ignored 运行）"),
     };
 
-    // 无活跃壁纸时，None 应回退到空字符串
+    // 期望值随真实显示器拓扑而定；无显示器时兜底空串。
+    let expected = mirrorstar_core::desktop::enumerate_displays()
+        .into_iter()
+        .find(|d| d.is_primary)
+        .map(|d| d.id)
+        .unwrap_or_default();
+
+    // 无活跃壁纸时，None 应回退到主显示器真实 id（无显示器时为空串）
     let result = resolve_display_id(None, &engine);
-    assert!(
-        result.is_empty(),
-        "无活跃壁纸时 resolve_display_id(None) 应返回空字符串，实际: {:?}",
+    assert_eq!(
+        result, expected,
+        "无活跃壁纸时 resolve_display_id(None) 应回退到主显示器真实 id，实际: {:?}",
         result
     );
 }

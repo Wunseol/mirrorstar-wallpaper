@@ -9,8 +9,8 @@ use crate::wallpaper::subprocess_base::{
     SubprocessRendererBase, MPV_CONNECT_INTERVAL_MS, MPV_CONNECT_RETRIES,
 };
 use crate::wallpaper::{
-    create_pause_channel, spawn_proc_exit_monitor, validate_renderer_speed, OwnedProcHandle,
-    PauseCommand, ScalingMode, WallpaperRenderer, WallpaperState,
+    create_pause_channel, spawn_proc_exit_monitor, validate_renderer_speed, LivenessProbe,
+    OwnedProcHandle, PauseCommand, ScalingMode, WallpaperRenderer, WallpaperState,
 };
 
 /// 判断是否应调用 WASAPI 音量操作（W11 COM 降级纯辅助函数）
@@ -379,6 +379,14 @@ impl VideoRenderer {
             // 恢复 → 重建 mpv → 再误判 的死循环（主窗口闪屏）。设为 never 后浮动期不再
             // 抢占前台，从源头消除该事件触发。
             "--focus-on=never".to_string(),
+            // 根因 G（轮换闪屏）：--geometry=+32000+32000 离屏定位。mpv 窗口创建即顶层可见
+            // （--force-window=yes），默认居中 960x540 浮动（实证 rect 472:230:976:579，
+            // IsWindowVisible=True），嵌入 WorkerW 前用户可见"窗口闪现"（浮动 ~80-250ms
+            // 直至 find_window_by_class 找到并嵌入）。离屏创建后窗口位于可视屏幕外
+            // （实证 rect 31993,32000，正常渲染），嵌入时由 embed_wallpaper 的
+            // SetWindowPos(0,0,1920,1080) 移回目标显示器，从源头消除闪现。仅影响初始位置，
+            // 与缩放参数（panscan/keepaspect/video-unscaled）不冲突。勿删！
+            "--geometry=+32000+32000".to_string(),
             format!("--input-ipc-server={}", ipc_path),
             // v10-A：缓存与解码队列限制（详见函数开头注释）
             "--cache=no".to_string(),
@@ -387,6 +395,20 @@ impl VideoRenderer {
             // v11.0：demuxer 后退缓冲清零 + 禁用时间维度缓存（见注释，勿加 --demuxer-max-bytes=0）
             "--demuxer-max-back-bytes=0".to_string(),
             "--cache-secs=0".to_string(),
+            // Task 4：在 v10/v11 基础上进一步限流以降低内存占用。
+            // - --vd-lavc-threads=4：限制视频解码线程数。mpv 默认 0=按 CPU 核数自动
+            //   上探（最多 16）。帧级多线程解码会为每条线程保留参考帧缓冲（1080p
+            //   单帧 ≈3MB、4K ≈12MB），多核高端机在 hwdec 失败回退软解时会占用大量
+            //   内存。固定为 4：对 1080p/4K 壁纸软解仍足够流畅，同时显著压低线程缓冲
+            //   上限。注：hwdec=auto 走硬件解码时该参数不参与软解线程创建，仅在回退
+            //   软解时生效，无副作用、不影响画质。
+            "--vd-lavc-threads=4".to_string(),
+            // - --demuxer-readahead-secs=0.5：将 demuxer 前向预读时间窗由默认 1s 减半。
+            //   --cache=no 下虽无 stream 缓存层，但 demuxer 仍按本参数预读数据包进入
+            //   其包队列（同 v10-A 注释所述 demuxer packet queues），降低该值可直接
+            //   压缩该队列内存。壁纸为本地文件、循环播放，0.5s 预读对本地磁盘绰绰有余，
+            //   不会造成播放卡顿或循环间隙。
+            "--demuxer-readahead-secs=0.5".to_string(),
             // 根因 D：--d3d11-flip=no 强制 bitblt-model presentation。
             // mpv 默认使用 flip-model presentation，窗口被 SetParent 嵌入 WorkerW 壁纸层后，
             // flip-model swapchain 处于非法状态，嵌入后 SetWindowPos 触发重配置时 D3D11
@@ -404,6 +426,20 @@ impl VideoRenderer {
         if let Some(log_path) = Self::build_mpv_log_path(&self.base.pipe_name) {
             tracing::info!(mpv_log = %log_path.display(), "mpv 日志文件路径");
             args.push(format!("--log-file={}", log_path.display()));
+        }
+
+        // 便携化根因（mpv 配置文件目录）：mpv 在 Windows 上默认 config-dir 为
+        // %APPDATA%\mpv，应用启动 mpv 时会自动创建该目录，导致用户数据散落到
+        // C 盘 Profile，违背"所有数据收束到安装目录"的设计理念。
+        // 通过 --config-dir 将其重定向到数据根/mpv，与应用日志等其他数据一致。
+        // 应用以命令行参数传全量配置（未使用任何 mpv 配置文件），该目录仅用于
+        // 阻止 mpv 写穿到 %APPDATA%\mpv，语义上容纳未来可能的用户自定义配置。
+        let config_dir = crate::config::data_root().join("mpv");
+        if let Err(e) = std::fs::create_dir_all(&config_dir) {
+            tracing::warn!(err = %e, "创建 mpv config-dir 失败，回退 mpv 默认行为");
+        } else {
+            tracing::info!(mpv_config_dir = %config_dir.display(), "mpv config-dir");
+            args.push(format!("--config-dir={}", config_dir.display()));
         }
 
         // 根据缩放模式设置视频缩放参数
@@ -482,6 +518,41 @@ impl VideoRenderer {
         }
         Ok(serde_json::Value::Object(map))
     }
+
+    /// 存活探针的属性查询（只查判定所需 4 属性，短超时）。
+    ///
+    /// 与 [`Self::diagnostic_playback_status`] 的差异有两点，均为"成本上界"服务：
+    /// 1. 属性集收敛到 4 个（判定只需要 `time-pos` / `pause` / `idle-active`，
+    ///    `eof-reached` 仅作诊断留痕）；
+    /// 2. 超时从 2s 降到 [`PROBE_PROPERTY_TIMEOUT`]（探针在持锁路径上运行）。
+    ///
+    /// 容错策略不变：单属性查询失败时写入 `{"error": ...}` 而不中断整体查询，
+    /// 由 [`liveness_probe_from_status`] 判定为 `None`（本轮不判定停滞）。
+    fn liveness_probe_status(&mut self) -> serde_json::Value {
+        let mut ipc = self.ipc.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(ref mut ipc) = *ipc else {
+            // IPC 未连接：返回空对象，[`liveness_probe_from_status`] 因缺少必需字段
+            // 自然返回 None（等价于原 diagnostic_playback_status 的 Err 分支），
+            // 本轮不判定停滞。
+            tracing::debug!("视频存活探针：IPC 未连接，本次不判定停滞");
+            return serde_json::json!({});
+        };
+        let mut map = serde_json::Map::new();
+        for prop in ["time-pos", "pause", "idle-active", "eof-reached"] {
+            match ipc.get_property_with_timeout(prop, PROBE_PROPERTY_TIMEOUT) {
+                Ok(v) => {
+                    map.insert(prop.to_string(), v);
+                }
+                Err(e) => {
+                    map.insert(
+                        prop.to_string(),
+                        serde_json::json!({ "error": e.to_string() }),
+                    );
+                }
+            }
+        }
+        serde_json::Value::Object(map)
+    }
 }
 
 /// 判断视频首帧是否已就绪（DR-33 原子交换锁外就绪判断，纯函数）。
@@ -512,6 +583,70 @@ pub fn video_first_frame_ready(status: &serde_json::Value) -> bool {
         ),
     };
     width_ok && idle_ok
+}
+
+/// 停滞判定阈值：两次采样间 `time-pos` 变化绝对值小于该值视为"时钟被钉住"。
+///
+/// 取 1ms 量级：正常播放（即使 0.25x 倍速）在两次采样（≥500ms）间前进量也远大于
+/// 此值；而循环点停滞、最后一帧 drain 未完成时 `time-pos` 完全不动（Δ=0）。用
+/// "绝对值 < 阈值"而非"curr <= prev"，是为了让跨越循环点的大幅回退（如 11.2 → 0.05）
+/// 因变化量巨大而不被误判为停滞（见 [`video_playback_stalled`]）。
+const STALL_EPSILON_SECS: f64 = 0.001;
+
+/// 存活探针的单属性 IPC 等待超时。
+///
+/// 探针运行在**持有引擎锁**的看护/退出校验路径上，mpv 响应缓慢时必须尽快放弃
+/// （4 属性 × 500ms ⇒ 最坏约 2s，而诊断查询的 2s × 7 属性最坏约 14s）。
+/// 超时即该属性解析失败 ⇒ 探针返回 `None` ⇒ 本轮不判定停滞（宁可漏判不误判）。
+const PROBE_PROPERTY_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(500);
+
+/// 解析 mpv 布尔类属性值（严格版，供存活探针使用）。
+///
+/// 兼容 mpv JSON IPC 的布尔形式与历史/测试用字符串（`"yes"` / `"no"`，与
+/// [`is_mpv_idle_active`] 的字符串处理一致）。与 [`is_mpv_idle_active`] 的关键区别：
+/// 后者取不到有效值时保守返回 `true`（继续轮询等待），而本函数在缺失 / 类型不符 /
+/// 错误对象时返回 `None`——存活探针必须能区分"明确的 false"与"查询失败"，否则会把
+/// IPC 故障误判为"未暂停 / 非 idle"进而误判停滞。
+fn parse_mpv_bool(value: &serde_json::Value) -> Option<bool> {
+    match value.as_bool() {
+        Some(b) => Some(b),
+        None => match value.as_str() {
+            Some("yes") => Some(true),
+            Some("no") => Some(false),
+            _ => None,
+        },
+    }
+}
+
+/// 从 mpv 属性查询结果解析存活探针快照（纯函数）。
+///
+/// `status` 为 [`VideoRenderer::diagnostic_playback_status`] 的返回（每字段可能是数值/布尔，
+/// 或查询失败时的 `{"error": ...}` 对象）。任一必需字段缺失 / 类型不符 / 为错误对象
+/// 时返回 `None`——**不把 IPC/解析故障误判为停滞**：判定方对 `None` 一律"不做判定"，
+/// 把 IPC 中断交给既有崩溃检测路径处理。
+pub fn liveness_probe_from_status(status: &serde_json::Value) -> Option<LivenessProbe> {
+    let time_pos = status.get("time-pos").and_then(|v| v.as_f64())?;
+    let paused = parse_mpv_bool(status.get("pause")?)?;
+    let idle_active = parse_mpv_bool(status.get("idle-active")?)?;
+    let eof_reached = parse_mpv_bool(status.get("eof-reached")?)?;
+    Some(LivenessProbe {
+        time_pos,
+        paused,
+        idle_active,
+        eof_reached,
+    })
+}
+
+/// 视频播放是否停滞（纯函数，判据见 spec D1）。
+///
+/// 判据：两次探针均非暂停、非 idle（未加载文件），且 `time-pos` 变化绝对值
+/// < [`STALL_EPSILON_SECS`]（时钟未前进）。`eof_reached` 不参与判定——stalled 时
+/// mpv 仍处于 DRAINING（尚未进入 EOF），据此判定会漏检。
+///
+/// 注意：循环播放跨越循环点时 `time-pos` 会**大幅回退**（如 11.2 → 0.05），
+/// 该变化绝对值远大于阈值，因此不会误判为停滞。
+pub fn video_playback_stalled(prev: &LivenessProbe, curr: &LivenessProbe) -> bool {
+    !curr.paused && !curr.idle_active && (curr.time_pos - prev.time_pos).abs() < STALL_EPSILON_SECS
 }
 
 impl WallpaperRenderer for VideoRenderer {
@@ -837,6 +972,32 @@ impl WallpaperRenderer for VideoRenderer {
         self.set_mouse_passthrough(!enabled);
     }
 
+    /// 禁止 mpv 在载入视频时按其窗口/工作区自适配尺寸（`auto-window-resize`，默认 yes）。
+    ///
+    /// 纯净壁纸模式的**临时顶层覆盖窗**必须严格保持显示器矩形（如 1920x1080）：
+    /// 若不关闭，mpv 会按工作区（任务栏占高）与视频宽高比自适配，覆写应用设定的几何
+    /// （实测 1920x1080 被改为 1848x1040@(36,20)）。
+    ///
+    /// **必须早于 [`Self::after_embed`]（即 loadfile）调用**：该属性在载入视频前生效，
+    /// 载入后设置不再影响本次适配（实测无效）。常规 WorkerW 壁纸不受影响（尺寸由
+    /// `embed_wallpaper` 的 SetWindowPos 决定），故本方法仅由纯净模式覆盖窗调用。
+    fn disable_auto_window_resize(&mut self) -> Result<(), crate::MirrorStarError> {
+        let mut ipc = self.ipc.lock().unwrap_or_else(|e| e.into_inner());
+        match ipc.as_mut() {
+            Some(ipc_client) => {
+                ipc_client.set_property("auto-window-resize", "no")?;
+                tracing::info!("已禁用 mpv 自动窗口适配（auto-window-resize=no，须早于 loadfile）");
+                Ok(())
+            }
+            None => {
+                tracing::error!("IPC 未连接，无法禁用 mpv 自动窗口适配");
+                Err(crate::MirrorStarError::IpcError(
+                    "mpv IPC 未连接，禁用 auto-window-resize 失败".to_string(),
+                ))
+            }
+        }
+    }
+
     /// 嵌入 WorkerW 壁纸层后通过 IPC 加载视频文件（根因 E 修复）
     ///
     /// mpv 以 `--idle=yes` 启动（空窗口、不加载文件），本方法在窗口被
@@ -879,6 +1040,15 @@ impl WallpaperRenderer for VideoRenderer {
     fn poll_first_frame_ready(&mut self) -> Result<bool, crate::MirrorStarError> {
         let status = self.diagnostic_playback_status()?;
         Ok(video_first_frame_ready(&status))
+    }
+
+    fn liveness_probe(&mut self) -> Option<LivenessProbe> {
+        // 使用瘦身后的 liveness_probe_status()：只查判定所需 4 属性、短超时，
+        // 使本探针在持有引擎锁的看护/退出校验路径上有界（最坏 4×500ms）。
+        // 语义不变：IPC 未连接 → 空对象 → None；单属性查询失败 → {"error": ...}
+        // → 必要字段解析失败 → None（本轮不判定停滞）。
+        let status = self.liveness_probe_status();
+        liveness_probe_from_status(&status)
     }
 
     fn create_pause_sender(&mut self, display_id: &str) -> Option<crate::wallpaper::PauseSender> {
@@ -1188,6 +1358,182 @@ mod tests {
         assert!(is_mpv_idle_active(&json!(1)));
     }
 
+    // ========== 存活探针：liveness_probe_from_status 解析测试 ==========
+
+    #[test]
+    fn liveness_probe_from_status_parses_booleans() {
+        use serde_json::json;
+        // 正常布尔形式：time-pos 数值 + pause/idle-active/eof-reached 布尔
+        let probe = liveness_probe_from_status(&json!({
+            "time-pos": 3.5,
+            "pause": false,
+            "idle-active": false,
+            "eof-reached": false,
+        }))
+        .expect("四个字段均为有效值时应解析成功");
+        assert_eq!(
+            probe,
+            LivenessProbe {
+                time_pos: 3.5,
+                paused: false,
+                idle_active: false,
+                eof_reached: false,
+            }
+        );
+
+        // 各布尔字段为 true 时也应如实解析
+        let paused_probe = liveness_probe_from_status(&json!({
+            "time-pos": 0.0,
+            "pause": true,
+            "idle-active": true,
+            "eof-reached": true,
+        }))
+        .expect("布尔 true 同样有效");
+        assert!(paused_probe.paused);
+        assert!(paused_probe.idle_active);
+        assert!(paused_probe.eof_reached);
+    }
+
+    #[test]
+    fn liveness_probe_from_status_accepts_string_yes_no() {
+        use serde_json::json;
+        // 兼容字符串 "yes"/"no"（与 is_mpv_idle_active 一致的字符串容错）
+        let probe = liveness_probe_from_status(&json!({
+            "time-pos": 1.25,
+            "pause": "no",
+            "idle-active": "no",
+            "eof-reached": "no",
+        }))
+        .expect("\"no\" 应解析为 false");
+        assert!(!probe.paused);
+        assert!(!probe.idle_active);
+        assert!(!probe.eof_reached);
+        assert_eq!(probe.time_pos, 1.25);
+
+        let probe_yes = liveness_probe_from_status(&json!({
+            "time-pos": 2.0,
+            "pause": "yes",
+            "idle-active": "yes",
+            "eof-reached": "yes",
+        }))
+        .expect("\"yes\" 应解析为 true");
+        assert!(probe_yes.paused);
+        assert!(probe_yes.idle_active);
+        assert!(probe_yes.eof_reached);
+    }
+
+    #[test]
+    fn liveness_probe_from_status_returns_none_on_error_or_missing() {
+        use serde_json::json;
+        let err = json!({ "error": "property not found" });
+
+        // 逐个字段替换为错误对象 → 整体 None
+        let base = json!({
+            "time-pos": 3.5,
+            "pause": false,
+            "idle-active": false,
+            "eof-reached": false,
+        });
+        for field in ["time-pos", "pause", "idle-active", "eof-reached"] {
+            let mut value = base.clone();
+            value[field] = err.clone();
+            assert!(
+                liveness_probe_from_status(&value).is_none(),
+                "字段 {field} 为错误对象时应返回 None"
+            );
+        }
+
+        // 逐个字段缺失 → 整体 None
+        for field in ["time-pos", "pause", "idle-active", "eof-reached"] {
+            let mut value = base.clone();
+            value.as_object_mut().unwrap().remove(field);
+            assert!(
+                liveness_probe_from_status(&value).is_none(),
+                "字段 {field} 缺失时应返回 None"
+            );
+        }
+
+        // time-pos 为 null / 非数值 → 整体 None（不把解析故障误判为停滞）
+        assert!(liveness_probe_from_status(&json!({
+            "time-pos": serde_json::Value::Null,
+            "pause": false,
+            "idle-active": false,
+            "eof-reached": false,
+        }))
+        .is_none());
+        // 其他字符串（非 yes/no）→ 布尔字段解析失败 → None
+        assert!(liveness_probe_from_status(&json!({
+            "time-pos": 1.0,
+            "pause": "maybe",
+            "idle-active": false,
+            "eof-reached": false,
+        }))
+        .is_none());
+    }
+
+    #[test]
+    fn liveness_probe_from_status_returns_none_for_empty_object() {
+        use serde_json::json;
+        // 空 JSON 对象是 VideoRenderer::liveness_probe_status 在"IPC 未连接/查询失败"
+        // 时返回的等价输入：缺少全部必需字段 → None（本轮不判定停滞）。
+        assert!(
+            liveness_probe_from_status(&json!({})).is_none(),
+            "空对象（IPC 未连接等价输入）应返回 None"
+        );
+    }
+
+    // ========== 存活探针：video_playback_stalled 判定测试 ==========
+
+    #[test]
+    fn video_playback_stalled_detects_frozen_clock() {
+        let playing = |time_pos: f64| LivenessProbe {
+            time_pos,
+            paused: false,
+            idle_active: false,
+            eof_reached: false,
+        };
+
+        // 正常前进 → 不 stalled
+        assert!(!video_playback_stalled(&playing(1.0), &playing(1.5)));
+        // 完全钉住（Δ=0）→ stalled
+        assert!(video_playback_stalled(&playing(7.3), &playing(7.3)));
+        // 微小平移（Δ<1ms）→ stalled
+        assert!(video_playback_stalled(&playing(2.0), &playing(2.0005)));
+        // 跨循环点大幅回退（11.2 → 0.05）→ 变化量巨大，不 stalled
+        assert!(!video_playback_stalled(&playing(11.2), &playing(0.05)));
+    }
+
+    #[test]
+    fn video_playback_stalled_false_when_paused_or_idle() {
+        // 暂停：时钟本就不前进，属预期 → 不 stalled
+        let paused = LivenessProbe {
+            time_pos: 5.0,
+            paused: true,
+            idle_active: false,
+            eof_reached: false,
+        };
+        assert!(!video_playback_stalled(&paused, &paused));
+
+        // idle（未加载文件）：无播放语义 → 不 stalled
+        let idle = LivenessProbe {
+            time_pos: 0.0,
+            paused: false,
+            idle_active: true,
+            eof_reached: false,
+        };
+        assert!(!video_playback_stalled(&idle, &idle));
+
+        // eof_reached 不参与判定：即便标记 EOF，只要时钟未前进且非暂停/非 idle
+        // 仍判为 stalled（stalled 时 mpv 处于 DRAINING，eof_reached 可能为 false）
+        let eof = LivenessProbe {
+            time_pos: 9.0,
+            paused: false,
+            idle_active: false,
+            eof_reached: true,
+        };
+        assert!(video_playback_stalled(&eof, &eof));
+    }
+
     // ========== Common args tests ==========
 
     #[test]
@@ -1224,12 +1570,40 @@ mod tests {
         // v11.0：demuxer 后退缓冲清零 + 禁用时间维度缓存参数
         assert!(args.contains(&"--demuxer-max-back-bytes=0".to_string()));
         assert!(args.contains(&"--cache-secs=0".to_string()));
+        // Task 4：进一步限流降内存参数（软解线程上限 + demuxer 预读时间窗减半）
+        assert!(
+            args.contains(&"--vd-lavc-threads=4".to_string()),
+            "应限制视频软解线程数为 4"
+        );
+        assert!(
+            args.contains(&"--demuxer-readahead-secs=0.5".to_string()),
+            "应将 demuxer 前向预读时间窗降为 0.5s"
+        );
         // 根因 D：--d3d11-flip=no 强制 bitblt 呈现模式，避免嵌入 WorkerW 后 flip-model 纹理创建失败黑屏
         assert!(args.contains(&"--d3d11-flip=no".to_string()));
         // 根因 C：--demuxer-max-bytes=0 会把解复用器缓冲清零导致 mpv 无媒体数据可播（黑屏+设置失败），必须禁止出现
         assert!(
             !args.iter().any(|a| a.starts_with("--demuxer-max-bytes=")),
             "--demuxer-max-bytes 参数（尤其 =0）会阻止 demuxer 读取数据，禁止出现"
+        );
+    }
+
+    #[test]
+    fn build_mpv_args_contains_task4_memory_limiting_args() {
+        // Task 4：进一步限流降内存的专用断言。
+        let renderer = create_renderer(ScalingMode::Fill);
+        let args = renderer.build_mpv_args();
+
+        // 限制视频软解线程数为 4（默认 0=按核数自动上探至 16），
+        // 压低帧级多线程解码的参考帧缓冲占用。
+        assert!(
+            args.contains(&"--vd-lavc-threads=4".to_string()),
+            "应包含 --vd-lavc-threads=4 以限制软解线程缓冲"
+        );
+        // demuxer 前向预读时间窗减半（默认 1s → 0.5s），压缩 demuxer 包队列内存。
+        assert!(
+            args.contains(&"--demuxer-readahead-secs=0.5".to_string()),
+            "应包含 --demuxer-readahead-secs=0.5 以压缩 demuxer 预读内存"
         );
     }
 
@@ -1741,6 +2115,32 @@ mod tests {
         renderer.set_speed(1.5);
         renderer.set_speed(0.5);
         renderer.set_speed(1.0);
+    }
+
+    // ========== SubTask 2.12：覆盖窗禁用 mpv 自动窗口适配 ==========
+
+    /// `disable_auto_window_resize` 在 IPC 未连接时返回 `Err`，与 `after_embed` 的
+    /// None 分支契约一致（调用方按 best-effort 处理，失败仅 warn）。
+    #[test]
+    fn disable_auto_window_resize_errors_when_ipc_absent() {
+        let mut renderer = create_renderer(ScalingMode::Fill);
+        let result = renderer.disable_auto_window_resize();
+        assert!(
+            result.is_err(),
+            "IPC 未连接时 disable_auto_window_resize 应返回 Err，实际: {result:?}"
+        );
+    }
+
+    /// 源码契约：方法须发送 `set_property("auto-window-resize", "no")`。
+    /// 运行期拼接搜索串，避免与本测试内的字面量自匹配。
+    #[test]
+    fn disable_auto_window_resize_sends_property_contract() {
+        let source = include_str!("video.rs");
+        let call = ["set_property(", "\"auto-window-resize\", \"no\")"].join("");
+        assert!(
+            source.contains(&call),
+            "video.rs 应包含 {call}（SubTask 2.12：禁用 mpv 自动窗口适配）"
+        );
     }
 
     // ========== v41-W-007 修复测试：Drop 显式断开 IPC socket 再停止进程 ==========

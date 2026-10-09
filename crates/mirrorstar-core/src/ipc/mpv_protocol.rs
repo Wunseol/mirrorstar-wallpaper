@@ -111,7 +111,7 @@ impl MpvIpcClient {
     /// 发送命令到 mpv，不等待响应（fire-and-forget）
     ///
     /// 仅构造 JSON（含 request_id）写入管道即返回，不读取 mpv 的 ack 响应。
-    /// 适用于 set_property / pause / resume / set_volume / set_loop_file / set_speed / quit
+    /// 适用于 set_property / pause / resume / set_volume / set_speed / quit
     /// 等无需返回数据的命令，避免 mpv 端处理延迟时同步等待 5s 超时导致 UI 卡顿（Bug #7）。
     ///
     /// 注意：调用方无法感知 mpv 是否成功执行命令。若命令失败，mpv 仍会异步返回 error 响应，
@@ -139,7 +139,20 @@ impl MpvIpcClient {
         &mut self,
         name: &str,
     ) -> Result<serde_json::Value, crate::MirrorStarError> {
-        self.send_command_with_timeout(&["get_property", name], Duration::from_secs(2))
+        self.get_property_with_timeout(name, Duration::from_secs(2))
+    }
+
+    /// 带自定义超时的属性查询。
+    ///
+    /// 与 [`Self::get_property`] 行为完全一致（含响应解析与 request_id 校验），
+    /// 唯一区别是 IPC 等待超时可调：存活探针这类"周期性、允许失败"的调用需要
+    /// 远短于默认 2s 的超时，避免在 mpv 响应缓慢时长时间占住调用方（引擎锁）。
+    pub fn get_property_with_timeout(
+        &mut self,
+        name: &str,
+        timeout: Duration,
+    ) -> Result<serde_json::Value, crate::MirrorStarError> {
+        self.send_command_with_timeout(&["get_property", name], timeout)
             .map(|r| r.data.unwrap_or(serde_json::Value::Null))
     }
 
@@ -174,11 +187,6 @@ impl MpvIpcClient {
             });
         }
         self.set_property("volume", &volume.to_string())
-    }
-
-    /// 设置循环播放（fire-and-forget）
-    pub fn set_loop_file(&mut self, enabled: bool) -> Result<(), crate::MirrorStarError> {
-        self.set_property("loop-file", if enabled { "yes" } else { "no" })
     }
 
     /// 加载视频文件（fire-and-forget）
@@ -354,5 +362,31 @@ mod tests {
     fn ipc_client_pipe_path_accessor() {
         let client = MpvIpcClient::new("my-mpv-socket");
         assert_eq!(client.pipe_path(), r"\\.\pipe\my-mpv-socket");
+    }
+
+    // --- get_property_with_timeout：与 get_property 行为等价（未连接同错误） ---
+
+    #[test]
+    fn get_property_with_timeout_same_error_as_get_property_when_disconnected() {
+        // 未连接时两者都应返回同类型错误（IpcNotConnected），
+        // 说明 get_property_with_timeout 复用了 get_property 的连接检查/发送路径，
+        // 唯一差异只是超时参数（此处无需真实 mpv）。
+        let mut default_client = MpvIpcClient::new("test-pipe");
+        let mut custom_client = MpvIpcClient::new("test-pipe");
+
+        let default_result = default_client.get_property("time-pos");
+        let custom_result =
+            custom_client.get_property_with_timeout("time-pos", Duration::from_millis(500));
+
+        match (&default_result, &custom_result) {
+            (
+                Err(crate::MirrorStarError::IpcNotConnected(a)),
+                Err(crate::MirrorStarError::IpcNotConnected(b)),
+            ) => assert_eq!(a, b, "未连接时应返回相同的 IpcNotConnected 错误信息"),
+            other => panic!(
+                "未连接时两者都应返回同类型错误 IpcNotConnected，实际: {:?}",
+                other
+            ),
+        }
     }
 }

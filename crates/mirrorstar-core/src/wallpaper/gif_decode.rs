@@ -23,7 +23,7 @@ pub(crate) struct GifFrame {
 /// v8-C: 从 40 降至 15。配合流式帧缓存（仅保留当前帧 + 前后各
 /// [`STREAMING_WINDOW_HALF`] 帧像素），活跃播放内存从全量 ~40MB 降至
 /// ~3 帧 × 降采样后尺寸。窗口外帧仅保留元数据（width/height/delay_ms），
-/// WM_TIMER 推进到空像素帧时通过 [`decode_gif_frame_at`] 按需重新解码。
+/// WM_TIMER 推进到空像素帧时通过 [`decode_single_frame_with_cursor`] 按需重新解码。
 pub(crate) const DEFAULT_MAX_GIF_MEMORY_MB: usize = 15;
 
 /// v8-C: 流式帧缓存窗口半幅。
@@ -31,7 +31,7 @@ pub(crate) const DEFAULT_MAX_GIF_MEMORY_MB: usize = 15;
 /// 活跃播放时仅保留当前帧 + 前后各 N 帧的像素数据在内存中（N = 此常量）。
 /// 例如 N=1 时窗口为 `[current-1, current+1]`，共 3 帧。
 /// 窗口外帧的 `pixels` 字段被清空（`clear` + `shrink_to_fit`），仅保留
-/// 元数据；推进到空像素帧时由 `decode_gif_frame_at` 从文件重新解码。
+/// 元数据；推进到空像素帧时由 `decode_single_frame_with_cursor` 从文件重新解码。
 ///
 /// (d): 原值 2（5 帧窗口）。#1+#2 持久化解码游标落地后，前向 re-decode
 /// 已降至 O(1) delta（见 `bench_cursor_o_1_forward` 实测：#1 prefetch per-call
@@ -43,7 +43,7 @@ pub(crate) const STREAMING_WINDOW_HALF: usize = 1;
 ///
 /// 预取解码的帧若超过此尺寸则跳过（不加入返回 Vec），
 /// 避免 4K GIF（每帧 ~6MB）× (2*`STREAMING_WINDOW_HALF`+1) 帧造成瞬时内存尖峰。被跳过的帧
-/// 仍由 [`decode_gif_frame_at`] 在 `WM_TIMER` 同步兜底解码（仅当前帧）。
+/// 仍由 [`decode_single_frame_with_cursor`] 在 `WM_TIMER` 同步兜底解码（仅当前帧）。
 pub(crate) const MAX_PREFETCH_FRAME_BYTES: usize = 8 * 1024 * 1024;
 
 /// v18: 流式窗口解码（可取消版）——解码过程中即时清空窗口外帧的像素。
@@ -305,77 +305,6 @@ pub fn gif_first_frame_oversized(path: &str) -> bool {
     }
 }
 
-/// v8-C: 按索引解码 GIF 文件的单个帧。
-///
-/// 用于流式帧缓存场景：当 `WM_TIMER` 推进到像素已被清空的帧时，调用本函数
-/// 从文件重新解码该帧的像素数据。降采样逻辑与全量解码一致，
-/// 确保按需解码结果与全量解码结果可互换。
-///
-/// # 性能说明
-///
-/// GIF 帧使用增量编码（每帧基于前帧差异），image crate 的 `Frames` 迭代器
-/// 无法跳过中间帧。因此本函数需从第 0 帧顺序解码到 `frame_index`，复杂度
-/// O(frame_index)。典型 GIF 帧数 < 100、单帧解码 < 10ms，可接受。
-///
-/// #1 后：生产预取路径已改用 [`prefetch_with_cursor`]（持久化解码游标，
-/// O(half) 而非 O(target+half)），消除了主动预取的重复解码。本函数因每次
-/// 调用都重新打开文件并从第 0 帧解码，仍为 O(target)；保留为同步兜底
-/// （`gif_memory::reload_current_frame_pixels`，#1 后罕见但触发即卡顿）
-/// 与测试/benchmark 基准对照使用。消除此 O(target) 兜底开销见候选优化
-/// `reload_current_frame_pixels` 改造。
-///
-/// # 参数
-///
-/// - `path`: GIF 文件路径
-/// - `frame_index`: 目标帧索引（0-based）
-/// - `max_memory_mb`: 内存预算（仅用于日志上下文，单帧解码不触发预算截断）
-///
-/// # 错误
-///
-/// - 文件不存在 / 无法打开：返回 `MirrorStarError::Io`
-/// - GIF 格式错误：返回 `MirrorStarError::ImageDecode`
-/// - `frame_index` 超出总帧数：返回 `MirrorStarError::ImageDecode`
-#[allow(dead_code)]
-pub(crate) fn decode_gif_frame_at(
-    path: &str,
-    frame_index: usize,
-    max_memory_mb: usize,
-) -> Result<GifFrame, MirrorStarError> {
-    // W12: 流式读取，BufReader 包装 File 避免一次性读入全部文件内容
-    let file = std::fs::File::open(path)?;
-    let reader = std::io::BufReader::new(file);
-
-    // v5.0 W-PERF-003: 使用缓存避免按需解码每次都调用 GetSystemMetrics
-    let (screen_w, screen_h) = super::get_screen_size();
-
-    use image::AnimationDecoder;
-    let decoder = image::codecs::gif::GifDecoder::new(reader)
-        .map_err(|e| MirrorStarError::ImageDecode(format!("GIF 解码初始化失败: {}", e)))?;
-    let frames_iter = decoder.into_frames();
-
-    for (current, frame_result) in frames_iter.enumerate() {
-        let frame = frame_result.map_err(|e| {
-            MirrorStarError::ImageDecode(format!("GIF 帧读取失败 (第 {} 帧): {}", current, e))
-        })?;
-        if current == frame_index {
-            let result = process_gif_frame(frame, screen_w, screen_h);
-            tracing::debug!(
-                frame_index,
-                width = result.width,
-                height = result.height,
-                max_memory_mb,
-                "v8-C: 按需解码单帧完成"
-            );
-            return Ok(result);
-        }
-    }
-
-    Err(MirrorStarError::ImageDecode(format!(
-        "GIF 帧索引 {} 超出范围（文件总帧数 <= {}）",
-        frame_index, frame_index
-    )))
-}
-
 /// #1: 预取请求（跨线程发送到 worker）。
 ///
 /// `target` 为预取窗口中心；`half` 为窗口半幅（前后各 `half` 帧），
@@ -531,14 +460,15 @@ pub(crate) fn prefetch_with_cursor(
 
 /// #2: 持久化解码游标的单帧解码——消除 sync 兜底 O(target) 重解码。
 ///
-/// 取代 [`decode_gif_frame_at`] 在 `reload_current_frame_pixels` 中的用途。
-/// 与 [`decode_gif_frame_at`]（每次从 0 解码到 target，O(target)）不同，本函数
+/// 取代旧的按需单帧解码函数（已删除的 `decode_gif_frame_at`）在
+/// `reload_current_frame_pixels` 中的用途。
+/// 与旧实现（每次从 0 解码到 target，O(target)）不同，本函数
 /// 复用调用方持有的 `frames_iter` + `cursor`：主线程 `GifRenderData` 局部变量，
 /// 跨多次 `reload_current_frame_pixels` 调用保留解码状态。
 ///
 /// 与 [`prefetch_with_cursor`] 的区别：
 /// - 仅返回 target 帧（非窗口），用于同步兜底解码当前帧
-/// - 不应用 v10-C 8MB 跳过（sync 兜底需处理 4K 帧，与 `decode_gif_frame_at` 一致）
+/// - 不应用 v10-C 8MB 跳过（sync 兜底需处理 4K 帧，与已删除的 `decode_gif_frame_at` 一致）
 ///
 /// # 复杂度
 ///
@@ -548,7 +478,7 @@ pub(crate) fn prefetch_with_cursor(
 ///   解码 `0..=target`，O(target)。
 /// - **首次调用**（`frames_iter` 为 None）：打开 GIF，O(target)。
 ///
-/// 旧 `decode_gif_frame_at` 每次调用 O(target)；本函数首次 O(target)，后续 O(1)。
+/// 旧的 `decode_gif_frame_at` 每次调用 O(target)；本函数首次 O(target)，后续 O(1)。
 ///
 /// # 参数
 ///
@@ -664,8 +594,7 @@ fn process_gif_frame(frame: image::Frame, screen_w: u32, screen_h: u32) -> GifFr
         let scale = (screen_w as f64 / width as f64).min(screen_h as f64 / height as f64);
         let dw = ((width as f64 * scale).round() as u32).max(1);
         let dh = ((height as f64 * scale).round() as u32).max(1);
-        let thumb =
-            image::imageops::thumbnail(&image::DynamicImage::ImageRgba8(img), dw, dh);
+        let thumb = image::imageops::thumbnail(&image::DynamicImage::ImageRgba8(img), dw, dh);
         let (tw, th) = thumb.dimensions();
         (tw, th, thumb.into_raw())
     } else {
@@ -682,8 +611,8 @@ fn process_gif_frame(frame: image::Frame, screen_w: u32, screen_h: u32) -> GifFr
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use super::super::SCREEN_SIZE_TEST_MUTEX;
+    use super::*;
 
     /// 最小有效 GIF（1x1 像素，GIF89a，含 2 色全局颜色表）
     const MINIMAL_GIF: &[u8] = &[
@@ -765,98 +694,6 @@ mod tests {
         assert_eq!(frame.pixels[1], 50, "首帧首像素 G 分量");
         assert_eq!(frame.pixels[2], 150, "首帧首像素 B 分量");
         assert_eq!(frame.pixels[3], 255, "首帧首像素 A 分量");
-    }
-
-    // ========== v8-C: decode_gif_frame_at 按需单帧解码测试 ==========
-
-    #[test]
-    fn test_decode_gif_frame_at_first_frame_minimal() {
-        // v8-C: 按索引 0 解码最小 GIF 的首帧
-        let dir = tempfile::tempdir().unwrap();
-        let gif_path = dir.path().join("minimal.gif");
-        std::fs::write(&gif_path, MINIMAL_GIF).unwrap();
-        let path = gif_path.to_str().unwrap();
-
-        let frame =
-            decode_gif_frame_at(path, 0, DEFAULT_MAX_GIF_MEMORY_MB).expect("应成功解码第 0 帧");
-        assert_eq!(frame.width, 1);
-        assert_eq!(frame.height, 1);
-        assert_eq!(frame.pixels.len(), 4, "1x1 RGBA = 4 字节");
-    }
-
-    #[test]
-    fn test_decode_gif_frame_at_specific_frame_pixel_value() {
-        // v8-C: 验证按需解码的像素值正确（RGBA 保持，GDI 经 BI_BITFIELDS 解释）
-        use image::codecs::gif::GifEncoder;
-        use image::ExtendedColorType;
-
-        let dir = tempfile::tempdir().unwrap();
-        let gif_path = dir.path().join("pixel_5frames.gif");
-        let file = std::fs::File::create(&gif_path).unwrap();
-        let mut encoder = GifEncoder::new(file);
-        for i in 0..5u8 {
-            let pixels = vec![i, 0, 0, 255]; // RGBA: R=i, G=0, B=0, A=255
-            encoder
-                .encode(&pixels, 1, 1, ExtendedColorType::Rgba8)
-                .expect("编码 GIF 帧应成功");
-        }
-        drop(encoder);
-
-        let path = gif_path.to_str().unwrap();
-        // 解码第 3 帧：RGBA [3,0,0,255]
-        let frame =
-            decode_gif_frame_at(path, 3, DEFAULT_MAX_GIF_MEMORY_MB).expect("应成功解码第 3 帧");
-        assert_eq!(frame.pixels.len(), 4);
-        assert_eq!(frame.pixels[0], 3, "R 分量应为 3");
-        assert_eq!(frame.pixels[1], 0, "G 分量应为 0");
-        assert_eq!(frame.pixels[2], 0, "B 分量应为 0");
-        assert_eq!(frame.pixels[3], 255, "A 分量应为 255");
-    }
-
-    #[test]
-    fn test_decode_gif_frame_at_out_of_range() {
-        // v8-C: 帧索引超出范围应返回错误而非 panic
-        let dir = tempfile::tempdir().unwrap();
-        let gif_path = dir.path().join("minimal.gif");
-        std::fs::write(&gif_path, MINIMAL_GIF).unwrap();
-        let path = gif_path.to_str().unwrap();
-
-        let result = decode_gif_frame_at(path, 10, DEFAULT_MAX_GIF_MEMORY_MB);
-        assert!(result.is_err(), "超出范围的帧索引应返回错误");
-        match result {
-            Err(MirrorStarError::ImageDecode(msg)) => {
-                assert!(
-                    msg.contains("超出范围"),
-                    "错误信息应包含'超出范围'，实际: {}",
-                    msg
-                );
-            }
-            other => panic!("期望 ImageDecode 错误，实际: {:?}", other),
-        }
-    }
-
-    #[test]
-    fn test_decode_gif_frame_at_nonexistent_file() {
-        // v8-C: 不存在的文件应返回错误
-        let result = decode_gif_frame_at(
-            "Z:\\nonexistent\\path\\no_such_file.gif",
-            0,
-            DEFAULT_MAX_GIF_MEMORY_MB,
-        );
-        assert!(result.is_err(), "不存在的文件应返回错误");
-    }
-
-    #[test]
-    fn test_decode_gif_frame_at_corrupted_gif() {
-        // v8-C: 损坏的 GIF 应返回错误而非 panic
-        let corrupted = &MINIMAL_GIF[..10];
-        let dir = tempfile::tempdir().unwrap();
-        let gif_path = dir.path().join("corrupted.gif");
-        std::fs::write(&gif_path, corrupted).unwrap();
-        let path = gif_path.to_str().unwrap();
-
-        let result = decode_gif_frame_at(path, 0, DEFAULT_MAX_GIF_MEMORY_MB);
-        assert!(result.is_err(), "损坏的 GIF 应返回错误");
     }
 
     // ========== v10-C: 单帧像素数据预取阈值测试 ==========
@@ -1612,33 +1449,17 @@ mod tests {
         );
     }
 
-    // ========== #1 + #2: 持久化游标 O(1) 前向解码对比测量 ==========
+    // ========== #1 + #2: 持久化游标 O(1) 前向解码测量 ==========
     //
-    // 目的：对比旧路径（每次从 0 解码，N 次前向调用 = O(N²) 总耗时）与
-    // 新路径（#1 prefetch_with_cursor / #2 decode_single_frame_with_cursor
+    // 目的：测量新路径（#1 prefetch_with_cursor / #2 decode_single_frame_with_cursor
     // 持久化游标，前向仅解码 1 帧 delta，N 次前向调用 = O(N) 总耗时）在
     // 完整前向播放循环（target=0..N-1，模拟一次 loop 的前向段）下的耗时。
     //
     // 运行：cargo test -p mirrorstar-core bench_cursor_o_1_forward --ignored --nocapture
     //
     // 标记 #[ignore] 因：生成多帧真实分辨率 GIF + 多次解码耗时较长，
-    // 不纳入常规测试运行。输出为测量表格（非断言），供人工分析 #1+#2 实际改善，
+    // 不纳入常规测试运行。输出为测量表格（非断言），供人工分析 #1+#2 实际表现，
     // 并为后续 (d) STREAMING_WINDOW_HALF 2→1 调优提供数据支撑。
-
-    /// 旧路径完整前向循环：N 次 `decode_gif_frame_at(i)`，每次从 0 解码到 i。总 O(N²)。
-    fn time_full_loop_old(path: &str, n_frames: usize) -> f64 {
-        let mut s: Vec<u128> = (0..3)
-            .map(|_| {
-                let t = std::time::Instant::now();
-                for i in 0..n_frames {
-                    let _ = decode_gif_frame_at(path, i, DEFAULT_MAX_GIF_MEMORY_MB).unwrap();
-                }
-                t.elapsed().as_micros()
-            })
-            .collect();
-        s.sort_unstable();
-        s[1] as f64 / 1000.0
-    }
 
     /// #2 sync 兜底完整前向循环：复用 `(frames_iter, cursor)`，每次前向 O(1) delta。总 O(N)。
     fn time_full_loop_sync(path: &str, screen_w: u32, screen_h: u32, n_frames: usize) -> f64 {
@@ -1704,9 +1525,8 @@ mod tests {
         super::super::set_screen_size_for_test(3840, 2160);
 
         println!();
-        println!("=== #1 + #2: 持久化游标 vs 旧 O(N) 路径（完整前向循环 target=0..N-1, median of 3, 屏幕 3840×2160）===");
+        println!("=== #1 + #2: 持久化游标 O(N) 前向路径（完整前向循环 target=0..N-1, median of 3, 屏幕 3840×2160）===");
         println!("注：与 bench_decode_o_n_growth 同条件（纯色高压缩帧，LZW 为真实 GIF 下界）。");
-        println!("    旧路径每次调用从 0 解码到 target → N 次调用 = O(N²)；");
         println!("    新路径持久化游标，前向仅解码 1 帧 delta → N 次调用 = O(N)。");
 
         let configs: &[(u32, u32, usize, &str)] =
@@ -1734,13 +1554,6 @@ mod tests {
             println!();
             println!("[{label}, {n_frames} 帧] 完整前向循环 target=0..{n_frames}-1:");
 
-            // 旧路径：N 次 decode_gif_frame_at(i)，每次 O(i) → 总 O(N²)
-            let old_ms = time_full_loop_old(&path, n_frames);
-            let old_per = old_ms / n_frames as f64;
-            println!(
-                "  旧 decode_gif_frame_at    总 {old_ms:>9.2} ms   (per-call ≈ {old_per:.3} ms)  O(N²)"
-            );
-
             // #2 sync 兜底：N 次 decode_single_frame_with_cursor(i) 复用 cursor，前向 O(1)
             let sync_ms = time_full_loop_sync(&path, screen_w, screen_h, n_frames);
             let sync_per = sync_ms / n_frames as f64;
@@ -1754,21 +1567,10 @@ mod tests {
             println!(
                 "  #1 prefetch_with_cursor   总 {prefetch_ms:>9.2} ms   (per-call ≈ {prefetch_per:.3} ms)  O(N)"
             );
-
-            // 加速比
-            if sync_ms > 0.0 {
-                println!("  → #2 vs 旧 加速比 ≈ {:.2}×", old_ms / sync_ms);
-            }
-            if prefetch_ms > 0.0 {
-                println!("  → #1 vs 旧 加速比 ≈ {:.2}×", old_ms / prefetch_ms);
-            }
         }
 
         println!();
-        println!("说明：N=帧数。前向段加速比 ≈ N/2（旧 O(N²) 总 / 新 O(N) 总的理论比）。");
-        println!("      实测加速比低于 N/2 因首帧仍 O(N) 打开 + 帧合成/降采样固定开销。");
-        println!("      回绕段未测（旧回绕 O(1)，新回绕 O(half)，差异小且仅 1 次/loop）。");
-        println!("      此数据为 (d) STREAMING_WINDOW_HALF 2→1 调优提供基线：");
+        println!("说明：N=帧数。此数据为 (d) STREAMING_WINDOW_HALF 2→1 调优提供基线：");
         println!("      若 #1 前向 per-call 已接近 #2，说明窗口解码成本可忽略，");
         println!("      (d) 降 half 主要省内存而对 CPU 影响极小。");
 

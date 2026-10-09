@@ -83,7 +83,7 @@ windows = { version = "0.58", features = [
 
 #### 进程与作业管理
 
-- `CreateProcessW` — 启动子进程（mpv.exe / mirrorstar-wp-proc.exe）
+- `CreateProcessW` — 启动子进程（mpv.exe / 壳进程 `--wp-proc` 模式实例）
 - 作业对象（`Win32_System_JobObjects`）— 约束子进程
 - `OpenProcess` / `GetWindowThreadProcessId` — PID 校验、窗口归属校验
 

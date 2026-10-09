@@ -13,17 +13,17 @@
 
 ## 1. 技术栈总览
 
-下表基于当前实际代码审计得出，版本号以 workspace `Cargo.toml` 与 `package.json` 为准。
+下表基于当前实际代码审计得出，版本号以 workspace `Cargo.toml` 为准。
 
 | 类别 | 技术 | 版本 | 用途 | 许可证 |
 |------|------|------|------|--------|
 | 核心语言 | Rust | 1.80（`rust-version`） | 应用主体开发（workspace edition 2021） | MIT / Apache-2.0 |
-| UI 框架 | Tauri | v2.11（启用 `tray-icon` feature） | 桌面应用框架（Rust 后端 + WebView2 前端） | MIT / Apache-2.0 |
-| 前端 | 原生 TypeScript + HTML + CSS | TS 5.5 / Vite 5.4 | 用户界面渲染（未使用 React/Vue/Angular） | MIT |
+| 应用壳 | Tauri | v2.11（启用 `tray-icon` feature） | 桌面应用壳（托盘 / 壁纸引擎 / 轮换调度 / 命令桥 / UI 子进程管理，Rust） | MIT / Apache-2.0 |
+| 主窗口 UI | Slint（原生 UI 子进程 `mirrorstar-ui.exe`） | 1.18（`default-features=false` + `renderer-software`） | 主窗口界面渲染（Rust 原生声明式 UI，无 Web 运行时，软件渲染） | GPL-3.0 / 商业（双许可） |
 | Windows API | windows-rs | 0.58 | Windows 系统 API 绑定 | MIT / Apache-2.0 |
 | 视频播放 | mpv.exe（外部子进程） | 外部进程（无 Rust crate） | 通过 mpv.exe 播放视频，捆绑于 `<exe_dir>/mpv/` 或 PATH | GPL-2.0 (mpv) |
 | 图片 / GIF | image crate | 0.25（`default-features=false`，启用 png/jpeg/gif/bmp/webp/tiff + rayon） | 静态图片与 GIF 解码（WebP 回退路径 + GIF 渲染） | MIT |
-| 网页壁纸 | webview2-com | 0.34 | WebView2 SDK Rust 绑定（由子进程 mirrorstar-wp-proc.exe 使用） | MIT |
+| 网页壁纸 | webview2-com | 0.34 | WebView2 SDK Rust 绑定（由壳进程 `--wp-proc` 模式子进程使用） | MIT |
 | 配置管理 | serde + toml | serde 1 / toml 0.8 | TOML 配置读写 | MIT |
 | 热重载 | notify | 7 | 配置文件系统监控 | CC0-1.0 / MIT |
 | 日志系统 | tracing + tracing-subscriber + tracing-appender | tracing 0.1 / subscriber 0.3 / appender 0.2 | 结构化日志 | MIT |
@@ -37,10 +37,10 @@
 | 系统目录 | dirs | 6 | 获取系统目录路径 | MIT / Apache-2.0 |
 | 注册表操作 | winreg | 0.55 | 开机自启与壁纸缩放模式注册表读写 | MIT |
 | UUID | uuid | 1（`v4`） | 命名管道、实例等唯一标识 | MIT / Apache-2.0 |
-| URL 工具 | percent-encoding | 2 | `wpfile://` 自定义协议路径解码 | MIT / Apache-2.0 |
+| URL 工具 | percent-encoding | 2 | （历史）`wpfile://` 自定义协议路径解码，随前端删除已移除 | MIT / Apache-2.0 |
 | 文件对话框 | tauri-plugin-dialog | 2.7 | Tauri 文件选择对话框插件 | MIT / Apache-2.0 |
 | 开机自启 | tauri-plugin-autostart | 2.5 | Tauri 开机自启插件 | MIT / Apache-2.0 |
-| 构建 / 测试工具 | Tauri CLI / Vite / Vitest / ESLint / Prettier / Terser | @tauri-apps/cli 2.11.2 / vite 5.4 / vitest 2.1.9 / eslint 9 / prettier 3.4 / terser 5.37 | 前端构建、测试、代码规范 | MIT |
+| 构建 / 测试工具 | Cargo / Tauri CLI / Rust 测试 | tauri-cli（`cargo install`）/ `cargo test` | 构建与测试（**无 npm / Vite / Vitest / ESLint / Prettier**） | MIT / Apache-2.0 |
 
 > 说明：早期文档中列出的 `anyhow`、`bitflags`、`softbuffer`、`raw-window-handle` 均为虚构依赖，实际代码未引入，已从本表移除。
 

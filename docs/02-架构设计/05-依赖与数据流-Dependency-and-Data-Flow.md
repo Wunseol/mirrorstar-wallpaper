@@ -58,7 +58,7 @@ graph LR
 | 壁纸引擎 → 原生壁纸 | 单向 | 引擎调用 native_wallpaper 模块通过 Windows 原生 API 设置静态壁纸（Native 模式） |
 | 原生壁纸 → winreg | 单向 | native_wallpaper 通过 winreg crate 读写注册表（WallPaperStyle/TileWallpaper） |
 | 原生壁纸 → Windows API | 单向 | native_wallpaper 调用 SystemParametersInfoW（windows::Win32::UI::WindowsAndMessaging）设置壁纸 |
-| 壁纸引擎 → 进程管理 | 单向 | 引擎通过进程管理器创建和终止壁纸子进程（视频→mpv.exe，网页→wp-proc.exe）     |
+| 壁纸引擎 → 进程管理 | 单向 | 引擎通过进程管理器创建和终止壁纸子进程（视频→mpv.exe，网页→壳进程 `--wp-proc` 模式）     |
 | 壁纸引擎 → 配置管理 | 单向 | 引擎读取壁纸配置和用户设置           |
 | 壁纸引擎 → 音频控制 | 单向 | 引擎控制壁纸音频的音量和静音          |
 | 进程管理 → IPC  | 单向 | 进程管理器通过两套独立 IPC 与子进程通信（mpv 原生 JSON IPC + wp-proc 自定义协议）      |
@@ -82,7 +82,7 @@ flowchart TD
 
     C1 --> D1[ProcessManager 启动 mpv.exe 子进程]
     D1 --> D1a[MpvIpcClient 命名管道 IPC<br/>mpv 原生 JSON 协议]
-    C3 --> D2[ProcessManager 启动 wp-proc.exe 子进程]
+    C3 --> D2[ProcessManager 以 --wp-proc 模式启动壳进程自身]
     D2 --> D2a[WpProcIpcClient 命名管道 IPC<br/>wp-proc 自定义协议]
     C2 --> EW2[主进程内创建窗口<br/>GDI 双缓冲渲染线程]
     C4 --> E{WallpaperMode}
@@ -215,7 +215,7 @@ MirrorStar 采用两套独立的命名管道协议（mpv 原生 JSON IPC + wp-pr
 
 ### 6.2 关键设计说明
 
-1. **两套独立 IPC 协议**：视频壁纸通过 `MpvIpcClient`（`ipc/mpv_protocol.rs`）使用 mpv 原生 JSON IPC 协议与 mpv.exe 通信；Web 壁纸通过 `WpProcIpcClient`（`ipc/wp_proc.rs`）使用 wp-proc 自定义协议与 wp-proc.exe 通信。两套协议独立设计，分别针对不同子进程的通信需求。
+1. **两套独立 IPC 协议**：视频壁纸通过 `MpvIpcClient`（`ipc/mpv_protocol.rs`）使用 mpv 原生 JSON IPC 协议与 mpv.exe 通信；Web 壁纸通过 `WpProcIpcClient`（`ipc/wp_proc.rs`）使用 wp-proc 自定义协议与壳 `--wp-proc` 模式子进程通信。两套协议独立设计，分别针对不同子进程的通信需求。
 
 2. **IPC 连接重试参数**：`ipc/mod.rs`（28 行）与 `client.rs`（1021 行）提供共用连接重试模式，`subprocess_base.rs` 定义具体参数——mpv 连接重试 `MPV_CONNECT_RETRIES=40×50ms=2s` 总超时；wp-proc 连接重试 `WP_PROC_CONNECT_RETRIES=160×50ms=8s` 总超时；窗口查找 `WINDOW_FIND_RETRIES=20×100ms=2s`。
 

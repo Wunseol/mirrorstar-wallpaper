@@ -181,6 +181,17 @@ pub(crate) fn handle_power_status_change() {
     }
 }
 
+/// 纯净壁纸模式退出后补跑一次电源状态判定
+///
+/// 模式运行期间 `try_pause_all_fast` / `try_resume_all_fast` 被 state.rs 首部守卫跳过
+/// （见 D5），`POWER_WAS_ON_BATTERY` 等状态可能滞后于真实电源状态。本入口在模式退出后
+/// 复用 `handle_power_status_change` 的既有逻辑补跑一次，纠正状态漂移（按
+/// `pause.pause_on_battery` 配置执行应有的处置）。
+pub(crate) fn reevaluate_now() {
+    tracing::info!("纯净壁纸模式退出后补跑一次电源状态判定");
+    handle_power_status_change();
+}
+
 /// 解析 Win32 SYSTEM_POWER_STATUS.ACLineStatus 字段（T-015 修复）
 ///
 /// 提取为独立纯函数以便单元测试覆盖状态映射逻辑（无需 Win32 环境）。

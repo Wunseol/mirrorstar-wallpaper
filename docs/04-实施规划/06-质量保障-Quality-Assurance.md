@@ -16,8 +16,10 @@
 本项目以**零警告、可测试、可发布**为核心质量目标，保障手段落在「本地工具链 + CI 流水线 + 集成测试」三层。
 
 - **Rust 侧**：`cargo test / clippy / fmt` 全部零告警（clippy 用 `-D warnings`）。
-- **前端侧**：TypeScript 类型检查、ESLint 零警告、Vitest 单测覆盖、Vite 构建必须通过。
-- **依赖安全**：`cargo audit` + `npm audit` 兜底。
+- **依赖安全**：`cargo audit` 兜底。
+- **e2e**：PowerShell 驱动脚本（`crates/mirrorstar-ui/`）做真机内存/CPU/交互冒烟验证。
+
+> 原前端质量门槛（TypeScript 类型检查、ESLint、Vitest、Vite 构建、npm audit）已随前端删除而取消。
 
 ## 2. 本地质量工具（命令）
 
@@ -30,18 +32,19 @@
 | `cargo fmt --all --check` | 格式检查 |
 | `cargo audit` | 依赖安全审计 |
 
-### 前端
+### e2e（PowerShell 驱动脚本，`crates/mirrorstar-ui/`）
 
-| npm 命令 | 用途 |
-|----------|------|
-| `npm run test` | Vitest run + 覆盖率（`@vitest/coverage-v8`） |
-| `npm run typecheck` | `tsc --noEmit` 类型检查 |
-| `npm run lint` | ESLint，`--max-warnings 0` |
-| `npm run build` | Vite 生产构建 |
+| 脚本 | 用途 |
+|------|------|
+| `measure_grid.ps1` | 网格内存/CPU 测量 |
+| `measure_scroll_reverify.ps1` | 滚动性能复测 |
+| `measure_preview.ps1` | 四类预览测量 |
+| `keyboard_smoke.ps1` | 键盘交互冒烟 |
+| `shell_measure.ps1` / `single_instance_check.ps1` | 壳内存测量 / 单实例校验（可能位于该目录） |
 
 ## 3. CI 流水线（真实流程）
 
-项目通过 `.github/workflows/checks.yml` 定义**可复用检查**，供 `ci.yml`（push/PR）与 `release.yml`（tag 触发的发布前置门）共享。checks.yml 包含两个 job：
+项目通过 `.github/workflows/checks.yml` 定义**可复用检查**，供 `ci.yml`（push/PR）与 `release.yml`（tag 触发的发布前置门）共享。checks.yml **仅包含 `rust-checks` 一个 job**（原 `frontend-checks` 已删除）。
 
 ### 3.1 rust-checks（windows-latest）
 
@@ -55,23 +58,14 @@
 | Run ignored tests | `cargo test --workspace -- --ignored`（`continue-on-error: true`，共享资源类串行，不阻断流程） |
 | Security audit | `cargo audit`（经 `install-action` 安装） |
 
-### 3.2 frontend-checks（windows-latest）
+### 3.2 frontend-checks（已删除）
 
-| 步骤 | 说明 |
-|------|------|
-| Setup Node 20 | `actions/setup-node@v4`（cache: npm） |
-| Install | `npm ci` |
-| npm audit | `npm audit --omit=dev --audit-level=high` |
-| npm audit (dev) | `npm audit --audit-level=critical` |
-| Build | `npm run build` |
-| TypeScript | `npx tsc --noEmit` |
-| ESLint | `npm run lint` |
-| Tests | `npm run test` |
+原 `frontend-checks` job（Setup Node 20 / `npm ci` / npm audit / Vite 构建 / `tsc` / ESLint / Vitest）已随前端删除**整体移除**，CI 不再使用 Node/npm。
 
 ### 3.3 触发与发布门
 
-- `ci.yml`：push / PR 触发，调用 checks。
-- `release.yml`：`v*` tag 触发，发布前先运行 checks 作为前置门，通过后才执行 `npm ci` + `tauri-action` 构建发布（draft release）。正式发布需配置签名密钥。
+- `ci.yml`：push / PR 触发，调用 checks（仅 rust-checks）。
+- `release.yml`：`v*` tag 触发，发布前先运行 checks 作为前置门，通过后执行 `cargo install tauri-cli` + `tauriScript: cargo tauri` 构建发布（draft release），不再使用 Node/npm。正式发布需配置签名密钥。
 
 ## 4. 测试覆盖（实测量）
 
@@ -92,16 +86,17 @@
 |------|------|----------|
 | `audio_integration.rs` | 61 | 音频集成 |
 | `ipc_timeout.rs` | 239 | IPC 超时与容错 |
-| `video_mpv_diagnostic.rs` | 69 | mpv 诊断 |
 | `video_wallpaper_fullpath.rs` | 124 | 视频壁纸全路径 |
 
-### 前端单测（`src/scripts/**/*.test.ts` + `main.test.ts`）
+### 原生 UI / e2e（`crates/mirrorstar-ui/`）
 
-覆盖 `ui/`、`utils/` 各模块及 IPC 封装；通过 `npm run test`（Vitest + coverage）在 CI 与本地执行。
+主窗口重构后新增 `mirrorstar-ui` crate，其单元/集成测试纳入 `cargo test --workspace`；真机端到端验证由 PowerShell 驱动脚本完成（见第 2 节 e2e 脚本表：`measure_grid.ps1`、`measure_scroll_reverify.ps1`、`measure_preview.ps1`、`keyboard_smoke.ps1` 等）。
+
+> **历史记录**：原前端单测（`src/scripts/**/*.test.ts`、`main.test.ts`）通过 `npm run test`（Vitest + coverage）执行；`src-tauri/tests/csp_guard.rs`（CSP 策略守卫）针对已移除的 WebView2 主窗口。二者均已随前端/主窗口重构删除。
 
 ## 5. 版本与变更控制
 
-- 依赖由 `Cargo.lock` / `package-lock.json` 锁定，保证可复现构建。
+- 依赖由 `Cargo.lock` 锁定，保证可复现构建（原 `package-lock.json` 已随前端删除）。
 - Rust 工具链由 `rust-toolchain.toml` 固定（stable / MSRV 1.80）。
 - 仓库启用 `.github/dependabot.yml` 跟踪依赖更新。
 

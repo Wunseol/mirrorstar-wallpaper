@@ -13,57 +13,54 @@
 
 ## 1. UI 框架
 
-### 选择：Tauri v2
+### 选择：Tauri 壳 + Slint 原生 UI 子进程
+
+主窗口已从 Tauri 内嵌 WebView2 重构为**独立原生 UI 子进程**（`mirrorstar-ui.exe`），Tauri 仅保留为壳（托盘、壁纸引擎、轮换调度、命令桥、UI 子进程管理）。
 
 **选择理由：**
 
-- **系统 WebView2**：Windows 10/11 已预装 WebView2 Runtime，无需额外安装
-- **Rust 后端**：后端逻辑用 Rust 编写（`src-tauri/` + `mirrorstar-core`），与核心业务代码无缝集成
-- **小二进制**：与 Electron 相比，无捆绑 Node/Chromium
-- **安全模型**：Tauri 的权限系统限制前端对系统 API 的访问，减少攻击面
-- **活跃社区**：插件生态丰富，版本适配良好（`tauri 2.11` + `tauri-plugin-dialog 2.7` + `tauri-plugin-autostart 2.5`）
+- **内存优先**：WebView2 主窗口需拉起多进程 Chromium 基线（约 +150-300MB），与"极低资源占用"目标冲突；原生 Slint UI 子进程软件渲染后在主窗口打开并静置时，壳 + UI 合计 private ≈ **16.8MB**（验收门槛 ≤40MB）
+- **Slint 1.18**：Rust 原生声明式 UI，无 Node/Chromium 运行时依赖，二进制体积小、启动快
+- **壳-UI 进程解耦**：UI 崩溃不影响壳与壁纸引擎，可持续驻留托盘
+- **Rust 后端**：业务逻辑继续用 Rust 编写（`src-tauri/` + `mirrorstar-core`），与核心业务代码无缝集成
+- **安全**：UI 子进程不复制业务、不直接读写配置文件，所有业务经 `ui_proto` 请求壳侧处理，攻击面收敛
 
 ### 与替代方案对比
 
 | 方案 | 优势 | 劣势 | 结论 |
 |------|------|------|------|
+| **Tauri WebView2 主窗口** | Rust 后端 + Web UI 灵活 | 主窗口需 Chromium 多进程基线，内存高 | ❌ 与轻量化目标冲突，已移除 |
 | **WPF** | 成熟稳定，XAML 数据绑定 | 需要 .NET Framework，体积大，样式定制复杂 | ❌ 运行时依赖过重 |
-| **egui** | 纯 Rust，即时模式 | 不适合复杂 UI，无 CSS 样式 | ❌ 不适合富 UI |
+| **egui** | 纯 Rust，即时模式 | 不适合复杂 UI，无声明式布局 | ❌ 不适合富 UI |
 | **WinUI3** | 微软官方，Fluent Design | 需要 Windows App SDK，Rust 绑定不成熟 | ❌ 依赖过重 |
-| **Tauri v2** ✅ | 系统 WebView2，Rust 后端，Web UI 灵活 | 需要 WebView2 Runtime（Win10/11 已预装） | ✅ 最佳平衡 |
+| **Slint 1.18 原生子进程** ✅ | Rust 原生、无 Web 运行时、内存低、声明式 | 需自绘控件与虚拟化网格 | ✅ 最佳平衡 |
 
-在**避免引入重型 UI 框架**的前提下，Tauri v2 利用系统预装的 WebView2 Runtime 与 Rust 后端，在**体积、性能与安全性**上取得最佳平衡，成为本项目的首选方案。
+### UI 技术方案
 
-### 前端方案
+**采用：Slint 1.18（Rust 原生）**
 
-**采用：原生 HTML + CSS + TypeScript（轻量方案）**
+- **绑定软件渲染**：`slint = { version = "1.18", default-features = false, features = ["renderer-software"] }`，**不编译** femtovg/skia（GPU/OpenGL 后端），避免 winit 选择 OpenGL 后端导致 +67MB 内存
+- **无前端构建产物**：不再使用 Vite / TypeScript / HTML / CSS，也不使用 npm；UI 布局写在 `.slint` 文件中，编译期生成 Rust 代码
+- **进程边界**：UI 位于独立 crate `crates/mirrorstar-ui/`（workspace 成员），通过 `mirrorstar-core::ui_proto` 的 NDJSON 行协议 over stdio 与壳通信（消息类型 `Hello` / `Request` / `Response` / `Event` / `Control`）
+- **虚拟化壁纸网格**：固定卡尺寸 + 固定列数，仅实例化可见区间 ±2 行缓冲；缩略图按本地文件路径直读（不经 IPC 传字节）
+- **四类预览**：图片（自绘）、视频（UI 进程内 spawn mpv 子窗口）、GIF（逐帧动画）、网页（按需创建临时 WebView2 子窗口，关闭后 `msedgewebview2.exe` 计数回落 0）
+- **拖拽排序 / 搜索 / 文件拖入 / 卡片操作**：均在原生命中实现
 
-`package.json` 实际前端工具链：
+> **未使用** React / Vue / Angular 等前端框架，也不再使用 Tauri IPC（`invoke`）——前端层已被原生 UI 子进程取代。
 
-- **TypeScript** `^5.5`：类型安全，配合 `tsc --noEmit` 做类型检查
-- **Vite** `^5.4`：开发服务器与构建
-- **Vitest** `^2.1.9`：单元测试（含 `@vitest/coverage-v8`，与 jsdom 环境）
-- **ESLint** `^9` + **Prettier** `^3` + **terser** `^5`：规范与压缩
-- **@tauri-apps/api** `^2`：Tauri 前端 API
-- **@tauri-apps/cli** `^2.11.2`：Tauri CLI
+### 主窗口按需启动（On-Demand）与空闲退出
 
-> **未使用** React / Vue / Angular 等重型框架。壁纸应用 UI（设置面板、壁纸列表、托盘菜单）相对简单，原生 TS 足够，避免引入虚拟 DOM / 响应式系统的体积与复杂度。
+MirrorStar 的主窗口不在应用启动时创建，也不由壳创建任何 WebView2 窗口（`tauri.conf.json` 的 `app.windows` 为 `[]`）：
 
-前后端通信通过 Tauri IPC（`invoke` + 事件 `emit`/`listen`）完成，前端通过 `@tauri-apps/api` 调用 `src-tauri/src/commands/` 下注册的 command。
-
-### 主窗口懒创建（Lazy Creation）策略
-
-MirrorStar 采用 WebView2 主窗口懒创建策略，而非在 `tauri.conf.json` 中静态定义窗口：
-
-- **`tauri.conf.json` 的 `windows` 配置不预建主窗口**：避免应用启动时自动创建窗口
-- **动态创建**：通过 `WebviewWindowBuilder`（`tauri::WebviewWindowBuilder`）在用户点击托盘菜单"打开主窗口"时按需创建
-- **托盘先行**：应用启动时仅初始化系统托盘（`TrayIconBuilder`）并常驻后台，主窗口在需要时懒创建
-- **关闭即隐藏**：窗口关闭时隐藏而非销毁，下次打开时显示（见 `create_or_show_main_window`）
+- **按需启动**：用户点击托盘"打开主窗口"时，壳侧 UI 子进程管理模块 spawn `mirrorstar-ui.exe`，先握手（`Hello`）再显示
+- **空闲退出**：窗口隐藏后按空闲超时（默认 300s，环境变量 `MIRRORSTAR_UI_IDLE_TIMEOUT_SECS`）退出 UI 子进程回收内存（回落至壳内存量级 ≈7.6MB），再次请求可重新拉起
+- **单实例**：同一时刻至多一个 UI 子进程实例
+- **显隐不激活**：窗口显示时以 `WS_EX_NOACTIVATE` 瞬时覆盖 + `SWP_NOACTIVATE`，不调用任何抢前台 API，避免误触发全屏检测 / 纯净模式；窗口标题保持"镜星壁纸"
 
 此策略的优势：
 
-- 减少应用启动时的资源占用，WebView2 运行时仅在用户打开主窗口时才初始化
-- 托盘常驻场景下，用户不操作 UI 时零 WebView2 开销，聚焦壁纸渲染性能
+- 托盘常驻场景下，用户不操作 UI 时零 UI 进程开销，聚焦壁纸渲染性能
+- 主窗口静置时壳 + UI 合计 private ≈ 16.8MB，远低于 WebView2 方案
 
 ### 系统托盘
 

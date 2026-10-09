@@ -2,6 +2,8 @@ mod commands;
 mod platform;
 mod scheduler;
 mod state;
+// Task 2：UI 子进程管理器与协议桥（壳模式下托管原生主窗口 UI 子进程）。
+mod ui_process;
 
 use mirrorstar_core::{
     init_logging, ConfigKind, ConfigLoadError, ConfigManager, DesktopIntegrator, PauseReason,
@@ -13,7 +15,7 @@ use tauri::{Emitter, Manager};
 
 use commands::*;
 use platform::{start_explorer_restart_monitor, start_fullscreen_monitor, start_workerw_check};
-use state::{create_or_show_main_window, perform_shutdown_blocking, record_main_window_destroyed, AppState};
+use state::{perform_shutdown_blocking, AppState};
 
 // ST-017: 重新导出 ST-007 提取的纯函数，供集成测试直接调用
 // （避免测试通过 format!() 字符串匹配模拟命令层逻辑）
@@ -77,7 +79,7 @@ pub use commands::wallpaper::resolve_display_id;
 // 12. **Explorer 重启监控**：`start_explorer_restart_monitor(desktop)`
 //     - 失败：内部记录，线程会自动退出
 //
-// 13. **AppState 构造**：组装 config_manager / wallpaper_engine / desktop / tray_paused / tray_pause_resume_item
+// 13. **AppState 构造**：组装 config_manager / wallpaper_engine / desktop / tray_paused / tray_pause_resume_item / tray_pure_mode_item
 //
 // ## Phase 2: Tauri Builder + setup 闭包
 //
@@ -141,158 +143,6 @@ pub use commands::wallpaper::resolve_display_id;
 //   - 理由：`exit(1)` 跳过 Drop，但 OS 会回收所有资源；
 //     返回 Err 需在 main 中处理，且 Drop 链可能因状态不一致而 panic
 //   - 代价：`exit(1)` 不调用 Drop，COM 引用计数可能泄漏（但进程退出后 OS 回收）
-
-/// 解析 HTTP Range 请求头，返回 (start, end) 字节范围（含端点）。
-///
-/// 支持的格式（RFC 7233）：
-/// - `bytes=0-1023` → (0, 1023)
-/// - `bytes=0-`     → (0, len-1)  从 start 到文件末尾
-/// - `bytes=-1023`  → (len-1023, len-1)  最后 1023 字节
-/// - `bytes=0-1023,2048-3071` → 只取第一个范围 (0, 1023)（简化，视频播放器不发多范围）
-///
-/// 返回 `None` 表示 Range 不满足（start >= len 或解析失败），
-/// 调用方应返回 416 Range Not Satisfiable。
-///
-/// 注意：end 会被 clamp 到 len-1，不会超出文件大小。
-fn parse_range_header(header: &str, len: u64) -> Option<(u64, u64)> {
-    let header = header.strip_prefix("bytes=")?;
-    // 只取第一个范围（忽略多范围，简化实现）
-    let first_range = header.split(',').next()?;
-    let (start_str, end_str) = first_range.split_once('-')?;
-
-    let (start, end) = if start_str.is_empty() {
-        // bytes=-1023 → 最后 1023 字节
-        let suffix: u64 = end_str.trim().parse().ok()?;
-        if suffix == 0 || suffix > len {
-            return None;
-        }
-        (len - suffix, len - 1)
-    } else if end_str.is_empty() {
-        // bytes=0- → 从 start 到文件末尾
-        let start: u64 = start_str.trim().parse().ok()?;
-        if start >= len {
-            return None;
-        }
-        (start, len - 1)
-    } else {
-        // bytes=0-1023
-        let start: u64 = start_str.trim().parse().ok()?;
-        let end: u64 = end_str.trim().parse().ok()?;
-        if start > end || start >= len {
-            return None;
-        }
-        (start, end.min(len - 1))
-    };
-
-    Some((start, end))
-}
-
-/// 根据文件扩展名返回 Content-Type（用于 wpfile:// 自定义协议响应）。
-///
-/// 覆盖壁纸应用支持的所有格式：图片（jpg/png/gif/bmp/webp/tiff）、
-/// 视频（mp4/webm/mkv/avi/mov）、网页（html/htm）。未匹配的扩展名返回
-/// `application/octet-stream`，浏览器会作为下载处理（壁纸场景不会命中）。
-fn content_type_for_extension(path: &str) -> &'static str {
-    let ext = std::path::Path::new(path)
-        .extension()
-        .and_then(|e| e.to_str())
-        .map(|e| e.to_lowercase())
-        .unwrap_or_default();
-    match ext.as_str() {
-        // 图片
-        "jpg" | "jpeg" => "image/jpeg",
-        "png" => "image/png",
-        "gif" => "image/gif",
-        "bmp" => "image/bmp",
-        "webp" => "image/webp",
-        "tiff" | "tif" => "image/tiff",
-        "svg" => "image/svg+xml",
-        "ico" => "image/x-icon",
-        // 视频
-        "mp4" => "video/mp4",
-        "webm" => "video/webm",
-        "mkv" => "video/x-matroska",
-        "avi" => "video/x-msvideo",
-        "mov" => "video/quicktime",
-        "wmv" => "video/x-ms-wmv",
-        "flv" => "video/x-flv",
-        // 网页
-        "html" | "htm" => "text/html; charset=utf-8",
-        // 默认
-        _ => "application/octet-stream",
-    }
-}
-
-// ── v16-D-009: wpfile 协议路径 scope 校验 ────────────────────────────────────
-//
-// wpfile:// 自定义协议绕过了 tauri.conf.json 中 `assetProtocol.scope` 的 allow/deny
-// 列表（asset scope 仅对 asset:// 协议生效，且 Windows 上 `\\?\` verbatim 前缀导致
-// glob 匹配失败，故改用自定义协议 handler 直接读文件）。此处复用 asset scope 的语义，
-// 在 handler 内重新实现 allow/deny 校验，恢复 defense-in-depth：
-// - allow：数据根（便携化后 = 安装目录，`mirrorstar_core::config::data_root()`）
-//   之下的路径（壁纸文件与缩略图存放目录均收束于此）
-// - deny：`$HOME` 下 7 个敏感目录（`.ssh` / `.aws` / `.gnupg` / `.config/ssh` /
-//   `.password-store` / `.kube` / `.docker`），deny 优先于 allow
-//
-// 与 `commands::wallpaper::is_path_within_data_dir` 一致，使用 `Path::starts_with` 按
-// 路径组件匹配（而非字节前缀），避免 `mirrorstar-evil` 等兄弟目录被误判为受信任目录。
-
-/// wpfile 协议路径 scope 校验的纯函数核心。
-///
-/// 将依赖环境的目录解析剥离到调用方，便于单测以临时目录构造确定性行为，避免
-/// 进程级环境变量（`USERPROFILE`）在并行测试中互相干扰。
-///
-/// - `file_path`：URL 解码后的绝对文件路径（允许 `/` 或 `\` 分隔符，`Path::starts_with`
-///   在 Windows 上对两种分隔符做组件级等价匹配）
-/// - `data_root`：数据根目录（便携化后 = 安装目录），allow 基目录
-/// - `home`：`$HOME`（`USERPROFILE`），deny 基目录
-///
-/// 返回 `true` 表示允许访问，`false` 表示拒绝（handler 返回 403 FORBIDDEN）。
-fn wpfile_path_allowed(
-    file_path: &str,
-    data_root: &std::path::Path,
-    home: &std::path::Path,
-) -> bool {
-    let path = std::path::Path::new(file_path);
-
-    // 1. deny 优先：命中任一敏感目录即拒绝（即便位于 allow 范围内也拒绝）
-    // `.config/ssh` 为两级子目录，`Path::join` 会正确处理其中的分隔符。
-    const DENY_SUBDIRS: &[&str] = &[
-        ".ssh",
-        ".aws",
-        ".gnupg",
-        ".config/ssh",
-        ".password-store",
-        ".kube",
-        ".docker",
-    ];
-    for sub in DENY_SUBDIRS {
-        if path.starts_with(home.join(sub)) {
-            return false;
-        }
-    }
-
-    // 2. allow：必须位于数据根（安装目录）之下
-    path.starts_with(data_root)
-}
-
-/// wpfile handler 专用 scope 校验封装：从数据根与 `USERPROFILE` 解析基目录后委托纯函数。
-///
-/// 数据根由 `mirrorstar_core::config::data_root()` 提供（便携化后 = 安装目录）；
-/// `USERPROFILE` 缺失（极端罕见）时 deny 检查跳过，不影响 allow 安全性。
-fn check_wpfile_scope(file_path: &str) -> Result<(), &'static str> {
-    let data_root = mirrorstar_core::config::data_root();
-    let home = std::env::var_os("USERPROFILE").map(std::path::PathBuf::from);
-    let empty = std::path::PathBuf::new();
-    // home 缺失时 deny 检查跳过（path.starts_with(empty) 仅对空路径为真，不影响安全）
-    let home = home.as_deref().unwrap_or(&empty);
-
-    if wpfile_path_allowed(file_path, &data_root, home) {
-        Ok(())
-    } else {
-        Err("路径不在受控数据目录内或命中敏感目录，拒绝访问")
-    }
-}
 
 // ── 全局 panic hook / 启动残留进程清理 ───────────────────────────────────────
 
@@ -425,12 +275,18 @@ impl Drop for HandleGuard {
     }
 }
 
-/// 启动清理：终止上次崩溃遗留的孤儿 mpv / wp-proc 进程
+/// 启动清理：终止上次崩溃遗留的孤儿 mpv / wp-proc / UI 子进程
 ///
 /// 当前进程刚启动尚未 spawn 任何子进程，此时任何名称匹配
-/// mpv.exe / mirrorstar-wp-proc.exe 的存活进程均为上次崩溃遗留。
+/// mpv.exe / mirrorstar-wp-proc.exe / mirrorstar-ui.exe 的存活进程均为上次遗留。
 /// 通过 ToolHelp 快照（CreateToolhelp32Snapshot + Process32FirstW/NextW）
 /// 枚举系统进程并逐个终止（不含当前进程）。失败仅记录日志，不致命。
+///
+/// **`mirrorstar-wp-proc.exe` 用于回收旧版本升级后残留的独立 wp-proc 孤儿进程**：
+/// 运行中的 exe 无法被安装器删除，可能跨版本存活，故按名清理。采用「同一 exe、双入口」
+/// 后，本版本 spawn 的网页壁纸子进程与壳**同名**（`mirrorstar-wallpaper.exe`），
+/// 因此不会被本条按名匹配误杀；本版本同名子进程的孤儿由 `ProcessManager` 施加的
+/// Job Object `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE` 兜底（主进程退出即内核回收子进程）。
 fn cleanup_stale_child_processes() {
     use windows::Win32::System::Diagnostics::ToolHelp::{
         CreateToolhelp32Snapshot, Process32FirstW, Process32NextW, PROCESSENTRY32W,
@@ -440,8 +296,13 @@ fn cleanup_stale_child_processes() {
         GetCurrentProcessId, OpenProcess, TerminateProcess, PROCESS_TERMINATE,
     };
 
-    // 目标残留进程名（统一小写比较）
-    const TARGET_NAMES: &[&str] = &["mpv.exe", "mirrorstar-wp-proc.exe"];
+    // 目标残留进程名（统一小写比较）。
+    // 含 mirrorstar-ui.exe：壳模式下 UI 子进程异常残留时，下次启动统一清理。
+    // 含 mirrorstar-wp-proc.exe：用于回收旧版本升级后残留的独立 wp-proc 孤儿进程
+    // （运行中的 exe 无法被安装器删除，可能跨版本存活）；本版本无同名产物，
+    // 本版本 spawn 的网页壁纸子进程与壳同名（mirrorstar-wallpaper.exe），不会被误杀
+    // （详见函数文档）；其孤儿由 Job Object KILL_ON_JOB_CLOSE 兜底。
+    const TARGET_NAMES: &[&str] = &["mpv.exe", "mirrorstar-wp-proc.exe", "mirrorstar-ui.exe"];
 
     let current_pid = unsafe { GetCurrentProcessId() };
 
@@ -515,6 +376,59 @@ fn cleanup_stale_child_processes() {
     }
 }
 
+/// 启动清理：尽力清空 WebView2 UserDataFolder 缓存目录下的内容（**崩溃残留兜底**）。
+///
+/// 每个 wp-proc 实例使用 `data_root()/webview2-cache/<pid>/` 作为独立 UserDataFolder
+/// （路径单源：`mirrorstar_core::wallpaper::wp_proc_user_data_folder`）。
+/// **正常退出路径已由 `WebRenderer::terminate()` / `Drop` 在子进程退出后回收该子目录**
+/// （见 `crates/mirrorstar-core/src/wallpaper/web.rs`），此处仅在应用启动时清空
+/// 目录内容，兜底清理崩溃/强杀导致未被回收的残留（此时尚未 spawn 任何 wp-proc，
+/// 且 `cleanup_stale_child_processes` 已尝试终止上次崩溃遗留的孤儿 wp-proc）。
+///
+/// 尽力而为：任何失败仅记录 warn，不阻断启动。残留孤儿进程可能仍短暂持有其缓存文件，
+/// 导致删除失败——下一次启动会再尝试清理。
+fn cleanup_webview2_cache() {
+    let cache_dir = mirrorstar_core::config::data_root().join("webview2-cache");
+    let entries = match std::fs::read_dir(&cache_dir) {
+        Ok(entries) => entries,
+        // 目录不存在（首次启动/从未用过 Web 壁纸）→ 无需清理，不告警。
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return,
+        Err(e) => {
+            tracing::warn!(error = %e, dir = %cache_dir.display(), "启动清理：读取 WebView2 缓存目录失败");
+            return;
+        }
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let result = if path.is_dir() {
+            std::fs::remove_dir_all(&path)
+        } else {
+            std::fs::remove_file(&path)
+        };
+        if let Err(e) = result {
+            tracing::warn!(error = %e, path = %path.display(), "启动清理：删除 WebView2 缓存项失败（残留孤儿进程可能仍持有）");
+        }
+    }
+}
+
+/// 将配置加载错误格式化为用户可读报文并 emit "config-load-error" 事件。
+///
+/// 回调路径（set_on_config_error）与 drain 排空路径（构造期暂存的待处理错误）
+/// 共用，避免两处文案漂移。
+fn emit_config_load_error(app_handle: &tauri::AppHandle, error: &ConfigLoadError) {
+    let msg = match error.kind {
+        ConfigKind::Config => {
+            format!("应用配置加载失败，已使用默认配置：{}", error.message)
+        }
+        ConfigKind::Library => {
+            format!("壁纸库加载失败，已使用空列表：{}", error.message)
+        }
+    };
+    if let Err(e) = app_handle.emit("config-load-error", &msg) {
+        tracing::warn!(error = %e, "emit config-load-error 失败");
+    }
+}
+
 pub fn run() {
     // 便携化（portable-data-root）：数据根 = 安装目录（exe 所在目录），
     // 在日志初始化之前确定，后续所有数据（配置/壁纸/缩略图/日志/WebView2 缓存）收束于此。
@@ -542,6 +456,9 @@ pub fn run() {
             None
         }
     };
+
+    // v17 启动期内存埋点：日志初始化完成（首个生命周期打点，亦初始化启动基准时刻）
+    mirrorstar_core::perf::mark_lifecycle("log_init");
 
     // v17 性能埋点：应用启动计时基线（日志初始化完成后开始计时）
     let boot_start = std::time::Instant::now();
@@ -632,12 +549,17 @@ pub fn run() {
     // 从配置中应用 GIF 内存管理策略到壁纸引擎
     {
         let config = config_manager.get_config();
-        let engine = wallpaper_engine.blocking_lock();
+        let mut engine = wallpaper_engine.blocking_lock();
         engine.set_gif_memory_strategy(
             config.gif.memory_strategy,
             config.gif.balanced_keep_frames,
             config.gif.max_memory_mb,
         );
+        // 种入按显示器缩放模式（配置为持久化真相源）。必须在配置加载后、
+        // 引擎可用前完成，使启动恢复 / 轮换 / 网格「设为壁纸」均沿用配置值。
+        // 锁顺序：此处仅持有 engine 锁（不获取 desktop 锁），符合 state.rs
+        // 顶部「engine → desktop」的锁顺序约定。
+        engine.seed_scaling_modes(&config.scaling.modes);
     }
 
     // 启动配置文件监视（热重载）
@@ -663,6 +585,13 @@ pub fn run() {
     // 当前进程刚启动尚未 spawn 任何子进程，任何同名存活进程均为崩溃残留。
     cleanup_stale_child_processes();
 
+    // 启动清理：清空 WebView2 缓存目录（每实例 PID 子目录），避免随运行次数累积。
+    cleanup_webview2_cache();
+
+    // Task 2/10：初始化 UI 子进程管理器（解析 mirrorstar-ui.exe 路径与空闲退出阈值）。
+    // 原生 UI 子进程即唯一主窗口，按需拉起，不在此处主动启动。
+    ui_process::init();
+
     // 壁纸轮换调度器：构造共享句柄（playback / 池 / 编排状态），后台主循环在
     // setup 闭包中 `start()`（需 AppHandle）。§16 启动时序见 scheduler.rs。
     let scheduler = scheduler::SchedulerHandle::new(
@@ -676,11 +605,12 @@ pub fn run() {
 
     let app_state = AppState {
         config_manager,
-        wallpaper_engine,
+        wallpaper_engine: wallpaper_engine.clone(),
         desktop,
         scheduler,
         tray_paused: AtomicBool::new(false),
         tray_pause_resume_item: OnceLock::new(),
+        tray_pure_mode_item: OnceLock::new(),
     };
 
     // v11.0 内存优化（Wave v11-D）：自定义 Tokio runtime，限制 worker_threads=2 + 512KB 栈 + 8 个阻塞线程
@@ -704,6 +634,14 @@ pub fn run() {
     let _runtime_guard = runtime.enter();
     tauri::async_runtime::set(runtime.handle().clone());
 
+    // 启动视频壁纸卡帧常驻看护（spec D4/D6）：每 5s 采样 Playing 视频渲染器的时钟，
+    // 停滞即分级自愈。任务随 runtime 结束，不做显式停止（见 liveness_watchdog 模块文档）。
+    //
+    // 必须在 `async_runtime::set()` **之后**启动：看护内部调用 `tauri::async_runtime::spawn`，
+    // 而 spawn 会以默认 runtime 先行初始化全局 RUNTIME；若先于 `set()` 调用，随后的
+    // `set()` 会 panic "runtime already initialized"（启动即崩溃，2026-09-30 实测根因）。
+    let _ = platform::liveness_watchdog::start_liveness_watchdog(wallpaper_engine);
+
     // v17 性能埋点：Phase 1 完成（基础设施 + runtime），进入 Tauri Builder
     tracing::info!(
         target: "mirrorstar::perf",
@@ -712,6 +650,8 @@ pub fn run() {
         rss_mb = format!("{:.1}", mirrorstar_core::perf::process_rss_mb()),
         "PERF-BOOT: Phase 1 完成"
     );
+    // v17 启动期内存埋点：引擎 / 配置等基础设施初始化完成
+    mirrorstar_core::perf::mark_lifecycle("engine_ready");
 
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
@@ -724,163 +664,6 @@ pub fn run() {
             None,
         ))
         .manage(app_state)
-        // 注册 wpfile 自定义 URI scheme protocol，绕过 Tauri
-        // asset protocol scope 限制。URL 形式为 `http://wpfile.localhost/...`。
-        //
-        // 原方案通过 assetProtocol.scope.allow 配置允许路径，但 Windows 上
-        // try_resolve_symlink_and_canonicalize 会给路径加 \\?\ 前缀（verbatim），
-        // 导致 glob 匹配失败，即使配置 "**" 也无法通过。本方案直接注册自定义协议，
-        // 在 handler 中读取文件并返回，不做 scope 检查。
-        //
-        // 前端通过 convertFileSrc(path, "wpfile") 生成 URL：
-        //   Windows: http://wpfile.localhost/<encoded_path>
-        //   Unix:    wpfile://localhost/<encoded_path>
-        //
-        // 支持 HTTP Range 请求（206 Partial Content）和 HEAD 请求：
-        // - Range：视频播放器按需加载指定字节范围，避免一次性读入大文件
-        //   （29MB 视频的内存峰值从 29MB 降至 1MB）
-        // - HEAD：视频播放器探测文件大小（Content-Length），不返回 body
-        // - 非 Range/HEAD：完整读取（图片等小文件，通常 <5MB）
-        //
-        // 单次 Range 最大 1MB（MAX_RANGE_LEN），与 Tauri 原生 asset protocol 一致，
-        // 防止恶意 Range 请求读取过多数据。
-        .register_uri_scheme_protocol("wpfile", |_ctx, request| {
-            use std::io::{Read, Seek, SeekFrom};
-            use tauri::http::{header, Response, StatusCode};
-
-            let uri_path = request.uri().path();
-            let encoded_path = uri_path.strip_prefix('/').unwrap_or(uri_path);
-            let file_path = percent_encoding::percent_decode_str(encoded_path)
-                .decode_utf8_lossy()
-                .into_owned();
-
-            // v16-D-009: scope 校验。wpfile:// 绕过 assetProtocol.scope，此处重新
-            // 实现 allow/deny 检查，仅放行数据根（便携化后 = 安装目录）之下的路径，
-            // 拒绝 7 个敏感目录。违规返回 403，避免泄露任意本地文件。
-            if let Err(reason) = check_wpfile_scope(&file_path) {
-                tracing::warn!(path = %file_path, reason, "wpfile 协议 scope 校验拒绝");
-                return Response::builder()
-                    .status(StatusCode::FORBIDDEN)
-                    .header(header::CONTENT_TYPE, "text/plain; charset=utf-8")
-                    .body(reason.as_bytes().to_vec())
-                    .unwrap();
-            }
-
-            let content_type = content_type_for_extension(&file_path);
-
-            // 打开文件
-            let mut file = match std::fs::File::open(&file_path) {
-                Ok(f) => f,
-                Err(e) => {
-                    tracing::warn!(error = %e, path = %file_path, "wpfile 协议打开文件失败");
-                    let status = if e.kind() == std::io::ErrorKind::NotFound {
-                        StatusCode::NOT_FOUND
-                    } else {
-                        StatusCode::INTERNAL_SERVER_ERROR
-                    };
-                    return Response::builder()
-                        .status(status)
-                        .header(header::CONTENT_TYPE, "text/plain; charset=utf-8")
-                        .body(e.to_string().into_bytes())
-                        .unwrap();
-                }
-            };
-
-            let len = match file.metadata() {
-                Ok(m) => m.len(),
-                Err(e) => {
-                    tracing::warn!(error = %e, path = %file_path, "wpfile 协议读取 metadata 失败");
-                    return Response::builder()
-                        .status(StatusCode::INTERNAL_SERVER_ERROR)
-                        .header(header::CONTENT_TYPE, "text/plain; charset=utf-8")
-                        .body(e.to_string().into_bytes())
-                        .unwrap();
-                }
-            };
-
-            // HEAD 请求：只返回头，不返回 body（视频播放器探测文件大小）
-            if request.method() == tauri::http::Method::HEAD {
-                return Response::builder()
-                    .header(header::CONTENT_TYPE, content_type)
-                    .header(header::CONTENT_LENGTH, len.to_string())
-                    .header(header::ACCEPT_RANGES, "bytes")
-                    .header(header::CACHE_CONTROL, "no-cache")
-                    .header(header::ACCESS_CONTROL_ALLOW_ORIGIN, "*")
-                    .body(Vec::new())
-                    .unwrap();
-            }
-
-            // Range 请求：只读取指定字节范围（视频按需加载）
-            if let Some(range_header) = request
-                .headers()
-                .get("range")
-                .and_then(|r| r.to_str().ok())
-            {
-                if let Some((start, end)) = parse_range_header(range_header, len) {
-                    // 限制单次最大 1MB（与 Tauri 原生 asset protocol 一致）
-                    const MAX_RANGE_LEN: u64 = 1000 * 1024;
-                    let end = end.min(start + MAX_RANGE_LEN - 1).min(len - 1);
-                    let nbytes = end - start + 1;
-
-                    let mut buf = Vec::with_capacity(nbytes as usize);
-                    if let Err(e) = file.seek(SeekFrom::Start(start)) {
-                        tracing::warn!(error = %e, path = %file_path, "wpfile 协议 seek 失败");
-                        return Response::builder()
-                            .status(StatusCode::INTERNAL_SERVER_ERROR)
-                            .header(header::CONTENT_TYPE, "text/plain; charset=utf-8")
-                            .body(e.to_string().into_bytes())
-                            .unwrap();
-                    }
-                    if let Err(e) = file.take(nbytes).read_to_end(&mut buf) {
-                        tracing::warn!(error = %e, path = %file_path, "wpfile 协议 Range 读取失败");
-                        return Response::builder()
-                            .status(StatusCode::INTERNAL_SERVER_ERROR)
-                            .header(header::CONTENT_TYPE, "text/plain; charset=utf-8")
-                            .body(e.to_string().into_bytes())
-                            .unwrap();
-                    }
-
-                    return Response::builder()
-                        .status(StatusCode::PARTIAL_CONTENT)
-                        .header(header::CONTENT_TYPE, content_type)
-                        .header(header::CONTENT_RANGE, format!("bytes {start}-{end}/{len}"))
-                        .header(header::CONTENT_LENGTH, nbytes.to_string())
-                        .header(header::ACCEPT_RANGES, "bytes")
-                        .header(header::CACHE_CONTROL, "no-cache")
-                        .header(header::ACCESS_CONTROL_ALLOW_ORIGIN, "*")
-                        .body(buf)
-                        .unwrap();
-                } else {
-                    // Range 不满足
-                    return Response::builder()
-                        .status(StatusCode::RANGE_NOT_SATISFIABLE)
-                        .header(header::CONTENT_RANGE, format!("bytes */{len}"))
-                        .header(header::ACCEPT_RANGES, "bytes")
-                        .body(Vec::new())
-                        .unwrap();
-                }
-            }
-
-            // 非 Range 请求：完整读取（图片等小文件）
-            let mut buf = Vec::with_capacity(len as usize);
-            if let Err(e) = file.read_to_end(&mut buf) {
-                tracing::warn!(error = %e, path = %file_path, "wpfile 协议完整读取失败");
-                return Response::builder()
-                    .status(StatusCode::INTERNAL_SERVER_ERROR)
-                    .header(header::CONTENT_TYPE, "text/plain; charset=utf-8")
-                    .body(e.to_string().into_bytes())
-                    .unwrap();
-            }
-
-            Response::builder()
-                .header(header::CONTENT_TYPE, content_type)
-                .header(header::CONTENT_LENGTH, len.to_string())
-                .header(header::ACCEPT_RANGES, "bytes")
-                .header(header::CACHE_CONTROL, "no-cache")
-                .header(header::ACCESS_CONTROL_ALLOW_ORIGIN, "*")
-                .body(buf)
-                .unwrap()
-        })
         .setup(move |app| {
             // T07：保存 AppHandle 到全局静态量，供 workerw_check 任务在 WorkerW
             // 重新初始化成功后 emit `desktop-status-changed` 事件通知前端。
@@ -888,6 +671,14 @@ pub fn run() {
             // v16-C-008：闭包以 `move` 捕获 `audio_disabled`（Copy bool，按值复制），
             // setup 要求 'static 闭包，须 ownership 而非借用。
             let _ = state::SHARED_APP_HANDLE.set(app.handle().clone());
+
+            // Task 2：事件桥——集中订阅壳侧 13 个事件并转发到原生 UI 子进程
+            // （不逐个改动各 emit 发射点）。转发为惰性：UI 进程未运行时零开销、零报错。
+            if let Some(manager) = ui_process::manager() {
+                ui_process::install_event_forwarding(app.handle(), manager.clone());
+                // 启动空闲退出检查：UI 窗口隐藏超时后回收子进程（内存归零）。
+                ui_process::spawn_idle_tick(manager);
+            }
 
             // v16-C-008：VolumeControl 降级时 emit `audio-disabled` 通知前端
             // SHARED_APP_HANDLE 刚 set 完，前端监听器在 init() 中注册，
@@ -899,6 +690,22 @@ pub fn run() {
                     tracing::warn!(error = %e, "emit audio-disabled 失败");
                 }
             }
+
+            // v17 内存归因埋点：后台每 60 秒输出一条应用组逐子进程内存归因日志
+            // （target `mirrorstar::perf`），为优化前后提供量化基线。
+            // 采样间隔 >= 30s（core 内下限保护），开销极小；返回的 JoinHandle
+            // 直接丢弃即 detached 线程，随进程退出而结束，无需额外管理。
+            let _ = mirrorstar_core::perf::spawn_memory_attribution_sampler(
+                std::time::Duration::from_secs(60),
+            );
+
+            // v17 启动期内存时间线：应用启动后前 60 秒按 ~1 秒间隔输出分类别内存，
+            // 之后线程自行结束，仅保留上面的 60 秒周期采样。受 MIRRORSTAR_MEM_TRACE
+            // 开关控制（值 0/off 时关闭）。返回的 JoinHandle 丢弃即 detached 线程。
+            let _ = mirrorstar_core::perf::spawn_startup_memory_timeline(
+                std::time::Duration::from_secs(60),
+                std::time::Duration::from_secs(1),
+            );
 
             // spawn 全局状态变更订阅任务
             //
@@ -951,7 +758,12 @@ pub fn run() {
                     let engine = engine.clone();
                     let cm = cm.clone();
                     tauri::async_runtime::spawn(async move {
-                        engine.lock().await.set_arrangement(cm.get_config().arrangement);
+                        let mut engine = engine.lock().await;
+                        engine.set_arrangement(cm.get_config().arrangement);
+                        // 配置热重载后重新种入 `[scaling].modes`（配置为持久化真相源）：
+                        // 手工编辑 config.toml 的缩放变更须即时进入引擎，而非等重启。
+                        // 仅持 engine 锁，符合 state.rs「engine → desktop」锁顺序约定。
+                        engine.seed_scaling_modes(&cm.get_config().scaling.modes);
                     });
                 }));
             }
@@ -970,17 +782,7 @@ pub fn run() {
                 state
                     .config_manager
                     .set_on_config_error(Arc::new(move |error: ConfigLoadError| {
-                        let msg = match error.kind {
-                            ConfigKind::Config => {
-                                format!("应用配置加载失败，已使用默认配置：{}", error.message)
-                            }
-                            ConfigKind::Library => {
-                                format!("壁纸库加载失败，已使用空列表：{}", error.message)
-                            }
-                        };
-                        if let Err(e) = app_handle.emit("config-load-error", &msg) {
-                            tracing::warn!(error = %e, "emit config-load-error 失败");
-                        }
+                        emit_config_load_error(&app_handle, &error);
                     }));
 
                 // drain 构造时捕获的待处理错误并立即 emit
@@ -988,17 +790,7 @@ pub fn run() {
                 if !pending.is_empty() {
                     let app_handle = app.handle().clone();
                     for error in pending {
-                        let msg = match error.kind {
-                            ConfigKind::Config => {
-                                format!("应用配置加载失败，已使用默认配置：{}", error.message)
-                            }
-                            ConfigKind::Library => {
-                                format!("壁纸库加载失败，已使用空列表：{}", error.message)
-                            }
-                        };
-                        if let Err(e) = app_handle.emit("config-load-error", &msg) {
-                            tracing::warn!(error = %e, "emit config-load-error 失败");
-                        }
+                        emit_config_load_error(&app_handle, &error);
                     }
                 }
             }
@@ -1009,15 +801,32 @@ pub fn run() {
             let quit_item = tauri::menu::MenuItem::with_id(app, "quit", "退出", true, None::<&str>)?;
             // DR-28：托盘"下一张壁纸"项，点击触发手动换图（不受暂停限制）。
             let next_item = tauri::menu::MenuItem::with_id(app, "next_wallpaper", "下一张壁纸", true, None::<&str>)?;
+            // 纯净壁纸模式入口：勾选项（唯一入口，勾选态与真实运行态由
+            // platform::pure_mode 双向同步）。初始未勾选。
+            let pure_mode_item = tauri::menu::CheckMenuItem::with_id(
+                app,
+                "pure_mode",
+                "纯净壁纸（按任意键退出）",
+                true,
+                false,
+                None::<&str>,
+            )?;
             // 存储菜单项引用以便后续更新文本
             {
                 let state = app.state::<AppState>();
                 // OnceLock 首次 set 必成功；setup 仅执行一次，无需处理 Err
                 let _ = state.tray_pause_resume_item.set(pause_resume_item.clone());
+                let _ = state.tray_pure_mode_item.set(pure_mode_item.clone());
             }
             let menu = tauri::menu::Menu::with_items(
                 app,
-                &[&open_item, &next_item, &pause_resume_item, &quit_item],
+                &[
+                    &open_item,
+                    &next_item,
+                    &pause_resume_item,
+                    &pure_mode_item,
+                    &quit_item,
+                ],
             )?;
 
             // Create tray icon
@@ -1030,7 +839,8 @@ pub fn run() {
                 .on_menu_event(move |app, event| {
                     match event.id.as_ref() {
                         "open" => {
-                            create_or_show_main_window(app);
+                            // 壳模式下拉起原生 UI 子进程，否则走既有 WebView2 路径。
+                            ui_process::open_main_window(app);
                         }
                         "pause_resume" => {
                             if let Some(state) = app.try_state::<AppState>() {
@@ -1105,6 +915,12 @@ pub fn run() {
                             // （perform_shutdown_blocking），确保 mpv 子进程终止与资源释放。
                             app.exit(0);
                         }
+                        "pure_mode" => {
+                            // 纯净壁纸模式入口：按权威运行态决定进入或退出
+                            // （不依赖菜单勾选态——原生菜单点击会自动翻转勾选，不可靠）。
+                            // toggle 内部立即 spawn 到异步 runtime，主线程不被阻塞。
+                            crate::platform::pure_mode::toggle(app.clone());
+                        }
                         "next_wallpaper" => {
                             // DR-28：手动"下一张壁纸"；None = 主/唯一单元（DR-36）。
                             // 经 manual_tx 由调度器主循环消费，不受暂停抑制（DR-9/DR-20）。
@@ -1123,7 +939,7 @@ pub fn run() {
                     } = event
                     {
                         let app = tray.app_handle();
-                        create_or_show_main_window(app);
+                        ui_process::open_main_window(app);
                     }
                 });
 
@@ -1139,6 +955,13 @@ pub fn run() {
 
             let _tray = tray_builder.build(app)?;
 
+            // 测试观察通道（仅测试）：设置 MIRRORSTAR_TEST_AUTOSHOW_MAIN_WINDOW=1 时
+            // 启动即拉起原生 UI 子进程并显示其窗口（供验收脚本 shell_measure.ps1 等观察）。
+            // 生产环境不设置即无任何影响。
+            if std::env::var_os("MIRRORSTAR_TEST_AUTOSHOW_MAIN_WINDOW").is_some() {
+                ui_process::open_main_window(app.handle());
+            }
+
             // WorkerW 有效性兜底检查（5 分钟间隔）
             // 主要监控由 TaskbarCreated 事件驱动，此检查仅作为事件遗漏的最终兜底
             let desktop_clone = app.state::<AppState>().desktop.clone();
@@ -1149,6 +972,141 @@ pub fn run() {
             {
                 let state = app.state::<AppState>();
                 state.scheduler.start(app.handle().clone());
+            }
+
+            // 测试观察通道（仅测试）：设置 MIRRORSTAR_TEST_PURE_MODE=<N> 时，启动后按轮数 N
+            // 循环执行"进入 → 保持 → 退出"的纯净壁纸模式往返，供自动化脚本验证
+            // "置顶 → 输入退出 → 嵌回"链路以及**进程内重复往返**。该钩子走的是与托盘
+            // 二次点击退出**完全相同**的 `toggle` 路径（其按权威状态幂等分流进入/退出）。
+            // 注意：进入与退出**两个 toggle 均为条件式**——toggle 前先查询
+            // `is_pure_mode_active()`，仅当状态确实需要翻转时才调用，使钩子在外部干扰
+            // 场景（脚本在模式内自行按键退出/进入）下依然稳定，不会把外部退出/进入反向
+            // 翻转。值不可解析为数字时按 1 轮处理（保留既有 `=1` 语义）。
+            // 生产环境不设置该环境变量即无任何影响。
+            if std::env::var_os("MIRRORSTAR_TEST_PURE_MODE").is_some() {
+                let rounds: u32 = std::env::var("MIRRORSTAR_TEST_PURE_MODE")
+                    .ok()
+                    .and_then(|v| v.trim().parse::<u32>().ok())
+                    .unwrap_or(1);
+                let handle = app.handle().clone();
+                tauri::async_runtime::spawn(async move {
+                    // 轮询等待引擎进入/退出模式（每 200ms 一次，最多 max_tries 次）；
+                    // 返回 true 表示已到达期望态。与既有钩子一致：AppState 不可用时跳过本轮探测。
+                    async fn wait_pure_mode(
+                        handle: &tauri::AppHandle,
+                        want_active: bool,
+                        max_tries: u32,
+                    ) -> bool {
+                        for _ in 0..max_tries {
+                            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+                            let Some(state) = handle.try_state::<AppState>() else {
+                                continue;
+                            };
+                            let engine = state.wallpaper_engine.clone();
+                            if engine.lock().await.is_pure_mode_active() == want_active {
+                                return true;
+                            }
+                        }
+                        false
+                    }
+
+                    tracing::info!(
+                        rounds,
+                        "[测试钩子] 开始纯净壁纸模式往返测试（MIRRORSTAR_TEST_PURE_MODE）"
+                    );
+                    for i in 1..=rounds {
+                        // 1. 最多等待 20s：每秒探测一次"是否已有活跃壁纸"，避免在 boot apply
+                        //    完成前进入而被引擎以"当前没有任何壁纸"拒绝（前置校验见 enter_pure_mode）。
+                        let mut wallpapered = false;
+                        for _ in 0..20 {
+                            tokio::time::sleep(std::time::Duration::from_millis(1000)).await;
+                            let Some(state) = handle.try_state::<AppState>() else {
+                                continue;
+                            };
+                            let engine = state.wallpaper_engine.clone();
+                            if engine.lock().await.has_any_wallpaper() {
+                                wallpapered = true;
+                                break;
+                            }
+                        }
+                        if !wallpapered {
+                            tracing::warn!(
+                                round = i,
+                                "[测试钩子] 20s 内未等到活跃壁纸，终止后续轮次（MIRRORSTAR_TEST_PURE_MODE）"
+                            );
+                            return;
+                        }
+
+                        // 2. 条件进入（与托盘二次点击同一 `toggle` 路径）：调用 toggle 前
+                        //    先查询权威状态，仅当当前未进入时才 toggle；若外部已进入则跳过，
+                        //    避免重复 toggle 反而把模式关掉。
+                        let already_active = match handle.try_state::<AppState>() {
+                            Some(state) => {
+                                state.wallpaper_engine.lock().await.is_pure_mode_active()
+                            }
+                            None => false,
+                        };
+                        if already_active {
+                            tracing::info!(
+                                round = i,
+                                rounds,
+                                "[测试钩子] 模式已被外部进入，跳过本轮进入 toggle"
+                            );
+                        } else {
+                            tracing::info!(round = i, rounds, "[测试钩子] 请求进入纯净壁纸模式");
+                            crate::platform::pure_mode::toggle(handle.clone());
+                        }
+
+                        // 3. 最多等待 5s（每 200ms，共 25 次）确认引擎已进入模式
+                        if !wait_pure_mode(&handle, true, 25).await {
+                            tracing::warn!(
+                                round = i,
+                                "[测试钩子] 等待进入纯净壁纸模式超时，终止后续轮次"
+                            );
+                            return;
+                        }
+
+                        // 4. 保持 3s（便于外部脚本观察置顶态）
+                        tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+
+                        // 5. 条件退出（同一 `toggle` 路径）：保持期结束后先查询权威状态，
+                        //    仅当仍处于模式内时才 toggle 退出；若外部脚本已退出则跳过本次
+                        //    toggle（否则会反向重新进入并导致后续"等待失效"超时告警）。
+                        let still_active = match handle.try_state::<AppState>() {
+                            Some(state) => {
+                                state.wallpaper_engine.lock().await.is_pure_mode_active()
+                            }
+                            None => false,
+                        };
+                        if still_active {
+                            tracing::info!(round = i, rounds, "[测试钩子] 请求退出纯净壁纸模式");
+                            crate::platform::pure_mode::toggle(handle.clone());
+                        } else {
+                            tracing::info!(
+                                round = i,
+                                rounds,
+                                "[测试钩子] 模式已被外部退出，跳过本轮退出 toggle"
+                            );
+                        }
+
+                        // 6. 最多等待 20s（每 200ms，共 100 次）确认已退出。
+                        //    窗口放宽到 20s：退出编排现含存活校验与可能的自愈（mpv 重建
+                        //    可达数秒），自愈场景下退出可能更久，避免钩子误报超时中止后续轮次。
+                        if !wait_pure_mode(&handle, false, 100).await {
+                            tracing::warn!(
+                                round = i,
+                                "[测试钩子] 等待退出纯净壁纸模式超时，终止后续轮次"
+                            );
+                            return;
+                        }
+
+                        tracing::info!("[测试钩子] 完成第 {i}/{rounds} 轮纯净壁纸模式往返");
+                    }
+                    tracing::info!(
+                        rounds,
+                        "[测试钩子] 纯净壁纸模式往返测试全部结束（MIRRORSTAR_TEST_PURE_MODE）"
+                    );
+                });
             }
 
             // v17 性能埋点：应用就绪（setup 闭包完成），输出总启动时间 + RSS
@@ -1163,19 +1121,10 @@ pub fn run() {
 
             Ok(())
         })
-        .on_window_event(|_window, event| {
-            if let tauri::WindowEvent::CloseRequested { .. } = event {
-                // v8.0 内存优化：不调用 api.prevent_close()，让 Tauri 默认销毁主窗口，
-                // 释放 WebView2 子进程树（msedgewebview2.exe ~150-300MB）内存。
-                // 窗口销毁后触发 RunEvent::ExitRequested(code=None)，由 .run() 回调中
-                // api.prevent_exit() 阻止应用退出保持托盘驻留；下次打开时
-                // create_or_show_main_window 走 build 路径重建窗口与 WebView2。
-            }
-        })
         .invoke_handler(tauri::generate_handler![
             get_wallpapers,
+            reorder_wallpapers,
             add_wallpaper,
-            regenerate_thumbnails,
             remove_wallpaper,
             set_wallpaper,
             pause_wallpaper,
@@ -1188,6 +1137,8 @@ pub fn run() {
             toggle_mute,
             set_interaction_mode,
             get_displays,
+            get_memory_report,
+            report_lifecycle_mark,
             get_wallpaper_state,
             open_file_dialog,
             toggle_auto_start,
@@ -1201,32 +1152,37 @@ pub fn run() {
             create_pool,
             update_pool,
             delete_pool,
+            reorder_pools,
             get_unit_states,
             set_active_pool,
             set_rotation_enabled,
             next_wallpaper,
+            prev_wallpaper,
         ])
         .build(tauri::generate_context!())
         .expect("error while building tauri application")
         .run(|app_handle, event| {
             // 退出清理统一入口：
-            // - code=None：主窗口被关闭导致的退出请求（v8.0 主窗口改为销毁以释放 WebView2
-            //   内存）。调用 api.prevent_exit() 阻止应用退出，保持托盘驻留，不执行清理。
+            // - code=None：最后窗口关闭引发的退出请求。本应用已无 Tauri 主窗口（主窗口为
+            //   独立 UI 子进程），此分支通常不再触发；保守起见仍阻止退出以保持托盘驻留。
             // - code=Some(_)：显式退出（托盘退出/系统关机），执行
             //   perform_shutdown_blocking 确保 mpv 子进程终止、壁纸窗口销毁、配置刷写、
             //   Hook/COM 释放，避免 mpv 孤立与资源泄漏。
             if let tauri::RunEvent::ExitRequested { code, api, .. } = event {
                 if code.is_none() {
-                    // 主窗口关闭：阻止退出，保持托盘运行，不执行退出清理。
-                    // 记录"主窗口最近销毁"时间戳，用于阻断销毁瞬间托盘事件重入
-                    // 导致的窗口自动重现（DR 防抖，见 state.rs 冷却逻辑）。
-                    record_main_window_destroyed();
                     api.prevent_exit();
-                } else if let Some(state) = app_handle.try_state::<AppState>() {
-                    perform_shutdown_blocking(
-                        &state.wallpaper_engine,
-                        &state.config_manager,
-                    );
+                } else {
+                    // Task 2：先回收 UI 子进程（若在运行），再执行统一清理，
+                    // 避免 mirrorstar-ui.exe 被遗留为孤儿进程。
+                    if let Some(manager) = ui_process::manager() {
+                        manager.shutdown();
+                    }
+                    if let Some(state) = app_handle.try_state::<AppState>() {
+                        perform_shutdown_blocking(
+                            &state.wallpaper_engine,
+                            &state.config_manager,
+                        );
+                    }
                 }
             }
         });
@@ -1234,140 +1190,7 @@ pub fn run() {
 
 #[cfg(test)]
 mod tests {
-    use super::{panic_hook_timestamp, wpfile_path_allowed};
-    use std::path::Path;
-
-    // 构造测试基目录：data_root / home 两个独立临时根，
-    // 避免触碰进程级环境变量，保证并行测试确定性。
-    struct ScopeDirs {
-        data_root: tempfile::TempDir,
-        home: tempfile::TempDir,
-    }
-
-    impl ScopeDirs {
-        fn new() -> Self {
-            Self {
-                data_root: tempfile::tempdir().unwrap(),
-                home: tempfile::tempdir().unwrap(),
-            }
-        }
-
-        fn data_root(&self) -> &Path {
-            self.data_root.path()
-        }
-        fn home(&self) -> &Path {
-            self.home.path()
-        }
-    }
-
-    #[test]
-    fn d009_allow_data_root_subpath() {
-        let d = ScopeDirs::new();
-        let p = d.data_root().join("wallpapers").join("a.png");
-        assert!(
-            wpfile_path_allowed(&p.to_string_lossy(), d.data_root(), d.home()),
-            "数据根（安装目录）子路径应被允许"
-        );
-    }
-
-    #[test]
-    fn d009_allow_data_root_thumbnails_subpath() {
-        let d = ScopeDirs::new();
-        let p = d.data_root().join("thumbnails").join("b.gif");
-        assert!(
-            wpfile_path_allowed(&p.to_string_lossy(), d.data_root(), d.home()),
-            "数据根下缩略图子路径应被允许"
-        );
-    }
-
-    #[test]
-    fn d009_allow_forward_slash_separator() {
-        // URL 解码后路径可能使用正斜杠；Windows Path::starts_with 对 / 与 \ 等价。
-        let d = ScopeDirs::new();
-        let base = d.data_root().to_string_lossy().replace('\\', "/");
-        let p = format!("{base}/wallpapers/a.mp4");
-        assert!(
-            wpfile_path_allowed(&p, d.data_root(), d.home()),
-            "正斜杠分隔的 allow 路径应被允许"
-        );
-    }
-
-    #[test]
-    fn d009_deny_sensitive_ssh() {
-        let d = ScopeDirs::new();
-        let p = d.home().join(".ssh").join("id_rsa");
-        assert!(
-            !wpfile_path_allowed(&p.to_string_lossy(), d.data_root(), d.home()),
-            "$HOME/.ssh 应被拒绝"
-        );
-    }
-
-    #[test]
-    fn d009_deny_sensitive_config_ssh_two_segments() {
-        let d = ScopeDirs::new();
-        let p = d.home().join(".config").join("ssh").join("config");
-        assert!(
-            !wpfile_path_allowed(&p.to_string_lossy(), d.data_root(), d.home()),
-            "$HOME/.config/ssh 应被拒绝（两级子目录）"
-        );
-    }
-
-    #[test]
-    fn d009_deny_sensitive_all_seven() {
-        let d = ScopeDirs::new();
-        for sub in [
-            ".ssh",
-            ".aws",
-            ".gnupg",
-            ".config/ssh",
-            ".password-store",
-            ".kube",
-            ".docker",
-        ] {
-            let p = d.home().join(sub).join("secret");
-            assert!(
-                !wpfile_path_allowed(&p.to_string_lossy(), d.data_root(), d.home()),
-                "$HOME/{sub} 应被拒绝"
-            );
-        }
-    }
-
-    #[test]
-    fn d009_deny_outside_data_dir() {
-        let d = ScopeDirs::new();
-        // 系统临时目录（不在数据根受控目录内）
-        let other = tempfile::tempdir().unwrap();
-        let p = other.path().join("evil.png");
-        assert!(
-            !wpfile_path_allowed(&p.to_string_lossy(), d.data_root(), d.home()),
-            "受控目录外的路径应被拒绝"
-        );
-    }
-
-    #[test]
-    fn d009_deny_sibling_data_root_prefix() {
-        // ST-001 回归：`<数据根名>-evil` 不应被误判为数据根的子目录。
-        let d = ScopeDirs::new();
-        let parent = d.data_root().parent().unwrap();
-        let name = d.data_root().file_name().unwrap().to_string_lossy();
-        let p = parent.join(format!("{name}-evil")).join("x.png");
-        assert!(
-            !wpfile_path_allowed(&p.to_string_lossy(), d.data_root(), d.home()),
-            "数据根-evil 兄弟目录应被拒绝"
-        );
-    }
-
-    #[test]
-    fn d009_deny_takes_precedence_over_allow() {
-        // 极端构造：让 home == data_root，构造一个既位于数据根 allow 范围、
-        // 又命中 home 下敏感 deny 目录的路径，验证 deny 优先于 allow。
-        let d = ScopeDirs::new();
-        let p = d.data_root().join(".ssh").join("id_rsa");
-        assert!(
-            !wpfile_path_allowed(&p.to_string_lossy(), d.data_root(), d.data_root()),
-            "deny 优先于 allow"
-        );
-    }
+    use super::panic_hook_timestamp;
 
     #[test]
     fn panic_hook_timestamp_matches_format() {
@@ -1401,6 +1224,69 @@ mod tests {
         assert!(
             ts.trim().len() == 23,
             "时间戳应为 19 + 1 空格 + 3 毫秒 = 23 字符: {ts}"
+        );
+    }
+
+    // ── 纯净壁纸模式托盘入口契约 ──────────────────────────────────────────
+
+    /// 托盘入口契约：应注册 `pure_mode` 菜单项 id，且该入口采用勾选项
+    /// （`CheckMenuItem`），使勾选态与真实运行态可双向同步。
+    #[test]
+    fn tray_check_item_and_menu_id_contract_markers() {
+        let source = include_str!("lib.rs");
+        // 运行期拼接搜索串，避免 include_str! 把测试自身的字面量计入匹配
+        let menu_id = ["\"pure_", "mode\""].join("");
+        let check_item = ["Check", "MenuItem"].join("");
+        assert!(source.contains(&menu_id), "托盘应注册 {menu_id} 菜单项 id");
+        assert!(
+            source.contains(&check_item),
+            "托盘『纯净壁纸』入口应使用 {check_item} 勾选项"
+        );
+    }
+
+    /// 测试钩子契约：`MIRRORSTAR_TEST_PURE_MODE` 往返钩子的进入/退出两步均为**条件式**
+    /// toggle —— toggle 前先查询 `is_pure_mode_active()`，仅当需要翻转时才调用，从而在
+    /// 外部干扰（脚本在模式内自行退出/进入）场景下不会把外部状态反向翻转。
+    #[test]
+    fn pure_mode_roundtrip_hook_conditional_toggle_markers() {
+        let source = include_str!("lib.rs");
+        // 运行期拼接搜索串，避免 include_str! 把测试自身的字面量计入匹配
+        let active_query = ["is_pure_mode", "_active"].join("");
+        let skip_exit = ["跳过本轮", "退出 toggle"].join("");
+        let skip_enter = ["跳过本轮", "进入 toggle"].join("");
+        assert!(
+            source.contains(&active_query),
+            "往返钩子应在 toggle 前通过 {active_query} 做条件判断"
+        );
+        assert!(
+            source.contains(&skip_exit),
+            "退出步骤检测到外部已退出时应记录『{skip_exit}』并跳过"
+        );
+        assert!(
+            source.contains(&skip_enter),
+            "进入步骤检测到外部已进入时应记录『{skip_enter}』并跳过"
+        );
+    }
+
+    /// 启动顺序契约：自定义 Tokio runtime 注册（`async_runtime::set`）必须先于
+    /// 存活看护任务启动——看护经 `tauri::async_runtime::spawn` 启动，而 spawn 会以
+    /// 默认 runtime 先行初始化全局 RUNTIME；若抢在 set 之前，set 将 panic
+    /// "runtime already initialized"（2026-09-30 实测启动即崩溃的根因）。
+    #[test]
+    fn async_runtime_set_precedes_liveness_watchdog_start() {
+        let source = include_str!("lib.rs");
+        // 运行期拼接搜索串，避免 include_str! 把测试自身的字面量计入匹配
+        let set_call = ["tauri::async_runtime::", "set("].join("");
+        let watchdog_call = ["start_liveness_", "watchdog("].join("");
+        let set_pos = source
+            .find(&set_call)
+            .expect("lib.rs 应注册自定义 Tokio runtime（async_runtime::set）");
+        let watchdog_pos = source
+            .find(&watchdog_call)
+            .expect("lib.rs 应启动存活看护（start_liveness_watchdog）");
+        assert!(
+            set_pos < watchdog_pos,
+            "async_runtime::set 必须先于 start_liveness_watchdog：否则默认 runtime 先行初始化，set() 会 panic"
         );
     }
 }

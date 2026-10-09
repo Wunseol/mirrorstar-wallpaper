@@ -4,19 +4,20 @@
 //! - 轮换配置读写：`get_rotation_config` / `update_rotation_config`
 //! - 池 CRUD：`list_pools` / `create_pool` / `update_pool` / `delete_pool`
 //! - 单元配置：`get_unit_states` / `set_active_pool` / `set_rotation_enabled`
-//! - 手动换图：`next_wallpaper`
+//! - 手动换图：`next_wallpaper` / `prev_wallpaper`
 //!
 //! 所有写操作（配置 / 池 / 单元状态）在落盘后通过 [`crate::scheduler::SchedulerHandle::wake`]
 //! 的 `notify_waiters()` 唤醒调度器重算 deadline / 失效重建采样器（DR-23）。手动
 //! `next_wallpaper` 走 `manual_tx` 通道，由主循环的 `select!` 即时消费（不受暂停限制，
-//! DR-9 / DR-20）。
+//! DR-9 / DR-20）；`prev_wallpaper` 直接调调度器回退历史栈（同样不受暂停限制）。
 //!
 //! 单元 key 校验（DR-40）：`AllSame` / `Span` 仅允许全局单元 `"all"`；`PerMonitor`
 //! 依显示器枚举校验 key 命中，缺省回退主显示器（DR-36）。孤儿单元一律拒绝。
 
-use mirrorstar_core::config::settings::{MIN_INTERVAL_MINUTES, RotationConfig};
+use mirrorstar_core::config::settings::{RotationConfig, MIN_INTERVAL_MINUTES};
 use mirrorstar_core::config::Pool;
 use mirrorstar_core::layout::{self, LayoutMonitor};
+use mirrorstar_core::ui_proto::UnitStateDto;
 use mirrorstar_core::MirrorStarError;
 use tauri::State;
 
@@ -104,6 +105,16 @@ pub fn delete_pool(state: State<'_, AppState>, id: String) -> Result<(), MirrorS
     Ok(())
 }
 
+/// 按新顺序重排池列表并落盘（`ids` 必须是当前池 id 集合的完全重排）。
+///
+/// 与 `update_pool` / `delete_pool` 一致：池列表变化后唤醒调度器重算（DR-23）。
+#[tauri::command]
+pub fn reorder_pools(state: State<'_, AppState>, ids: Vec<String>) -> Result<(), MirrorStarError> {
+    state.config_manager.reorder_pools(ids)?;
+    state.scheduler.wake.notify_waiters();
+    Ok(())
+}
+
 // ── 单元配置 ────────────────────────────────────────────────────────────────
 
 #[tauri::command]
@@ -129,15 +140,10 @@ pub fn set_rotation_enabled(
 }
 
 /// 单元配置回读结构（前端渲染单元面板初始态用，见 fix-rotation-scheduler Task 6）。
-#[derive(serde::Serialize, Clone)]
-pub struct UnitStateDto {
-    pub key: String,
-    /// 生效池 id；None = "全部"池（DR-35）
-    pub active_pool: Option<String>,
-    /// 单元轮换开关
-    pub enabled: bool,
-}
-
+///
+/// 定义已下沉到 [`mirrorstar_core::ui_proto::UnitStateDto`]，本命令直接复用该核心类型
+/// （与 `mirrorstar-ui` 进程共用同一份定义，禁止任一侧手写重复结构）。
+///
 /// 回读调度器 `playback` 中所有单元的激活池与轮换开关。
 ///
 /// 供前端在渲染单元配置面板前回填真实状态，避免 UI 默认态（全部 / 关）覆盖
@@ -173,6 +179,20 @@ pub fn next_wallpaper(
     // 手动通道即时唤醒主循环执行（不受暂停限制，DR-9 / DR-20）。
     let _ = state.scheduler.manual_tx.send(Some(key));
     Ok(())
+}
+
+/// 回退上一张（对称 `next_wallpaper`；Task 1 边界 1/3/4/5/6/7/8/9/10/11/12）。
+///
+/// 返回 `None` = 无上一张（历史栈空 / 可用历史已消费尽），前端提示"没有上一张"并
+/// 保持按钮可用；`Some(id)` = 已回退到的壁纸 id。不受暂停限制（与 next 一致）。
+#[tauri::command]
+pub async fn prev_wallpaper(
+    state: State<'_, AppState>,
+    app: tauri::AppHandle,
+    key: Option<String>,
+) -> Result<Option<String>, MirrorStarError> {
+    let key = validate_unit_key(state.inner(), &key)?;
+    Ok(state.scheduler.prev_wallpaper(&key, &app).await)
 }
 
 // ── 单元 key 校验辅助 ───────────────────────────────────────────────────────

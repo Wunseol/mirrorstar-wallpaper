@@ -1,6 +1,8 @@
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
+
+use windows::Win32::Foundation::HWND;
 
 use crate::audio::volume::VolumeControl;
 use crate::config::settings::Arrangement;
@@ -11,8 +13,9 @@ use crate::wallpaper::image::ImageRenderer;
 use crate::wallpaper::video::VideoRenderer;
 use crate::wallpaper::web::WebRenderer;
 use crate::wallpaper::{
-    GifMemoryStrategy, PauseCommand, PauseReason, PauseSender, ScalingMode, WallpaperRenderer,
-    WallpaperSource, WallpaperType, DEFAULT_BALANCED_KEEP_FRAMES,
+    GifMemoryStrategy, LivenessProbe, PauseCommand, PauseReason, PauseSender, ScalingMode,
+    WallpaperRenderer, WallpaperSource, WallpaperState, WallpaperType,
+    DEFAULT_BALANCED_KEEP_FRAMES,
 };
 use crate::MirrorStarError;
 
@@ -79,6 +82,14 @@ pub struct SetWallpaperPending {
     pub config: RendererConfig,
     /// 是否需要在创建渲染器前清除原生壁纸
     pub clear_native: bool,
+    /// 是否延迟清除旧的系统壁纸（旧 Native → 新 WorkerW 时置 true）。
+    ///
+    /// 消除"先关后设"间隙帧：`prepare_set_wallpaper` 关闭旧壁纸时**不立即清除**
+    /// 系统壁纸（旧画面保持显示），待新 WorkerW 窗嵌入后再由
+    /// `complete_set_wallpaper` 补清除（见 DR-33 原子交换 / 轮换丝滑度审计）。
+    /// 仅当 `clear_native` 为 true（新 WorkerW 需清理旧 Native 壁纸）且旧壁纸
+    /// 为 Native 模式时启用；旧 WorkerW / 无旧壁纸时恒为 false。
+    pub defer_clear_native: bool,
 }
 
 // ── 原子交换（DR-33 方案 C / DR-40 双窗安全）───────────────────────────────
@@ -137,6 +148,47 @@ pub enum SwapOutcome {
     /// 换槽完成（old→new）
     Committed,
 }
+
+/// 纯净壁纸模式的运行态快照（D7）。
+///
+/// `WallpaperEngine::pure_mode` 为 `Some` 即"当前处于纯净壁纸模式"，是该模式是否
+/// 活跃的**权威状态**（进程级 `pure_mode::is_active()` 标志只用于给调度器 / 状态守卫
+/// 做无锁短路判断）。
+///
+/// # 字段职责
+///
+/// - `lifted`：本次从 WorkerW 摘出并置顶的（显示器ID, 窗口句柄）列表。退出时逐个
+///   交给 `DesktopIntegrator::reattach_after_pure_mode` 按 `arrangement` 嵌回。
+/// - `arrangement`：进入时的排列方式快照。退出回嵌必须沿用进入时的排列（模式内
+///   用户不可改配置），避免用退出时刻的排列错误地重新布局窗口。
+///
+/// Native 静态图片的临时呈现窗口不在此结构中，单独存于
+/// [`WallpaperEngine::pure_mode_temp`]（自带渲染器句柄，无需回嵌，直接终止即可）。
+pub(crate) struct PureModeState {
+    /// 已摘出并置顶的壁纸窗口：显示器ID -> 句柄
+    pub(crate) lifted: Vec<(String, HWND)>,
+    /// 进入时的壁纸排列方式快照（退出回嵌沿用）
+    pub(crate) arrangement: Arrangement,
+}
+
+// SAFETY: PureModeState 含 HWND（窗口句柄），windows-rs 将其建模为裸指针
+// （`*mut c_void`），故默认不满足 `Send`。
+//
+// Send 安全性：`HWND` 本质是指针大小的**句柄令牌**（不透明整数），其值可安全地跨线程
+// 传递——它不指向 Rust 拥有的内存，不携带 Rust 可变状态，复制/移动该值不会产生数据
+// 竞争。`String` / `Arrangement` 本身即 `Send`。
+//
+// 访问约束：本结构只由 `WallpaperEngine::pure_mode` 持有，而 `WallpaperEngine` 的
+// 所有访问都经 `Arc<tokio::sync::Mutex<WallpaperEngine>>` 串行化（`&mut self` 借用），
+// 因此 `lifted` 的写入（`enter_pure_mode`）与读取（`exit_pure_mode` /
+// `abort_pure_mode`）在同一锁内串行执行，不存在并发读写。真正的 Win32 窗口操作
+// （`detach_for_pure_mode` / `reattach_after_pure_mode`）统一委托给
+// `DesktopIntegrator`，其跨线程安全性与锁内阻塞风险已在 `desktop/mod.rs` 的
+// `unsafe impl Send for DesktopIntegrator` 处完整论证（D-004 / v41-D-009）。
+//
+// Sync 不需要：`Mutex<T>: Sync` 只要求 `T: Send`；调用方不会直接共享
+// `&PureModeState` 引用（本结构也不实现 `Sync`）。
+unsafe impl Send for PureModeState {}
 
 /// 壁纸引擎，管理所有壁纸实例的生命周期
 ///
@@ -276,6 +328,19 @@ pub struct WallpaperEngine {
     /// 对 W-008 的回退场景足够：用户连续切换缩放模式时，前一次成功的模式
     /// 会被记录，可作为下一次切换失败时的回退目标。
     pub(crate) wallpaper_scaling_modes: HashMap<String, ScalingMode>,
+    /// 纯净壁纸模式运行态：`Some` 即"处于模式"（权威状态，见 [`PureModeState`]）。
+    ///
+    /// 由 [`WallpaperEngine::enter_pure_mode`] 写入、[`WallpaperEngine::exit_pure_mode`] /
+    /// [`WallpaperEngine::abort_pure_mode`] 取出，天然提供进入/退出幂等语义。
+    pub(crate) pure_mode: Option<PureModeState>,
+    /// 纯净壁纸模式的临时呈现渲染器（D4）：显示器ID -> 渲染器。
+    ///
+    /// 用于给"使用原生 API 静态图片（`WallpaperMode::Native`、没有窗口）"的显示器
+    /// 补一个可置顶的 `ImageRenderer` 窗口。**绝不**注册进 `wallpapers` /
+    /// `pause_senders` / `wallpaper_sources` / `wallpaper_mode` 等权威状态映射——
+    /// 它们不参与壁纸状态机、轮换、暂停位图，只在本模式生命周期内存在，退出/中止
+    /// 时逐个 `terminate()` 并清空。
+    pub(crate) pure_mode_temp: Vec<(String, Box<dyn WallpaperRenderer>)>,
     /// 测试钩子：注入 `set_wallpaper` 返回值以测试 W-008 回退逻辑
     ///
     /// 仅 `#[cfg(test)]` 存在。测试预填结果队列，`call_set_wallpaper_for_scaling`
@@ -283,6 +348,34 @@ pub struct WallpaperEngine {
     #[cfg(test)]
     pub(crate) set_wallpaper_results:
         std::sync::Mutex<std::collections::VecDeque<Result<(), MirrorStarError>>>,
+}
+
+/// display-id 解析纯逻辑（单一真相源，抽出便于单测各分支）
+///
+/// 回退链：显式非空 → 当前活跃壁纸 display_id → 主显示器真实 id → 兜底空串。
+/// 空串视为「未指定」，任何一环为空串都继续向下回退；三者皆无时返回空串，
+/// 保证无显示器环境下行为与改动前一致且不 panic。
+pub(crate) fn resolve_display_id_from(
+    explicit: Option<String>,
+    first_active: Option<&str>,
+    primary: Option<&str>,
+) -> String {
+    if let Some(id) = explicit {
+        if !id.is_empty() {
+            return id;
+        }
+    }
+    if let Some(id) = first_active {
+        if !id.is_empty() {
+            return id.to_string();
+        }
+    }
+    if let Some(id) = primary {
+        if !id.is_empty() {
+            return id.to_string();
+        }
+    }
+    String::new()
 }
 
 impl WallpaperEngine {
@@ -311,6 +404,8 @@ impl WallpaperEngine {
             pause_reasons: std::sync::Mutex::new(PauseReason(0)),
             global_state_changed,
             wallpaper_scaling_modes: HashMap::new(),
+            pure_mode: None,
+            pure_mode_temp: Vec::new(),
             #[cfg(test)]
             set_wallpaper_results: std::sync::Mutex::new(std::collections::VecDeque::new()),
         }
@@ -382,6 +477,15 @@ impl WallpaperEngine {
         display_id: &str,
         mode: ScalingMode,
     ) -> Result<(), MirrorStarError> {
+        // 先取旧记忆（视频切换失败时作为回滚目标），再立即记录用户本次意图。
+        // 必须在写入新值之前取，保证回退语义与实际生效值一致（不重复查找）。
+        let original_mode = self.scaling_mode_for(display_id);
+        // 记录用户选择的缩放模式：即使当前**无活跃壁纸**也写入，使后续
+        // set_wallpaper（轮换 / 网格「设为壁纸」/ 启动恢复）的缺省回退能取到
+        // 用户最新设置，而不是停留在旧值。
+        self.wallpaper_scaling_modes
+            .insert(display_id.to_string(), mode);
+
         // 检查是否为 Native 模式
         if self.is_native_mode(display_id) {
             // Native 模式重新调用 set_native_wallpaper 应用新缩放模式
@@ -404,15 +508,15 @@ impl WallpaperEngine {
                 tracing::info!(display_id, ?mode, "视频壁纸切换缩放模式，重启渲染器");
                 let source_clone = source.clone();
                 let type_clone = *wp_type;
-                // W-008: 关闭原壁纸前记录原始缩放模式与壁纸源，用于失败回退
-                let original_mode = self
-                    .wallpaper_scaling_modes
-                    .get(display_id)
-                    .copied()
-                    .unwrap_or_default();
+                // W-008: original_mode 已在入口处取（写入新值之前），此处直接复用
                 let original_source = source_clone.clone();
-                // 先关闭当前壁纸
+                // 先关闭当前壁纸。close_wallpaper 会同步清理该显示器的
+                // wallpaper_scaling_modes 条目，故关闭后立即重新写入用户本次
+                // 选择的新值，保证视频重启期间记忆与用户意图一致（否则成功路径
+                // 结束时记忆会因 close 清理而丢失）。
                 self.close_wallpaper(display_id)?;
+                self.wallpaper_scaling_modes
+                    .insert(display_id.to_string(), mode);
                 // 尝试以新缩放模式重启（call_set_wallpaper_for_scaling 支持测试注入）
                 let new_result = self.call_set_wallpaper_for_scaling(
                     display_id,
@@ -422,9 +526,7 @@ impl WallpaperEngine {
                 );
                 match new_result {
                     Ok(()) => {
-                        // 成功：更新缩放模式记录，供下次切换时作为回退目标
-                        self.wallpaper_scaling_modes
-                            .insert(display_id.to_string(), mode);
+                        // 成功：记忆已在入口处写入新值，无需重复
                         return Ok(());
                     }
                     Err(new_err) => {
@@ -442,15 +544,20 @@ impl WallpaperEngine {
                             original_mode,
                         ) {
                             Ok(()) => {
-                                // 回退成功：返回包含原错误信息的 Err
-                                // （engine 状态已恢复到 original_mode，但本次调用视为失败）
+                                // 回退成功：把记忆恢复为 original_mode（入口处已写入
+                                // 未生效的新值），再返回包含原错误信息的 Err。
+                                self.wallpaper_scaling_modes
+                                    .insert(display_id.to_string(), original_mode);
                                 return Err(MirrorStarError::DesktopIntegration(format!(
                                     "切换缩放模式失败（已回退到原模式 {:?}）：{}",
                                     original_mode, new_err
                                 )));
                             }
                             Err(rollback_err) => {
-                                // 回退也失败：返回双重错误，明确提示壁纸已停止需手动恢复
+                                // 回退也失败：壁纸已停止，需手动恢复。记忆同样恢复为
+                                // original_mode（新值未生效），与实际呈现保持一致。
+                                self.wallpaper_scaling_modes
+                                    .insert(display_id.to_string(), original_mode);
                                 return Err(MirrorStarError::DesktopIntegration(format!(
                                     "切换缩放模式失败且回退也失败，壁纸已停止，需手动恢复。原错误: {}; 回退错误: {}",
                                     new_err, rollback_err
@@ -467,6 +574,36 @@ impl WallpaperEngine {
             renderer.set_scaling_mode(mode);
         }
         Ok(())
+    }
+
+    /// 对全部活跃显示器逐个应用缩放模式（`display_id = "all"` 广播语义）。
+    ///
+    /// 单显示器失败不中断其余显示器（例如某屏走 Native 模式路径失败）：记录
+    /// warn 并继续，函数最终返回首个错误；全部成功时返回 `Ok`。选择「记首错但
+    /// 继续」的语义——广播的意图是尽力让每个显示器达成目标，个别失败不应
+    /// 回滚已成功的显示器。无活跃显示器时为 no-op 返回 `Ok`。
+    pub fn set_scaling_mode_for_all(&mut self, mode: ScalingMode) -> Result<(), MirrorStarError> {
+        // 先写 "all" 兜底键（无精确项 / 无任何活跃显示器时生效），再广播到各
+        // 活跃显示器（广播内部对具体 id 写入各自条目）。
+        self.wallpaper_scaling_modes.insert("all".to_string(), mode);
+        let ids = self.active_display_ids();
+        let mut first_err: Option<MirrorStarError> = None;
+        for id in ids {
+            if let Err(e) = self.set_scaling_mode(&id, mode) {
+                tracing::warn!(
+                    display_id = %id,
+                    error = %e,
+                    "广播缩放模式对单个显示器失败，继续处理其余显示器"
+                );
+                if first_err.is_none() {
+                    first_err = Some(e);
+                }
+            }
+        }
+        match first_err {
+            Some(e) => Err(e),
+            None => Ok(()),
+        }
     }
 
     /// 调用 set_wallpaper 进行缩放模式切换（W-008：支持测试注入）
@@ -516,6 +653,17 @@ impl WallpaperEngine {
     /// 设置交互模式
     pub fn set_interaction_mode(&mut self, enabled: bool) -> Result<(), MirrorStarError> {
         self.interaction_mode = enabled;
+        // 纯净模式契约（D2）：模式内强制关闭鼠标穿透。此时已置顶的窗口不得再被打开
+        // `WS_EX_TRANSPARENT`（否则会破坏"任意点击退出"的拦截）。故仅更新字段（供
+        // `exit_pure_mode` 按 `!self.interaction_mode` 正确还原穿透），跳过对已置顶窗口的
+        // 交互/穿透切换。
+        if self.pure_mode.is_some() {
+            tracing::info!(
+                enabled,
+                "纯净壁纸模式进行中：仅记录交互模式，跳过对已置顶窗口的穿透/交互切换"
+            );
+            return Ok(());
+        }
         for renderer in self.wallpapers.values_mut() {
             renderer.set_interaction_mode(enabled);
             renderer.set_mouse_passthrough(!enabled);
@@ -554,13 +702,31 @@ impl WallpaperEngine {
             .unwrap_or(PauseReason(0))
     }
 
+    /// 将配置中持久化的「按显示器缩放模式」种入运行时记忆。
+    ///
+    /// 配置（`AppConfig.scaling.modes`）是持久化真相源：对已存在的同 key
+    /// **以配置值覆盖**，避免运行时残留值遮挡配置（例如本次启动前临时的
+    /// `set_scaling_mode` 调用）。启动时在配置加载后调用一次。
+    ///
+    /// 特殊键 `"all"`（全部显示器 / 新显示器兜底）原样种入，由
+    /// [`Self::scaling_mode_for`] 的查找链在无精确项时兜底。
+    pub fn seed_scaling_modes(&mut self, modes: &BTreeMap<String, ScalingMode>) {
+        for (display_id, mode) in modes {
+            self.wallpaper_scaling_modes
+                .insert(display_id.clone(), *mode);
+        }
+        tracing::info!(count = modes.len(), "已种入按显示器缩放模式配置");
+    }
+
     /// 读取指定显示器当前生效的缩放模式（DR-25，调度器轮换 apply 继承用）。
     ///
-    /// 返回该显示器 per-display 记忆的缩放模式；未记录时回退 `ScalingMode::default()`
-    /// （与手动 `set_wallpaper` 的默认路径一致）。
+    /// 查找链：`精确 display_id` → 特殊键 `"all"`（全部显示器 / 新显示器兜底）
+    /// → `ScalingMode::default()`。未记录时回退默认（Fill），与手动
+    /// `set_wallpaper` 的默认路径一致。
     pub fn scaling_mode_for(&self, display_id: &str) -> ScalingMode {
         self.wallpaper_scaling_modes
             .get(display_id)
+            .or_else(|| self.wallpaper_scaling_modes.get("all"))
             .copied()
             .unwrap_or_default()
     }
@@ -599,35 +765,45 @@ impl WallpaperEngine {
         source: &WallpaperSource,
         wallpaper_type: WallpaperType,
     ) -> Result<SetWallpaperPending, MirrorStarError> {
-        // 职责 1：关闭现有壁纸（含原生壁纸清除）
-        if self.has_wallpaper(display_id) {
-            self.close_wallpaper(display_id)?;
-        }
+        // 职责 0：记录旧壁纸模式（必须在 close_wallpaper 移除 wallpaper_mode 之前读取）
+        //
+        // 用于"延迟清除"判定（旧 Native → 新 WorkerW）：关闭旧 Native 壁纸时不立即
+        // 清除系统壁纸，待新 WorkerW 窗嵌入后由 complete_set_wallpaper 补清除，
+        // 消除"先关后设"期间桌面露默认背景的间隙帧（轮换丝滑度审计 Task 3 结论）。
+        let old_mode_was_native = self.has_wallpaper(display_id)
+            && self.wallpaper_mode.get(display_id) == Some(&WallpaperMode::Native);
 
-        // 职责 2：决定壁纸模式
+        // 新壁纸模式（纯函数，仅计算一次供职责 1/2/4 复用）
         let mode = determine_wallpaper_mode(source, wallpaper_type);
+
+        // 职责 1：关闭现有壁纸
+        // 旧 Native 壁纸的清除延后到新窗嵌入后（defer_clear_native=true 分支在
+        // complete_set_wallpaper 中补调 clear_native_wallpaper），此处不立即清除，
+        // 旧画面保持显示直至新窗覆盖。
+        if self.has_wallpaper(display_id) {
+            // 延迟清除仅适用于"旧 Native → 新 WorkerW"；其余场景 close 时立即清除
+            let defer = old_mode_was_native && mode == WallpaperMode::WorkerW;
+            self.close_wallpaper_with_clear(display_id, !defer)?;
+        }
 
         // 职责 3：获取配置快照（Arc 克隆，不持有 engine 借用）
         let config = self.renderer_config();
 
         // 职责 4：计算 clear_native 标志
-        // 注意：close_wallpaper 已清除原有壁纸模式，此处 is_native_mode 返回 false。
-        // 但 construct_renderer 内部对 Video/Gif/Web 类型在 clear_native=true 时会
-        // 调用 clear_native_wallpaper。为保持与原 set_wallpaper 一致的行为，
-        // 在 close_wallpaper 之前记录原始模式。
-        // 由于 close_wallpaper 已执行，此处 clear_native 始终为 false（与原逻辑一致：
-        // 原 set_wallpaper 在 close_wallpaper 之后才调用 is_native_mode）。
-        // W-012：此路径下 clear_native 恒为 false（因 close_wallpaper 已执行，
-        // is_native_mode 返回 false）。该行为与原 set_wallpaper 在 close_wallpaper
-        // 之后调用 is_native_mode 一致。仅 create_and_play_renderer（异步路径，
-        // construct_renderer 入口）使用 clear_native = true，该路径不经过
-        // close_wallpaper，可保留原始 is_native_mode 判断。
+        // close_wallpaper 已移除 wallpaper_mode，此处 is_native_mode 恒为 false（W-012）：
+        // 与原 set_wallpaper 在 close_wallpaper 之后才调用 is_native_mode 的行为一致。
+        // 仅 create_and_play_renderer（异步路径，construct_renderer 入口）使用
+        // clear_native = true，该路径不经过 close_wallpaper。
         let clear_native = self.is_native_mode(display_id);
+        // 延迟清除判定：仅"旧 Native → 新 WorkerW"需要。新 Native 模式由
+        // set_native_wallpaper_internal 直接覆盖旧壁纸，无需清除。
+        let defer_clear_native = old_mode_was_native && mode == WallpaperMode::WorkerW;
 
         Ok(SetWallpaperPending {
             mode,
             config,
             clear_native,
+            defer_clear_native,
         })
     }
 
@@ -635,19 +811,48 @@ impl WallpaperEngine {
     ///
     /// 将已 `play()` 的渲染器嵌入 WorkerW 并注册到 engine。
     /// 仅适用于 WorkerW 模式（Native 模式由 `set_native_wallpaper_internal` 处理）。
+    ///
+    /// `defer_clear_native` 由调用方从 `prepare_set_wallpaper` 返回的
+    /// `SetWallpaperPending::defer_clear_native` 传入：为 true 表示旧壁纸是 Native
+    /// 且切换前未立即清除（`prepare_set_wallpaper` 关闭旧壁纸时跳过清除），须在新窗
+    /// 嵌入成功后补调 `clear_native_wallpaper`，消除"先关后设"间隙帧。
     pub fn complete_set_wallpaper(
         &mut self,
         renderer: Box<dyn WallpaperRenderer>,
         display_id: &str,
         source: &WallpaperSource,
         wallpaper_type: WallpaperType,
+        defer_clear_native: bool,
     ) -> Result<(), MirrorStarError> {
-        self.embed_and_register_renderer(renderer, display_id, source, wallpaper_type)
+        self.embed_and_register_renderer(renderer, display_id, source, wallpaper_type)?;
+
+        // 补清除：新 WorkerW 窗已嵌入（覆盖全屏），此刻清除旧系统壁纸不会产生
+        // 可见间隙。清除失败仅记录日志（系统壁纸残留被新窗完全覆盖，用户不可见）。
+        if defer_clear_native {
+            if let Err(e) = native_wallpaper::clear_native_wallpaper() {
+                tracing::warn!(
+                    error = %e,
+                    display_id,
+                    "延迟清除旧原生壁纸失败（残留壁纸已被新 WorkerW 窗覆盖）"
+                );
+            }
+        }
+
+        Ok(())
     }
 
     /// 检查指定显示器是否已有壁纸
     pub fn has_wallpaper(&self, display_id: &str) -> bool {
         self.wallpapers.contains_key(display_id) || self.wallpaper_mode.contains_key(display_id)
+    }
+
+    /// 返回当前存在活跃壁纸（WorkerW 或原生）的全部显示器 id。
+    ///
+    /// 供调度器在多屏排列变更时按新布局关闭"不再属于新布局"的渲染器
+    /// （多屏排列即时生效，Task 5）。以 `wallpaper_mode` 为权威集合——两种模式
+    /// （WorkerW 嵌入 / 原生设置）均写入该映射，与 `cleanup_internal` 一致。
+    pub fn active_display_ids(&self) -> Vec<String> {
+        self.wallpaper_mode.keys().cloned().collect()
     }
 
     /// 返回第一个活跃壁纸的 display_id（FE-001 修复）
@@ -657,6 +862,33 @@ impl WallpaperEngine {
     /// 多显示器场景下前端应显式传入 `display_id`，避免依赖此回退。
     pub fn first_active_display_id(&self) -> Option<&str> {
         self.wallpapers.keys().next().map(|s| s.as_str())
+    }
+
+    /// 统一 display-id 解析器（单一真相源）
+    ///
+    /// 将「未指定 / 空串」的 display_id 规范化为真实显示器 id，回退链：
+    /// 显式非空 → 当前活跃壁纸 display_id（`first_active_display_id`）
+    /// → 主显示器真实 id（`primary_display_id`）→ 兜底空串（无显示器时）。
+    /// 手动 / 轮换 / 启动恢复三条设置路径统一复用本方法，保证状态 HashMap
+    /// 键一致，`""` 永不作为合法键。
+    pub fn resolve_display_id(&self, display_id: Option<String>) -> String {
+        resolve_display_id_from(
+            display_id,
+            self.first_active_display_id(),
+            self.primary_display_id().as_deref(),
+        )
+    }
+
+    /// 返回主显示器的真实 id（`is_primary == true` 项）
+    ///
+    /// 取自自由函数 `crate::desktop::enumerate_displays()`（不持锁，安全），
+    /// 对齐 `layout::plan` / `layout::validate_unit_key` 的「缺省回退主显示器」约定。
+    /// 无显示器（枚举为空 / 无主屏标记）时返回 `None`。
+    fn primary_display_id(&self) -> Option<String> {
+        crate::desktop::enumerate_displays()
+            .into_iter()
+            .find(|d| d.is_primary)
+            .map(|d| d.id)
     }
 
     /// 订阅全局状态变更通知
@@ -819,14 +1051,7 @@ impl WallpaperEngine {
             return Err(e);
         }
 
-        self.wallpaper_mode
-            .insert(display_id.to_string(), WallpaperMode::WorkerW);
-        self.wallpaper_sources
-            .insert(display_id.to_string(), (source.clone(), wallpaper_type));
-        if let Some(sender) = renderer.create_pause_sender(display_id) {
-            self.register_pause_sender(sender, display_id);
-        }
-        self.wallpapers.insert(display_id.to_string(), renderer);
+        self.register_renderer_maps(renderer, display_id, source, wallpaper_type);
         Ok(())
     }
 
@@ -904,6 +1129,128 @@ impl WallpaperEngine {
         self.wallpapers.insert(display_id.to_string(), renderer);
         tracing::info!(display_id, "全屏恢复：渲染器已重新嵌入并注册");
         Ok(())
+    }
+
+    /// 复活一个已被终止（`WallpaperState::Terminated`，`hwnd()` 为空）的渲染器。
+    ///
+    /// 由 `fast_path.rs::resume_all_fast` 的 Terminated 分支抽取而来（纯净壁纸模式
+    /// `enter_pure_mode` 对"被全屏应用终止 / 子进程崩溃"的显示器同样需要先重建再置顶，
+    /// 见 D3），行为与原内联实现**逐行一致**：
+    ///
+    /// 1. `play()` 完整重启渲染器（视频渲染器在 `after_embed` 时从保存进度续播）
+    /// 2. `reembed_and_register_renderer` 重新嵌入 WorkerW、执行 `after_embed`
+    ///    （IPC `loadfile` 重新加载视频）并重建 PauseSender
+    /// 3. 将共享状态同步为 `Playing` 并 `notify_state_changed` 通知前端 UI
+    ///
+    /// # 暂停位图
+    ///
+    /// **不触碰** `pause_reasons`：本方法只负责"重建渲染器窗口"，暂停/恢复位图由
+    /// 调用方（`resume_all_fast` / `enter_pure_mode`）自行协调，避免把无关语义
+    /// 塞入位图。
+    ///
+    /// # 错误处理
+    ///
+    /// 任一失败分支均记录与原实现相同的 `error` 日志并返回 `Err`（调用方负责聚合
+    /// 为 `failed` 列表或向上传播）。
+    pub(crate) fn revive_terminated(&mut self, display_id: &str) -> Result<(), MirrorStarError> {
+        // 先通过 `get_mut().map(|r| r.play())` 得到 `Option<Result<..>>`：
+        // 闭包返回 play() 的 Result，借用随 map 调用结束而释放，之后才能
+        // 以 `&mut self` 调用 reembed_and_register_renderer（避免借用冲突）。
+        match self.wallpapers.get_mut(display_id).map(|r| r.play()) {
+            Some(Ok(())) => {
+                match self.reembed_and_register_renderer(display_id) {
+                    Ok(()) => {
+                        // 此处 get 返回 reembed 替换后的新 sender；将共享状态
+                        // 同步为 Playing 并通知前端 UI。
+                        if let Some(sender) = self.pause_senders.get(display_id) {
+                            sender.set_state(WallpaperState::Playing);
+                            sender.notify_state_changed(display_id);
+                        }
+                        Ok(())
+                    }
+                    Err(e) => {
+                        tracing::error!(
+                            display_id,
+                            error = %e,
+                            "全屏终止后重启壁纸失败：重新嵌入失败"
+                        );
+                        Err(e)
+                    }
+                }
+            }
+            Some(Err(e)) => {
+                tracing::error!(display_id, error = %e, "全屏终止后重启壁纸失败");
+                Err(e)
+            }
+            None => {
+                tracing::error!(display_id, "全屏终止后重启壁纸失败：渲染器不存在");
+                Err(MirrorStarError::DesktopIntegration(format!(
+                    "全屏终止后重启壁纸失败：渲染器不存在 ({display_id})"
+                )))
+            }
+        }
+    }
+
+    /// 采集"应为播放"的视频渲染器探针快照（display_id 升序，便于测试确定性）。
+    ///
+    /// 只收集 `state() == Playing` 且 `liveness_probe()` 返回 `Some` 的显示器：
+    /// - Terminated（已被全屏处置终止）不参与——由既有恢复路径负责；
+    /// - Paused 不参与——暂停时时钟本就不前进，属预期；
+    /// - 图片 / GIF / 网页渲染器探针为 `None`，自然不入集。
+    ///
+    /// 之所以把"逐屏可能阻塞的 IPC 查询"收敛到本方法并只在调用方显式采样时执行：
+    /// 看护/退出编排持有上一轮快照做比较，判定策略留在调用方（引擎只提供原语），
+    /// 避免引擎自行起线程或缓存采样引入额外状态。排序保证多屏结果稳定，便于断言。
+    pub fn probe_playing_videos(&mut self) -> Vec<(String, LivenessProbe)> {
+        let mut probes: Vec<(String, LivenessProbe)> = self
+            .wallpapers
+            .iter_mut()
+            .filter(|(_, renderer)| renderer.state() == WallpaperState::Playing)
+            .filter_map(|(display_id, renderer)| {
+                renderer
+                    .liveness_probe()
+                    .map(|probe| (display_id.clone(), probe))
+            })
+            .collect();
+        probes.sort_by(|a, b| a.0.cmp(&b.0));
+        probes
+    }
+
+    /// 自愈停滞的视频渲染器（重建渲染器，复用既有"全屏终止后恢复"链路）。
+    ///
+    /// 顺序：`terminate()`（失败仅 warn 并继续）→ `revive_terminated(display_id)`
+    /// （`play()` + `reembed_and_register_renderer()` + PauseSender 状态同步）。
+    ///
+    /// **禁止**在渲染器仍存活时直接调用 `play()`：`VideoRenderer::play()` 无条件
+    /// spawn 新 mpv 进程/窗口，会产生第二个 mpv。故必须先 `terminate()`。
+    /// **不触碰** `pause_reasons` 位图：自愈只重建渲染器，暂停语义由调用方保证。
+    pub fn heal_stalled_renderer(
+        &mut self,
+        display_id: &str,
+        prev_time_pos: f64,
+        curr_time_pos: f64,
+        source: &str,
+    ) -> Result<(), MirrorStarError> {
+        tracing::warn!(
+            display_id,
+            prev_time_pos,
+            curr_time_pos,
+            source,
+            "检测到视频壁纸输出停滞，执行自愈（重建渲染器）"
+        );
+        // 先终止：terminate 会置 Terminated 状态 + `ipc.quit` + `stop_process`（超时强杀）。
+        // 失败不阻断——即便进程未能优雅退出，随后 revive_terminated 的 play() 仍会尝试
+        // 重建；强杀兜底在 stop_process 内已尽力。终止失败仅 warn 保留证据。
+        if let Some(renderer) = self.wallpapers.get_mut(display_id) {
+            if let Err(e) = renderer.terminate() {
+                tracing::warn!(
+                    display_id,
+                    error = %e,
+                    "停滞自愈：终止渲染器失败，继续尝试重建"
+                );
+            }
+        }
+        self.revive_terminated(display_id)
     }
 
     /// 为 PauseSender spawn 状态变更转发任务并注册到 `pause_senders`。
@@ -1118,11 +1465,28 @@ impl WallpaperEngine {
         }
     }
 
-    /// 关闭指定显示器的壁纸
+    /// 关闭指定显示器上的壁纸（立即清除系统壁纸）。
     ///
     /// 同步清理 5 个 per-display_id HashMap：pause_senders / wallpaper_mode /
     /// wallpaper_sources / wallpapers / wallpaper_scaling_modes，确保关闭后无残留状态。
+    ///
+    /// 等价于 `close_wallpaper_with_clear(display_id, true)`——Native 壁纸关闭时
+    /// 同步清除系统壁纸设置。需要"关闭但不立即清除"（延迟清除，用于轮换丝滑度
+    /// 修复）时请使用私有实现 `close_wallpaper_with_clear(display_id, false)`。
     pub fn close_wallpaper(&mut self, display_id: &str) -> Result<(), MirrorStarError> {
+        self.close_wallpaper_with_clear(display_id, true)
+    }
+
+    /// 关闭指定显示器上的壁纸，可控制是否清除系统壁纸。
+    ///
+    /// `clear_native=false` 用于"先关后设"延迟清除场景：关闭旧 Native 壁纸时保留
+    /// 系统壁纸（旧画面保持显示），待新 WorkerW 窗嵌入后再由调用方补清除。
+    /// 所有其他调用点传入 `true` 保持原语义。
+    fn close_wallpaper_with_clear(
+        &mut self,
+        display_id: &str,
+        clear_native: bool,
+    ) -> Result<(), MirrorStarError> {
         // 移除快速控制发送端
         self.pause_senders.remove(display_id);
         // 移除壁纸模式记录
@@ -1133,9 +1497,14 @@ impl WallpaperEngine {
         self.wallpaper_scaling_modes.remove(display_id);
 
         if let Some(WallpaperMode::Native) = mode {
-            // 原生壁纸：清除系统壁纸设置
-            native_wallpaper::clear_native_wallpaper()?;
-            tracing::info!(display_id, "关闭原生壁纸");
+            if clear_native {
+                // 原生壁纸：清除系统壁纸设置
+                native_wallpaper::clear_native_wallpaper()?;
+                tracing::info!(display_id, "关闭原生壁纸");
+            } else {
+                // 延迟清除：保留系统壁纸，待新窗嵌入后补清除
+                tracing::debug!(display_id, "关闭原生壁纸（延迟清除，待新窗嵌入后补清）");
+            }
         } else if let Some(mut renderer) = self.wallpapers.remove(display_id) {
             // WorkerW 壁纸：尝试全部清理步骤，收集失败信息（不 fail-fast）
             let mut errors: Vec<String> = Vec::new();
@@ -1191,65 +1560,553 @@ impl WallpaperEngine {
         Ok(())
     }
 
-    /// 更新壁纸窗口位置（显示器配置变化时）
-    pub fn update_positions(&mut self) -> Result<(), MirrorStarError> {
-        let displays = crate::desktop::enumerate_displays();
+    // ── 纯净壁纸模式编排（D3 / D4 / D7 / D8）───────────────────────────────
+    //
+    // 设计要点：
+    // - **权威状态**：`self.pure_mode` 为 `Some` 即"处于模式"，进入/退出据此幂等。
+    // - **标志时序（D7）**：`pure_mode::set_active(true)` 必须在任何置顶动作**之前**
+    //   置位（使并发的调度器/状态守卫立即开始抑制），`set_active(false)` 必须在
+    //   全部回嵌**完成之后**清除（使任何读方观察到的"活跃"都对应一致窗口层级）。
+    // - **失败回滚**：逐屏置顶，任一屏失败即把已摘出的窗口全部嵌回、清标志并返回
+    //   `Err`，不留"半进入"状态。
+    // - **零 resize（D1）**：摘出/置顶复用 `pure_mode` 原语，矩形保持进入前不变。
 
-        // W-005 修复：Span 模式下 GetSystemMetrics 调用结果与渲染器数量无关，
-        // 在 for 循环前缓存为局部变量，循环内复用，避免 N 个渲染器产生 4N 次系统调用。
-        // 各渲染器使用同一组虚拟屏幕坐标，计算结果与修复前一致。
-        // 仅当存在待更新的渲染器时才调用 GetSystemMetrics（与原实现的惰性调用行为一致）。
-        let span_metrics: Option<(i32, i32, i32, i32)> =
-            if self.arrangement == Arrangement::Span && !self.wallpapers.is_empty() {
-                use windows::Win32::UI::WindowsAndMessaging::{
-                    GetSystemMetrics, SM_CXVIRTUALSCREEN, SM_CYVIRTUALSCREEN, SM_XVIRTUALSCREEN,
-                    SM_YVIRTUALSCREEN,
-                };
-                let virtual_x = unsafe { GetSystemMetrics(SM_XVIRTUALSCREEN) };
-                let virtual_y = unsafe { GetSystemMetrics(SM_YVIRTUALSCREEN) };
-                let virtual_w = unsafe { GetSystemMetrics(SM_CXVIRTUALSCREEN) };
-                let virtual_h = unsafe { GetSystemMetrics(SM_CYVIRTUALSCREEN) };
-                Some((virtual_x, virtual_y, virtual_w, virtual_h))
+    /// 进入纯净壁纸模式：把正在播放的壁纸窗口摘出 WorkerW 并置顶全屏。
+    ///
+    /// 幂等：已处于模式（`self.pure_mode.is_some()`）时直接返回 `Ok(())`。
+    ///
+    /// # 前置校验（D8）
+    ///
+    /// `wallpaper_mode` 为空（当前没有任何显示器设置壁纸）→ 返回
+    /// [`MirrorStarError::InvalidArgument`]，记录 warn，不进入模式。
+    ///
+    /// # 执行顺序（见 D3 / D4 / D7）
+    ///
+    /// 1. `pure_mode::set_active(true)`（**早于任何置顶**）
+    /// 2. 遍历 `wallpapers`：`hwnd()` 为空的渲染器先 [`Self::revive_terminated`] 重建，
+    ///    再 `DesktopIntegrator::detach_for_pure_mode` 摘出 + 置顶；**视频显示器例外**
+    ///    （架构 D1）：不摘出，原窗口全程留在 WorkerW 继续播放，改由临时顶层渲染器覆盖
+    /// 3. Native 静态图片（无窗口）→ 为"有 Native 记录且没有 WorkerW 壁纸"的显示器
+    ///    创建临时 `ImageRenderer` 窗口并置顶（见 [`Self::enter_pure_mode_temp_windows`]）
+    /// 4. 全部成功后：关闭鼠标穿透（D2）、注册置顶窗口表（供 TaskbarCreated 重断言）、
+    ///    写入 `self.pure_mode`
+    ///
+    /// 任一步失败 → 回滚（嵌回已摘出窗口 + 终止已建临时渲染器 + 清标志）并返回原错误。
+    pub fn enter_pure_mode(&mut self) -> Result<(), MirrorStarError> {
+        // 幂等：已处于模式，无操作
+        if self.pure_mode.is_some() {
+            return Ok(());
+        }
+
+        // 前置校验：没有任何壁纸时拒绝进入（D8）
+        if self.wallpaper_mode.is_empty() {
+            tracing::warn!("纯净壁纸模式：当前没有任何壁纸，拒绝进入");
+            return Err(MirrorStarError::InvalidArgument {
+                reason: "当前没有任何壁纸，无法进入纯净壁纸模式".into(),
+            });
+        }
+
+        // 标志必须早于置顶（D7）：置位后调度器/状态守卫立即开始抑制轮换与自动暂停
+        crate::pure_mode::set_active(true);
+
+        // 进入时快照排列方式：退出回嵌沿用（模式内用户不可改配置）
+        let arrangement = self.arrangement();
+        // 先收集 display_id，避免遍历 self.wallpapers 与后续 &mut self 调用借用冲突
+        let display_ids: Vec<String> = self.wallpapers.keys().cloned().collect();
+
+        let mut lifted: Vec<(String, HWND)> = Vec::new();
+        for display_id in &display_ids {
+            // 无窗口（被全屏终止 / 子进程崩溃）→ 先重建渲染器再摘出（D3）
+            let no_hwnd = self
+                .wallpapers
+                .get(display_id)
+                .map(|r| r.hwnd().is_none())
+                .unwrap_or(false);
+            // 仅在需要时复活；失败即整体失败（回滚已摘出的窗口）
+            let revive_result = if no_hwnd {
+                self.revive_terminated(display_id)
             } else {
-                None
+                Ok(())
             };
+            if let Err(e) = revive_result {
+                tracing::error!(display_id, error = %e, "纯净壁纸模式：重建渲染器失败，回滚");
+                self.rollback_pure_mode_enter(lifted, arrangement);
+                return Err(e);
+            }
 
-        // 收集位置更新失败的显示器，循环结束后统一告警（不 fail-fast）
-        let mut failures: Vec<(String, String)> = Vec::new();
-
-        for (display_id, renderer) in &mut self.wallpapers {
-            if let Some((virtual_x, virtual_y, virtual_w, virtual_h)) = span_metrics {
-                // W01 修复：不 clamp SM_XVIRTUALSCREEN/SM_YVIRTUALSCREEN 的负值。
-                // 多显示器场景下副显示器位于主显示器左侧/上方时，虚拟屏幕原点为负值，
-                // clamp 到 0 会导致 Span 模式壁纸窗口位置错误（偏移到主显示器内）。
-                // 仅保留宽高的 > 0 守卫（宽高不能为负，GetSystemMetrics 失败时返回 0）。
-                if let Err(e) = renderer.set_position(
-                    virtual_x,
-                    virtual_y,
-                    if virtual_w > 0 { virtual_w } else { 1920 },
-                    if virtual_h > 0 { virtual_h } else { 1080 },
+            // 架构 D1：视频显示器**原窗口全程不搬动**（不摘出、不 SetParent /
+            // SetWindowPos / ShowWindow）。实测"把视频窗口摘出 WorkerW 并置顶"会毒化
+            // 本会话的 WorkerW 子层（之后该层不再产出可呈现帧，且退出侧的重建 / 回嵌 /
+            // 窗口级唤醒手段均被证伪），而顶层窗口呈现正常（置顶期间画面在动）。故纯净
+            // 模式的视频呈现改用**临时顶层渲染器覆盖**：原窗口留在 WorkerW 继续播放
+            //（`wallpapers` / `wallpaper_sources` / `wallpaper_mode` / `active_wallpapers`
+            // / `pause_senders` 条目全程不变），退出时销毁覆盖窗口即原样显露。
+            if matches!(
+                self.wallpaper_sources.get(display_id),
+                Some((_, WallpaperType::Video))
+            ) {
+                // 目标矩形（复用 `pure_mode_target_rect`：Span 用虚拟屏整屏，否则取该
+                // 显示器矩形）。临时窗口初始在 +32000 离屏，不能用 GetWindowRect 取目标矩形。
+                let Some((x, y, w, h)) = self.pure_mode_target_rect(display_id, arrangement) else {
+                    tracing::error!(
+                        display_id,
+                        "纯净壁纸模式：未找到显示器矩形，放弃临时视频覆盖（原窗口不受影响）"
+                    );
+                    continue;
+                };
+                // 配置快照复用既有无副作用的 `renderer_config()`（`prepare_set_wallpaper`
+                // 亦用之），避免调用 prepare 本体引入关闭旧壁纸等副作用。
+                let config = self.renderer_config();
+                let scaling = self.scaling_mode_for(display_id);
+                let Some(source) = self
+                    .wallpaper_sources
+                    .get(display_id)
+                    .map(|(s, _)| s.clone())
+                else {
+                    continue;
+                };
+                // 顺序 play → lift_window_to_rect → after_embed：与 boot"窗口稳定嵌入后
+                // loadfile"语义一致，避免离屏先加载的呈现竞态。全程 best-effort：失败即
+                // 终止该临时渲染器并放弃本显示器覆盖（error!），不回滚整个进入流程。
+                let mut renderer = match construct_renderer(
+                    &source,
+                    WallpaperType::Video,
+                    scaling,
+                    &config,
+                    false,
                 ) {
-                    failures.push((display_id.clone(), e.to_string()));
-                }
-            } else {
-                if let Some(display) = displays.iter().find(|d| d.id == *display_id) {
-                    if let Err(e) = renderer.set_position(
-                        display.x,
-                        display.y,
-                        display.width as i32,
-                        display.height as i32,
-                    ) {
-                        failures.push((display_id.clone(), e.to_string()));
+                    Ok(r) => r,
+                    Err(e) => {
+                        tracing::error!(
+                            display_id,
+                            error = %e,
+                            "纯净壁纸模式：创建临时视频覆盖渲染器失败（放弃本显示器覆盖，原窗口不受影响）"
+                        );
+                        continue;
                     }
+                };
+                let Some(hwnd) = renderer.hwnd() else {
+                    tracing::error!(
+                        display_id,
+                        "纯净壁纸模式：临时视频覆盖渲染器无句柄（放弃本显示器覆盖）"
+                    );
+                    let _ = renderer.terminate();
+                    continue;
+                };
+                // 与 embed_wallpaper Step 1 同源：去边框 + 去任务栏（NOACTIVATE/TOOLWINDOW）。
+                // 覆盖窗是新 mpv 顶层窗口，默认带标题栏；不做这两步会在纯净模式里露出窗口边框。
+                if let Err(e) = crate::desktop::window::make_borderless(hwnd) {
+                    tracing::warn!(
+                        display_id,
+                        error = %e,
+                        "纯净壁纸模式：覆盖窗去边框失败（仅美观受影响，继续置顶）"
+                    );
+                }
+                crate::desktop::window::remove_from_taskbar(hwnd);
+                // 根因（SubTask 2.12）：mpv 的 `auto-window-resize`（默认 yes）会在载入
+                // 视频时按工作区（任务栏占 40px）与视频 16:9 自适配窗口，覆写应用设定的
+                // 几何（实测 1920x1080 被改为 1848x1040@(36,20)）。实测在 loadfile **之前**
+                // 设 `auto-window-resize=no` 可稳定保持 1920x1080（14/14 采样，画面非黑且在动、
+                // 无黑边）；loadfile 之后再设无效。故必须在置顶后、`after_embed()`（loadfile）
+                // 之前关闭该属性（best-effort，失败仅 warn 继续）。
+                if let Err(e) = renderer.disable_auto_window_resize() {
+                    tracing::warn!(
+                        display_id,
+                        error = %e,
+                        "纯净壁纸模式：禁用 mpv 自动窗口适配失败（覆盖窗可能不严格全屏，继续）"
+                    );
+                }
+                if let Err(e) = crate::pure_mode::lift_window_to_rect(hwnd, x, y, w, h) {
+                    tracing::error!(
+                        display_id,
+                        error = %e,
+                        "纯净壁纸模式：临时视频覆盖窗口置顶失败（放弃本显示器覆盖，原窗口不受影响）"
+                    );
+                    let _ = renderer.terminate();
+                    continue;
+                }
+                if let Err(e) = renderer.after_embed() {
+                    tracing::error!(
+                        display_id,
+                        error = %e,
+                        "纯净壁纸模式：临时视频覆盖 loadfile 失败（放弃本显示器覆盖，原窗口不受影响）"
+                    );
+                    let _ = renderer.terminate();
+                    continue;
+                }
+                tracing::info!(
+                    display_id,
+                    "进入纯净壁纸模式：视频改用临时渲染器覆盖（原窗口不搬动）"
+                );
+                self.pure_mode_temp.push((display_id.clone(), renderer));
+                continue;
+            }
+
+            // 摘出 + 置顶（保持矩形不变，不隐藏）
+            let detach_result = {
+                let mut desktop = self.desktop.lock().unwrap_or_else(|e| e.into_inner());
+                desktop.detach_for_pure_mode(display_id)
+            };
+            match detach_result {
+                Ok(hwnd) => lifted.push((display_id.clone(), hwnd)),
+                Err(e) => {
+                    tracing::error!(display_id, error = %e, "纯净壁纸模式：摘出置顶窗口失败，回滚");
+                    self.rollback_pure_mode_enter(lifted, arrangement);
+                    return Err(e);
                 }
             }
         }
 
-        if !failures.is_empty() {
-            tracing::warn!(failed = ?failures, "部分显示器位置更新失败");
+        // Native 静态图片的临时呈现窗口（D4 / D8）
+        if let Err(e) = self.enter_pure_mode_temp_windows(arrangement, &lifted) {
+            self.rollback_pure_mode_enter(lifted, arrangement);
+            return Err(e);
         }
 
+        // F5：进入后必须至少覆盖一个显示器（摘出窗口或临时呈现窗口），否则为"空模式"——
+        // 会置位标志、安装输入钩子并抑制轮换，却没有任何窗口被覆盖，必须回滚拒绝。
+        // 注意：`rollback_pure_mode_enter` 以值接收 `lifted`（此分支 `return`，
+        // 故后续成功路径仍可继续使用 `lifted`）。
+        if lifted.is_empty() && self.pure_mode_temp.is_empty() {
+            tracing::warn!(
+                "纯净壁纸模式：没有可覆盖的壁纸窗口（无活跃窗口且无临时呈现窗口），拒绝进入并回滚"
+            );
+            self.rollback_pure_mode_enter(lifted, arrangement);
+            return Err(MirrorStarError::InvalidArgument {
+                reason: "没有可覆盖的壁纸窗口，拒绝进入纯净壁纸模式".into(),
+            });
+        }
+
+        // 关闭鼠标穿透（D2）：置顶窗若保持 WS_EX_TRANSPARENT，点击会落到下层桌面
+        for (display_id, _) in &lifted {
+            if let Some(renderer) = self.wallpapers.get_mut(display_id) {
+                renderer.set_mouse_passthrough(false);
+            }
+        }
+
+        // 注册置顶窗口（覆盖式写入），供 TaskbarCreated 广播后重断言 Z 序
+        let all_hwnds = self.collect_pure_mode_hwnds(&lifted);
+        crate::pure_mode::register_lifted(&all_hwnds);
+
+        let temp_count = self.pure_mode_temp.len();
+        tracing::info!(
+            displays = lifted.len(),
+            temp_windows = temp_count,
+            "已进入纯净壁纸模式（壁纸窗口已摘出并置顶全屏）"
+        );
+        self.pure_mode = Some(PureModeState {
+            lifted,
+            arrangement,
+        });
         Ok(())
+    }
+
+    /// 为 Native 静态图片创建临时呈现窗口并置顶（`enter_pure_mode` 的第 3 步，D4 / D8）。
+    ///
+    /// 仅当 `wallpaper_mode` 中存在 `WallpaperMode::Native`（原生 API 静态图片，没有
+    /// 窗口）时才创建工作；创建方式为 `ImageRenderer::new` + `play()`
+    /// （**不**走 `construct_renderer`，避免其 `ensure_desktop_ready` 对 WorkerW 的
+    /// 重试依赖与副作用）。
+    ///
+    /// # 覆盖范围（D4 / D8）
+    ///
+    /// - `arrangement == Span`：创建 **1 个**跨虚拟屏窗口（矩形取
+    ///   [`crate::pure_mode::virtual_screen_rect`]）
+    /// - 否则：逐屏（`desktop::enumerate_displays`）为"**有 Native 记录**且
+    ///   **没有 WorkerW 壁纸窗口**"的显示器各创建一个窗口；既无 WorkerW 壁纸也无
+    ///   Native 记录的显示器保持桌面原样（不覆盖）
+    ///
+    /// # 失败
+    ///
+    /// 任一临时窗口创建失败 → 终止本次失败的渲染器并把错误上抛给 `enter_pure_mode`
+    /// （由其统一回滚，此时已创建成功的临时渲染器已在 `pure_mode_temp` 中，会被一并
+    /// 终止）。已创建的临时渲染器存入 `self.pure_mode_temp`，**绝不**注册进权威状态
+    /// 映射，也不写入 `lifted`（它们不需要回嵌，只需终止）。
+    fn enter_pure_mode_temp_windows(
+        &mut self,
+        arrangement: Arrangement,
+        lifted: &[(String, HWND)],
+    ) -> Result<(), MirrorStarError> {
+        /// 单个临时呈现窗口的创建目标（显示器ID + 图片路径 + 目标屏幕矩形）。
+        struct TempWindowTarget {
+            display_id: String,
+            path: String,
+            rect: (i32, i32, i32, i32),
+        }
+
+        // 收集 Native 静态图片记录：display_id -> 文件路径
+        let native_records: Vec<(String, String)> = self
+            .wallpaper_mode
+            .iter()
+            .filter(|(_, mode)| **mode == WallpaperMode::Native)
+            .filter_map(|(display_id, _)| {
+                match self.wallpaper_sources.get(display_id) {
+                    Some((WallpaperSource::File(path), _)) => {
+                        Some((display_id.clone(), path.clone()))
+                    }
+                    // URL 来源的 Native 记录不适用（原生壁纸只支持本地文件）
+                    _ => None,
+                }
+            })
+            .collect();
+        if native_records.is_empty() {
+            return Ok(());
+        }
+        // lifted 只作只读参考（判断"该显示器是否已有 WorkerW 壁纸窗口"）
+        let lifted_ids: Vec<&str> = lifted.iter().map(|(id, _)| id.as_str()).collect();
+
+        // 计算临时窗口目标（见局部结构 `TempWindowTarget`）。统一经
+        // [`Self::pure_mode_target_rect`] 取矩形（与视频覆盖分支同一实现）。
+        let mut targets: Vec<TempWindowTarget> = Vec::new();
+        if arrangement == Arrangement::Span {
+            // Span：一个跨虚拟屏的窗口即可铺满全部显示器
+            let (native_display_id, path) = &native_records[0];
+            let rect = self
+                .pure_mode_target_rect(native_display_id, arrangement)
+                .expect("Span 模式下 virtual_screen_rect 恒返回有效矩形");
+            targets.push(TempWindowTarget {
+                display_id: native_display_id.clone(),
+                path: path.clone(),
+                rect,
+            });
+        } else {
+            for display in crate::desktop::enumerate_displays() {
+                // 已有 WorkerW 壁纸窗口的显示器：其窗口已置顶，不再叠加
+                if lifted_ids.contains(&display.id.as_str()) {
+                    continue;
+                }
+                // 仅"有 Native 记录"的显示器补窗口（D8：两者皆无的显示器不覆盖）
+                let Some((_, path)) = native_records
+                    .iter()
+                    .find(|(display_id, _)| *display_id == display.id)
+                else {
+                    continue;
+                };
+                let Some(rect) = self.pure_mode_target_rect(&display.id, arrangement) else {
+                    continue;
+                };
+                targets.push(TempWindowTarget {
+                    display_id: display.id.clone(),
+                    path: path.clone(),
+                    rect,
+                });
+            }
+        }
+
+        for target in targets {
+            let TempWindowTarget {
+                display_id,
+                path,
+                rect: (x, y, w, h),
+            } = target;
+            let mut renderer = ImageRenderer::new(path, self.scaling_mode_for(&display_id));
+            if let Err(e) = renderer.play() {
+                tracing::error!(display_id, error = %e, "纯净壁纸模式：临时呈现窗口播放失败");
+                if let Err(te) = renderer.terminate() {
+                    tracing::warn!(error = %te, "临时呈现窗口创建失败后终止渲染器也失败");
+                }
+                return Err(e);
+            }
+            let Some(hwnd) = renderer.hwnd() else {
+                let _ = renderer.terminate();
+                return Err(MirrorStarError::DesktopIntegration(format!(
+                    "临时呈现窗口无句柄: {display_id}"
+                )));
+            };
+            // 与 embed_wallpaper Step 1 同源：去边框 + 去任务栏（NOACTIVATE/TOOLWINDOW）。
+            // 临时呈现窗是新顶层窗口，默认带标题栏；不做这两步会在纯净模式里露出窗口边框。
+            if let Err(e) = crate::desktop::window::make_borderless(hwnd) {
+                tracing::warn!(
+                    display_id,
+                    error = %e,
+                    "纯净壁纸模式：临时呈现窗去边框失败（仅美观受影响，继续置顶）"
+                );
+            }
+            crate::desktop::window::remove_from_taskbar(hwnd);
+            if let Err(e) = crate::pure_mode::lift_window_to_rect(hwnd, x, y, w, h) {
+                tracing::error!(display_id, error = %e, "纯净壁纸模式：临时呈现窗口置顶失败");
+                if let Err(te) = renderer.terminate() {
+                    tracing::warn!(error = %te, "临时呈现窗口置顶失败后终止渲染器也失败");
+                }
+                return Err(e);
+            }
+            self.pure_mode_temp.push((display_id, Box::new(renderer)));
+        }
+        Ok(())
+    }
+
+    /// 进入失败的统一回滚：嵌回已摘出窗口、终止已建临时渲染器、清标志。
+    ///
+    /// 逐个 best-effort（失败仅 warn，不阻断回滚），最后清除进程级标志，使失败的
+    /// 进入操作不遗留"半进入"状态。**调用后必定丢弃 `lifted`**（以值接收），
+    /// 保证不会被误用于后续成功路径。
+    fn rollback_pure_mode_enter(&mut self, lifted: Vec<(String, HWND)>, arrangement: Arrangement) {
+        for (display_id, hwnd) in lifted {
+            let reattach_result = {
+                let mut desktop = self.desktop.lock().unwrap_or_else(|e| e.into_inner());
+                desktop.reattach_after_pure_mode(&display_id, hwnd, arrangement)
+            };
+            if let Err(e) = reattach_result {
+                // F1b：回滚路径同样兜底——进入失败不得留下仍置顶遮挡桌面的窗口。
+                // 复用共享 helper（仅对有效句柄隐藏，隐藏失败补 warn，随后记 error）。
+                crate::desktop::hide_window_on_reattach_failure(
+                    &display_id,
+                    hwnd,
+                    &e,
+                    "纯净壁纸模式进入失败回滚：嵌回壁纸窗口失败",
+                );
+            }
+        }
+        for (display_id, mut renderer) in self.pure_mode_temp.drain(..) {
+            if let Err(e) = renderer.terminate() {
+                tracing::warn!(
+                    display_id,
+                    error = %e,
+                    "纯净壁纸模式进入失败回滚：终止临时渲染器失败"
+                );
+            }
+        }
+        crate::pure_mode::set_active(false);
+    }
+
+    /// 汇总当前置顶窗口句柄（`lifted` + 临时呈现窗口），供
+    /// [`crate::pure_mode::register_lifted`] 注册。
+    fn collect_pure_mode_hwnds(&self, lifted: &[(String, HWND)]) -> Vec<HWND> {
+        let mut hwnds: Vec<HWND> = lifted.iter().map(|(_, hwnd)| *hwnd).collect();
+        for (_, renderer) in &self.pure_mode_temp {
+            if let Some(hwnd) = renderer.hwnd() {
+                hwnds.push(hwnd);
+            }
+        }
+        hwnds
+    }
+
+    /// 计算纯净壁纸模式覆盖窗口的目标屏幕矩形（单一实现，供视频覆盖分支与临时呈现窗口复用）。
+    ///
+    /// - `arrangement == Span`：整个虚拟屏矩形（[`crate::pure_mode::virtual_screen_rect`]），
+    ///   恒为 `Some`；
+    /// - 否则：按 `display_id` 在 [`crate::desktop::enumerate_displays`] 中查该显示器矩形，
+    ///   查不到返回 `None`（调用方据此放弃该显示器的覆盖）。
+    fn pure_mode_target_rect(
+        &self,
+        display_id: &str,
+        arrangement: Arrangement,
+    ) -> Option<(i32, i32, i32, i32)> {
+        if arrangement == Arrangement::Span {
+            Some(crate::pure_mode::virtual_screen_rect())
+        } else {
+            crate::desktop::enumerate_displays()
+                .into_iter()
+                .find(|d| d.id == display_id)
+                .map(|d| (d.x, d.y, d.width as i32, d.height as i32))
+        }
+    }
+
+    /// 退出纯净壁纸模式：按进入时记录的排列把窗口嵌回 WorkerW 并恢复穿透设置。
+    ///
+    /// 幂等：`self.pure_mode` 为 `None` 时直接返回 `Ok(())`。
+    ///
+    /// # 执行顺序（D7）
+    ///
+    /// 1. 逐个把 `lifted` 的窗口交给 `DesktopIntegrator::reattach_after_pure_mode`
+    ///    嵌回（best-effort，失败仅 warn 并继续，含 F1 隐藏兜底）
+    /// 2. `terminate()` 并清空全部临时呈现渲染器（含架构 D1 的视频临时覆盖窗口——
+    ///    销毁覆盖窗口后，WorkerW 中全程未被搬动的原视频窗口即原样显露）
+    /// 3. 按 `interaction_mode` 还原鼠标穿透（`set_mouse_passthrough(!interaction_mode)`）
+    /// 4. `clear_lifted()` → `set_active(false)`（**标志清除晚于回嵌完成**）
+    pub fn exit_pure_mode(&mut self) -> Result<(), MirrorStarError> {
+        let Some(state) = self.pure_mode.take() else {
+            return Ok(());
+        };
+        let PureModeState {
+            lifted,
+            arrangement,
+        } = state;
+
+        // 1. 嵌回 WorkerW（沿用进入时的排列方式，D1 的几何由 embed_wallpaper 重新计算）
+        for (display_id, hwnd) in &lifted {
+            let reattach_result = {
+                let mut desktop = self.desktop.lock().unwrap_or_else(|e| e.into_inner());
+                desktop.reattach_after_pure_mode(display_id, *hwnd, arrangement)
+            };
+            if let Err(e) = reattach_result {
+                // F1：嵌回失败即降级兜底。该窗口仍带 HWND_TOPMOST，若继续置顶会遮挡桌面，
+                // 而此时模式标志与输入钩子均已撤除，用户没有任何输入退出路径——故必须
+                // best-effort 隐藏它（复用共享 helper：仅对有效句柄操作，隐藏失败补 warn）。
+                crate::desktop::hide_window_on_reattach_failure(
+                    display_id,
+                    *hwnd,
+                    &e,
+                    "退出纯净壁纸模式：嵌回 WorkerW 失败（下一次设置壁纸或重启应用后恢复）",
+                );
+            }
+        }
+
+        // 2. 销毁临时呈现渲染器（不注册进权威状态，直接终止）。
+        // 架构 D1：视频显示器的原窗口全程留在 WorkerW、未被搬动（不进入 `lifted`），其
+        // 纯净模式呈现由这里 drain 的"临时顶层覆盖渲染器"承担；销毁覆盖窗口后原视频窗口
+        // 即原样显露并继续播放，无需回嵌/重建。
+        for (display_id, mut renderer) in self.pure_mode_temp.drain(..) {
+            if let Err(e) = renderer.terminate() {
+                tracing::warn!(display_id, error = %e, "退出纯净壁纸模式：终止临时渲染器失败");
+            }
+        }
+
+        // 3. 还原穿透：配置为穿透模式时恢复穿透，交互模式下保持非穿透
+        let restore_passthrough = !self.interaction_mode;
+        for (display_id, _) in &lifted {
+            if let Some(renderer) = self.wallpapers.get_mut(display_id) {
+                renderer.set_mouse_passthrough(restore_passthrough);
+            }
+        }
+
+        // 4. 清标志（晚于回嵌完成，D7）
+        crate::pure_mode::clear_lifted();
+        crate::pure_mode::set_active(false);
+
+        tracing::info!(displays = lifted.len(), "已退出纯净壁纸模式");
+        Ok(())
+    }
+
+    /// 中止纯净壁纸模式（应用退出路径专用）。
+    ///
+    /// 与 [`Self::exit_pure_mode`] 的区别：**不做回嵌**。应用退出时已摘出的窗口随后
+    /// 由 `cleanup_internal` 统一终止（对已摘出窗口的 `remove_wallpaper` 的
+    /// `SetParent(None) + SW_HIDE` 幂等安全），此时再嵌回桌面纯属浪费且可能触发
+    /// 一次多余的 Explorer 交互。
+    ///
+    /// 只做三件事：终止全部临时呈现渲染器、清空置顶窗口注册表、清除进程级标志；
+    /// 每个失败仅 warn（退出路径不阻断）。
+    pub fn abort_pure_mode(&mut self) {
+        let had_state = self.pure_mode.take().is_some();
+        let temp_count = self.pure_mode_temp.len();
+        for (display_id, mut renderer) in self.pure_mode_temp.drain(..) {
+            if let Err(e) = renderer.terminate() {
+                tracing::warn!(display_id, error = %e, "中止纯净壁纸模式：终止临时渲染器失败");
+            }
+        }
+        crate::pure_mode::clear_lifted();
+        crate::pure_mode::set_active(false);
+        if had_state {
+            tracing::info!(
+                temp_windows = temp_count,
+                "已中止纯净壁纸模式（不做回嵌，窗口随后由退出清理统一终止）"
+            );
+        }
+    }
+
+    /// 查询当前是否处于纯净壁纸模式（供 src-tauri 编排层读取）。
+    pub fn is_pure_mode_active(&self) -> bool {
+        self.pure_mode.is_some()
+    }
+
+    /// 查询当前是否至少有一个显示器已设置壁纸（供编排层 / 测试钩子判断"是否可进入纯净壁纸模式"）。
+    ///
+    /// 语义：`wallpaper_mode` 非空即表示至少有一个显示器已应用壁纸——WorkerW 类型在窗口
+    /// 嵌入时写入该映射（因此非空同时意味着窗口已就位），Native 类型在设置系统壁纸时写入
+    /// （无需窗口）。纯净壁纸模式的前置校验与"开机应用完成后才进入"的探针都用本方法。
+    pub fn has_any_wallpaper(&self) -> bool {
+        !self.wallpaper_mode.is_empty()
     }
 
     /// 内部清理：关闭所有壁纸、恢复桌面、清除快速路径发送端
@@ -1298,6 +2155,10 @@ impl WallpaperEngine {
 
     /// 关闭所有壁纸并清理（用于应用退出）
     pub fn shutdown(&mut self) {
+        // 退出路径先中止纯净壁纸模式：**不回嵌**（窗口随后由 cleanup_internal 统一
+        // 终止，对已摘出窗口的 remove_wallpaper 的 SetParent(None)+SW_HIDE 幂等安全），
+        // 只终止临时呈现渲染器并清除进程级标志 / 置顶窗口注册表。
+        self.abort_pure_mode();
         self.cleanup_internal();
         tracing::info!("WallpaperEngine 已关闭所有壁纸");
     }
@@ -1487,7 +2348,10 @@ pub fn build_new_renderer(
 ///
 /// - 视频：复用 [`VideoRenderer::poll_first_frame_ready`]（trait 覆写，内部轮询
 ///   mpv 至 `width>0 且 idle-active=false`）；每 `poll_interval` 查询一次。
-/// - 图片 / GIF / 网页：trait 默认实现立即返回就绪，一次查询即返回。
+/// - 图片 / GIF：覆写为轮询首次 WM_PAINT 绘制完成标志（`first_frame_ready`），
+///   确保换槽前新窗首帧已绘制并可见。
+/// - 网页：trait 默认实现立即返回就绪（wp-proc WebView2 渲染异步，无内容渲染
+///   信号上报，见轮换丝滑度审计结论，已知限制）。
 ///
 /// 失败或超时返回 `Err`（旧壁纸照常显示，零回滚），由调用方 `terminate` 新渲染器。
 pub fn wait_new_ready(
@@ -1625,6 +2489,57 @@ mod tests {
         );
     }
 
+    // ── 统一 display-id 解析（单一真相源，纯函数分支） ─────────────────────
+
+    #[test]
+    fn resolve_display_id_from_explicit_takes_priority() {
+        // ① 显式非空优先返回，忽略活跃/主屏
+        assert_eq!(
+            resolve_display_id_from(
+                Some(r"\\.\DISPLAY2".to_string()),
+                Some(r"\\.\DISPLAY1"),
+                Some(r"\\.\DISPLAY1"),
+            ),
+            r"\\.\DISPLAY2"
+        );
+    }
+
+    #[test]
+    fn resolve_display_id_from_falls_back_to_first_active() {
+        // ② 显式空/None + 有活跃壁纸 → 返回活跃键
+        assert_eq!(
+            resolve_display_id_from(None, Some(r"\\.\DISPLAY1"), Some(r"\\.\DISPLAY9")),
+            r"\\.\DISPLAY1"
+        );
+        assert_eq!(
+            resolve_display_id_from(Some(String::new()), Some(r"\\.\DISPLAY1"), None),
+            r"\\.\DISPLAY1"
+        );
+    }
+
+    #[test]
+    fn resolve_display_id_from_falls_back_to_primary() {
+        // ③ 显式空/None + 无活跃壁纸但有主屏 → 返回主屏 id
+        assert_eq!(
+            resolve_display_id_from(None, None, Some(r"\\.\DISPLAY1")),
+            r"\\.\DISPLAY1"
+        );
+        assert_eq!(
+            resolve_display_id_from(Some(String::new()), Some(""), Some(r"\\.\DISPLAY1")),
+            r"\\.\DISPLAY1"
+        );
+    }
+
+    #[test]
+    fn resolve_display_id_from_empty_when_all_missing() {
+        // ④ 三者皆无 → 返回空串且不 panic（真实环境无显示器时的确定性行为）
+        assert_eq!(resolve_display_id_from(None, None, None), String::new());
+        assert_eq!(
+            resolve_display_id_from(Some(String::new()), Some(""), Some("")),
+            String::new()
+        );
+    }
+
     // ── 测试辅助 ──────────────────────────────────────────────────────────
 
     /// Mock 渲染器共享状态：记录渲染器接收到的所有调用
@@ -1639,6 +2554,13 @@ mod tests {
         paused: bool,
         resumed: bool,
         state: WallpaperState,
+        /// 存活探针结果队列：每次 `liveness_probe()` 弹出队首（空则返回 `None`）。
+        ///
+        /// 用预填队列而非固定返回值，便于测试按调用顺序区分多次采样（如看护/自愈场景
+        /// 需要"第一次 Some、第二次 None"这类序列）。
+        probe_results: std::collections::VecDeque<Option<LivenessProbe>>,
+        /// 存活探针被调用的次数（用于断言采样确实发生）。
+        probe_calls: usize,
     }
 
     impl MockRendererState {
@@ -1654,6 +2576,8 @@ mod tests {
                 paused: false,
                 resumed: false,
                 state: WallpaperState::Initializing,
+                probe_results: std::collections::VecDeque::new(),
+                probe_calls: 0,
             }
         }
     }
@@ -1739,6 +2663,12 @@ mod tests {
         }
         fn create_pause_sender(&mut self, _display_id: &str) -> Option<PauseSender> {
             self.pause_sender.take()
+        }
+        fn liveness_probe(&mut self) -> Option<LivenessProbe> {
+            let mut s = self.shared.lock().unwrap();
+            s.probe_calls += 1;
+            // 弹出队首；队列空即返回 None（模拟"该渲染器不支持/无探针"）。
+            s.probe_results.pop_front().unwrap_or(None)
         }
     }
 
@@ -2014,6 +2944,97 @@ mod tests {
         assert!(result.is_ok());
     }
 
+    // ========== seed_scaling_modes / scaling_mode_for 兜底 测试 ==========
+
+    #[test]
+    fn seed_scaling_modes_scaling_mode_for_returns_config_value() {
+        // 种子化后 scaling_mode_for 返回配置值（配置为持久化真相源）
+        let mut engine = create_test_engine();
+        let mut modes = BTreeMap::new();
+        modes.insert(r"\\.\DISPLAY1".to_string(), ScalingMode::Tile);
+        modes.insert(r"\\.\DISPLAY2".to_string(), ScalingMode::Fit);
+        engine.seed_scaling_modes(&modes);
+
+        assert_eq!(engine.scaling_mode_for(r"\\.\DISPLAY1"), ScalingMode::Tile);
+        assert_eq!(engine.scaling_mode_for(r"\\.\DISPLAY2"), ScalingMode::Fit);
+        // 无精确项且无 "all" 兜底 → 默认 Fill
+        assert_eq!(engine.scaling_mode_for(r"\\.\DISPLAY9"), ScalingMode::Fill);
+    }
+
+    #[test]
+    fn seed_scaling_modes_overwrites_existing_runtime_value() {
+        // 同 key 时以配置值覆盖运行时残留值
+        let mut engine = create_test_engine();
+        engine
+            .wallpaper_scaling_modes
+            .insert(r"\\.\DISPLAY1".to_string(), ScalingMode::Center);
+        let mut modes = BTreeMap::new();
+        modes.insert(r"\\.\DISPLAY1".to_string(), ScalingMode::Stretch);
+        engine.seed_scaling_modes(&modes);
+
+        assert_eq!(
+            engine.scaling_mode_for(r"\\.\DISPLAY1"),
+            ScalingMode::Stretch
+        );
+    }
+
+    #[test]
+    fn scaling_mode_for_all_fallback_used_when_no_exact_match() {
+        // "all" 兜底：无精确项时对所有显示器生效；精确项优先
+        let mut engine = create_test_engine();
+        let mut modes = BTreeMap::new();
+        modes.insert("all".to_string(), ScalingMode::Tile);
+        modes.insert(r"\\.\DISPLAY1".to_string(), ScalingMode::Fit);
+        engine.seed_scaling_modes(&modes);
+
+        assert_eq!(engine.scaling_mode_for(r"\\.\DISPLAY1"), ScalingMode::Fit);
+        assert_eq!(engine.scaling_mode_for(r"\\.\DISPLAY2"), ScalingMode::Tile);
+        assert_eq!(engine.scaling_mode_for("unknown"), ScalingMode::Tile);
+    }
+
+    #[test]
+    fn scaling_mode_for_defaults_to_fill_when_empty() {
+        // 既无精确项也无 "all" → 默认 Fill（与既有默认行为一致）
+        let engine = create_test_engine();
+        assert_eq!(engine.scaling_mode_for(r"\\.\DISPLAY1"), ScalingMode::Fill);
+    }
+
+    // ========== set_scaling_mode_for_all（"all" 广播）测试 ==========
+
+    #[test]
+    fn set_scaling_mode_for_all_applies_to_every_active_display() {
+        // "all" 广播应作用于全部活跃显示器（此处用 Gif 走 renderer 直调路径）
+        let mut engine = create_test_engine();
+        let (r1, s1) = MockRenderer::new();
+        let (r2, s2) = MockRenderer::new();
+        let src1 = WallpaperSource::File("/a.gif".to_string());
+        let src2 = WallpaperSource::File("/b.gif".to_string());
+        engine
+            .embed_and_register_renderer(Box::new(r1), r"\\.\DISPLAY1", &src1, WallpaperType::Gif)
+            .unwrap();
+        engine
+            .embed_and_register_renderer(Box::new(r2), r"\\.\DISPLAY2", &src2, WallpaperType::Gif)
+            .unwrap();
+
+        engine.set_scaling_mode_for_all(ScalingMode::Tile).unwrap();
+
+        assert_eq!(
+            s1.lock().unwrap().scaling_mode_calls,
+            vec![ScalingMode::Tile]
+        );
+        assert_eq!(
+            s2.lock().unwrap().scaling_mode_calls,
+            vec![ScalingMode::Tile]
+        );
+    }
+
+    #[test]
+    fn set_scaling_mode_for_all_no_active_displays_returns_ok() {
+        // 无活跃显示器时为 no-op 返回 Ok（不 panic）
+        let mut engine = create_test_engine();
+        assert!(engine.set_scaling_mode_for_all(ScalingMode::Fit).is_ok());
+    }
+
     // ========== set_speed 测试 ==========
 
     #[tokio::test]
@@ -2103,6 +3124,43 @@ mod tests {
         let result = engine.set_interaction_mode(true);
         assert!(result.is_ok());
         assert!(engine.interaction_mode);
+    }
+
+    #[test]
+    fn set_interaction_mode_skipped_while_pure_mode_active() {
+        // B2：纯净模式活跃时，set_interaction_mode 仅更新字段（供退出时还原），
+        // 跳过对已置顶窗口的交互/穿透切换（D2：模式内强制关闭穿透，不得重开）。
+        let mut engine = create_test_engine();
+        let (renderer, shared) = MockRenderer::new();
+        let source = WallpaperSource::File("/test.gif".to_string());
+        engine
+            .embed_and_register_renderer(
+                Box::new(renderer),
+                "monitor_0",
+                &source,
+                WallpaperType::Gif,
+            )
+            .unwrap();
+        // 模拟"已进入纯净模式"的权威状态（此处仅需 Some，不涉及真实窗口）。
+        engine.interaction_mode = true;
+        engine.pure_mode = Some(PureModeState {
+            lifted: Vec::new(),
+            arrangement: engine.arrangement(),
+        });
+
+        let result = engine.set_interaction_mode(false);
+        assert!(result.is_ok());
+        assert!(!engine.interaction_mode, "模式内仍应更新字段以供退出时还原");
+
+        let state = shared.lock().unwrap();
+        assert!(
+            state.interaction_mode_calls.is_empty(),
+            "纯净模式内不应切换渲染器交互模式"
+        );
+        assert!(
+            state.passthrough_calls.is_empty(),
+            "纯净模式内不应重开鼠标穿透（D2）"
+        );
     }
 
     // ========== toggle_interaction 测试 ==========
@@ -2424,201 +3482,6 @@ mod tests {
         assert!(engine.wallpapers.is_empty());
     }
 
-    // ========== update_positions 测试 ==========
-
-    #[test]
-    fn update_positions_per_monitor_no_panic() {
-        // PerMonitor 模式：使用 enumerate_displays 查找位置
-        // 即使显示器 ID 不匹配真实显示器，函数也应返回 Ok（跳过该渲染器）
-        let mut engine = create_test_engine();
-        let (renderer, _shared) = MockRenderer::new();
-        let source = WallpaperSource::File("/test.mp4".to_string());
-        engine
-            .embed_and_register_renderer(
-                Box::new(renderer),
-                "nonexistent_display",
-                &source,
-                WallpaperType::Video,
-            )
-            .unwrap();
-
-        let result = engine.update_positions();
-        assert!(result.is_ok());
-    }
-
-    #[test]
-    fn update_positions_span_arrangement_no_panic() {
-        // Span 模式：使用 GetSystemMetrics 获取虚拟屏幕尺寸
-        let mut engine = create_test_engine();
-        engine.set_arrangement(Arrangement::Span);
-        let (renderer, shared) = MockRenderer::new();
-        let source = WallpaperSource::File("/test.mp4".to_string());
-        engine
-            .embed_and_register_renderer(
-                Box::new(renderer),
-                "monitor_0",
-                &source,
-                WallpaperType::Video,
-            )
-            .unwrap();
-
-        let result = engine.update_positions();
-        assert!(result.is_ok());
-
-        // Span 模式下应调用 set_position（GetSystemMetrics 返回值）
-        let state = shared.lock().unwrap();
-        assert_eq!(state.position_calls.len(), 1);
-    }
-
-    #[test]
-    fn update_positions_empty_wallpapers_returns_ok() {
-        // 无壁纸时应返回 Ok（no-op）
-        let mut engine = create_test_engine();
-        let result = engine.update_positions();
-        assert!(result.is_ok());
-    }
-
-    // ========== W01 修复测试：Span 模式负坐标不 clamp ==========
-
-    #[test]
-    fn update_positions_span_passes_raw_virtual_screen_coords_without_clamping() {
-        // W01 修复验证：Span 模式下 SM_XVIRTUALSCREEN/SM_YVIRTUALSCREEN 可能为负值
-        // （副显示器位于主显示器左侧/上方时，虚拟屏幕原点为负）。
-        // 原实现 `if virtual_x > 0 { virtual_x } else { 0 }` 将负值 clamp 到 0，
-        // 导致 Span 模式壁纸窗口位置错误（偏移到主显示器内）。
-        // 修复后应将原始值直接传递给 set_position，仅保留宽高的 > 0 守卫。
-        //
-        // 本测试通过对比 GetSystemMetrics 原始值与 set_position 收到的值，
-        // 验证无 clamp 转换。在副显示器位于左侧/上方的多显示器环境会捕获回归
-        // （负值被错误 clamp 为 0）；单显示器环境下值通常为 0，测试仍通过且
-        // 文档化预期行为。
-        let mut engine = create_test_engine();
-        engine.set_arrangement(Arrangement::Span);
-        let (renderer, shared) = MockRenderer::new();
-        let source = WallpaperSource::File("/test.mp4".to_string());
-        engine
-            .embed_and_register_renderer(
-                Box::new(renderer),
-                "monitor_0",
-                &source,
-                WallpaperType::Video,
-            )
-            .unwrap();
-
-        // 读取原始 GetSystemMetrics 值用于比较
-        use windows::Win32::UI::WindowsAndMessaging::{
-            GetSystemMetrics, SM_CXVIRTUALSCREEN, SM_CYVIRTUALSCREEN, SM_XVIRTUALSCREEN,
-            SM_YVIRTUALSCREEN,
-        };
-        let raw_x = unsafe { GetSystemMetrics(SM_XVIRTUALSCREEN) };
-        let raw_y = unsafe { GetSystemMetrics(SM_YVIRTUALSCREEN) };
-        let raw_w = unsafe { GetSystemMetrics(SM_CXVIRTUALSCREEN) };
-        let raw_h = unsafe { GetSystemMetrics(SM_CYVIRTUALSCREEN) };
-
-        let result = engine.update_positions();
-        assert!(result.is_ok());
-
-        let state = shared.lock().unwrap();
-        assert_eq!(state.position_calls.len(), 1);
-        let (x, y, w, h) = state.position_calls[0];
-        // W01: x/y 应等于原始 GetSystemMetrics 值，不做 clamp 到 0
-        assert_eq!(
-            x, raw_x,
-            "SM_XVIRTUALSCREEN 应直接传递给 set_position，不做 clamp"
-        );
-        assert_eq!(
-            y, raw_y,
-            "SM_YVIRTUALSCREEN 应直接传递给 set_position，不做 clamp"
-        );
-        // 宽高保留 > 0 守卫（GetSystemMetrics 失败时返回 0，回退到默认值）
-        assert_eq!(w, if raw_w > 0 { raw_w } else { 1920 });
-        assert_eq!(h, if raw_h > 0 { raw_h } else { 1080 });
-    }
-
-    // ========== W-005 修复测试：Span 模式 GetSystemMetrics 调用缓存 ==========
-
-    #[test]
-    fn w005_update_positions_span_caches_system_metrics() {
-        // W-005 修复验证：Span 模式下 GetSystemMetrics(SM_XVIRTUALSCREEN 等) 调用次数
-        // 应为常数次（4 次），与渲染器数量 N 无关。
-        //
-        // 原实现在 for 循环内对每个渲染器调用 4 次 GetSystemMetrics（共 4N 次）。
-        // 修复后改为在循环前缓存为局部变量，循环内复用（共 4 次）。
-        //
-        // 由于 GetSystemMetrics 是 Win32 FFI，无法直接 mock 计数，本测试通过行为验证：
-        // 注册 N=3 个渲染器，断言每个渲染器收到的位置值都相同，且与循环前
-        // GetSystemMetrics 快照一致 —— 这正是"循环内复用缓存值"的预期行为。
-        // 同时验证"多渲染器行为一致性"这一修复的关键不变量。
-        let n = 3;
-        let mut engine = create_test_engine();
-        engine.set_arrangement(Arrangement::Span);
-
-        let mut shared_states = Vec::new();
-        for i in 0..n {
-            let (renderer, shared) = MockRenderer::new();
-            let source = WallpaperSource::File(format!("/test_{}.mp4", i));
-            engine
-                .embed_and_register_renderer(
-                    Box::new(renderer),
-                    &format!("monitor_{}", i),
-                    &source,
-                    WallpaperType::Video,
-                )
-                .unwrap();
-            shared_states.push(shared);
-        }
-        assert_eq!(engine.wallpapers.len(), n);
-
-        // 读取循环前 GetSystemMetrics 快照（与 update_positions 内的缓存时机一致）
-        use windows::Win32::UI::WindowsAndMessaging::{
-            GetSystemMetrics, SM_CXVIRTUALSCREEN, SM_CYVIRTUALSCREEN, SM_XVIRTUALSCREEN,
-            SM_YVIRTUALSCREEN,
-        };
-        let raw_x = unsafe { GetSystemMetrics(SM_XVIRTUALSCREEN) };
-        let raw_y = unsafe { GetSystemMetrics(SM_YVIRTUALSCREEN) };
-        let raw_w = unsafe { GetSystemMetrics(SM_CXVIRTUALSCREEN) };
-        let raw_h = unsafe { GetSystemMetrics(SM_CYVIRTUALSCREEN) };
-        let expected = (
-            raw_x,
-            raw_y,
-            if raw_w > 0 { raw_w } else { 1920 },
-            if raw_h > 0 { raw_h } else { 1080 },
-        );
-
-        let result = engine.update_positions();
-        assert!(result.is_ok());
-
-        // 所有 N 个渲染器应各收到恰好 1 次 set_position 调用，
-        // 且值与循环前 GetSystemMetrics 缓存快照一致（证明值被复用而非逐次重新获取）
-        for (i, shared) in shared_states.iter().enumerate() {
-            let state = shared.lock().unwrap();
-            assert_eq!(
-                state.position_calls.len(),
-                1,
-                "渲染器 {} 应收到恰好 1 次 set_position 调用",
-                i
-            );
-            assert_eq!(
-                state.position_calls[0], expected,
-                "渲染器 {} 应收到缓存的虚拟屏幕坐标（与循环前快照一致，证明值被复用）",
-                i
-            );
-        }
-
-        // 关键不变量：N 个渲染器收到的位置值完全相同（同一组缓存坐标）。
-        // 若实现回退为循环内逐次调用 GetSystemMetrics，在多显示器配置快速变化时
-        // 可能产生不一致；缓存则保证一致性。
-        let first = shared_states[0].lock().unwrap().position_calls[0];
-        for (i, shared) in shared_states.iter().enumerate() {
-            let state = shared.lock().unwrap();
-            assert_eq!(
-                state.position_calls[0], first,
-                "所有渲染器应收到相同的缓存坐标（渲染器 {} 与渲染器 0 不一致）",
-                i
-            );
-        }
-    }
-
     // ========== W-008 修复测试：set_scaling_mode 失败回退 ==========
 
     #[test]
@@ -2826,6 +3689,76 @@ mod tests {
         );
     }
 
+    // ========== set_scaling_mode 记忆写入（无活跃壁纸 / "all" 兜底 / 回退恢复） ==========
+
+    #[test]
+    fn set_scaling_mode_records_mode_without_active_wallpaper() {
+        // 无活跃壁纸时调用 set_scaling_mode，也应记录用户选择的缩放模式。
+        // 此前仅在视频重启成功分支写入，导致"无活跃壁纸改缩放"后记忆停留在旧值，
+        // 后续 set_wallpaper 缺省回退取到错误值。
+        let mut engine = create_test_engine();
+        let result = engine.set_scaling_mode("monitor_0", ScalingMode::Tile);
+        assert!(result.is_ok(), "无活跃壁纸时应为 no-op 返回 Ok");
+        assert_eq!(
+            engine.scaling_mode_for("monitor_0"),
+            ScalingMode::Tile,
+            "无活跃壁纸时也应记录用户选择的缩放模式"
+        );
+    }
+
+    #[test]
+    fn set_scaling_mode_for_all_records_all_fallback_key() {
+        // "all" 广播应写入 "all" 兜底键，使无精确项的显示器（含无任何活跃显示器
+        // 的场景）也能取到用户选择。
+        let mut engine = create_test_engine();
+        engine
+            .set_scaling_mode_for_all(ScalingMode::Center)
+            .unwrap();
+        assert_eq!(engine.scaling_mode_for("all"), ScalingMode::Center);
+        assert_eq!(
+            engine.scaling_mode_for(r"\\.\DISPLAY9"),
+            ScalingMode::Center,
+            "无精确项显示器应经 'all' 兜底取到该模式"
+        );
+    }
+
+    #[test]
+    fn w008_rollback_success_restores_original_mode_in_memory() {
+        // 视频壁纸切换失败并回退成功时，记忆应恢复为 original_mode（而非未生效的新值）。
+        let mut engine = create_test_engine();
+        let (renderer, _shared) = MockRenderer::new();
+        let source = WallpaperSource::File("/test.mp4".to_string());
+        engine
+            .embed_and_register_renderer(
+                Box::new(renderer),
+                "monitor_0",
+                &source,
+                WallpaperType::Video,
+            )
+            .unwrap();
+        // 预置旧记忆为 Center，作为本次切换的 original_mode
+        engine
+            .wallpaper_scaling_modes
+            .insert("monitor_0".to_string(), ScalingMode::Center);
+
+        // 注入：new_mode 失败 → rollback 成功
+        {
+            let mut queue = engine.set_wallpaper_results.lock().unwrap();
+            queue.push_back(Err(MirrorStarError::DesktopIntegration(
+                "模拟新缩放模式重启失败".to_string(),
+            )));
+            queue.push_back(Ok(()));
+        }
+
+        let result = engine.set_scaling_mode("monitor_0", ScalingMode::Fit);
+        assert!(result.is_err(), "回退成功仍应返回 Err");
+        assert_eq!(
+            engine.scaling_mode_for("monitor_0"),
+            ScalingMode::Center,
+            "回退成功后记忆应恢复为 original_mode"
+        );
+    }
+
     // ========== W13 修复测试：路径规范化匹配 ==========
 
     #[test]
@@ -3016,5 +3949,579 @@ mod tests {
             !new_shared.lock().unwrap().terminated,
             "新窗不应被 terminate"
         );
+    }
+
+    // ========== 纯净壁纸模式：进入/退出/中止/查询（D7 / D8）==========
+
+    // `crate::pure_mode::is_active()` 是进程级全局静态量，而 libtest 默认并行运行测试：
+    // 任一"置位该标志"的用例（enter 路径 / abort 路径）都会让并行运行的"断言标志为假"
+    // 的用例偶发失败。所有读写该标志的用例共用同一把互斥锁即可彻底消除该竞态
+    // （与 `wallpaper::SCREEN_SIZE_TEST_MUTEX` 的既有稳定性修复同构）。
+    static PURE_MODE_FLAG_TEST_MUTEX: Mutex<()> = Mutex::new(());
+
+    /// 获取纯净壁纸模式标志测试的串行锁（容忍中毒，避免一个用例 panic 后连锁失败）。
+    fn lock_pure_mode_flag_tests() -> std::sync::MutexGuard<'static, ()> {
+        PURE_MODE_FLAG_TEST_MUTEX
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// D8：`wallpaper_mode` 为空（无任何壁纸）时 `enter_pure_mode` 返回
+    /// `InvalidArgument`，且**不置位**进程级标志（不进入"半进入"状态）。
+    #[test]
+    fn pure_mode_enter_rejects_when_no_wallpaper_and_leaves_flag_unset() {
+        let _guard = lock_pure_mode_flag_tests();
+        // 进程级标志是单源静态量，先归零，避免其它测试的遗留值干扰断言
+        crate::pure_mode::set_active(false);
+        let mut engine = create_test_engine();
+        assert!(
+            engine.wallpaper_mode.is_empty(),
+            "新构造的测试引擎应无任何壁纸记录"
+        );
+
+        let err = engine
+            .enter_pure_mode()
+            .expect_err("无任何壁纸时 enter_pure_mode 应拒绝进入");
+        let is_invalid_arg = matches!(err, MirrorStarError::InvalidArgument { .. });
+        assert!(
+            is_invalid_arg,
+            "无任何壁纸时应返回 InvalidArgument，实际: {err:?}"
+        );
+        assert!(
+            !crate::pure_mode::is_active(),
+            "拒绝进入时不得置位进程级标志 pure_mode::is_active()"
+        );
+        assert!(
+            !engine.is_pure_mode_active(),
+            "拒绝进入时引擎权威状态应保持未进入"
+        );
+    }
+
+    /// D7：未进入模式时 `exit_pure_mode` 是 no-op（`Ok(())`，无任何副作用）。
+    #[test]
+    fn pure_mode_exit_when_not_active_is_noop() {
+        let _guard = lock_pure_mode_flag_tests();
+        crate::pure_mode::set_active(false);
+        let mut engine = create_test_engine();
+
+        let result = engine.exit_pure_mode();
+        assert!(
+            result.is_ok(),
+            "未进入模式时 exit_pure_mode 应为 no-op 返回 Ok，实际: {:?}",
+            result.err()
+        );
+        assert!(engine.pure_mode.is_none(), "no-op 不应产生引擎权威状态");
+        assert!(
+            engine.pure_mode_temp.is_empty(),
+            "no-op 不应产生临时呈现渲染器"
+        );
+        assert!(!crate::pure_mode::is_active(), "no-op 不应置位进程级标志");
+        assert!(!engine.is_pure_mode_active(), "查询应保持未进入");
+    }
+
+    /// D7：未进入模式时 `abort_pure_mode` 安全（无 panic、清空临时渲染器），
+    /// 且在"已置位标志"的构造下能复位进程级标志。
+    #[test]
+    fn pure_mode_abort_when_not_active_is_safe_and_resets_flag() {
+        let _guard = lock_pure_mode_flag_tests();
+        let mut engine = create_test_engine();
+        // 构造"标志已置位"场景（模拟运行中/上一轮异常遗留）
+        crate::pure_mode::set_active(true);
+
+        engine.abort_pure_mode();
+        assert!(
+            !crate::pure_mode::is_active(),
+            "abort_pure_mode 应复位进程级标志"
+        );
+        assert!(engine.pure_mode.is_none(), "中止后不应残留引擎权威状态");
+        assert!(
+            engine.pure_mode_temp.is_empty(),
+            "中止后不应残留临时呈现渲染器"
+        );
+
+        // 幂等：再次调用不 panic，且标志仍为 false（测试结束不留污染）
+        engine.abort_pure_mode();
+        assert!(
+            !crate::pure_mode::is_active(),
+            "重复中止后进程级标志应仍为 false"
+        );
+    }
+
+    /// D7：`is_pure_mode_active` 初值为 false（新引擎未进入模式）。
+    #[test]
+    fn pure_mode_is_pure_mode_active_initially_false() {
+        let engine = create_test_engine();
+        assert!(
+            !engine.is_pure_mode_active(),
+            "新引擎 is_pure_mode_active 初值应为 false"
+        );
+        assert!(engine.pure_mode.is_none(), "新引擎 pure_mode 应为 None");
+    }
+
+    /// F5：引擎状态不一致（`wallpaper_mode` 有 Native 记录但无可显示资源）时，
+    /// `enter_pure_mode` 应拒绝进入"空模式"：返回 `Err`、回滚复位进程级标志、
+    /// 不残留临时呈现渲染器、不写入引擎权威状态。
+    #[test]
+    fn pure_mode_enter_rejects_empty_mode_when_no_window_covered() {
+        let _guard = lock_pure_mode_flag_tests();
+        // 进程级标志是单源静态量，先归零，避免其它测试的遗留值干扰断言
+        crate::pure_mode::set_active(false);
+        let mut engine = create_test_engine();
+        // 模拟"有记录但无可显示资源"的不一致状态：Native 记录存在，但
+        // `wallpaper_sources` 为空 → 既无活跃窗口、也无临时呈现窗口。
+        engine
+            .wallpaper_mode
+            .insert("d1".to_string(), WallpaperMode::Native);
+        assert!(engine.wallpapers.is_empty(), "构造场景下应无活跃壁纸窗口");
+
+        let err = engine
+            .enter_pure_mode()
+            .expect_err("无可覆盖窗口时 enter_pure_mode 应拒绝进入（F5 空模式）");
+        assert!(
+            matches!(err, MirrorStarError::InvalidArgument { .. }),
+            "空模式应返回 InvalidArgument，实际: {err:?}"
+        );
+        assert!(
+            !crate::pure_mode::is_active(),
+            "拒绝进入时应回滚并复位进程级标志 pure_mode::is_active()"
+        );
+        assert!(
+            engine.pure_mode_temp.is_empty(),
+            "拒绝进入后不应残留临时呈现渲染器"
+        );
+        assert!(
+            engine.pure_mode.is_none(),
+            "拒绝进入后引擎权威状态应保持未进入"
+        );
+
+        // 复位进程级标志（幂等，避免污染其它测试）
+        crate::pure_mode::set_active(false);
+    }
+
+    /// F1：`exit_pure_mode` 在嵌回失败时进入降级兜底（best-effort 隐藏 + error 日志），
+    /// 以无效句柄构造"嵌回必失败"场景：断言不 panic、状态被清理、进程级标志复位。
+    #[test]
+    fn pure_mode_exit_hides_window_on_reattach_failure_without_panic() {
+        let _guard = lock_pure_mode_flag_tests();
+        crate::pure_mode::set_active(false);
+        let mut engine = create_test_engine();
+        // 直接写入"已进入模式"的权威状态，携带无效句柄（HWND(1)）使嵌回必然失败；
+        // 此时 IsWindow 为假 → 隐藏兜底分支可能被跳过（允许），重点是不 panic 且状态被清理。
+        engine.pure_mode = Some(PureModeState {
+            lifted: vec![("D1".to_string(), HWND(1 as *mut _))],
+            arrangement: engine.arrangement(),
+        });
+
+        let result = engine.exit_pure_mode();
+        assert!(
+            result.is_ok(),
+            "嵌回失败应走降级兜底（不向上抛错），实际: {:?}",
+            result.err()
+        );
+        assert!(engine.pure_mode.is_none(), "退出后引擎权威状态应被清空");
+        assert!(!crate::pure_mode::is_active(), "退出后进程级标志应复位");
+
+        // 复位进程级标志（幂等，避免污染其它测试）
+        crate::pure_mode::set_active(false);
+    }
+
+    // ========== 纯净壁纸模式：文档标记测试（沿用仓库 include_str! 惯例）==========
+
+    /// 提取源码中 `start..end` 之间的片段。
+    ///
+    /// `start` / `end` 取首次出现处：目标函数的定义位于测试模块之前，`find` 返回的
+    /// 首个匹配即真实定义（与 `pure_mode/mod.rs::get_window_rect_precedes_set_parent`
+    /// 的既有做法一致）。
+    fn source_segment<'a>(source: &'a str, start: &str, end: &str) -> &'a str {
+        let s = source.find(start).expect("源码应包含起始标记");
+        let e = s + source[s..].find(end).expect("源码应包含结束标记");
+        &source[s..e]
+    }
+
+    /// 关键契约存在性：标志时序（置位早于置顶 / 清除晚于回嵌）、shutdown 先中止模式、
+    /// 模式内关闭鼠标穿透、置顶窗口注册、`PureModeState` 的 `Send` 说明。
+    #[test]
+    fn pure_mode_source_contract_markers() {
+        let source = include_str!("manager.rs");
+
+        // D7：enter_pure_mode 段落必须先置位标志（早于任何置顶动作）
+        let enter = source_segment(
+            source,
+            "pub fn enter_pure_mode(&mut self)",
+            "fn enter_pure_mode_temp_windows(",
+        );
+        let set_true = ["set_active(", "true)"].join("");
+        assert!(
+            enter.contains(&set_true),
+            "enter_pure_mode 段落应包含 {set_true}（标志置位早于置顶，D7）"
+        );
+
+        // D7：exit_pure_mode 段落应清除标志并清空置顶窗口注册表
+        let exit = source_segment(
+            source,
+            "pub fn exit_pure_mode(&mut self)",
+            "pub fn abort_pure_mode(&mut self)",
+        );
+        let set_false = ["set_active(", "false)"].join("");
+        let clear = ["clear_", "lifted()"].join("");
+        assert!(
+            exit.contains(&set_false),
+            "exit_pure_mode 段落应包含 {set_false}（标志清除晚于回嵌，D7）"
+        );
+        assert!(
+            exit.contains(&clear),
+            "exit_pure_mode 段落应包含 {clear}（清空置顶窗口注册表）"
+        );
+
+        // F1：exit_pure_mode 函数段（切至 abort_pure_mode 文档注释前）必须在嵌回失败时执行
+        // 隐藏兜底。R3 后该兜底已抽为共享 helper `desktop::hide_window_on_reattach_failure`
+        // （实现 `IsWindow` + `ShowWindow(SW_HIDE)`，位于 desktop 模块），故此处断言
+        // exit_pure_mode 调用该 helper 并传入 `*hwnd`；helper 的隐藏实现断言见
+        // `desktop::tests::pure_mode_half_detach_recovery_markers`（标记随实现一同移动）。
+        let exit_body = {
+            let start = source
+                .find("pub fn exit_pure_mode(&mut self)")
+                .expect("源码应包含 exit_pure_mode 定义");
+            let end = start
+                + source[start..]
+                    .find("/// 中止纯净壁纸模式")
+                    .expect("源码应包含 abort_pure_mode 文档注释");
+            &source[start..end]
+        };
+        let hide_helper = ["hide_window_on_reattach_", "failure("].join("");
+        let helper_at = exit_body
+            .find(&hide_helper)
+            .expect("exit_pure_mode 段落应调用共享隐藏兜底 helper（F1：嵌回失败隐藏兜底）");
+        assert!(
+            exit_body[helper_at..].contains(&["*hwnd", ","].join("")),
+            "exit_pure_mode 的隐藏兜底调用应传入 *hwnd（F1：对嵌回失败窗口执行隐藏兜底）"
+        );
+
+        // F5：enter_pure_mode 段落必须包含"空模式拒绝"文案
+        let reject = ["拒绝进入", "纯净壁纸模式"].join("");
+        assert!(
+            enter.contains(&reject),
+            "enter_pure_mode 段落应包含 {reject} 文案（F5：空模式拒绝）"
+        );
+
+        // shutdown 首部应先中止模式（abort_pure_mode）再走既有清理（cleanup_internal）
+        let shutdown = source_segment(
+            source,
+            "pub fn shutdown(&mut self)",
+            "pub fn construct_renderer",
+        );
+        let abort = ["self.", "abort_pure_mode();"].join("");
+        let cleanup = ["self.", "cleanup_internal();"].join("");
+        let abort_at = shutdown
+            .find(&abort)
+            .expect("shutdown 应调用 abort_pure_mode()");
+        let cleanup_at = shutdown
+            .find(&cleanup)
+            .expect("shutdown 应调用 cleanup_internal()");
+        assert!(
+            abort_at < cleanup_at,
+            "shutdown 首部必须先 abort_pure_mode() 再 cleanup_internal()"
+        );
+
+        // D2：进入时对每个置顶窗关闭鼠标穿透
+        let passthrough = ["set_mouse_passthrough(", "false)"].join("");
+        assert!(
+            source.contains(&passthrough),
+            "源码应包含 {passthrough}（D2：模式内关闭鼠标穿透）"
+        );
+
+        // B2：set_interaction_mode 在纯净模式活跃时须提前返回（仅记录字段，跳过穿透切换），
+        // 否则外部 enabled=false 会重开已置顶窗口的穿透，破坏 D2 契约。
+        let sim = source_segment(
+            source,
+            "pub fn set_interaction_mode(&mut self,",
+            "pub fn toggle_interaction",
+        );
+        assert!(
+            sim.contains(&["self.pure_mode", ".is_some()"].join("")),
+            "set_interaction_mode 应含纯净模式守卫（self.pure_mode.is_some()）"
+        );
+        assert!(
+            sim.contains(&["return ", "Ok(())"].join("")),
+            "set_interaction_mode 纯净模式守卫应提前 return Ok(())"
+        );
+
+        // B1：静态图片/GIF 的临时呈现窗（enter_pure_mode_temp_windows）同样须在置顶前
+        // 去边框 + 去任务栏，与 embed_wallpaper Step 1 同源。
+        let temp_fn = source_segment(
+            source,
+            "fn enter_pure_mode_temp_windows(",
+            "/// 进入失败的统一回滚",
+        );
+        let temp_lift = ["lift_window_to_rect(", "hwnd, x, y, w, h)"].join("");
+        let temp_lift_at = temp_fn
+            .find(&temp_lift)
+            .expect("临时呈现窗应调用 lift_window_to_rect(hwnd, x, y, w, h)");
+        let temp_borderless = ["make_borderless(", "hwnd)"].join("");
+        let temp_taskbar = ["remove_from_taskbar(", "hwnd)"].join("");
+        let temp_borderless_at = temp_fn
+            .find(&temp_borderless)
+            .expect("临时呈现窗应在置顶前调用 make_borderless(hwnd)");
+        let temp_taskbar_at = temp_fn
+            .find(&temp_taskbar)
+            .expect("临时呈现窗应在置顶前调用 remove_from_taskbar(hwnd)");
+        assert!(
+            temp_borderless_at < temp_lift_at,
+            "临时呈现窗 {temp_borderless} 须位于 {temp_lift} 之前（B1：与 embed_wallpaper Step 1 同源）"
+        );
+        assert!(
+            temp_taskbar_at < temp_lift_at,
+            "临时呈现窗 {temp_taskbar} 须位于 {temp_lift} 之前（B1：与 embed_wallpaper Step 1 同源）"
+        );
+
+        // 置顶窗口注册（供 TaskbarCreated 广播后重断言 Z 序）
+        let register = ["register_", "lifted"].join("");
+        assert!(
+            source.contains(&register),
+            "源码应包含 {register}（登记置顶窗口以便重断言）"
+        );
+
+        // PureModeState 含 HWND（非 Send），须有 unsafe impl Send + SAFETY 论证
+        let send_impl = ["unsafe impl Send for ", "PureModeState"].join("");
+        assert!(
+            source.contains(&send_impl),
+            "源码应包含 {send_impl}（HWND 破坏 Send，需显式论证）"
+        );
+    }
+
+    /// 架构 D1 契约：进入侧视频显示器**不摘出**，改用临时顶层渲染器覆盖；退出侧
+    /// "退出重建 / 视频跳过回嵌"死代码已清除。
+    ///
+    /// 实验结论：进入侧"把视频窗口摘出 WorkerW 并置顶"会毒化本会话 WorkerW 子层
+    /// （之后该层不再产出可呈现帧），而退出侧的窗口级唤醒/重建/回嵌手段全部被证伪。
+    /// D1 让原视频窗口全程留在 WorkerW，纯净模式呈现改由临时顶层覆盖渲染器承担。
+    /// 本测试以 `include_str!` + 运行期拼接搜索串（避免自匹配），断言：
+    /// 1) `enter_pure_mode` 含"视频改用临时渲染器覆盖"标记与 `WallpaperType::Video` 判定；
+    /// 2) 视频分支不调用 `detach_for_pure_mode`（原窗口不搬动）；
+    /// 3) `exit_pure_mode` 不再包含"已重建视频渲染器"与"视频跳过回嵌"（死代码防回归）。
+    #[test]
+    fn pure_mode_enter_video_overlay_contract() {
+        let source = include_str!("manager.rs");
+
+        // enter 段：从函数定义到下一个 helper 定义前，仅取 enter_pure_mode 函数体
+        // （视频分支已内联其中）。
+        let enter_body = source_segment(
+            source,
+            "pub fn enter_pure_mode(&mut self)",
+            "fn enter_pure_mode_temp_windows(",
+        );
+
+        // 运行期拼接，避免与本测试内的字面量自匹配。
+        let overlay_marker = ["视频改用临时", "渲染器覆盖"].join("");
+        let video_guard = ["Some((_, WallpaperType::", "Video))"].join("");
+        let detach = ["detach_for_", "pure_mode(display_id)"].join("");
+
+        assert!(
+            enter_body.contains(&overlay_marker),
+            "enter_pure_mode 应包含 {overlay_marker} 标记（D1：视频改用临时渲染器覆盖）"
+        );
+        assert!(
+            enter_body.contains(&video_guard),
+            "enter_pure_mode 应包含 {video_guard} 判定（识别视频显示器）"
+        );
+
+        // 视频分支区域：从视频类型判定 `if matches!(...)` 到其后非视频的"摘出 + 置顶"
+        // 分支之前（该区域内含视频分支的全部内层 `continue;`），不得出现 detach 调用。
+        let guard_at = enter_body
+            .find(&video_guard)
+            .expect("enter_pure_mode 应包含视频类型判定");
+        let branch_rel_end = enter_body[guard_at..]
+            .find("// 摘出 + 置顶")
+            .expect("视频分支之后应有非视频摘出分支");
+        let video_branch = &enter_body[guard_at..guard_at + branch_rel_end];
+        assert!(
+            video_branch.contains(&overlay_marker),
+            "视频分支应包含 {overlay_marker}（使用临时渲染器覆盖）"
+        );
+        assert!(
+            !video_branch.contains(&detach),
+            "视频分支不得调用 {detach}（D1：原视频窗口全程留在 WorkerW，不摘出）"
+        );
+
+        // SubTask 2.10：覆盖窗须先无边框化（去边框 + 去任务栏）再置顶，与
+        // embed_wallpaper Step 1 同源。运行期拼接，避免匹配文档注释中的函数名提及。
+        let borderless = ["make_borderless(", "hwnd)"].join("");
+        let taskbar = ["remove_from_taskbar(", "hwnd)"].join("");
+        let lift = ["lift_window_to_rect(", "hwnd, x, y, w, h)"].join("");
+        let borderless_at = video_branch
+            .find(&borderless)
+            .expect("视频覆盖分支应在置顶前调用 make_borderless(hwnd)");
+        let taskbar_at = video_branch
+            .find(&taskbar)
+            .expect("视频覆盖分支应在置顶前调用 remove_from_taskbar(hwnd)");
+        let lift_at = video_branch
+            .find(&lift)
+            .expect("视频覆盖分支应调用 lift_window_to_rect(hwnd, x, y, w, h)");
+        assert!(
+            borderless_at < lift_at,
+            "{borderless} 须位于 {lift} 之前（与 embed_wallpaper Step 1 同源，先无边框再置顶）"
+        );
+        assert!(
+            taskbar_at < lift_at,
+            "{taskbar} 须位于 {lift} 之前（与 embed_wallpaper Step 1 同源，先前去边框再去任务栏再置顶）"
+        );
+
+        // SubTask 2.12：置顶前须先禁用 mpv 自动窗口适配（auto-window-resize），否则
+        // mpv 会在 loadfile 时覆写应用设定的几何。须位于 lift_window_to_rect 之前。
+        let disable_resize = ["disable_auto_window_", "resize()"].join("");
+        let disable_at = video_branch
+            .find(&disable_resize)
+            .expect("视频覆盖分支应在置顶前调用 disable_auto_window_resize()");
+        assert!(
+            disable_at < lift_at,
+            "{disable_resize} 须位于 {lift} 之前（载入前关闭 auto-window-resize，严格保持显示器矩形）"
+        );
+
+        // 死代码防回归：exit_pure_mode 不得再含"已重建视频渲染器"与"视频跳过回嵌"。
+        let exit_body = source_segment(
+            source,
+            "pub fn exit_pure_mode(&mut self)",
+            "/// 中止纯净壁纸模式",
+        );
+        let dead_rebuild = ["已重建视频", "渲染器"].join("");
+        let dead_skip = ["视频跳过回嵌", "，直接重建"].join("");
+        assert!(
+            !exit_body.contains(&dead_rebuild),
+            "exit_pure_mode 不应再包含 {dead_rebuild}（退出重建死代码应已删除）"
+        );
+        assert!(
+            !exit_body.contains(&dead_skip),
+            "exit_pure_mode 不应再包含 {dead_skip}（视频跳过回嵌死代码应已删除）"
+        );
+    }
+
+    // ========== 渲染器存活探针 / 停滞自愈测试 ==========
+
+    /// 构造一个 Playing 状态的 MockRenderer 并注册到 engine，返回共享状态句柄。
+    fn register_playing_mock(
+        engine: &mut WallpaperEngine,
+        display_id: &str,
+        probe: Option<LivenessProbe>,
+    ) -> Arc<Mutex<MockRendererState>> {
+        let (renderer, shared) = MockRenderer::new();
+        let source = WallpaperSource::File(format!("/{display_id}.mp4"));
+        engine
+            .embed_and_register_renderer(
+                Box::new(renderer),
+                display_id,
+                &source,
+                WallpaperType::Video,
+            )
+            .unwrap();
+        {
+            let mut st = shared.lock().unwrap();
+            st.state = WallpaperState::Playing;
+            if let Some(probe) = probe {
+                st.probe_results.push_back(Some(probe));
+            }
+        }
+        shared
+    }
+
+    fn test_probe(time_pos: f64) -> LivenessProbe {
+        LivenessProbe {
+            time_pos,
+            paused: false,
+            idle_active: false,
+            eof_reached: false,
+        }
+    }
+
+    /// 测试 A：`probe_playing_videos` 只返回 `Playing` 且探针为 `Some` 的显示器。
+    #[test]
+    fn probe_playing_videos_filters_non_playing_and_none_probe() {
+        let mut engine = create_test_engine();
+
+        // Playing + 探针 Some → 应入集
+        let _s0 = register_playing_mock(&mut engine, "monitor_0", Some(test_probe(3.0)));
+
+        // Playing + 探针 None（该类型不支持探针）→ 不入集
+        let s1 = {
+            let (renderer, shared) = MockRenderer::new();
+            let source = WallpaperSource::File("/m1.mp4".to_string());
+            engine
+                .embed_and_register_renderer(
+                    Box::new(renderer),
+                    "monitor_1",
+                    &source,
+                    WallpaperType::Video,
+                )
+                .unwrap();
+            // 空队列 → liveness_probe() 返回 None
+            shared.lock().unwrap().state = WallpaperState::Playing;
+            shared
+        };
+
+        // Paused + 探针 Some → 不入集（且不应被查询）
+        let s2 = {
+            let (renderer, shared) = MockRenderer::new();
+            let source = WallpaperSource::File("/m2.mp4".to_string());
+            engine
+                .embed_and_register_renderer(
+                    Box::new(renderer),
+                    "monitor_2",
+                    &source,
+                    WallpaperType::Video,
+                )
+                .unwrap();
+            let mut st = shared.lock().unwrap();
+            st.state = WallpaperState::Paused;
+            st.probe_results.push_back(Some(test_probe(9.0)));
+            drop(st);
+            shared
+        };
+
+        let probes = engine.probe_playing_videos();
+        assert_eq!(
+            probes,
+            vec![("monitor_0".to_string(), test_probe(3.0))],
+            "仅 Playing 且探针为 Some 的显示器应入集"
+        );
+        // Playing+None 的显示器被查询了一次（返回 None 故不入集）
+        assert_eq!(s1.lock().unwrap().probe_calls, 1);
+        // Paused 的显示器因不满足 state 过滤，根本不应被查询
+        assert_eq!(s2.lock().unwrap().probe_calls, 0);
+    }
+
+    /// 测试 B：`heal_stalled_renderer` 先 terminate 再 play（复用 revive 链路），终态 Playing。
+    #[test]
+    fn heal_stalled_renderer_terminates_then_plays() {
+        let mut engine = create_test_engine();
+        let shared = register_playing_mock(&mut engine, "monitor_0", None);
+
+        engine
+            .heal_stalled_renderer("monitor_0", 1.0, 1.0, "pure-mode-exit")
+            .unwrap();
+
+        let st = shared.lock().unwrap();
+        assert!(st.terminated, "自愈应先 terminate 渲染器（避免残留旧 mpv）");
+        assert!(st.played, "自愈应再 play() 重建渲染器");
+        assert_eq!(st.state, WallpaperState::Playing, "自愈后终态应为 Playing");
+    }
+
+    /// 测试 C：`heal_stalled_renderer` 不触碰 `pause_reasons` 位图。
+    ///
+    /// 直接手动设置非空位图（而非 `pause_all_fast`，后者会把 state 置为 Paused 干扰断言）。
+    #[test]
+    fn heal_stalled_renderer_preserves_pause_reasons() {
+        let mut engine = create_test_engine();
+        let _shared = register_playing_mock(&mut engine, "monitor_0", None);
+
+        // 手动设置非空位图：全屏 + 电池
+        *engine.pause_reasons.lock().unwrap() = PauseReason::FULLSCREEN | PauseReason::BATTERY;
+        let before = engine.pause_reasons_snapshot();
+
+        engine
+            .heal_stalled_renderer("monitor_0", 2.0, 2.0, "watchdog")
+            .unwrap();
+
+        let after = engine.pause_reasons_snapshot();
+        assert_eq!(before, after, "自愈不应改动 pause_reasons 位图");
+        assert!(!after.is_empty(), "位图应保持非空（暂停语义由调用方保证）");
     }
 }
