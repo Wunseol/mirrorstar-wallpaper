@@ -172,13 +172,17 @@ fn write_wallpaper_style(style: &str, tile: &str) -> Result<(), crate::MirrorSta
             crate::MirrorStarError::DesktopIntegration(format!("打开注册表失败: {}", e))
         })?;
 
-    desktop.set_value(REG_VAL_WALLPAPER_STYLE, &style).map_err(|e| {
-        crate::MirrorStarError::DesktopIntegration(format!("写入 WallPaperStyle 失败: {}", e))
-    })?;
+    desktop
+        .set_value(REG_VAL_WALLPAPER_STYLE, &style)
+        .map_err(|e| {
+            crate::MirrorStarError::DesktopIntegration(format!("写入 WallPaperStyle 失败: {}", e))
+        })?;
 
-    desktop.set_value(REG_VAL_TILE_WALLPAPER, &tile).map_err(|e| {
-        crate::MirrorStarError::DesktopIntegration(format!("写入 TileWallpaper 失败: {}", e))
-    })?;
+    desktop
+        .set_value(REG_VAL_TILE_WALLPAPER, &tile)
+        .map_err(|e| {
+            crate::MirrorStarError::DesktopIntegration(format!("写入 TileWallpaper 失败: {}", e))
+        })?;
 
     Ok(())
 }
