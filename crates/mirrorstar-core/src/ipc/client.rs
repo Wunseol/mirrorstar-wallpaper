@@ -7,7 +7,7 @@
 //! `tokio::task::spawn_blocking` 包裹，否则会阻塞 tokio worker 线程导致 runtime 卡顿。
 //!
 //! 超时对照表见 `ipc/mod.rs`。
-
+//!
 //! 命名管道 IPC 客户端通用基础设施
 //!
 //! 提供 `NamedPipeClient<T>` 泛型基类，封装 Windows 命名管道客户端的

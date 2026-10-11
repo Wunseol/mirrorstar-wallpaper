@@ -846,7 +846,7 @@ impl ConfigManager {
     /// 清理 thumbnails 目录下的 0 字节损坏缩略图文件
     ///
     /// 扫描 `<config_path.parent()>/thumbnails/` 目录，删除所有文件大小为 0 的文件。
-    /// 用于启动时清理异常中断（如进程被杀、ffmpeg 抽帧失败）产生的损坏缩略图，
+    /// 用于启动时清理异常中断（如进程被杀、mpv 抽帧失败）产生的损坏缩略图，
     /// 避免前端通过 `convertFileSrc` 加载 0 字节文件导致预览空白。
     ///
     /// 路径从 `self.config_path.parent()` 推导（C03：与实例数据目录一致，
@@ -1080,18 +1080,6 @@ impl ConfigManager {
             .library_save_mutex
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        // v5.0 A-PERF-003: 锁获取与落盘逻辑分离，避免持锁期间执行落盘逻辑时
-        // 再次获取 library_save_mutex 导致死锁（Mutex 不可重入）。
-        self.save_library_locked()
-    }
-
-    /// `save_library` 的内部实现，假设调用方已持有 `library_save_mutex`。
-    ///
-    /// 仅供 `save_library` 在持锁后调用，其他写路径应直接调用 `save_library`。
-    ///
-    /// 注：config 路径不需要 `_locked` 版本，因 `flush` / `maybe_save_config` 直接
-    /// 持有 `config_save_mutex` 后调用 `save_config_to_file`，无内部辅助函数需求。
-    fn save_library_locked(&self) -> Result<(), MirrorStarError> {
         // 克隆后 read guard 在语句结束时自动释放，避免在持锁期间执行 IO
         let lib = self
             .wallpaper_library
@@ -1143,7 +1131,7 @@ impl ConfigManager {
     ) -> Result<(AppConfig, Option<ConfigLoadError>), MirrorStarError> {
         // SEC-003 / C08：TOCTOU 安全的有界读取由 read_bounded_utf8_file 统一处理
         //（File::open + take(MAX+1) + read_to_end，单次调用消除竞态窗口）。
-        let content = match read_bounded_utf8_file(path, MAX_CONFIG_FILE_SIZE)? {
+        let content = match read_bounded_utf8_file(path)? {
             None => return Ok((AppConfig::default(), None)),
             Some(c) => c,
         };
@@ -1215,7 +1203,7 @@ impl ConfigManager {
     ) -> Result<(WallpaperLibrary, Option<ConfigLoadError>), MirrorStarError> {
         // SEC-003 / C08：TOCTOU 安全的有界读取由 read_bounded_utf8_file 统一处理
         //（与 load_config 共用，单次 File::open + take(MAX+1) + read_to_end 消除竞态窗口）。
-        let content = match read_bounded_utf8_file(path, MAX_CONFIG_FILE_SIZE)? {
+        let content = match read_bounded_utf8_file(path)? {
             None => return Ok((WallpaperLibrary::default(), None)),
             Some(c) => c,
         };
@@ -1430,10 +1418,10 @@ fn recover_section<T>(
 /// 攻击窗口）。现改为单次 `File::open` + `read_to_end` + `.take(MAX_SIZE + 1)`
 /// 限制读取字节数，消除 OOM 风险：
 /// - 文件不存在 → 返回 `Ok(None)`，由调用方回退到默认配置（不视为错误）
-/// - 读取字节数 > `max_size` → 返回 `Err(ConfigParse)`（读取被截断不会 OOM）
+/// - 读取字节数 > `MAX_CONFIG_FILE_SIZE` → 返回 `Err(ConfigParse)`（读取被截断不会 OOM）
 /// - 非 UTF-8 → 返回 `Err(Io(InvalidData))`（与原 `read_to_string` 行为一致）
 /// - 其他 IO 错误 → 传播
-fn read_bounded_utf8_file(path: &Path, max_size: u64) -> Result<Option<String>, MirrorStarError> {
+fn read_bounded_utf8_file(path: &Path) -> Result<Option<String>, MirrorStarError> {
     let file = match std::fs::File::open(path) {
         Ok(f) => f,
         // 文件不存在时返回 None，由调用方回退到默认配置
@@ -1443,13 +1431,13 @@ fn read_bounded_utf8_file(path: &Path, max_size: u64) -> Result<Option<String>, 
 
     use std::io::Read;
     let mut buf = Vec::new();
-    // .take(MAX_SIZE + 1) 限制最多读取 MAX_SIZE + 1 字节，消除 OOM 风险；
-    // 若实际读取字节数 > MAX_SIZE，则文件超过上限。
-    file.take(max_size + 1).read_to_end(&mut buf)?;
-    if buf.len() > max_size as usize {
+    // .take(MAX_CONFIG_FILE_SIZE + 1) 限制最多读取上限 + 1 字节，消除 OOM 风险；
+    // 若实际读取字节数 > MAX_CONFIG_FILE_SIZE，则文件超过上限。
+    file.take(MAX_CONFIG_FILE_SIZE + 1).read_to_end(&mut buf)?;
+    if buf.len() > MAX_CONFIG_FILE_SIZE as usize {
         return Err(MirrorStarError::ConfigParse(format!(
             "文件超过 {} 字节上限（读取 {} 字节）",
-            max_size,
+            MAX_CONFIG_FILE_SIZE,
             buf.len()
         )));
     }

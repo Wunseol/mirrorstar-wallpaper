@@ -932,8 +932,10 @@ impl AppStore {
 
     /// 应用一条推送事件（增量更新）。
     ///
-    /// 真正做增量的是壁纸库相关事件；其余事件只更新计数与"最近事件"摘要——完整 UI 与
-    /// 更细的增量策略属 Task 4–7。
+    /// 壁纸库事件（added/updated/removed/source-missing/thumbnail-failed）做增量更新；
+    /// `desktop-status-changed` / `audio-disabled` / `wallpaper-rotated` / `displays-changed`
+    /// 更新各自的状态字段；其余事件（含空负载的 `config-changed`）只更新计数与「最近事件」
+    /// 摘要，其快照重拉由 `main` 侧的事件回调完成。
     pub fn apply_event(&mut self, event: &UiEvent) {
         self.event_count = self.event_count.saturating_add(1);
 
@@ -1177,7 +1179,8 @@ impl AppStore {
     }
 }
 
-/// 状态仓投影出的纯数据视图；`main` 负责把它逐字段写回 Slint。
+/// 状态仓投影出的纯数据视图；`main` 负责其中已绑定 Slint 属性的字段写回（`server_info` /
+/// `event_count` 目前仅供测试与诊断，未绑定）。
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct AppView {
     pub connected: bool,

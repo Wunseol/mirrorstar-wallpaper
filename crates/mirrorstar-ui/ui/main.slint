@@ -861,7 +861,7 @@ export component MainWindow inherits Window {
     callback drag-ended();
     callback drag-started(string, length, length);
     // 键盘动作分发（Task 9.7.2 / 9.7.3）：返回 true 表示已处理并消费该按键。
-    // action ∈ {left, right, up, down, next, prev, activate, delete, dismiss}。
+    // action ∈ {left, right, up, down, next, prev, activate, delete, dismiss, mute}。
     callback key-command(string) -> bool;
 
     // ── 设置面板回调（Task 6 / Task 7，由 Rust 实现）─────────────────────────

@@ -5,7 +5,7 @@
 //!
 //! ## 职责划分
 //!
-//! 模块内分为两层：
+//! 模块内主要分为两层，另有若干模块级自由函数：
 //!
 //! 1. **`DesktopIntegrator`（状态层，本文件）**
 //!    - 持有 `progman_hwnd` / `workerw_hwnd` / `active_wallpapers` 等可变状态
@@ -22,6 +22,13 @@
 //!    - 包含 `window` 子模块（窗口样式操作：`make_borderless` /
 //!      `set_mouse_passthrough` / `remove_from_taskbar`）与
 //!      `native_wallpaper` 子模块（注册表 + SystemParametersInfoW 原生壁纸）
+//!
+//! 3. **模块级自由函数（本文件，与状态层解耦）**
+//!    - `enumerate_displays`：枚举显示器（供状态层缓存与外部调用）
+//!    - `hide_window_on_reattach_failure`：嵌回失败后的隐藏兜底（best-effort）
+//!    - `extract_utf16_string`：UTF-16 缓冲区转 `String` 的辅助函数
+//!
+//! 这些函数不持有 `DesktopIntegrator` 状态，被状态层或其它模块按需调用。
 //!
 //! ## 调用顺序
 //!
@@ -47,7 +54,12 @@
 //!   所有公共方法均需持有 Mutex 锁
 //! - `unsafe impl Send for DesktopIntegrator`（HWND 跨线程传递安全），
 //!   详见类型上方 SAFETY 注释与 v41-D-009 阻塞上界分析
-//! - 锁持有期间最坏阻塞 ≈ 220ms（`WM_SPAWN_WORK_TIMEOUT_MS` 200ms + EnumWindows 遍历）
+//! - 锁持有期间最坏阻塞分两种场景（口径不同，勿混用）：
+//!   1. `ensure_workerw_ready` 查找路径 ≈ 220ms（`WM_SPAWN_WORK_TIMEOUT_MS`
+//!      200ms + 两次 EnumWindows 遍历，典型 < 10ms）；
+//!   2. WorkerW 失效后重新嵌入活跃壁纸的循环路径上界 = N×200ms
+//!      （N = 活跃壁纸数，即 D-004 所述 `embed_wallpaper` 的 SetParent/
+//!      SetWindowPos 同步消息最坏超时之和，通常 N ≤ 2）
 //! - 重试 sleep 由调用方在释放锁后执行，避免持锁 sleep
 //! - `worker_w` 模块函数无状态、无线程亲和性，可在任意线程调用
 //!   （但 Win32 窗口操作建议在创建窗口的线程上执行，当前通过同步消息跨线程调用）
@@ -111,8 +123,6 @@ pub struct DesktopIntegrator {
     active_wallpapers: HashMap<String, (HWND, Arrangement)>,
     /// 用户原始系统壁纸路径
     original_wallpaper: Option<String>,
-    /// 是否已完成 WorkerW 初始化
-    initialized: bool,
     /// 显示器列表缓存（D-013：避免 PerMonitor 分支重复 enumerate_displays）
     ///
     /// 缓存 `(Vec<DisplayInfo>, Instant)` 元组，TTL 5s。`Option` 的 `Default`
@@ -169,7 +179,6 @@ impl DesktopIntegrator {
             workerw_hwnd: None,
             active_wallpapers: HashMap::new(),
             original_wallpaper,
-            initialized: false,
             cached_displays: None,
         }
     }
@@ -181,14 +190,9 @@ impl DesktopIntegrator {
     /// 注意：本方法只尝试一次，不包含重试逻辑。重试（含 sleep）由调用方在
     /// 释放 desktop 锁后执行，以避免持锁 sleep 阻塞其他 desktop 访问者。
     pub fn ensure_initialized(&mut self) -> Result<(), MirrorStarError> {
-        // 已初始化且有效则直接返回，避免不必要的 find_workerw_no_retry 调用
-        if self.is_workerw_valid() {
-            return Ok(());
-        }
-        // ensure_workerw_ready 返回 bool 表示是否实际执行了初始化，
-        // 此处调用方不关心是否实际初始化，丢弃 bool。
-        let _did_init = self.ensure_workerw_ready()?;
-        Ok(())
+        // ensure_workerw_ready 内部已包含 is_workerw_valid 早退，此处无需重复检查。
+        // 其返回的 bool 表示是否实际执行了初始化，本方法不关心，丢弃即可。
+        self.ensure_workerw_ready().map(|_| ())
     }
 
     /// 确保 WorkerW 已就绪：若未初始化或已失效，重新查找 WorkerW 句柄
@@ -225,8 +229,10 @@ impl DesktopIntegrator {
             return Ok(false);
         }
 
-        // 记录是否为"重新初始化"场景（之前已初始化但句柄失效）
-        let was_initialized = self.initialized;
+        // 记录是否为"重新初始化"场景（之前已初始化但句柄失效）。
+        // 由 workerw_hwnd.is_some() 派生：workerw_hwnd 仅在成功查找 WorkerW 后置为
+        // Some（且从不重置为 None），与原 initialized 字段语义完全等价。
+        let was_initialized = self.workerw_hwnd.is_some();
         if was_initialized {
             tracing::warn!("WorkerW 句柄失效，可能是 Explorer 重启，正在重新初始化...");
         }
@@ -239,7 +245,6 @@ impl DesktopIntegrator {
 
         self.progman_hwnd = Some(progman_hwnd);
         self.workerw_hwnd = Some(workerw_hwnd);
-        self.initialized = true;
 
         if was_initialized {
             // D-004: 锁内阻塞风险

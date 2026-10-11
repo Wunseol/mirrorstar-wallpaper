@@ -380,9 +380,6 @@ fn format_response(response: &WpProcResponse) -> Result<String, serde_json::Erro
     Ok(format!("{}\n", resp_json))
 }
 
-// v41-WP-004: build_post_message_failed_response 已移至 command.rs
-// （与 ok_response / error_response 并列，统一 IPC 响应构造辅助函数位置）。
-
 /// WP02: 限流读取的错误类型
 #[derive(Debug)]
 enum LineReadError {

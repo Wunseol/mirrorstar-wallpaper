@@ -2,7 +2,7 @@ mod commands;
 mod platform;
 mod scheduler;
 mod state;
-// Task 2：UI 子进程管理器与协议桥（壳模式下托管原生主窗口 UI 子进程）。
+// UI 子进程管理器与协议桥（壳模式下托管原生主窗口 UI 子进程）。
 mod ui_process;
 
 use mirrorstar_core::{
@@ -440,7 +440,7 @@ pub fn run() {
 
     // Initialize logging
     //
-    // Task 9.3: 必须将 WorkerGuard 绑定到变量并持有至 run() 返回（应用退出）。
+    // 必须将 WorkerGuard 绑定到变量并持有至 run() 返回（应用退出）。
     // guard drop 后 tracing_appender 的非阻塞写入器后台线程会退出并刷写缓冲，
     // 提前 drop 会导致后续日志（含退出清理日志）丢失。原先 `if let Err` 写法
     // 在 Ok 路径直接丢弃 guard，现已改为持有。`_log_guard` 作用域覆盖整个 run()，
@@ -588,7 +588,7 @@ pub fn run() {
     // 启动清理：清空 WebView2 缓存目录（每实例 PID 子目录），避免随运行次数累积。
     cleanup_webview2_cache();
 
-    // Task 2/10：初始化 UI 子进程管理器（解析 mirrorstar-ui.exe 路径与空闲退出阈值）。
+    // 初始化 UI 子进程管理器（解析 mirrorstar-ui.exe 路径与空闲退出阈值）。
     // 原生 UI 子进程即唯一主窗口，按需拉起，不在此处主动启动。
     ui_process::init();
 
@@ -672,7 +672,7 @@ pub fn run() {
             // setup 要求 'static 闭包，须 ownership 而非借用。
             let _ = state::SHARED_APP_HANDLE.set(app.handle().clone());
 
-            // Task 2：事件桥——集中订阅壳侧 13 个事件并转发到原生 UI 子进程
+            // 事件桥——集中订阅壳侧 13 个事件并转发到原生 UI 子进程
             // （不逐个改动各 emit 发射点）。转发为惰性：UI 进程未运行时零开销、零报错。
             if let Some(manager) = ui_process::manager() {
                 ui_process::install_event_forwarding(app.handle(), manager.clone());
@@ -895,9 +895,7 @@ pub fn run() {
                                 } else {
                                     tracing::info!("通过托盘菜单恢复所有壁纸");
                                 }
-                                // 乐观更新菜单文本（set_text 内部会阻塞等待主线程，
-                                // 而菜单事件在主线程派发，因此需在非主线程调用以避免死锁）。
-                                // 部分失败时上面 spawn_blocking 内会回滚文本。
+                                // 乐观更新菜单文本（部分失败时上面 spawn_blocking 内会回滚文本）。
                                 // T06：改用 spawn_blocking 复用 tokio 阻塞线程池，
                                 // 避免每次菜单点击都创建新 OS 线程。
                                 let new_text = if now_paused { "恢复壁纸" } else { "暂停壁纸" };
@@ -1172,7 +1170,7 @@ pub fn run() {
                 if code.is_none() {
                     api.prevent_exit();
                 } else {
-                    // Task 2：先回收 UI 子进程（若在运行），再执行统一清理，
+                    // 先回收 UI 子进程（若在运行），再执行统一清理，
                     // 避免 mirrorstar-ui.exe 被遗留为孤儿进程。
                     if let Some(manager) = ui_process::manager() {
                         manager.shutdown();
@@ -1194,7 +1192,7 @@ mod tests {
 
     #[test]
     fn panic_hook_timestamp_matches_format() {
-        // Task 6：崩溃防线有效性——panic hook 写入 crash.log 的时间戳是纯函数，
+        // 崩溃防线有效性——panic hook 写入 crash.log 的时间戳是纯函数，
         // 隔离测试其格式正确，保证 panic 诊断日志可解析（据此定位崩溃时刻）。
         let ts = panic_hook_timestamp();
         // 形如 "YYYY-MM-DD HH:MM:SS.mmm"
@@ -1214,7 +1212,7 @@ mod tests {
 
     #[test]
     fn panic_hook_timestamp_payload_extraction() {
-        // Task 6：验证 panic hook 能从 payload 提取字符串信息（&'static str / String）。
+        // 验证 panic hook 能从 payload 提取字符串信息（&'static str / String）。
         // panic hook 内部不可 panic（否则递归崩溃），此处通过构造 PanicHookInfo 验证
         // trace_panic_info 的字符串提取分支可编译且不 panic。直接构造 PanicHookInfo
         // 需不稳定的 panic API，故降级为验证时间戳与格式层；真正的字符串提取在

@@ -62,7 +62,7 @@ use tauri::Emitter;
 use tokio::sync::mpsc::{self, UnboundedReceiver, UnboundedSender};
 use tokio::sync::Notify;
 
-/// 原子交换进行中守卫（RAII，Task 4.1/4.2）
+/// 原子交换进行中守卫（RAII）。
 ///
 /// 构造时置位 `ATOMIC_SWAP_IN_PROGRESS`，Drop 时复位。在 `apply_to_display` 的
 /// 原子交换路径（阶段 A 嵌入 → B 首帧就绪 → C commit）创建，确保：
@@ -206,11 +206,11 @@ impl SchedulerHandle {
         self.flush_playback();
     }
 
-    // ── 上一张（prev_wallpaper，Task 1 边界表 1/3/4/5/6/7/8/9/10/11/12） ─────────
+    // ── 上一张（prev_wallpaper，边界表 1/3/4/5/6/7/8/9/10/11/12） ─────────
 
     /// 回退上一张：pop 历史栈顶经 [`apply_wallpaper_to_unit`] 应用；栈空返回 None。
     ///
-    /// Task 1 边界：prev 消费即 pop 不放回（3/10）；只读历史栈、与采样算法无关（4）；
+    /// 边界：prev 消费即 pop 不放回（3/10）；只读历史栈、与采样算法无关（4）；
     /// 不受暂停限制（5/6）；按单元隔离（7）；目标已删除 / apply 真失败则继续 pop 下一个
     /// （8/9）；prev 目标即当前视为无效回退继续找更早（12）。成功后 emit
     /// `wallpaper-rotated` 并落盘 `playback.toml`（暂停态下播放器维持暂停，DR-20）。
@@ -263,7 +263,7 @@ impl SchedulerHandle {
 }
 
 /// 回退循环主体：从单元历史栈 pop 栈顶，经 `apply`（返回 [`UnitApplyResult::Applied`]
-/// 表示应用成功）决定是否返回；栈空返回 None（Task 1 边界 1/3/8/9：栈空→None；
+/// 表示应用成功）决定是否返回；栈空返回 None（边界 1/3/8/9：栈空→None；
 /// 消费即 pop 不放回；apply 失败 / 目标已删除 → 继续 pop 下一个可用历史）。
 ///
 /// 边界 8/9/12 的"失败继续 pop"只针对真失败（`Failed`：目标已删除 / 换图失败 /
@@ -400,14 +400,14 @@ async fn run_loop(
     // 引擎构造默认 per_monitor；boot / 轮换会快照 renderer_config 读引擎内部
     // arrangement，此处先同步顶层配置，避免 Span / AllSame 几何错位（P0-2）。
     handle.engine.lock().await.set_arrangement(cfg.arrangement);
-    // 记录已生效的排列：主循环据此检测排列变更并按新布局即时重建（Task 5）。
+    // 记录已生效的排列：主循环据此检测排列变更并按新布局即时重建。
     let mut applied_arrangement = cfg.arrangement;
     apply_boot(&handle, &layout, &app).await;
     handle.flush_playback();
 
     let mut next_rotation: Option<Instant> = None;
 
-    // 显示器热插拔检测（Task 7）：以启动时枚举结果初始化"已知集合"，避免首个 tick
+    // 显示器热插拔检测：以启动时枚举结果初始化"已知集合"，避免首个 tick
     // 误报为变化；此后每 3 秒轮询一次（Windows 侧消息窗口为 message-only 窗口，收不到
     // WM_DISPLAYCHANGE 广播，故用轮询）。错过 tick 直接跳过，不补跑。
     let mut known_display_ids: Vec<String> = display_ids(&enumerate_displays(&handle));
@@ -417,7 +417,7 @@ async fn run_loop(
     loop {
         // 每次醒来重读配置（热重载 / config 命令 / watcher 均落在此处生效）。
         let cfg = handle.config_manager.get_config();
-        // 多屏排列变更即时生效（Task 5）：同步引擎排列 → 对齐布局 → 立即按新布局
+        // 多屏排列变更即时生效：同步引擎排列 → 对齐布局 → 立即按新布局
         // 重建渲染器（关闭不再属于新布局的渲染器，并按各单元当前壁纸重新应用；不重新
         // 采样，不改变用户当前壁纸）。排列未变化时不触发任何重建，避免无谓重建/闪屏。
         let arr_changed = arrangement_changed(applied_arrangement, cfg.arrangement);
@@ -511,7 +511,7 @@ async fn run_loop(
                 next_rotation = None;
             }
             Why::DisplayCheck => {
-                // 显示器热插拔（Task 7）：仅当 id 集合真正变化时推送新列表并即时生效
+                // 显示器热插拔：仅当 id 集合真正变化时推送新列表并即时生效
                 //（与排列变更一致）；集合未变化不做任何副作用，避免误触发重建 / 闪屏。
                 let displays = enumerate_displays(&handle);
                 let current_ids = display_ids(&displays);
@@ -809,7 +809,7 @@ async fn apply_boot(handle: &SchedulerHandle, layout: &LayoutPlane, app: &tauri:
         }
     }
 
-    // v17 启动期内存埋点：开机壁纸应用完成，标签带上各单元当前壁纸类型。
+    // 启动期内存埋点：开机壁纸应用完成，标签带上各单元当前壁纸类型。
     // 先取出 current id 并释放 playback 锁，再查配置解析类型，避免跨锁嵌套。
     let current_ids: Vec<(String, Option<String>)> = {
         let play = handle.playback.lock().unwrap_or_else(|e| e.into_inner());
@@ -846,22 +846,22 @@ async fn apply_boot(handle: &SchedulerHandle, layout: &LayoutPlane, app: &tauri:
     mirrorstar_core::perf::mark_lifecycle(&format!("boot_wallpaper_applied {type_summary}"));
 }
 
-// ── 排列变更即时重建（Task 5）─────────────────────────────────────────────────
+// ── 排列变更即时重建─────────────────────────────────────────────────
 
-/// 排列是否发生变化（同值短路，Task 5）：仅当已生效排列与当前配置排列不同才需重建，
+/// 排列是否发生变化（同值短路）：仅当已生效排列与当前配置排列不同才需重建，
 /// 避免无谓重建 / 闪屏。
 fn arrangement_changed(applied: Arrangement, current: Arrangement) -> bool {
     applied != current
 }
 
-// ── 显示器热插拔检测（Task 7）─────────────────────────────────────────────────
+// ── 显示器热插拔检测─────────────────────────────────────────────────
 
 /// 提取显示器 id 列表（顺序不保证，集合比较由 [`display_set_changed`] 归一）。
 fn display_ids(displays: &[DisplayInfo]) -> Vec<String> {
     displays.iter().map(|d| d.id.clone()).collect()
 }
 
-/// 显示器 id 集合是否发生变化（纯函数，顺序无关，Task 7）。
+/// 显示器 id 集合是否发生变化（纯函数，顺序无关）。
 ///
 /// 排序后逐项比较，忽略枚举顺序差异；集合相同返回 `false`（同值短路，避免周期性
 /// 检测误触发重建 / 闪屏）。
@@ -921,7 +921,7 @@ async fn close_stale_renderers(handle: &SchedulerHandle, layout: &LayoutPlane) {
     }
 }
 
-/// 多屏排列变更后按新布局立即重建渲染器（Task 5，即时生效）。
+/// 多屏排列变更后按新布局立即重建渲染器（即时生效）。
 ///
 /// 步骤：
 /// 1. 关闭不再属于新布局的渲染器（[`close_stale_renderers`]）；
@@ -1051,7 +1051,7 @@ enum UnitApplyResult {
 ///   入栈成为"上一张"候选（build 回退列表）。
 /// - prev 路径传 `false`：prev 是"回退导航"，**不应再入栈**它正在离开的壁纸——否则
 ///   连续点击 prev 时前一次 push 的 entry 会让第二次 pop 弹回刚才的壁纸，造成
-///   w3→w2→w3 震荡，而非逐级回退（Task 1 边界 3：连点逐级回退，prev 消费即不放回）。
+///   w3→w2→w3 震荡，而非逐级回退（边界 3：连点逐级回退，prev 消费即不放回）。
 async fn apply_wallpaper_to_unit(
     handle: &SchedulerHandle,
     layout: &LayoutPlane,
@@ -1182,7 +1182,7 @@ async fn apply_to_display(
                     Ok(ApplyOutcome::Skipped)
                 }
                 Ok(BuildOutcome::Ready(renderer)) => {
-                    // Task 4.2：阶段 A→C 全程置"原子交换进行中"标志，全屏终止/恢复
+                    // 阶段 A→C 全程置"原子交换进行中"标志，全屏终止/恢复
                     // 检测到该标志时跳过本次（见 state.rs），防止交换期间重建 WorkerW
                     // 导致 commit 前校验失败。守卫 Drop 时（含所有错误路径）自动复位。
                     let _swap_guard = AtomicSwapInProgressGuard::new();
@@ -1662,7 +1662,7 @@ mod tests {
         assert!(!unit_is_rotatable(&handle, "b"));
     }
 
-    // ── Task 4.3：原子交换互斥标志（ATOMIC_SWAP_IN_PROGRESS）测试 ─────────────
+    // ── 原子交换互斥标志（ATOMIC_SWAP_IN_PROGRESS）测试 ─────────────
 
     /// 串行化读写全局 `ATOMIC_SWAP_IN_PROGRESS` 的测试。
     ///
@@ -1735,7 +1735,7 @@ mod tests {
         assert!(!crate::state::atomic_swap_in_progress());
     }
 
-    // ── Task 2：prev_wallpaper（上一张回退，边界 1/3/8/9）测试 ──────────────────
+    // ── prev_wallpaper（上一张回退，边界 1/3/8/9）测试 ──────────────────
     //
     // 循环主体提取为 `pop_history_until_applied`（apply 注入闭包），单测用假 apply
     // 覆盖边界语义，无需构造 Tauri App。历史依据：测试中构造真实 Wry App
@@ -1955,7 +1955,7 @@ mod tests {
         );
     }
 
-    // ── Task 5：多屏排列切换即时重建 ───────────────────────────────────────
+    // ── 多屏排列切换即时重建 ───────────────────────────────────────
 
     #[test]
     fn arrangement_changed_short_circuits_on_same_value() {
@@ -2004,7 +2004,7 @@ mod tests {
         );
     }
 
-    // ── Task 7：显示器热插拔检测 ───────────────────────────────────────────
+    // ── 显示器热插拔检测 ───────────────────────────────────────────
 
     #[test]
     fn display_set_changed_ignores_order_but_detects_add_remove_swap() {

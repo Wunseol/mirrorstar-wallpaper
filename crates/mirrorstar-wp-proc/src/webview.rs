@@ -30,7 +30,8 @@ use webview2_com::{
 
 use mirrorstar_core::MirrorStarError;
 
-// WP-010: 多显示器场景的回退尺寸。当系统显示器枚举失败或 rect 解析异常时使用，
+// WP-010: 多显示器场景的回退尺寸。仅在未传 `--rect`（`None`）时使用；
+// 若 `--rect` 已提供但解析失败，`parse_rect` 返回 Err 而不再回退到本尺寸。
 // 不针对特定显示器分辨率，仅作"合理默认"占位（与系统桌面 1920x1080 主流分辨率对齐）。
 //
 // v41-WP-007: 回退尺寸选择的业务理由文档化。
@@ -127,6 +128,15 @@ const INJECT_CSP_SCRIPT: &str = r#"
 /// execute_script_and_report / create_webview），避免前缀字符串修改需同步多处。
 pub(crate) fn corewebview2_error(e: impl std::fmt::Display) -> MirrorStarError {
     MirrorStarError::DesktopIntegration(format!("获取 WebView 失败: {}", e))
+}
+
+/// 将 WebView2 环境创建失败转换为 `MirrorStarError::DesktopIntegration`。
+///
+/// 统一 `create_webview` 中 3 处"创建 WebView2 环境失败"错误转换模式
+/// （UserDataFolder + options / UserDataFolder + 默认 options / 完全回退默认环境），
+/// 避免前缀字符串修改需同步多处。
+fn env_create_error(e: webview2_com::Error) -> MirrorStarError {
+    MirrorStarError::DesktopIntegration(format!("创建 WebView2 环境失败: {}", e))
 }
 
 // ── 窗口位置解析 ─────────────────────────────────────────────────────────────
@@ -982,12 +992,7 @@ pub(crate) fn create_webview(
                         &callback,
                     )
                     .map_err(webview2_com::Error::WindowsError)
-                    .map_err(|e| {
-                        MirrorStarError::DesktopIntegration(format!(
-                            "创建 WebView2 环境失败: {}",
-                            e
-                        ))
-                    })?;
+                    .map_err(env_create_error)?;
                 }
             }
             // v15-C-002: UserDataFolder 可用但 options 构建失败——保留 UserDataFolder
@@ -1004,12 +1009,7 @@ pub(crate) fn create_webview(
                         &callback,
                     )
                     .map_err(webview2_com::Error::WindowsError)
-                    .map_err(|e| {
-                        MirrorStarError::DesktopIntegration(format!(
-                            "创建 WebView2 环境失败: {}",
-                            e
-                        ))
-                    })?;
+                    .map_err(env_create_error)?;
                 }
             }
             // v15-C-002: UserDataFolder 构建失败——完全回退到默认 CreateCoreWebView2Environment
@@ -1689,7 +1689,7 @@ mod tests {
     #[test]
     fn test_build_url_rejects_other_dangerous_schemes_case_variants() {
         // WP-001: 其他危险协议的大小写变体也应被阻断
-        // 注：`ABOUT:blank` 已由 test_build_url_allows_about_blank_case_insensitive 验证放行，
+        // 注：`ABOUT:blank` 已由 test_build_url_rejects_about_blank_case_insensitive 验证拒绝，
         // 故此处不包含 about 用例。
         let cases = [
             ("DATA:text/html,<script>alert(1)</script>", "data"),

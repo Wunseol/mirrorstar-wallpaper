@@ -780,10 +780,13 @@ impl WallpaperEngine {
         // 旧 Native 壁纸的清除延后到新窗嵌入后（defer_clear_native=true 分支在
         // complete_set_wallpaper 中补调 clear_native_wallpaper），此处不立即清除，
         // 旧画面保持显示直至新窗覆盖。
+        // 延迟清除判定：仅"旧 Native → 新 WorkerW"需要。新 Native 模式由
+        // set_native_wallpaper_internal 直接覆盖旧壁纸，无需清除。
+        let defer_clear_native = old_mode_was_native && mode == WallpaperMode::WorkerW;
+
         if self.has_wallpaper(display_id) {
             // 延迟清除仅适用于"旧 Native → 新 WorkerW"；其余场景 close 时立即清除
-            let defer = old_mode_was_native && mode == WallpaperMode::WorkerW;
-            self.close_wallpaper_with_clear(display_id, !defer)?;
+            self.close_wallpaper_with_clear(display_id, !defer_clear_native)?;
         }
 
         // 职责 3：获取配置快照（Arc 克隆，不持有 engine 借用）
@@ -795,9 +798,6 @@ impl WallpaperEngine {
         // 仅 create_and_play_renderer（异步路径，construct_renderer 入口）使用
         // clear_native = true，该路径不经过 close_wallpaper。
         let clear_native = self.is_native_mode(display_id);
-        // 延迟清除判定：仅"旧 Native → 新 WorkerW"需要。新 Native 模式由
-        // set_native_wallpaper_internal 直接覆盖旧壁纸，无需清除。
-        let defer_clear_native = old_mode_was_native && mode == WallpaperMode::WorkerW;
 
         Ok(SetWallpaperPending {
             mode,

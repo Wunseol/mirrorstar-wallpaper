@@ -363,7 +363,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     result.map_err(|e| e.into())
 }
 
-/// 注册事件 / 控制 / 断开 / 滚动四类回调。
+/// 注册事件 / 控制 / 断开三类回调（滚动回调见 [`install_viewport_handler`]）。
 fn install_handlers(
     client: &Arc<UiClient>,
     store: &Arc<Mutex<AppStore>>,
@@ -1558,7 +1558,7 @@ fn lock_job(job: &Arc<Mutex<AddJob>>) -> std::sync::MutexGuard<'_, AddJob> {
     job.lock().unwrap_or_else(|e| e.into_inner())
 }
 
-/// 注册全部网格交互回调（搜索 / 选中 / 卡片操作 / 拖拽 / 添加按钮 / 预览桩）。
+/// 注册全部网格交互回调（搜索 / 选中 / 卡片操作 / 拖拽 / 添加按钮 / 预览打开）。
 ///
 /// 约定：这些闭包会被 Slint 以 `Fn` 多次调用，故捕获的共享态只能是 `Arc`/`Weak`，
 /// 且**不能把捕获值 move 出去**——需要移动时先在闭包体内克隆一份。

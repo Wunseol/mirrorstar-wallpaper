@@ -14,7 +14,7 @@ crate-type = ["lib"]
 
 [build-dependencies]
 # v16-D-019：移除空 features= []（默认即无 feature，显式空数组冗余）
-tauri-build = { version = "2", features = [] }
+tauri-build = { version = "2" }
 
 [dependencies]
 mirrorstar-core = { path = "../crates/mirrorstar-core" }
@@ -32,4 +32,3 @@ windows = { workspace = true }
 
 [dev-dependencies]
 tempfile = "3"
-tokio = { workspace = true }

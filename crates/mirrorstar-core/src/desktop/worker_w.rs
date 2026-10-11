@@ -366,7 +366,6 @@ unsafe fn check_sibling_workerw(hwnd: HWND, direction: GET_WINDOW_CMD, lparam: L
 }
 
 /// 递归查找指定类名的子窗口
-#[allow(clippy::never_loop)] // 首段为单次直查（找到即 return），不真正循环
 unsafe fn find_child_by_class(
     parent: HWND,
     class_name: windows::core::PCWSTR,
@@ -376,15 +375,10 @@ unsafe fn find_child_by_class(
         return None;
     }
     // 查找直接子窗口中类名匹配的第一个窗口；找到即返回，否则继续深层搜索。
-    let child = HWND::default();
-    loop {
-        let Ok(next_child) = FindWindowExW(parent, child, class_name, None) else {
-            break;
-        };
-        if next_child.is_invalid() {
-            break;
+    if let Ok(child) = FindWindowExW(parent, HWND::default(), class_name, None) {
+        if !child.is_invalid() {
+            return Some(child);
         }
-        return Some(next_child);
     }
 
     // 未在直接子窗口中找到，递归搜索更深层

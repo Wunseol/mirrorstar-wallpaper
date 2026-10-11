@@ -99,7 +99,7 @@ async fn is_pure_mode_active(app: &AppHandle) -> bool {
 
 /// 托盘溢出浮出窗（任务栏"隐藏栏"）的窗口类名：Win11 由 XAML island 承载，
 /// Win10 及部分旧版为经典窗口。两者都按**类名精确匹配**（实机取证见
-/// `docs/05-优化文档/03-desktop模块.md`）。
+/// `docs/04-优化文档/03-desktop模块.md`）。
 const TRAY_OVERFLOW_CLASS_WIN11: &str = "TopLevelWindowForOverflowXamlIsland";
 const TRAY_OVERFLOW_CLASS_LEGACY: &str = "NotifyIconOverflowWindow";
 

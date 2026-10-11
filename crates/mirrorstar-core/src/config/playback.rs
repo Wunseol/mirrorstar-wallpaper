@@ -107,14 +107,9 @@ pub struct PlaybackStore {
     path: PathBuf,
 }
 
-impl Default for PlaybackStore {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
 impl PlaybackStore {
     /// 使用 `data_root()` 下的 `playback.toml` 构造 store。
+    #[allow(clippy::new_without_default)] // 无「默认实例」语义，路径依赖 data_root()
     pub fn new() -> Self {
         Self::new_in_dir(crate::config::manager::data_root())
     }

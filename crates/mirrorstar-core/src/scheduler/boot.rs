@@ -27,7 +27,9 @@ pub enum BootDecision {
 ///
 /// # 决策逻辑
 /// - 若 `current_exists`：
-///   - 当前是 Web → `Restore(current)`（DR-18 豁免，恒可恢复，不参与推进采样）。
+///   - 当前是 Web：若 `enabled && on_boot && unit_enabled && pool_count >= 2` → `Advance`
+///     （P1-3 / DR-18 推进语义：采样经 `filter_candidates` 跳过 Web，改取池内下一张）；
+///     否则 → `Restore(current)`（DR-18 Web 豁免：手动设 Web 的延续恒允许恢复）。
 ///   - 否则若 `enabled && on_boot && unit_enabled && pool_count >= 2` → `Advance`。
 ///   - 否则 → `Restore(current)`（无条件基础行为，DR-12，不受 enabled 门控）。
 /// - 否则（current 已删 / 无上次壁纸）：

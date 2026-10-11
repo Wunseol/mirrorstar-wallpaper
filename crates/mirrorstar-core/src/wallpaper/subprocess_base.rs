@@ -93,7 +93,7 @@ const WALLPAPER_WINDOW_PROP: windows::core::PCWSTR = windows::core::w!("MirrorSt
 /// - Win32 窗口查找（按标题 + PID 校验）
 /// - 捆绑可执行文件查找
 /// - 公共状态字段（state / hwnd / scaling_mode / pipe_name / pause_sender）
-/// - Job Object 内存限制（v8-B：限制 mpv/wp-proc 子进程内存为 256MB）
+/// - Job Object 内存限制（v8-B：限制 mpv/wp-proc 子进程内存为 2048MB）
 ///
 /// 注意：IPC 客户端因 mpv 与 wp-proc 协议差异较大（方法名、命令集不同），
 /// 由具体渲染器自行持有，本基类不涉及 IPC 通信。
@@ -113,7 +113,7 @@ pub struct SubprocessRendererBase {
     /// v8-B：带内存限制的 Job Object 守卫。
     ///
     /// `ProcessManager` 内部已关联一个仅 `KILL_ON_JOB_CLOSE` 的 Job Object（兜底
-    /// 孤儿进程清理），本守卫额外施加 `JOB_OBJECT_LIMIT_PROCESS_MEMORY`（256MB）+
+    /// 孤儿进程清理），本守卫额外施加 `JOB_OBJECT_LIMIT_PROCESS_MEMORY`（2048MB）+
     /// `KILL_ON_JOB_CLOSE`。Windows 8+ 嵌套 Job Object 支持两者叠加生效。
     ///
     /// Drop 顺序（结构体字段声明序）：`process` 先于 `job_guard` drop，
@@ -154,7 +154,7 @@ impl SubprocessRendererBase {
 
     /// 启动子进程，返回 PID
     ///
-    /// v8-B：进程启动后关联 `JobObjectGuard`（256MB 内存限制 + `KILL_ON_JOB_CLOSE`）。
+    /// v8-B：进程启动后关联 `JobObjectGuard`（2048MB 内存限制 + `KILL_ON_JOB_CLOSE`）。
     ///
     /// **关于 `CREATE_SUSPENDED`**：现有 `ProcessManager::start` 未使用 `CREATE_SUSPENDED`，
     /// 进程在 `CreateProcessW` 后立即运行，到 `JobObjectGuard::assign_process` 之间存在

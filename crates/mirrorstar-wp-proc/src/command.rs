@@ -171,17 +171,19 @@ fn navigate_to_url(
     wait_result?
 }
 
-/// 执行 WebView2 脚本并构造响应（Pause/Resume 共用）。
+/// 执行 WebView2 脚本并构造响应（Pause/Resume/SetVolume/ToggleMute 共用）。
 ///
 /// WP-001 修复：消除 Pause/Resume 分支的代码重复。原两个分支各约 74 行，
 /// 仅 3 处差异（JS 脚本字符串、日志消息、错误前缀），其余 channel 创建、
 /// `ExecuteScriptCompletedHandler` 回调、`ExecuteScript` 调用、
 /// `wait_with_pump_timeout` 等待与 `WpProcResponse` 构造完全相同。
-/// 提取为公共函数后，差异点通过 `script` 与 `op_name` 参数化。
+/// 提取为公共函数后，差异点通过 `script` 与 `op_name` 参数化；SetVolume/ToggleMute
+/// 后续接入同一路径，故本函数共服务 4 个控制命令。
 ///
-/// - `script`: 注入的 JS 字符串（Pause 调 `m.pause()`，Resume 调 `m.play()`）
-/// - `op_name`: "Pause" 或 "Resume"，用于错误前缀、wait_with_pump_timeout 标签、
-///   以及通过 `op_cn` 映射的中文日志动词（"暂停" / "恢复"）
+/// - `script`: 注入的 JS 字符串（Pause 调 `m.pause()`，Resume 调 `m.play()`，
+///   SetVolume/ToggleMute 分别使用 `build_set_volume_script` 产出的脚本）
+/// - `op_name`: "Pause" / "Resume" / "SetVolume" / "ToggleMute" 之一，用于错误前缀、
+///   `wait_with_pump_timeout` 标签、以及通过 `op_cn` 映射的中文日志动词
 ///
 /// 错误响应格式保持与原分支完全一致：
 /// - CoreWebView2() 失败 → `error = "获取 WebView 失败: <e>"`
@@ -533,8 +535,9 @@ pub(crate) fn handle_command(
             }
             ok_response(request_id)
         }
-        // WP-001: Pause/Resume 共用 execute_script_and_report，差异点（JS 脚本、
-        // 日志动词、错误前缀）通过 script/op_name 参数化。错误响应格式保持不变。
+        // WP-001: Pause/Resume/SetVolume/ToggleMute 共用 execute_script_and_report，
+        // 差异点（JS 脚本、日志动词、错误前缀）通过 script/op_name 参数化。
+        // 错误响应格式保持不变。
         // M2: 控制类命令统一走 run_control_command——导航进行中先入队（导航完成后
         // 统一执行，避免对旧页面注入脚本），非导航期立即执行；FIFO 串行化保证
         // 命令序号单调。M3: Resume 脚本重放当前音量（dataset._lastVolume + 进程侧
@@ -615,7 +618,7 @@ mod tests {
     #[test]
     fn handle_command_terminate_returns_ok() {
         // Terminate 调用 DestroyWindow(hwnd)，错误被忽略，始终返回 Ok。
-        // 不触碰 controller，故 null controller 安全。
+        // 不触碰 controller，故 dangling controller 安全（不解引用）。
         let hwnd = test_hwnd();
         let controller = test_controller();
         let cmd = WpProcCommand::Terminate { request_id: 100 };
@@ -629,7 +632,7 @@ mod tests {
     //
     // width/height <= 0 应返回 Error，不调用 SetWindowPos。
     // x/y 允许负数（多显示器场景下副显示器坐标可能为负），不校验。
-    // 测试使用 HWND::default()（无效句柄）和 test_controller()（null 接口），
+    // 测试使用 HWND::default()（无效句柄）和 test_controller()（dangling 接口），
     // 但因校验在 SetWindowPos/SetBounds 之前返回，不会实际调用 Win32 API 或 controller 方法，
     // 可在无窗口环境的单元测试中安全运行。
     #[test]
@@ -739,7 +742,7 @@ mod tests {
     // - ResponseStatus 序列化为 lowercase（通过直接构造 WpProcResponse）
     #[test]
     fn json_protocol_round_trip_terminate() {
-        // Terminate 的完整 JSON 往返：不调用 controller 方法，null controller 安全。
+        // Terminate 的完整 JSON 往返：不调用 controller 方法，dangling controller 安全（不解引用）。
         let input_json = r#"{"command":"terminate","request_id":1003}"#;
         let cmd: WpProcCommand = serde_json::from_str(input_json).unwrap();
         let hwnd = test_hwnd();
@@ -1003,11 +1006,11 @@ mod tests {
     // 测试使用 HWND::default()（无效句柄），SetWindowPos 应返回 Err
     // （Win32 对 null HWND 返回 FALSE，windows-rs 转换为 Err）。
     // SetWindowPos 失败后立即 return Error，不会调用 controller.SetBounds，
-    // 故 null controller 安全（与 handle_command_terminate_returns_ok 相同模式）。
+    // 故 dangling controller 安全（不解引用，与 handle_command_terminate_returns_ok 相同模式）。
     #[test]
     fn wp06_set_position_setwindowpos_failure_returns_error() {
         let hwnd = test_hwnd(); // HWND::default() - invalid
-        let controller = test_controller(); // null - SetBounds 不会被调用
+        let controller = test_controller(); // dangling - SetBounds 不会被调用
         let cmd = WpProcCommand::SetPosition {
             request_id: 6001,
             x: 0,
@@ -1076,8 +1079,8 @@ mod tests {
     //      SetWindowPos 立即失败返回 Error，到不了 GetClientRect）。构造一个
     //      "SetWindowPos 成功但 GetClientRect 失败" 的 hwnd 需要真实窗口环境。
     //   2. SetBounds 失败：需要 SetWindowPos + GetClientRect 均成功后，调用
-    //      controller.SetBounds。但 test_controller() 是 null COM 接口，调用
-    //      SetBounds 会解引用 null vtable 指针导致崩溃（与 Pause/Resume 同样限制）。
+    //      controller.SetBounds。但 test_controller() 是 dangling COM 接口（非 null），
+    //      调用 SetBounds 会解引用无效 vtable 指针导致崩溃（与 Pause/Resume 同样限制）。
     //
     // 故此处降级为验证错误响应构造逻辑（与 handle_command 中实际构造响应的代码
     // 完全一致），断言 status/error/JSON 格式契约。真实失败路径需集成测试

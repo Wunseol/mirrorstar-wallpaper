@@ -324,7 +324,7 @@ pub fn reorder_members(ids: &[String], from: usize, to: usize) -> Vec<String> {
     next
 }
 
-// ── 调度单元 key（对齐 arrangement.ts::unitKeysForArrangement / backend DR-40）──
+// ── 调度单元 key（对齐 mirrorstar_core::layout 单元规则 / backend DR-40）──
 
 /// 调度单元（key + 展示标签）。
 #[derive(Debug, Clone, PartialEq, Eq)]

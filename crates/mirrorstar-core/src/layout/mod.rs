@@ -1,11 +1,13 @@
 //! 多屏排列布局域（DR-2 / 多屏排列顶层逻辑）。
 //!
-//! 本模块是"多屏排列"的**唯一逻辑归属**：将（排列方式 × 显示器拓扑）以纯函数计算为
+//! 本模块是"多屏排列"的**唯一权威逻辑归属**：将（排列方式 × 显示器拓扑）以纯函数计算为
 //! 布局平面 [`LayoutPlane`]——单元划分、主显示器。调度器 / 命令层均只是该域的消费方，
 //! 不再各自实现"编排 → 单元"映射（此前该规则在 `scheduler::reconcile_and_align` 与
-//! `commands::rotation::validate_unit_key` 两处重复、零单测，已收敛到本模块）；前端
-//! TS 侧 `unitKeysForArrangement` 为独立实现——TS 无法消费 Rust 函数，仅按同一规则
-//! 保持语义对齐。
+//! `commands::rotation::validate_unit_key` 两处重复、零单测，已收敛到本模块）。
+//!
+//! 注：`crates/mirrorstar-ui/src/settings.rs::unit_keys_for_arrangement` 仍保留一份等价
+//! 独立实现（同 workspace 且已依赖 `mirrorstar-core`，本可消费本模块函数），按同一规则
+//! 维护、待后续统一；本模块仍是权威规则来源。
 //!
 //! ## 纯函数约束
 //!

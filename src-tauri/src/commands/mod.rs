@@ -10,12 +10,13 @@
 //!
 //! - `config`：配置管理命令（`get_config` / `update_config` /
 //!   `get_arrangement` / `update_arrangement`）
-//! - `system`：系统级命令（`get_displays` / `check_desktop_status` /
+//! - `system`：系统级命令（`get_displays` / `get_memory_report` /
+//!   `report_lifecycle_mark` / `check_desktop_status` / `set_interaction_mode` /
 //!   `open_file_dialog` / `toggle_auto_start` / `get_auto_start_status`）
 //! - `wallpaper`：壁纸生命周期命令（`get_wallpapers` / `reorder_wallpapers` /
 //!   `add_wallpaper` / `remove_wallpaper` / `set_wallpaper` /
 //!   `pause_wallpaper` / `resume_wallpaper` / `set_volume` / `toggle_mute` /
-//!   `set_interaction_mode` / `get_wallpaper_state` / `set_scaling_mode` /
+//!   `get_wallpaper_state` / `set_scaling_mode` /
 //!   `set_speed`）
 //! - `rotation`：轮播命令（`get_rotation_config` / `update_rotation_config` /
 //!   `list_pools` / `create_pool` / `update_pool` / `delete_pool` /
@@ -48,6 +49,8 @@
 //!     toggle_mute,
 //!     set_interaction_mode,
 //!     get_displays,
+//!     get_memory_report,
+//!     report_lifecycle_mark,
 //!     get_wallpaper_state,
 //!     open_file_dialog,
 //!     toggle_auto_start,

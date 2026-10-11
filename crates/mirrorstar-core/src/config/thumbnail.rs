@@ -554,15 +554,13 @@ pub fn generate_video_thumbnail(
         });
     }
 
-    std::fs::create_dir_all(thumbnail_dir)?;
-
     generate_video_thumbnail_via_mpv(file_path, thumbnail_dir)
 }
 
 /// 探测图片格式并返回对应的 image crate `ImageFormat`
 ///
-/// 暴露为 `pub(crate)` 以便测试覆盖格式映射逻辑。
-pub(crate) fn guess_image_format(file_path: &str) -> Option<ImageFormat> {
+/// 模块内私有，供本模块测试覆盖格式映射逻辑。
+fn guess_image_format(file_path: &str) -> Option<ImageFormat> {
     let ext = Path::new(file_path).extension()?.to_str()?.to_lowercase();
     match ext.as_str() {
         "jpg" | "jpeg" => Some(ImageFormat::Jpeg),

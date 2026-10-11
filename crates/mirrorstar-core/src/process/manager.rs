@@ -29,7 +29,7 @@ pub struct ProcessManager {
     executable: PathBuf,
 }
 
-// SAFETY (Task 9.1.2 soundness 论证):
+// SAFETY:
 // 本块包含 Send / !Sync / Drop 契约三类论证，顺序如下。
 //
 // `ProcessManager` 包含三类字段：`Option<HANDLE>`、`Option<u32>`、`PathBuf`。

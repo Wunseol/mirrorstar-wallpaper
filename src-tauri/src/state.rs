@@ -19,7 +19,7 @@ use tauri::AppHandle;
 /// 注意：`pause_senders` 已移入 `WallpaperEngine`，快速路径方法（pause/resume/
 /// volume/mute）通过 engine 锁访问，不再需要独立的 `pause_senders` 锁。
 ///
-/// # 锁获取路径审查（Task 19.2）
+/// # 锁获取路径审查
 ///
 /// - `set_wallpaper` 命令：通过 `spawn_blocking` 获取 engine 锁（`blocking_lock`），
 ///   engine 内部获取 `desktop` 锁，符合 engine → desktop 顺序。
@@ -134,7 +134,7 @@ pub struct AppState {
 
 // ── Global Statics ──────────────────────────────────────────────────────────
 //
-// Task 9.2 全局静态量收敛评估（保守策略：全部保留，仅文档化）
+// 全局静态量收敛评估（保守策略：全部保留，仅文档化）
 //
 // 共 15 个全局静态量。评估结论：**全部保留，不做收敛**。理由如下：
 //
@@ -224,7 +224,7 @@ pub(crate) static WIN_EVENT_HOOK: Mutex<Option<SendWinEventHook>> = Mutex::new(N
 /// HWINEVENTHOOK 的 Send/Sync 包装器（原始类型包含裸指针，未实现 Send/Sync）
 pub(crate) struct SendWinEventHook(pub windows::Win32::UI::Accessibility::HWINEVENTHOOK);
 
-// SAFETY (Task 9.1.1 soundness 论证):
+// SAFETY (soundness 论证):
 //
 // `HWINEVENTHOOK` 是 SetWinEventHook 返回的句柄，本质是一个指针大小的数值令牌，
 // 本身不持有任何 Rust 可变状态。包装器 `SendWinEventHook` 仅持有该令牌，无其他字段。
@@ -461,7 +461,7 @@ pub(crate) fn try_resume_all_fast(reason: PauseReason) -> Option<Vec<String>> {
     Some(failed)
 }
 
-/// 原子交换进行中？（只读查询，Task 4.3 互斥决策判定条件）
+/// 原子交换进行中？（只读查询，互斥决策判定条件）
 ///
 /// 仅读取全局 `ATOMIC_SWAP_IN_PROGRESS` 标志，供全屏终止/恢复的跳过分支使用。
 /// 置位/复位由调度器侧 `AtomicSwapInProgressGuard`（RAII，scheduler.rs）负责。
@@ -470,7 +470,7 @@ pub(crate) fn atomic_swap_in_progress() -> bool {
     ATOMIC_SWAP_IN_PROGRESS.load(Ordering::SeqCst)
 }
 
-/// 阻塞式恢复所有壁纸（供后台恢复线程使用，Task 7.1/7.2）
+/// 阻塞式恢复所有壁纸（供后台恢复线程使用）
 ///
 /// 与 [`try_resume_all_fast`] 的区别：后者运行于 Win32 回调上下文，必须用
 /// `try_lock`（锁忙即跳过，不能阻塞消息循环）；本函数运行于专用的后台恢复线程
@@ -491,7 +491,7 @@ pub(crate) fn resume_all_fast_blocking(reason: PauseReason) -> Option<Vec<String
         tracing::warn!(reason = ?reason, "纯净壁纸模式运行中，跳过壁纸暂停/恢复/终止处置（模式退出后会补跑判定）");
         return None;
     }
-    // Task 4.3：原子交换进行中时跳过全屏恢复（语义同 try_terminate_all_fast）。
+    // 原子交换进行中时跳过全屏恢复（语义同 try_terminate_all_fast）。
     // 返回 None 使调用方保留 FULLSCREEN_WAS，由周期复查线程在交换结束后重试恢复。
     if atomic_swap_in_progress() {
         tracing::warn!(reason = ?reason, "原子交换进行中，跳过 resume_all_fast_blocking（周期复查线程会重试）");
@@ -521,7 +521,7 @@ pub(crate) fn try_terminate_all_fast(reason: PauseReason) -> Option<Vec<String>>
         tracing::warn!(reason = ?reason, "纯净壁纸模式运行中，跳过壁纸暂停/恢复/终止处置（模式退出后会补跑判定）");
         return None;
     }
-    // Task 4.3：原子交换进行中时跳过全屏终止。原子交换阶段 A→C 期间 WorkerW
+    // 原子交换进行中时跳过全屏终止。原子交换阶段 A→C 期间 WorkerW
     // 正在被新窗嵌入/换槽，此时终止会重建 WorkerW 导致 commit 前校验失败
     // （"新窗父窗口已非当前 WorkerW"）与首帧等待超时。返回 None 与"锁忙跳过"语义
     // 一致：调用方不更新状态，事件会重复触发。
@@ -622,7 +622,7 @@ fn try_lock_with_timeout<T>(
 /// 4. 释放 SetWinEventHook、唤醒监控线程退出
 /// 5. 主线程 COM 清理（与 `run()` 中的 CoInitializeEx 配对）
 ///
-/// T04 修复：使用 `try_lock_engine_with_timeout`（3s 超时）获取 engine 锁
+/// T04 修复：使用 `try_lock_with_timeout`（3s 超时）获取 engine 锁
 /// （同步上下文，ExitRequested 期间 runtime 仍存活，进行中的壁纸命令会很快释放锁，
 /// 3s 超时平衡了"优雅关闭渲染器"与"不无限阻塞退出"）。超时则跳过 `engine.shutdown()`，
 /// 渲染器进程随应用退出由系统回收。通过 `SHUTDOWN_DONE` 守卫保证幂等。
@@ -847,7 +847,7 @@ mod tests {
     use super::*;
     use std::sync::atomic::AtomicBool;
 
-    // ── SubTask 5.3.3: SHUTDOWN_DONE 守卫逻辑测试 ──────────────────────────────
+    // ── SHUTDOWN_DONE 守卫逻辑测试 ──────────────────────────────
 
     /// 测试 SHUTDOWN_DONE 守卫的原子交换逻辑
     ///
@@ -886,7 +886,7 @@ mod tests {
         assert_eq!(swapped, current, "swap 应返回 swap 前的值");
     }
 
-    // ── SubTask 5.3.1: perform_shutdown_blocking 幂等性测试 ─────────────────────
+    // ── perform_shutdown_blocking 幂等性测试 ─────────────────────
 
     /// 测试 perform_shutdown_blocking 的幂等性
     ///

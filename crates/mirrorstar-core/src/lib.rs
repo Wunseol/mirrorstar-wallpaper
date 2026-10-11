@@ -109,7 +109,7 @@ pub enum MirrorStarError {
     #[error("无效的 URL 协议: {scheme}")]
     InvalidUrl { scheme: String },
 
-    /// 无效参数（N-009: 命令行参数含非法字符如换行符）
+    /// 无效参数（参数/取值校验失败，如音量/速度越界或含非法字符；源自 N-009）
     #[error("无效参数: {reason}")]
     InvalidArgument { reason: String },
 

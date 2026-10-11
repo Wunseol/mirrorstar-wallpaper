@@ -81,7 +81,7 @@ use mirrorstar_core::MirrorStarError;
 
 pub use bridge::install_event_forwarding;
 
-pub use paths::resolve_ui_exe;
+use paths::resolve_ui_exe;
 
 /// 空闲退出阈值的环境变量名（单位：秒）。
 pub const IDLE_TIMEOUT_ENV: &str = "MIRRORSTAR_UI_IDLE_TIMEOUT_SECS";

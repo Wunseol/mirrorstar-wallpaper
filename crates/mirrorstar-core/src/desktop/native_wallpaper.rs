@@ -3,6 +3,15 @@ use crate::wallpaper::ScalingMode;
 /// Windows 原生支持的图片格式
 const NATIVE_SUPPORTED_EXTENSIONS: &[&str] = &["jpg", "jpeg", "png", "bmp", "tif", "tiff", "dib"];
 
+/// 壁纸注册表设置所在子键（HKCU 下，`HKEY_CURRENT_USER\Control Panel\Desktop`）
+const REG_DESKTOP_SUBKEY: &str = "Control Panel\\Desktop";
+
+/// 注册表壁纸缩放模式值名
+const REG_VAL_WALLPAPER_STYLE: &str = "WallPaperStyle";
+
+/// 注册表壁纸平铺标志值名
+const REG_VAL_TILE_WALLPAPER: &str = "TileWallpaper";
+
 /// 判断文件格式是否支持 Windows 原生壁纸 API
 pub fn is_native_supported(file_path: &str) -> bool {
     let ext = std::path::Path::new(file_path)
@@ -158,16 +167,16 @@ fn write_wallpaper_style(style: &str, tile: &str) -> Result<(), crate::MirrorSta
 
     let hkcu = RegKey::predef(HKEY_CURRENT_USER);
     let desktop = hkcu
-        .open_subkey_with_flags("Control Panel\\Desktop", KEY_SET_VALUE)
+        .open_subkey_with_flags(REG_DESKTOP_SUBKEY, KEY_SET_VALUE)
         .map_err(|e| {
             crate::MirrorStarError::DesktopIntegration(format!("打开注册表失败: {}", e))
         })?;
 
-    desktop.set_value("WallPaperStyle", &style).map_err(|e| {
+    desktop.set_value(REG_VAL_WALLPAPER_STYLE, &style).map_err(|e| {
         crate::MirrorStarError::DesktopIntegration(format!("写入 WallPaperStyle 失败: {}", e))
     })?;
 
-    desktop.set_value("TileWallpaper", &tile).map_err(|e| {
+    desktop.set_value(REG_VAL_TILE_WALLPAPER, &tile).map_err(|e| {
         crate::MirrorStarError::DesktopIntegration(format!("写入 TileWallpaper 失败: {}", e))
     })?;
 
@@ -187,7 +196,7 @@ fn read_wallpaper_style() -> Option<(String, String)> {
     use winreg::RegKey;
 
     let hkcu = RegKey::predef(HKEY_CURRENT_USER);
-    let desktop = match hkcu.open_subkey_with_flags("Control Panel\\Desktop", KEY_QUERY_VALUE) {
+    let desktop = match hkcu.open_subkey_with_flags(REG_DESKTOP_SUBKEY, KEY_QUERY_VALUE) {
         Ok(k) => k,
         Err(e) => {
             tracing::warn!(
@@ -198,7 +207,7 @@ fn read_wallpaper_style() -> Option<(String, String)> {
         }
     };
 
-    let style: String = match desktop.get_value("WallPaperStyle") {
+    let style: String = match desktop.get_value(REG_VAL_WALLPAPER_STYLE) {
         Ok(v) => v,
         Err(e) => {
             tracing::warn!(
@@ -209,7 +218,7 @@ fn read_wallpaper_style() -> Option<(String, String)> {
         }
     };
 
-    let tile: String = match desktop.get_value("TileWallpaper") {
+    let tile: String = match desktop.get_value(REG_VAL_TILE_WALLPAPER) {
         Ok(v) => v,
         Err(e) => {
             tracing::warn!(

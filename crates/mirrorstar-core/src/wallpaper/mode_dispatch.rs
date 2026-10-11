@@ -137,10 +137,6 @@ impl WallpaperEngine {
                     source,
                     wallpaper_type,
                 );
-            } else {
-                return Err(MirrorStarError::DesktopIntegration(
-                    "静态图片壁纸仅支持本地文件".to_string(),
-                ));
             }
         }
 

@@ -8,7 +8,7 @@ use windows::Win32::System::Threading::{
     GetExitCodeProcess, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
 };
 
-// 修复历史与 A-TD 技术债明细见 docs/05-优化文档/05-audio-ipc-process模块.md §2.1
+// 修复历史与 A-TD 技术债明细见 docs/04-优化文档/05-audio-ipc-process模块.md §2.1
 
 // TODO(A-001): 未实现 IMMNotificationClient 主动监听；A-001 后 `refresh_session_manager`
 // 在 WASAPI 调用失败时尝试 COM 重新初始化 + 设备重连，作为惰性自愈方案。
@@ -53,7 +53,8 @@ pub struct VolumeControl {
 //      因此即便创建于 STA 主线程，在 MTA 线程（tokio worker）上调用其方法也安全。
 //   2. COM 接口指针本身仅是指针大小的令牌，移动所有权不产生别名或数据竞争。
 //   3. 调用方契约：使用 VolumeControl 的线程必须已初始化 COM。本项目主线程为 STA
-//      （由 Tauri/tao 自动初始化），但 tokio 默认 **不** 在 worker/blocking 线程
+//      （由 `src-tauri/src/lib.rs` 的 `ComGuard::new_sta_or_exit()` 显式初始化，见该文件 L478），
+//      但 tokio 默认 **不** 在 worker/blocking 线程
 //      初始化 COM，spawn_blocking 调用方需自行初始化（见 T-005 修复：
 //      `src-tauri/src/commands/wallpaper.rs` 的 spawn_blocking 闭包用 ComGuard）。
 //

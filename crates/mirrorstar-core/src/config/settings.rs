@@ -144,7 +144,7 @@ impl Default for GeneralConfig {
     fn default() -> Self {
         Self {
             auto_start: false,
-            minimize_to_tray: true,
+            minimize_to_tray: default_true(),
         }
     }
 }
@@ -173,9 +173,9 @@ pub struct AudioConfig {
 impl Default for AudioConfig {
     fn default() -> Self {
         Self {
-            volume: 0.8,
+            volume: default_volume(),
             muted: false,
-            preview_volume: 0.5,
+            preview_volume: default_preview_volume(),
             preview_muted: false,
         }
     }
@@ -400,8 +400,8 @@ pub struct VideoConfig {
 impl Default for VideoConfig {
     fn default() -> Self {
         Self {
-            hwdec: true,
-            speed: 1.0,
+            hwdec: default_true(),
+            speed: default_speed(),
         }
     }
 }
@@ -578,7 +578,7 @@ impl Default for RotationConfig {
         Self {
             enabled: false,
             on_boot: false,
-            interval_minutes: DEFAULT_INTERVAL_MINUTES,
+            interval_minutes: default_interval_minutes(),
             order: Order::default(),
             order_default_migrated: false,
             arrangement_legacy: None,

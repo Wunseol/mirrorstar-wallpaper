@@ -2,7 +2,7 @@ use std::time::Duration;
 
 use crate::ipc::client::NamedPipeClient;
 
-// 直接序列化结构体，跳过 json! 宏的中间 Value 树分配（详见各 send_command_* 内联实现）
+// 直接序列化结构体，跳过 json! 宏的中间 Value 树分配
 #[derive(serde::Serialize)]
 struct MpvCommand<'a> {
     command: &'a [&'a str],
