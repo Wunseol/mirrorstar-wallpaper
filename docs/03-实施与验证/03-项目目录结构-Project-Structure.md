@@ -36,7 +36,6 @@ mirrorstar-wallpaper/
 │   └── 04-优化文档/
 ├── mpv/                         # 捆绑的 mpv 播放器（mpv.exe + license）
 ├── src-tauri/                   # Tauri 壳（Rust + 配置 + 图标 + 测试）
-├── wallpaper/                   # 本地示例壁纸（mp4 / png）
 ├── Cargo.toml                   # Rust workspace 清单
 ├── Cargo.lock                   # 依赖锁定
 ├── LICENSE                      # 开源许可证
