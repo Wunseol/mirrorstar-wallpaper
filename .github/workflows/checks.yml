@@ -9,7 +9,7 @@ jobs:
   rust-checks:
     runs-on: windows-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       # Rust stable 通道：满足 MSRV 1.80（Cargo.toml rust-version），同时跟进新版编译优化与 lints
       - name: Install Rust stable
