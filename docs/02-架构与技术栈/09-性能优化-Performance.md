@@ -393,8 +393,141 @@ GIF 内存预算从 200MB 降至 40MB（`MAX_GIF_MEMORY_MB`）。暂停时释放
 | 网格滚动 CPU | 47.6% | **10.5%** |
 
 > 结论：原生 UI 子进程方案以"整体进程按需启停"替代了 WebView2 的"参数裁剪 + 非活跃态挂起"，在内存与 CPU 上均大幅下降。
+>
+> **数值归口**：上表的验收基线数值已并入 §22「资源占用穷举清单」（作为"无壁纸 + 主窗口开/关"情形的基线来源）。如需完整口径、其它情形与来源标注，一律以 §22 为准，其它章节不再重复维护同一事实。
 
 **e2e / 驱动脚本**：`crates/mirrorstar-ui/` 下的 PowerShell 脚本（`measure_grid.ps1`、`measure_scroll_reverify.ps1`、`measure_preview.ps1`、`keyboard_smoke.ps1`，以及 `shell_measure.ps1`、`single_instance_check.ps1`）用于真机采集上述数值。
+
+## 22. 资源占用穷举清单（`enumerate-wallpaper-resource-usage`）
+
+> 本节为**资源占用的权威清单**：穷举「壁纸类型 × 运行状态 × 叠加态」下应用组的系统资源占用情形与资源持有者。其它章节涉及资源数值时以本节为准（如需引用请指向本节），避免重复维护同一事实。
+
+### 22.1 口径与来源标注
+
+**进程分类口径**：`Main`＝壳根进程 `mirrorstar-wallpaper.exe`；`WpProc`＝与壳同名但**非根**的 `--wp-proc` 子进程；`Mpv`＝`mpv.exe`；`WebView2`＝`msedgewebview2.exe`；`Other`＝其余后代（如 `conhost.exe`）。以上五类即 `crates/mirrorstar-core/src/perf.rs::ProcessCategory` 的归因口径；本清单的采集脚本（见 §22.2）在其基础上把 `mirrorstar-ui.exe` 从 `Other` 中单独拆出记为 `UI`，便于观察主窗口 UI 子进程——注意 `perf.rs` 自身并不区分 `UI`，`mirrorstar-ui.exe` 在 `perf.rs` 归因中仍计入 `Other`。
+
+**资源维度**：进程分类与数量、线程数、GDI 对象数、USER 对象数、私有提交（Private）、工作集（WS）、GPU 显存（独占/共享）、CPU、句柄数、磁盘占用（缩略图缓存 / 日志 / WebView2 UDF）。
+
+**来源标注**：
+- **【实】**＝本机实测（对正在运行的实例做只读采集，见 §22.4）。
+- **【底】**＝复用既有验收/需求基线（§21、NFR-001/002 等），未重复测量。
+- **【导】**＝代码推导（资源持有者由代码确证；绝对数值**待实测**，不伪造）。
+
+### 22.2 采集环境与工具
+
+| 项 | 值 |
+|---|---|
+| OS | Windows 10 22H2（`10.0.19045`） |
+| CPU | 12th Gen Intel Core i3-12100F（4 核 / 8 逻辑处理器） |
+| 内存 | 32,607 MB |
+| GPU | NVIDIA GeForce RTX 5060 |
+| 采集工具 | `.trae/scripts/measure-resource-matrix.ps1`（**纯只读**：不停止进程、不写安装目录、不改配置） |
+| 采集时刻 | 2026-10-13（被采实例：视频壁纸，PID 8120） |
+| 数据根 | 安装目录 `C:\Tools\Mirror Star Wallpaper`（便携式，`MIRRORSTAR_DATA_ROOT` 未设置） |
+
+> 说明：应用为**单实例**（命名互斥体 `MirrorStarWallpaper_SingleInstance`），受控全矩阵实测需独占运行。本次采集**不干扰**用户正在运行的实例，仅对其做只读采样；其余情形在 §22.3 标【导】并附代码来源。
+
+### 22.3 情形 × 资源占用穷举矩阵
+
+| # | 情形 | 状态 | 资源持有者（进程 / 线程 / 窗口 / 对象） | 进程数（分类） | 线程 | GDI/USER | 私有提交 | 工作集 | GPU | CPU | 来源 |
+|---|---|---|---|---|---|---|---|---|---|---|---|
+| 1 | 无壁纸·仅壳（托盘常驻） | 无壁纸 | 壳进程；托盘 + 调度主循环 + 看护(5s) + 热插拔(3s) + WorkerW 检查(300s) | Main×1 | 待实测 | 待实测 | 【实】壳 10.4MB | 【实】壳 28.3MB | — | 【底】<0.1% | 【实/底】 |
+| 2 | 无壁纸 + 主窗口打开 | 无壁纸 | +`mirrorstar-ui.exe`（Slint 软件渲染，虚拟化网格） | Main×1 + UI×1 | 待实测 | 待实测 | 【底】壳+UI ≈16.8MB | 待实测 | — | 【底】idle ≈0.4% / 滚动 10.5% | 【底】(§21) |
+| 3 | 无壁纸 + 主窗口关闭（UI 空闲超时退出） | 无壁纸 | 仅壳（UI 进程在默认 300s 空闲超时后退出） | Main×1 | 待实测 | 待实测 | 【底】≈7.6MB | 待实测 | — | 待实测 | 【底】(§21) |
+| 4 | Native 静态图（jpg/jpeg/png/bmp/tif/tiff/dib）播放 | 播放 | **无渲染器**：`SystemParametersInfoW` + 注册表，由系统承载 | Main×1 | 壁纸侧 0 | 壁纸侧 0 | 壁纸侧 ~0 | 壁纸侧 ~0 | — | ~0 | 【导】`desktop/native_wallpaper.rs` |
+| 5 | Native 静态图 暂停 | 暂停 | 空操作（no-op，无渲染器可暂停） | Main×1 | 0 | 0 | ~0 | ~0 | — | ~0 | 【导】`mode_dispatch.rs` |
+| 6 | WorkerW 静态图（WebP）播放 | 播放 | 壳内壁纸线程 `mirrorstar-wallpaper` + GDI 双缓冲窗口（`mem_dc`/`mem_bitmap`/`image_bitmap`） | Main×1 | +1 壁纸线程 | 窗口 + GDI DC/Bitmap | 【导】像素 ~5–30MB（随分辨率） | 【导】~10–30MB | — | 低 | 【导】`wallpaper/image.rs`、`gdi_cache.rs` |
+| 7 | WorkerW 静态图（WebP）暂停 | 暂停 | 释放像素 + `mem_bitmap`（保留 `image_bitmap` 与线程） | Main×1 | 保留线程 | 保留 `image_bitmap` | 下降至接近 0 | 下降 | — | ~0 | 【导】`image.rs` Pause 分支 |
+| 8 | GIF 播放 | 播放 | 壳内 GIF 线程 `mirrorstar-gif-wallpaper` + 帧像素 + `WM_TIMER` + 可选预取线程 | Main×1 | +1（+预取） | 窗口 + GDI | 【导】≤40MB（帧预算 `max_memory_mb`） | 【导】~10–50MB | — | 中 | 【导】`wallpaper/gif.rs`、`gif_decode.rs` |
+| 9 | GIF 暂停·Aggressive | 暂停 | 仅保留当前帧，释放其余帧像素 | Main×1 | 保留线程 | 保留窗口/GDI | 【导】~1–5MB | 下降 | — | ~0 | 【导】`gif_memory.rs` |
+| 10 | GIF 暂停·Balanced（默认） | 暂停 | 保留当前帧 ±`balanced_keep_frames`（默认 10） | Main×1 | 保留线程 | 保留窗口/GDI | 【导】介于 9/11 之间 | 折中 | — | ~0 | 【导】`gif_memory.rs`、`config/settings.rs` |
+| 11 | GIF 暂停·Performance | 暂停 | 保留全部帧像素 | Main×1 | 保留线程 | 保留窗口/GDI | 【导】≤40MB（不释放） | 不下降 | — | ~0 | 【导】`gif_memory.rs` |
+| 12 | GIF 暂停·Adaptive | 暂停 | 按可用内存自动选保留帧数（目标占用可用内存 2%） | Main×1 | 保留线程 | 保留窗口/GDI | 【导】自适应 | 自适应 | — | ~0 | 【导】`gif_memory.rs` |
+| 13 | 视频 播放（硬解 `--hwdec=auto`） | 播放 | **外部 `mpv.exe`**（Job 2GB）+ WorkerW 嵌入 + 音频线程 `mirrorstar-video-audio` | Main×1 + Mpv×1 | 【实】113（合计） | 【实】33/64（合计） | 【实】407.8MB | 【实】193.8MB | 【实】独占 545.2 / 共享 30.7MB | 【实】采样时刻≈0 | 【实】`video.rs::build_mpv_args` |
+| 14 | 视频 播放（软解回退，`--vd-lavc-threads=4`） | 播放 | 同上，解码下沉到 CPU 多线程 | Main×1 + Mpv×1 | +解码线程 | 同上 | 更高（参考帧缓冲） | 更高 | 更低 | 更高 | 【导】`video.rs` |
+| 15 | 视频 暂停（手动 / 全屏 pause 策略） | 暂停 | **mpv 常驻、不释放**：IPC `pause` + 静音，停留当前帧 | Main×1 + Mpv×1 | 不释放 | 不释放 | ≈播放态 | ≈播放态 | ≈播放态 | ~0 | 【导】`video.rs::pause` |
+| 16 | 视频 全屏 terminate 策略 | 终止 | `pause_for_fullscreen()`＝`terminate()`：销毁 mpv 进程 | Main×1 | 释放 | 释放 | 回落至壳量级 | 回落 | — | — | 【导】`video.rs::pause_for_fullscreen` |
+| 17 | 网页 播放 | 播放 | **壳 `--wp-proc` 子进程** + WebView2（多进程）+ IPC 命名管道 | Main×1 + WpProc×1 + WebView2×n | 待实测 | 待实测 | 待实测（WebView2 基线属 150–300MB 量级，历史口径） | 待实测 | GPU 合成 | 中 | 【导】`wallpaper/web.rs`、`mirrorstar-wp-proc/src/webview.rs` |
+| 18 | 网页 暂停（手动 / 全屏 pause 策略） | 暂停 | **子进程常驻、不释放**：仅 IPC 暂停渲染 | 同 #17 | 不释放 | 不释放 | ≈播放态 | ≈播放态 | ≈播放态 | ~0 | 【导】`web.rs` |
+| 19 | 网页 全屏 terminate 策略 | 终止 | 销毁 `--wp-proc` 子进程 + 清理 per-PID UDF（`remove_dir_all`） | Main×1 | 释放 | 释放 | 回落至壳量级 | 回落 | — | — | 【导】`web.rs::terminate` |
+| 20 | 图片预览打开 | 叠加 | UI 进程内解码（上限 1280×720，关闭必须显式释放否则常驻） | +UI×1 | +1 | +宿主子窗 | 【导】≤~2.6MB（RGB8） | 【导】小 | — | 低 | 【导】`preview/photo.rs` |
+| 21 | GIF 预览打开 | 叠加 | UI 进程内惰性逐帧（常驻＝当前帧 + 下一帧解码峰值） | +UI×1 | +1 | +宿主子窗 | 【导】≈2 帧像素 | 【导】小 | — | 低 | 【导】`preview/gif.rs` |
+| 22 | 视频预览打开 | 叠加 | **UI 进程内另起独立 mpv**（`--wid` 宿主方案，与壁纸 mpv 完全独立，+1 进程） | +UI×1 + Mpv×1 | 另计 | 另计 | 另计（独立 mpv） | 另计 | GPU 解码 | 中 | 【导】`preview/video.rs` |
+| 23 | 网页预览打开 | 叠加 | UI 进程内 WebView2 + 独立 UDF（`webview2-cache/ui-<pid>`） | +UI×1 + WebView2×n | 另计 | 另计 | 另计（WebView2） | 另计 | GPU 合成 | 中 | 【导】`preview/web.rs` |
+| 24 | 预览全屏 | 叠加 | 同 #20–#23，几何铺满整窗，控制条空闲 1.5s 隐藏 | 同对应预览 | | | 同对应预览 | | | | 【导】`preview/mod.rs` |
+| 25 | 纯净壁纸模式 | 叠加 | 壁纸窗口置顶 `HWND_TOPMOST` + `WS_EX_NOACTIVATE` + 低级输入钩子 + 存活看护线程 | 同底层渲染器 | +钩子/看护线程 | — | 增（Native 下需**另建临时顶层呈现窗口**） | 增 | 同底层 | + | 【导】`platform/pure_mode.rs`、`pure_mode_input.rs` |
+| 26 | 多屏·PerMonitor（默认） | 叠加 | 每显示器一个渲染器实例（N＝显示器数） | ×N 相应子进程 | ×N | ×N | ×N | ×N | ×N | ×N | 【导】`scheduler.rs`、`wallpaper/manager.rs` |
+| 27 | 多屏·AllSame | 叠加 | 各屏同壁纸，仍为 N 个渲染器 | ×N（同上） | ×N | ×N | ×N | ×N | ×N | ×N | 【导】`config/settings.rs` |
+| 28 | 多屏·Span（跨屏拉伸） | 叠加 | **单**跨屏渲染器贯通虚拟桌面 | 壁纸侧 ×1 | ×1 | ×1 | ×1 | ×1 | ×1 | 低 | 【导】`desktop/worker_w.rs::embed_wallpaper` |
+| 29 | 壁纸轮换调度运行 | 叠加 | 壳内单条 tokio 主循环（`select!`），无「每显示器一线程」 | Main×1 | 复用 | — | 复用 | 复用 | — | 切换瞬时 | 【导】`scheduler.rs` |
+| 30 | 电池供电暂停（`pause_on_battery`） | 叠加 | `pause_all_fast(BATTERY)`，语义同对应类型的暂停 | 同底层类型 | 同暂停语义 | 同暂停语义 | 同暂停语义 | 同暂停语义 | — | ~0 | 【导】`platform/power.rs` |
+| 31 | 全屏暂停（`fullscreen_action=pause`） | 叠加 | 同对应类型的暂停（视频/网页**仅 IPC，不释放子进程**） | 同底层类型 | 不释放 | 不释放 | ≈播放态 | ≈播放态 | ≈播放态 | ~0 | 【导】`platform/fullscreen.rs` |
+| 32 | 全屏终止（`fullscreen_action=terminate`，默认） | 叠加 | 销毁子进程（视频 mpv / 网页 wp-proc+WebView2） | Main×1 | 释放 | 释放 | 回落 | 回落 | — | — | 【导】`fullscreen.rs` |
+| 33 | 显示器热插拔 3s 轮询 | 叠加 | 壳内 `interval(3s)`，仅集合真变时推 `displays-changed` 并重建 | Main×1 | 复用 | — | 复用 | 复用 | — | ~0 | 【导】`scheduler.rs` |
+| 34 | 启动期峰值 | 叠加 | 冷启动初始化（引擎/配置/WorkerW/开机壁纸） | Main×1（UI 不创建） | — | — | 【底】历史口径见 §20（WebView2 时代，**已失效**） | — | — | — | 【底】 |
+
+### 22.4 实测明细（对正在运行的视频壁纸实例，只读采样）
+
+被采实例为**视频壁纸**（`mpv.exe` 命令含 `--hwdec=auto --vo=gpu --idle=yes`，IPC 管道 `mirrorstar-mpv-<guid>`）；采样时刻**无** `mirrorstar-ui.exe` / `msedgewebview2.exe` / `--wp-proc` 子进程。3 次采样结果一致。
+
+| 成员 | PID | 类别 | 私有提交 | 工作集 | 线程 | 句柄 | GDI | USER |
+|---|---|---|---|---|---|---|---|---|
+| `mirrorstar-wallpaper.exe` | 8120 | Main（根） | 10.4MB | 28.3MB | 69 | 273 | 15 | 29 |
+| `mpv.exe` | 13512 | Mpv | 397.4MB | 165.5MB | 44 | 585 | 18 | 35 |
+| **合计** | — | 2 进程 | **407.8MB** | **193.8MB** | **113** | **858** | **33** | **64** |
+
+- **GPU**：独占 545.2MB / 共享 30.7MB（RTX 5060 + `--hwdec=auto` 硬解；随分辨率/码率变化）。
+- **CPU**：采样 6s 内各类别均 ≈0%（经独立复核：mpv 累计 CPU 在该时刻近乎不动，判定为**空闲/暂停**时刻，非采样故障）。
+- **磁盘**：数据根下 `logs` 6.53MB、`thumbnails` 0.06MB；`webview2-cache` 目录不存在（该实例未用网页壁纸）。
+- **说明**：`mpv` 私有提交 397.4MB 为该素材（视频文件）在硬解下的常驻解码/表面占用，属**素材相关**，4K 高码率会更接近理论上界（见 §22.5）。
+
+**复用基线（来自既有验收 / 需求，同口径，未重复测量）：**
+
+| 情形 | 数值 | 来源 |
+|---|---|---|
+| 主窗口打开并静置（壳 + UI 合计 private） | ≈16.8MB（验收门槛 ≤40MB） | §21 |
+| 主窗口关闭（UI 空闲超时退出）后 | ≈7.6MB | §21 |
+| 主窗口打开时 idle CPU | ≈0.4% | §21 |
+| 网格滚动 CPU | 10.5% | §21 |
+| 暂停态主进程（工作集） | ≈17.14MB（2026-07-24 运行时记录 17.1MB） | NFR-001 / 架构与技术栈总览 |
+
+### 22.5 代码推导的资源上界 / 预算（绝对值待实测）
+
+| 资源点 | 上界 / 预算 | 代码来源 |
+|---|---|---|
+| 视频/网页子进程内存 | Job Object 单进程上限 `SUBPROCESS_MEMORY_LIMIT_BYTES = 2GB` | `wallpaper/subprocess_base.rs` |
+| mpv 解码内存限流 | `--cache=no`（省 ~75MB）、`--vd-queue-max-bytes=16MB`、`--ad-queue-max-bytes=4MB`、`--demuxer-max-back-bytes=0`、`--cache-secs=0`、`--demuxer-readahead-secs=0.5`、`--vd-lavc-threads=4`；队列自适应 `max(16MB, 帧字节×3)` | `video.rs::build_mpv_args`/`probe_video_size_and_tune_queue` |
+| GIF 帧像素预算 | 配置层默认 `max_memory_mb = 40`（合法 10–500）；库解码层默认 `DEFAULT_MAX_GIF_MEMORY_MB = 15`；帧数上限 `.min(1000)`；单帧预取 ≤8MB | `config/settings.rs`、`gif_decode.rs` |
+| GIF 暂停保留帧 | `balanced_keep_frames = 10`（合法 1–1000）；流式窗口 `current±1` | `gif_memory.rs`、`gif_decode.rs` |
+| 网页 WebView2 限流 | `--renderer-process-limit=1`、`--js-flags=--max-old-space-size=512`、`--disk-cache-size=10MB`、禁用 `MediaCache,FontCache,GpuMemDiscardable,BackForwardCache` | `mirrorstar-wp-proc/src/webview.rs` |
+| 图片解码上限 | `MAX_WALLPAPER_DIMENSION=7680`、`MAX_UPSCALE_FACTOR=2.0`、`MAX_IMAGE_DIMENSION=16384` | `wallpaper/image.rs` |
+| 预览图片上限 | `PREVIEW_MAX_W=1280` × `PREVIEW_MAX_H=720` | `preview/photo.rs` |
+| 内存归因能力 | `sample_memory_report()`（分类别进程数/WS/Private/总计）、`MEM-ATTRIB` 周期采样（≥30s）、`MEM-TIMELINE`/`MEM-MARK` 启动期；入口 Tauri 命令 `get_memory_report` | `crates/mirrorstar-core/src/perf.rs`、`src-tauri/src/commands/system.rs` |
+
+### 22.6 关键结论（易被忽略的占用点）
+
+1. **Native 静态图是唯一「零运行时资源」情形**：无渲染器、无窗口、无线程、无 GDI，仅写注册表 + `SystemParametersInfoW`；其暂停为 no-op。WebP 因不在原生支持集而**必然**回退 WorkerW/GDI。
+2. **视频 / 网页的「暂停」不等于释放**：`pause()` 仅发 IPC，`mpv.exe` / `--wp-proc`+WebView2 **持续常驻**；只有全屏 `terminate`（默认策略）才真正销毁子进程。因此「暂停态内存低」的直觉对视频/网页类型不成立。
+3. **预览会叠加额外子进程**：视频预览在 UI 进程内**另起独立 mpv**（+1 进程）；网页预览在 UI 进程内**另起 WebView2**（+若干 `msedgewebview2.exe`）。它们与壁纸侧渲染器完全独立、不可复用。
+4. **多屏按显示器数线性放大**：PerMonitor/AllSame 下渲染器与子进程数 ≈ 显示器数（N 个视频屏 ⇒ 最多 N 个 `mpv.exe`；N 个网页屏 ⇒ 最多 N 套 `--wp-proc`+WebView2）；Span 则为单跨屏渲染器。
+5. **纯净模式**有额外常驻（置顶窗口 + 低级输入钩子 + 存活看护线程）；Native 壁纸下还需为此**另建临时顶层呈现窗口**（打破其「零窗口」特性）。
+6. **壳侧常驻线程**：调度主循环、看护(5s)、热插拔(3s)、WorkerW 检查(300s) 均常驻，是「仅壳」情形的固定成本来源。
+7. **主窗口 UI 是独立进程且按需启停**：打开 ≈16.8MB（壳+UI，§21），关闭后 UI 空闲超时退出回落 ≈7.6MB——UI 不常驻。
+
+### 22.7 缺口（待实测）
+
+以下情形因应用为单实例、且本次不干扰用户正在运行的实例而**未实测**，已在矩阵中标注来源，后续可在独占环境按 §22.8 复现：Native/WebP 静态图、GIF（含 4 策略）、网页壁纸、四类预览、纯净模式、多屏排列（PerMonitor/AllSame/Span）、纯净模式下的临时窗口、以及各类别在「播放（非空闲）」时刻的 CPU/GPU 峰值。
+
+### 22.8 如何自行复现
+
+```powershell
+# 只读采样应用组（自动定位根进程，排除 --wp-proc 子进程）
+powershell.exe -NoProfile -ExecutionPolicy Bypass `
+  -File ".trae\scripts\measure-resource-matrix.ps1" -SampleSeconds 6 -Repeat 3
+# 可选：-RootPid <pid>；-DataRoot <dir> 指定数据根以统计磁盘占用
+```
+
+脚本输出每维度一行 `KEY=value`（`COUNT_*` / `PRIV_*` / `WS_*` / `THREADS_*` / `HANDLES_*` / `GDI_*` / `USER_*` / `GPU_*` / `CPU_*` / `DISK_*`），可解析后填入 §22.3 矩阵。若要覆盖全部情形，需在**独占运行**下逐一切换壁纸类型与状态后重复采样。
 
 ***
 
