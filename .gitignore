@@ -64,8 +64,8 @@ __tmp_patch_*.ps1
 
 # Binaries（外部二进制依赖，体积大且版本/平台特定）
 # mpv 播放器（视频壁纸渲染依赖，按 README 指引单独下载解压）
-# 例外：mpv/license 为项目自写的小型定制许可文本（~19KB，稳定），需跟随源码入库，
-# CI 全新 checkout 才有该资源（tauri.conf.json resources 引用它）；mpv.exe（~123MB）仍忽略，
-# 由 CI 的 provisioning 步骤按固定 release + SHA256 下载（详见 .github/workflows/checks.yml）
+# 例外：mpv/license 为项目自写的小型定制许可文本（~19KB，稳定），需跟随源码入库
+# （tauri.conf.json resources 引用它，全新 checkout 需要该资源）；mpv.exe（~123MB）仍忽略，
+# 需按 README 指引手动下载官方 release 并解压放入 mpv/ 目录
 mpv/*
 !mpv/license

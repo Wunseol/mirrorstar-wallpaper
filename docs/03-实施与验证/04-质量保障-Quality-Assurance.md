@@ -9,13 +9,13 @@
 | 更新日期 | 2026-10-12                |
 | 文档状态 | 已实现（基于真实代码审计，2026-10）        |
 
-> 本文由原《质量保障》改写，聚焦质量目标、真实测试命令、CI 流程与验收标准；具体测试数据与实测值见 [测试报告](./05-测试报告-Test-Reports.md)。
+> 本文由原《质量保障》改写，聚焦质量目标、真实测试命令与验收标准；具体测试数据与实测值见 [测试报告](./05-测试报告-Test-Reports.md)。
 
 ***
 
 ## 1. 质量目标
 
-项目以**零警告、可测试、可发布**为核心质量目标，保障手段落在「本地工具链 + CI 流水线 + 单元/集成测试 + e2e 脚本」多层。
+项目以**零警告、可测试、可发布**为核心质量目标，保障手段落在「本地工具链 + 单元/集成测试 + e2e 脚本」多层。
 
 - **Rust 侧**：`cargo test / clippy / fmt` 全部零告警（clippy 用 `-D warnings`）。
 - **依赖安全**：`cargo audit` 兜底。
@@ -46,27 +46,20 @@
 | `shell_measure.ps1` | 壳内存测量 |
 | `single_instance_check.ps1` | 单实例校验 |
 
-## 3. CI 流水线（真实流程）
+## 3. 质量门（本地手工执行）
 
-项目通过 `.github/workflows/checks.yml` 定义**可复用检查工作流**（`workflow_call`），供 `ci.yml`（push/PR）与 `release.yml`（tag 触发的发布前置门）共享，**仅含 `rust-checks` 单一 job**（运行于 `windows-latest`）。
+项目不使用 CI，全部检查在本地手工执行。提交前依次运行以下命令（零警告为准）：
 
-### 3.1 rust-checks 步骤
-
-| 步骤 | 说明 |
+| 命令 | 说明 |
 |------|------|
-| Setup Rust stable | `dtolnay/rust-toolchain@stable`（components: clippy, rustfmt），兼容 MSRV 1.80 |
-| Cache cargo | `Swatinem/rust-cache@v2`（key 含 Cargo.lock / Cargo.toml / runner.os） |
-| Provision mpv runtime | 固定 release（20260903）+ SHA256 校验下载 `mpv.exe`（编译期资源校验需要） |
-| Test | `cargo test --workspace`（隐含编译，无独立 Build 步骤） |
-| Clippy | `cargo clippy --workspace --all-targets -- -D warnings` |
-| Format check | `cargo fmt --all --check` |
-| Run ignored tests | `cargo test --workspace -- --ignored`（`continue-on-error: true`，不阻断流程） |
-| Security audit | `cargo audit`（经 `taiki-e/install-action@cargo-audit` 安装） |
+| `cargo check --workspace` | 编译检查 |
+| `cargo test --workspace` | 全部单元/集成测试（隐含编译） |
+| `cargo clippy --workspace --all-targets -- -D warnings` | Lint，零警告 |
+| `cargo fmt --all --check` | 格式检查 |
+| `cargo test --workspace -- --ignored` | 共享资源类串行测试（本地按需执行） |
+| `cargo audit` | 依赖安全审计 |
 
-### 3.2 触发与发布门
-
-- `ci.yml`：push / PR（`main` / `master`）触发，复用 checks。
-- `release.yml`：`v*` tag 触发，三 job 结构 `verify-secrets → checks → build-and-release`；发布前先运行 checks 作为前置门，通过后 `cargo install tauri-cli` + `tauriScript: cargo tauri` 构建并起草 Release（draft）。正式发布需配置签名密钥。
+> 打包与发布由本地执行 `cargo tauri build` 生成 NSIS 安装包后人工发布。
 
 ## 4. 测试体系与覆盖
 
@@ -95,12 +88,10 @@
 
 - 依赖由 `Cargo.lock` 锁定，保证可复现构建。
 - Rust 工具链由 `rust-toolchain.toml` 固定（stable / MSRV 1.80）。
-- 仓库启用 `.github/dependabot.yml` 跟踪依赖更新（cargo / github-actions 两生态）。
-- 发布通过 `release.yml` 的 `verify-secrets` 前置门 + 复用 checks，保证发版与 CI 质量门一致。
 
 ## 6. 验收标准
 
-各阶段验收以「可通过 §3 CI 全部检查」为最低通过线，并补充人工功能验证：
+各阶段验收以「可通过 §3 质量门全部检查」为最低通过线，并补充人工功能验证：
 
 - 壁纸应用/显示/退出恢复；
 - 托盘与单实例；

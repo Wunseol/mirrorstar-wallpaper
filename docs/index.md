@@ -38,9 +38,9 @@
 | 文档 | 说明 |
 |------|------|
 | [01-实施与验证总览](./03-实施与验证/01-实施与验证总览-Implementation-and-Verification-Overview.md) | 总体策略、阶段依赖、当前进度总结、改进方向（合并原《实施规划总览》与《开发阶段划分》） |
-| [02-开发环境与构建](./03-实施与验证/02-开发环境与构建-Development-Environment-and-Build.md) | 环境搭建指南、常用命令（Rust + Tauri CLI，无 npm）、CI 构建/发布流程（合并原《开发环境搭建》与《构建基础设施》） |
+| [02-开发环境与构建](./03-实施与验证/02-开发环境与构建-Development-Environment-and-Build.md) | 环境搭建指南、常用命令（Rust + Tauri CLI，无 npm）、本地构建/发布流程（合并原《开发环境搭建》与《构建基础设施》） |
 | [03-项目目录结构](./03-实施与验证/03-项目目录结构-Project-Structure.md) | 实际目录结构（4 个 workspace 成员，含原生 UI 子进程 crate） |
-| [04-质量保障](./03-实施与验证/04-质量保障-Quality-Assurance.md) | 验收标准、测试策略、CI 流程 |
+| [04-质量保障](./03-实施与验证/04-质量保障-Quality-Assurance.md) | 验收标准、测试策略、本地质量门 |
 | [05-测试报告](./03-实施与验证/05-测试报告-Test-Reports.md) | 三份历史测试报告合并（2026-06-25 / 2026-07-05 / 2026-07-24） |
 
 > **说明**：以上测试报告均为**历史记录**（主窗口原生 UI 重构前，基于旧前端与 WebView2 主窗口）。当前测试体系为 Rust 单元/集成测试（`cargo test --workspace`）+ PowerShell 驱动脚本 e2e（`crates/mirrorstar-ui/`），运行方式见 [开发环境与构建](./03-实施与验证/02-开发环境与构建-Development-Environment-and-Build.md) 与 [质量保障](./03-实施与验证/04-质量保障-Quality-Assurance.md)。

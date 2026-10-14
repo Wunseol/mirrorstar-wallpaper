@@ -223,7 +223,7 @@
 
 - **Rust 单元/集成测试**：`cargo test --workspace`，覆盖 `mirrorstar-core` / `mirrorstar-ui` / `mirrorstar-wp-proc` / 壳（`mirrorstar-wallpaper`）；共享资源类测试标记 `#[ignore]`，由 `cargo test --workspace -- --ignored` 串行执行。
 - **e2e（真机）**：`crates/mirrorstar-ui/` 下的 PowerShell 驱动脚本（`measure_grid.ps1`、`measure_scroll_reverify.ps1`、`measure_preview.ps1`、`keyboard_smoke.ps1`、`shell_measure.ps1`、`single_instance_check.ps1`）。
-- **CI**：`.github/workflows/checks.yml` 的 `rust-checks`（test / clippy / fmt / ignored / cargo audit），详见 [质量保障](./04-质量保障-Quality-Assurance.md)。
+- **质量门**：本地手工执行 `cargo test --workspace` / `cargo clippy --workspace --all-targets -- -D warnings` / `cargo fmt --all --check` / `cargo test --workspace -- --ignored` / `cargo audit`，详见 [质量保障](./04-质量保障-Quality-Assurance.md)。
 
 ***
 

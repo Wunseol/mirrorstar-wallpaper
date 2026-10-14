@@ -15,9 +15,6 @@ MirrorStar Wallpaper 基于 Rust + Tauri v2 打造，通过 WorkerW 原生嵌入
   <img src="https://img.shields.io/badge/Tauri-v2-blue" alt="Tauri" />
 </p>
 
-<!-- CI status badge: 仓库公开后替换为真实 workflow URL -->
-<!-- Release badge: 仓库公开后替换为真实 release URL -->
-
 ## 简介
 
 镜星壁纸是一款面向 **Windows 桌面** 的动态壁纸方案。它尊重系统原生行为：全屏应用切换与电源状态通过系统事件（`SetWinEventHook`、`PBT_APMPOWERSTATUSCHANGE`）感知，壁纸渲染与主窗口 UI 分别运行在独立子进程，在沉浸感与稳定性之间取得平衡。
@@ -70,7 +67,6 @@ Rust workspace 四个成员：`src-tauri` / `crates/mirrorstar-core` / `crates/m
 
 ```
 mirrorstar-wallpaper/
-├── .github/                  # CI/CD 工作流与依赖升级配置
 ├── crates/
 │   ├── mirrorstar-core/      # 共享核心库（配置 / 桌面 / 壁纸 / 音频 / IPC / 进程 / 调度 / 布局 / UI 协议）
 │   ├── mirrorstar-ui/        # 原生主窗口 UI 子进程（Slint，独立二进制 mirrorstar-ui.exe）
@@ -103,7 +99,7 @@ mirrorstar-wallpaper/
 - MSVC Build Tools（Visual Studio 2022，"Desktop development with C++" 工作负载，含 Windows SDK）
 - Tauri CLI 2.11（`cargo install tauri-cli --version "^2.11" --locked`）
 
-> **不再需要 Node.js / npm**：项目已无前端构建产物，CI 亦不安装 Node；主窗口为原生 Slint UI 子进程。
+> **不再需要 Node.js / npm**：项目已无前端构建产物；主窗口为原生 Slint UI 子进程。
 
 #### 构建与运行
 
@@ -122,7 +118,7 @@ cargo tauri dev --additional-watch-folders crates/mirrorstar-ui
 
 #### mpv 运行时获取
 
-视频壁纸依赖 `mpv.exe`（体积大，约 120 MB，已被 `.gitignore` 忽略、不入库）。请按官方发布获取 Windows x64 构建（项目 CI 固定 release `20260903` 并以 SHA256 校验下载），将解压得到的 `mpv.exe` 放入仓库根 `mpv/` 目录；`tauri_build` 在编译期会校验该文件存在。`mpv/license` 为随源码入库的许可文本，无需另行获取。
+视频壁纸依赖 `mpv.exe`（体积大，约 120 MB，已被 `.gitignore` 忽略、不入库）。请手动下载官方 release `20260903`（`mpv-x86_64-v3-20260903-git-69e63f425a.7z`），将解压得到的 `mpv.exe` 放入仓库根 `mpv/` 目录；`tauri_build` 在编译期会校验该文件存在。`mpv/license` 为随源码入库的许可文本，无需另行获取。
 
 #### 常用命令
 
@@ -181,7 +177,7 @@ cargo clean   # 删除整个 target/，下次构建自动复现
 欢迎参与贡献。在提交变更前，请：
 
 1. 阅读 [docs/index.md](./docs/index.md) 及相关目录文档，理解架构与规范。
-2. 确保以下门槛全部通过（与 CI 质量门一致），零警告：
+2. 确保以下门槛全部通过（与本地质量门一致），零警告：
    - `cargo test --workspace`
    - `cargo clippy --workspace --all-targets -- -D warnings`
    - `cargo fmt --all --check`

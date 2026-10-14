@@ -45,7 +45,7 @@ serde_json = "1"
 toml = "0.8"
 
 # Async runtime
-# v16-D-013：收紧到 minor 级（1.52），避免 dependabot 在 minor 范围内自由升级引入 breaking change
+# v16-D-013：收紧到 minor 级（1.52），避免依赖在 minor 范围内自由升级引入 breaking change
 tokio = { version = "1.52", features = ["rt", "rt-multi-thread", "macros", "time", "fs", "sync", "io-util"] }
 
 # Error handling

@@ -26,7 +26,7 @@
 - **每个里程碑交付可运行程序**
 - **风险前置**：把技术风险最高的部分（桌面集成、视频播放）放在最前阶段尽早验证
 - **垂直切片**：每个阶段实现从底层到呈现层的完整垂直功能切片
-- **持续集成**：从第一天起建立 CI 流水线（`cargo test` / `clippy` / `fmt --check` / `cargo audit`），确保每次提交可编译可测试
+- **质量门**：提交前在本地执行 `cargo check` / `clippy` / `fmt --check` / `test` / `cargo audit`，确保可编译可测试
 
 ### 1.2 开发方法论
 
@@ -63,7 +63,7 @@ graph LR
 | Phase 3 | Web 壁纸子进程 | ✅ 已完成 |
 | Phase 4 | 体验优化 | ✅ 已完成 |
 | Phase 2 | 架构优化与代码清理 | ✅ 已完成 |
-| Phase 5 | 打包发布 | 🔧 已配置（NSIS + 资源 + 发布流水线），正式打 tag 待执行 |
+| Phase 5 | 打包发布 | 🔧 已配置（NSIS + 资源），待本地打包发布 |
 | Phase 6 | 主窗口原生 UI 重构 | ✅ 已完成 |
 | Phase 1 | 前端 UI 补全 | ⚫ 已废弃（历史，能力迁至 Phase 6） |
 
@@ -101,8 +101,8 @@ graph LR
 **Phase 5：打包发布 🔧 已配置**
 
 - `bundle.targets = ["nsis"]`；资源捆绑 `mpv.exe` 与 `mirrorstar-ui.exe`；图标/标识配置就绪。
-- 发布流水线 `.github/workflows/release.yml`：打 `v*` tag 触发，`verify-secrets → checks → build-and-release`，使用 `cargo install tauri-cli` + `tauriScript: cargo tauri`（不依赖 Node/npm）。
-- 待办：正式打 `v0.x.x` tag 触发一次发布。
+- 发布由本地执行 `cargo tauri build` 打包 NSIS 安装包后人工发布（不依赖 Node/npm）。
+- 待办：本地打包并完成一次发布。
 
 **Phase 6：主窗口原生 UI 重构 ✅**
 
@@ -135,7 +135,7 @@ graph LR
 | Web 壁纸子进程 | ✅ 100% | 壳 `--wp-proc` 模式（`mirrorstar-wp-proc` 库 crate）+ `WpProcIpcClient` + `WebRenderer` |
 | 主窗口原生 UI | ✅ 100% | `crates/mirrorstar-ui/`（Slint）虚拟化网格、设置、四类预览、键盘/拖放交互 |
 | 壁纸轮换调度 | ✅ 100% | 调度器与多屏排列（`mirrorstar-core/src/scheduler/`，壳侧 `scheduler.rs`） |
-| 打包发布 | 🔧 已配置 | NSIS 安装包 + 资源捆绑 + Release 流水线 |
+| 打包发布 | 🔧 已配置 | NSIS 安装包 + 资源捆绑，本地 `cargo tauri build` 打包 |
 
 > 各模块的职责与规模细节见 [模块设计](../02-架构与技术栈/02-模块设计-Module-Design.md) 与 [项目目录结构](./03-项目目录结构-Project-Structure.md)。
 

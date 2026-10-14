@@ -438,7 +438,7 @@ MirrorStar 的技术选型围绕「零运行时依赖、事件驱动、轻量渲
 
 ### 依赖更新策略
 
-- **锁定策略**：workspace 依赖采用 minor 精确版本（如 tokio 1.52、tauri 2.11），避免 dependabot 在 minor 内引入 breaking change
+- **锁定策略**：workspace 依赖采用 minor 精确版本（如 tokio 1.52、tauri 2.11），依赖升级由人工评估，避免在 minor 内引入 breaking change
 - **可复现构建**：`Cargo.lock` 纳入版本控制
 - **最小依赖**：仅引入必要依赖；已移除 `protocol-asset` 等无用 feature 与虚构依赖
 

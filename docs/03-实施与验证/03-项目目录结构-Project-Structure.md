@@ -19,12 +19,6 @@
 mirrorstar-wallpaper/
 ├── .cargo/
 │   └── config.toml              # Cargo 配置（不配镜像；windows 注入 /MANIFESTDEPENDENCY）
-├── .github/
-│   ├── workflows/
-│   │   ├── checks.yml           # 可复用检查工作流（仅 rust-checks）
-│   │   ├── ci.yml               # push/PR 触发，复用 checks
-│   │   └── release.yml          # v* tag 触发，verify-secrets → checks → build-and-release
-│   └── dependabot.yml           # cargo / github-actions 两生态更新
 ├── crates/
 │   ├── mirrorstar-core/         # 共享核心库（配置/桌面/壁纸/音频/IPC/进程/调度/布局/性能/UI 协议）
 │   ├── mirrorstar-ui/           # 原生主窗口 UI 子进程（Slint，独立二进制 mirrorstar-ui.exe）
@@ -138,15 +132,9 @@ members = [
 
 配置：`tauri.conf.json`（见 §5）。
 
-## 4. CI/CD（.github/workflows/）
+## 4. 构建与发布
 
-| 工作流 | 说明 |
-|--------|------|
-| `checks.yml` | 可复用检查：仅 `rust-checks`（含 Provision mpv → test/clippy/fmt/ignored/cargo audit） |
-| `ci.yml` | push / PR 触发，复用 `checks.yml` |
-| `release.yml` | `v*` tag 触发，`verify-secrets → checks → build-and-release`；`cargo install tauri-cli` + `tauriScript: cargo tauri`（不依赖 Node/npm） |
-
-构建/发布流程的完整步骤见 [开发环境与构建](./02-开发环境与构建-Development-Environment-and-Build.md)。
+项目不使用 CI，全部检查在本地手工执行；构建/发布与质量门命令见 [开发环境与构建](./02-开发环境与构建-Development-Environment-and-Build.md)。
 
 ## 5. 配置（tauri.conf.json）
 
@@ -161,7 +149,7 @@ members = [
 
 ## 6. mpv 捆绑
 
-仓库根 `mpv/` 包含 `mpv.exe`（视频播放器）与 `license`（许可证），通过 `bundle.resources` 随安装包分发（见 §5）。运行时查找策略为：捆绑路径优先，找不到时回退到系统 `PATH`。CI 中 `mpv/` 被 `.gitignore` 忽略（体积超限），由 `checks.yml` / `release.yml` 固定版本（20260903）+ SHA256 下载补齐。
+仓库根 `mpv/` 包含 `mpv.exe`（视频播放器）与 `license`（许可证），通过 `bundle.resources` 随安装包分发（见 §5）。运行时查找策略为：捆绑路径优先，找不到时回退到系统 `PATH`。`mpv/` 被 `.gitignore` 忽略（体积超限），需本地手动放置 `mpv.exe`。
 
 ## 7. 已删除的历史结构
 

@@ -9,9 +9,9 @@
 | 更新日期 | 2026-10-12                |
 | 文档状态 | 已实现（基于真实代码审计，2026-10）        |
 
-> 本文合并原《开发环境搭建》与《构建基础设施》，统一工具链与命令，并以真实 CI 工作流为准重写构建/发布流程。
+> 本文合并原《开发环境搭建》与《构建基础设施》，统一工具链与命令，并以当前仓库真实配置为准重写构建/发布流程。
 >
-> **不依赖 Node/npm**：主窗口为原生 Slint UI，仓库无前端构建产物，CI 亦不安装 Node；原有 npm/vitest/eslint/前端 CI 等表述已删除。
+> **不依赖 Node/npm**：主窗口为原生 Slint UI，仓库无前端构建产物；原有 npm/vitest/eslint 等前端相关表述已删除。
 
 ***
 
@@ -85,7 +85,7 @@ cargo tauri dev
 | `cargo fmt --all --check` | 格式检查 |
 | `cargo audit` | 依赖安全审计 |
 
-> `cargo test --workspace` 默认跳过 `#[ignore]` 的共享资源类测试；如需执行用 `cargo test --workspace -- --ignored`（CI 中以 `continue-on-error` 运行）。
+> `cargo test --workspace` 默认跳过 `#[ignore]` 的共享资源类测试；如需执行用 `cargo test --workspace -- --ignored`（本地按需执行，不阻断主线流程）。
 
 ### e2e（PowerShell 驱动脚本，`crates/mirrorstar-ui/`）
 
@@ -115,20 +115,19 @@ cargo tauri build          # 生成 NSIS 安装包（含资源）
 - `build`：空对象（无 `beforeBuildCommand` / `frontendDist` / `devUrl`，不依赖前端产物）。
 - `app.security.csp`：`default-src 'self'`；`app.withGlobalTauri`: `false`；`app.windows`: `[]`。
 
-> 发布由 GitHub Actions `.github/workflows/release.yml` 在打 `v*` tag 时自动执行（需配置签名密钥 `TAURI_SIGNING_PRIVATE_KEY` / `TAURI_SIGNING_PRIVATE_KEY_PASSWORD`）。Tauri v2 NSIS 默认启用签名，未配置密钥会失败，需在仓库 Secrets 中配置。
+> 项目不再使用自动发布；打包由本地 `cargo tauri build` 完成。Tauri v2 NSIS 默认启用签名，需在本地配置签名私钥（环境变量 `TAURI_SIGNING_PRIVATE_KEY` / `TAURI_SIGNING_PRIVATE_KEY_PASSWORD`），否则打包失败。
 
 ## 6. 构建工具链版本
 
 | 工具 | 版本 | 配置位置 |
 |------|------|----------|
 | Rust (MSRV) | 1.80 | 根 `Cargo.toml` `rust-version = "1.80"` |
-| Rust (CI) | stable | `checks.yml` `dtolnay/rust-toolchain@stable`（`components: clippy, rustfmt`） |
-| Rust (本地) | stable | `rust-toolchain.toml` `channel = "stable"` |
+| Rust (本地) | stable | `rust-toolchain.toml` `channel = "stable"`（`components: clippy, rustfmt`），兼容 MSRV 1.80 |
 | Tauri | 2.11 | 根 `Cargo.toml` `tauri = { version = "2.11", features = ["tray-icon"] }`；`tauri.conf.json` `$schema` 锁定 `tauri-v2.11.2` |
-| Tauri CLI | ^2.11 | `release.yml` `cargo install tauri-cli --version "^2.11" --locked` |
+| Tauri CLI | ^2.11 | 本地执行 `cargo install tauri-cli --version "^2.11" --locked` |
 | Slint | 1.18 | `crates/mirrorstar-ui/Cargo.toml`（`default-features = false` + `renderer-software`） |
 | webview2-com | 0.34 | 根 `Cargo.toml`（评估保持 0.34：0.38 传递依赖 windows 0.61 与 workspace windows 0.58 不兼容） |
-| mpv（运行时） | 20260903 | `checks.yml` / `release.yml` 固定 release + SHA256 下载 |
+| mpv（运行时） | 20260903 | 手动下载官方 release `20260903`（SHA256 校验）并放入 `mpv/` |
 
 ### 依赖与版本要点
 
@@ -138,33 +137,20 @@ cargo tauri build          # 生成 NSIS 安装包（含资源）
 - `[profile.release]`：`lto = true` / `codegen-units = 1` / `strip = "symbols"` / `panic = "abort"`；`[profile.dev] opt-level = 1`（改善 dev 下 GIF 解码等重计算场景）。
 - `src-tauri/Cargo.toml` `[lib] crate-type = ["lib"]`（桌面专用场景裁剪，移除无用的 cdylib/staticlib）；`tauri-build = "2"`。
 
-## 7. CI/CD 现状
+## 7. 质量门（本地手工执行）
 
-项目通过 `.github/workflows/checks.yml` 定义**可复用检查工作流**（`workflow_call`），供 `ci.yml`（push/PR）与 `release.yml`（tag 触发的发布前置门）共享。**仅含 `rust-checks` 单一 job**，运行于 `windows-latest`。
+项目不使用 CI，全部检查在本地手工执行。提交前依次运行以下命令（零警告为准）：
 
-### 7.1 rust-checks 步骤（真实顺序）
-
-| 步骤 | 说明 |
+| 命令 | 说明 |
 |------|------|
-| Checkout | `actions/checkout@v4` |
-| Install Rust stable | `dtolnay/rust-toolchain@stable`（`components: clippy, rustfmt`），兼容 MSRV 1.80 |
-| Cache cargo | `Swatinem/rust-cache@v2`（cache-key 含 Cargo.lock / Cargo.toml / runner.os） |
-| Provision mpv runtime | `pwsh` 固定 release（20260903）+ SHA256 校验下载 `mpv.exe`（`mpv/` 在 `.gitignore`，`tauri_build::try_build` 编译期校验其存在） |
-| Test | `cargo test --workspace`（隐含编译，无独立 Build 步骤） |
-| Clippy | `cargo clippy --workspace --all-targets -- -D warnings` |
-| Format check | `cargo fmt --all --check` |
-| Run ignored tests | `cargo test --workspace -- --ignored`（`continue-on-error: true`，不阻断流程） |
-| Install cargo-audit | `taiki-e/install-action@cargo-audit` |
-| Security audit | `cargo audit` |
+| `cargo check --workspace` | 编译检查 |
+| `cargo test --workspace` | 全部单元/集成测试（隐含编译） |
+| `cargo clippy --workspace --all-targets -- -D warnings` | Lint，零警告 |
+| `cargo fmt --all --check` | 格式检查 |
+| `cargo test --workspace -- --ignored` | 共享资源类串行测试（本地按需执行） |
+| `cargo audit` | 依赖安全审计 |
 
-### 7.2 触发与发布门
-
-- `ci.yml`：push / PR（`main` / `master`）触发，`checks: uses: ./.github/workflows/checks.yml`（仅 13 行）。
-- `release.yml`：tag `v*` 触发，`permissions: contents: write`，三 job 结构 `verify-secrets → checks → build-and-release`：
-  - `verify-secrets`（`ubuntu-latest`）：对 `TAURI_SIGNING_PRIVATE_KEY` / `_PASSWORD` 判空 fail-fast。
-  - `checks`（`needs: verify-secrets`）：复用 checks.yml，质量门与 CI 完全一致。
-  - `build-and-release`（`windows-latest`）：checkout → Rust stable → rust-cache → `cargo install tauri-cli` → 再次 Provision mpv runtime → `tauri-apps/tauri-action@v0`（`tauriScript: cargo tauri`，`releaseDraft: true`）。
-- `.github/dependabot.yml`：weekly（周一）调度，覆盖 **cargo / github-actions 两生态**（无 npm），每生态 `open-pull-requests-limit: 5`，含同生态 minor/patch 分组与 `chore(deps)` 提交前缀。
+> 打包与发布由本地执行 `cargo tauri build` 生成 NSIS 安装包后人工发布。
 
 ## 8. 构建配置要点与构建机制
 
@@ -184,8 +170,8 @@ cargo tauri build          # 生成 NSIS 安装包（含资源）
 ### 8.3 已修正的过时表述
 
 - 移除 Node / npm / Vite / Vitest / TypeScript / ESLint / Prettier 及 `package.json` 相关内容（宿主文件已随前端删除）。
-- `frontend-checks` CI job 已删除，CI 仅 `rust-checks` 单 job。
-- Dependabot 覆盖为 cargo / github-actions **两生态**（非三生态）。
+- 原前端 `frontend-checks` 检查已随前端一并删除。
+- 依赖升级由人工评估，无自动更新机器人。
 - `rust-toolchain.toml` **存在且已入库**（此前"未提交"描述失真）。
 - workspace 结构为 **4 个成员**（含 `crates/mirrorstar-ui`）。
 - `clippy.toml` 已删除（Rust ≥1.74 clippy 自动读取 `Cargo.toml` 的 rust-version）。
@@ -193,7 +179,6 @@ cargo tauri build          # 生成 NSIS 安装包（含资源）
 ### 8.4 待确认项（未实施，登记备查）
 
 - `mirrorstar-ui` / `mirrorstar-wp-proc` 声明了直接依赖 `serde` 但源码仅用 `serde_json`（属依赖图声明变更，待单独处理）。
-- `checks.yml` 与 `release.yml` 的 mpv provisioning 脚本逐字重复，可抽 composite action（会改动 workflow step 结构）。
 - `capabilities/default.json` 中 `dialog:allow-open` 已被 `dialog:default` 覆盖；`gen/schemas/` 下 `desktop-schema.json` 与 `windows-schema.json` 字节相同且入库；`rustfmt.toml` 多项为默认值。
 
 ## 9. 常见问题
