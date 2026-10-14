@@ -403,6 +403,8 @@ async fn run_loop(
     // 记录已生效的排列：主循环据此检测排列变更并按新布局即时重建。
     let mut applied_arrangement = cfg.arrangement;
     apply_boot(&handle, &layout, &app).await;
+    // v17 启动关键路径埋点：boot 壁纸已应用（首个 apply 完成）
+    mirrorstar_core::perf::mark_boot_stage("boot_wallpaper_applied");
     handle.flush_playback();
 
     let mut next_rotation: Option<Instant> = None;

@@ -20,6 +20,11 @@ pub struct MpvResponse {
 /// mpv IPC 客户端类型标记（用于 `NamedPipeClient<T>` 的类型参数）
 struct MpvClient;
 
+/// 播放速度量程下限（与 mpv `speed` 属性、UI 滑块量程一致）。
+pub const SPEED_MIN: f32 = 0.25;
+/// 播放速度量程上限。
+pub const SPEED_MAX: f32 = 4.0;
+
 /// mpv IPC 客户端，通过命名管道控制 mpv 播放器
 ///
 /// 基于 `NamedPipeClient<T>` 泛型基类的薄封装，仅实现 mpv 协议特定的
@@ -208,7 +213,7 @@ impl MpvIpcClient {
     /// I-005：在发送给 mpv 前校验输入。`speed` 必须为有限值（非 NaN/inf）且在
     /// `[0.25, 4.0]` 范围内（与文档注释一致），越界返回 `MirrorStarError::InvalidArgument`，不发送命令。
     pub fn set_speed(&mut self, speed: f32) -> Result<(), crate::MirrorStarError> {
-        if !speed.is_finite() || !(0.25..=4.0).contains(&speed) {
+        if !speed.is_finite() || !(SPEED_MIN..=SPEED_MAX).contains(&speed) {
             return Err(crate::MirrorStarError::InvalidArgument {
                 reason: format!("speed 必须在 [0.25, 4.0] 范围内且为有限值，实际: {}", speed),
             });

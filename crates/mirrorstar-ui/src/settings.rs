@@ -364,10 +364,10 @@ pub fn volume_percent(volume: f32) -> i32 {
     (volume.clamp(0.0, 1.0) * 100.0).round() as i32
 }
 
-/// 播放速度滑块量程下限（归一化值 0.0 对应）。
-pub const SPEED_MIN: f32 = 0.25;
-/// 播放速度滑块量程上限（归一化值 1.0 对应）。
-pub const SPEED_MAX: f32 = 4.0;
+/// 播放速度滑块量程下限（单一来源见 `mirrorstar_core::ipc::mpv_protocol`）。
+pub const SPEED_MIN: f32 = mirrorstar_core::ipc::mpv_protocol::SPEED_MIN;
+/// 播放速度滑块量程上限。
+pub const SPEED_MAX: f32 = mirrorstar_core::ipc::mpv_protocol::SPEED_MAX;
 
 /// 播放速度 sanitize：NaN → 1.0，越界 clamp 到 `[SPEED_MIN, SPEED_MAX]`（滑块量程）。
 pub fn sanitize_speed(speed: f32) -> f32 {

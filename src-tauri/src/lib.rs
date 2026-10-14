@@ -224,6 +224,9 @@ fn trace_panic_info(info: &std::panic::PanicHookInfo<'_>) {
     if let Err(e) = std::fs::create_dir_all(&root) {
         tracing::error!(error = %e, "panic hook：创建数据根目录失败，无法写 crash.log");
     }
+    // 自限幅：同一会话内反复 panic（含被 catch_unwind 捕获者）会持续追加 crash.log；
+    // 每次追加前按大小轮转，避免会话内无上限增长（启动期 rotate 仅兜底）。
+    let _ = mirrorstar_core::log_retention::rotate_crash_log(&root);
     let path = root.join("crash.log");
     match std::fs::OpenOptions::new()
         .create(true)
@@ -430,6 +433,10 @@ fn emit_config_load_error(app_handle: &tauri::AppHandle, error: &ConfigLoadError
 }
 
 pub fn run() {
+    // v17 启动关键路径埋点：进程基线（必须早于 init_data_root / init_logging），
+    // 后续 mark_boot_stage 的耗时均相对该时刻。与内存采样无关，始终启用。
+    mirrorstar_core::perf::mark_boot_stage("process_start");
+
     // 便携化（portable-data-root）：数据根 = 安装目录（exe 所在目录），
     // 在日志初始化之前确定，后续所有数据（配置/壁纸/缩略图/日志/WebView2 缓存）收束于此。
     mirrorstar_core::config::init_data_root(mirrorstar_core::config::resolve_data_root());
@@ -459,6 +466,8 @@ pub fn run() {
 
     // v17 启动期内存埋点：日志初始化完成（首个生命周期打点，亦初始化启动基准时刻）
     mirrorstar_core::perf::mark_lifecycle("log_init");
+    // v17 启动关键路径埋点：日志初始化完成
+    mirrorstar_core::perf::mark_boot_stage("log_init");
 
     // v17 性能埋点：应用启动计时基线（日志初始化完成后开始计时）
     let boot_start = std::time::Instant::now();
@@ -546,6 +555,47 @@ pub fn run() {
         std::process::exit(1);
     }));
 
+    // 启动期非关键清理移入后台线程（与 WorkerW 预初始化线程并行），
+    // 避免占用「开机壁纸应用」关键路径。两项清理均 best-effort，失败仅 warn，不阻断启动。
+    //
+    // 时序正确性：`cleanup_webview2_cache` 必须在任何 wp-proc（网页壁纸子进程）spawn
+    // 之前完成——wp-proc 仅由调度器 `apply_boot` 或用户设置网页壁纸触发 spawn，二者均
+    // 远晚于本线程（Phase 1 即 spawn，早于 Tauri Builder / setup / 调度器 `start()`）。
+    // 故后台清理不会与 wp-proc 的 UserDataFolder 写入产生竞态。
+    //
+    // `cleanup_stale_child_processes` 仍保持在主线程、任何子进程 spawn 之前同步执行
+    // （其正确性依赖「启动时本进程尚未 spawn 任何子进程」），位置未变。
+    //
+    // detached 线程：无需 join（不做过度设计），随进程退出结束；清理目标仅为残留文件，
+    // 退出期竞态无碍。desktop 锁由既有 WorkerW 线程持有，与本线程互不相干。
+    {
+        let config_manager_clone = config_manager.clone();
+        if let Err(e) = std::thread::Builder::new()
+            .name("mirrorstar-boot-cleanup".to_string())
+            .spawn(move || {
+                // 清理旧版本残留 / 异常中断产生的 0 字节损坏缩略图，避免前端预览空白
+                if let Err(e) = config_manager_clone.cleanup_corrupted_thumbnails() {
+                    tracing::warn!(error = %e, "清理损坏缩略图文件失败");
+                }
+                // 清空 WebView2 缓存目录（每实例 PID 子目录），避免随运行次数累积
+                cleanup_webview2_cache();
+                // 全量日志清理：剪枝 mpv 实例日志 / 应用日志，并轮转超限崩溃日志
+                let report = mirrorstar_core::log_retention::prune_logs(
+                    &mirrorstar_core::config::data_root(),
+                );
+                tracing::info!(
+                    mpv_deleted = report.mpv_deleted,
+                    app_deleted = report.app_deleted,
+                    crash_rotated = report.crash_rotated,
+                    freed_bytes = report.freed_bytes,
+                    "启动日志清理完成"
+                );
+            })
+        {
+            tracing::warn!(error = %e, "创建启动清理后台线程失败");
+        }
+    }
+
     // 从配置中应用 GIF 内存管理策略到壁纸引擎
     {
         let config = config_manager.get_config();
@@ -568,11 +618,7 @@ pub fn run() {
         Err(e) => tracing::warn!(error = %e, "配置文件监视启动失败"),
     }
 
-    // 启动时清理 0 字节损坏缩略图文件
-    // 清理旧版本残留或异常中断产生的损坏缩略图，避免前端加载 0 字节文件导致预览空白
-    if let Err(e) = config_manager.cleanup_corrupted_thumbnails() {
-        tracing::warn!(error = %e, "清理损坏缩略图文件失败");
-    }
+    // 注：损坏缩略图清理已移至上方 "mirrorstar-boot-cleanup" 后台线程（非关键路径）。
 
     // 启动全屏应用检测
     start_fullscreen_monitor(wallpaper_engine.clone(), config_manager.clone());
@@ -585,8 +631,9 @@ pub fn run() {
     // 当前进程刚启动尚未 spawn 任何子进程，任何同名存活进程均为崩溃残留。
     cleanup_stale_child_processes();
 
-    // 启动清理：清空 WebView2 缓存目录（每实例 PID 子目录），避免随运行次数累积。
-    cleanup_webview2_cache();
+    // 注：WebView2 缓存清理已移至上方 "mirrorstar-boot-cleanup" 后台线程。
+    // 时序保证：wp-proc 仅在调度器 apply_boot / 用户设置网页壁纸时 spawn，
+    // 均晚于 Phase 1 内该后台线程，故缓存清理先于任何 wp-proc 实例启动。
 
     // 初始化 UI 子进程管理器（解析 mirrorstar-ui.exe 路径与空闲退出阈值）。
     // 原生 UI 子进程即唯一主窗口，按需拉起，不在此处主动启动。
@@ -652,6 +699,8 @@ pub fn run() {
     );
     // v17 启动期内存埋点：引擎 / 配置等基础设施初始化完成
     mirrorstar_core::perf::mark_lifecycle("engine_ready");
+    // v17 启动关键路径埋点：Phase 1 完成（基础设施 + runtime），即将进入 Tauri Builder
+    mirrorstar_core::perf::mark_boot_stage("phase1_ready");
 
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
@@ -971,6 +1020,8 @@ pub fn run() {
                 let state = app.state::<AppState>();
                 state.scheduler.start(app.handle().clone());
             }
+            // v17 启动关键路径埋点：轮换调度器主循环已启动
+            mirrorstar_core::perf::mark_boot_stage("scheduler_started");
 
             // 测试观察通道（仅测试）：设置 MIRRORSTAR_TEST_PURE_MODE=<N> 时，启动后按轮数 N
             // 循环执行"进入 → 保持 → 退出"的纯净壁纸模式往返，供自动化脚本验证
@@ -1116,6 +1167,10 @@ pub fn run() {
                 private_mb = format!("{:.1}", mirrorstar_core::perf::process_private_mb()),
                 "PERF-BOOT: 应用启动完成"
             );
+
+            // v17 启动关键路径埋点：setup 收尾，输出各阶段耗时汇总
+            mirrorstar_core::perf::mark_boot_stage("setup_ready");
+            mirrorstar_core::perf::emit_boot_summary();
 
             Ok(())
         })

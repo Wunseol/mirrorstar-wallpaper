@@ -254,7 +254,7 @@ MirrorStar 采用三类跨进程通信通道（两套命名管道 + 一套 stdio
 ├── playback.toml      # 轮换播放状态（独立于配置，见《10-壁纸轮换调度器》）
 ├── wallpapers/        # 壁纸文件
 ├── thumbnails/        # 缩略图
-├── logs/              # 日志（mirrorstar.log + mpv-*.log）
+├── logs/              # 日志（mirrorstar.log.<日期> + mpv-*.log），受保留上限约束
 └── config.lock        # 写锁
 ```
 
@@ -317,7 +317,11 @@ max_memory_mb = 40               # 帧像素内存预算（[10,500]）
 let log_dir = crate::config::data_root().join("logs");   // 数据根/logs
 std::fs::create_dir_all(&log_dir)?;
 
-let file_appender = tracing_appender::rolling::daily(log_dir, "mirrorstar.log"); // 按日轮转
+let file_appender = RollingFileAppender::builder()
+    .rotation(Rotation::DAILY)                        // 按日轮转
+    .filename_prefix("mirrorstar.log")
+    .max_log_files(APP_LOG_KEEP + 1)                  // 保留最新 KEEP 个（官方建议传 KEEP+1）
+    .build(&log_dir)?;
 let (non_blocking, guard) = tracing_appender::non_blocking(file_appender);
 
 let env_filter = EnvFilter::try_from_default_env()        // 优先 RUST_LOG
@@ -331,10 +335,15 @@ tracing_subscriber::fmt()
 
 要点：
 
-- **日志目录**：`<data_root>/logs/mirrorstar.log`，`rolling::daily` 按日轮转
+- **日志目录**：`<data_root>/logs/mirrorstar.log.<日期>`，`Rotation::DAILY` 按日轮转
 - **级别控制**：`RUST_LOG` 环境变量，默认 `info`
 - **`guard` 生命周期**：`init_logging()` 返回 `WorkerGuard`，由 Tauri `run()` 持有至退出，提前 drop 会丢失尾部日志
 - **mpv 日志**：写入同目录 `mpv-<uuid>.log`（见《05-壁纸渲染》）
+- **日志保留策略**（`mirrorstar-core/src/log_retention.rs`，均 best-effort——目录缺失/删除失败（Windows 文件占用）仅 `tracing::warn` 忽略，绝不 panic）：
+  - **应用日志**：按日轮转 + `max_log_files` 保留最新 `APP_LOG_KEEP = 7` 个（`max_log_files` 传 `KEEP + 1`，实际保留可能略低于设定值）；
+  - **mpv 日志**：保留最新 `MPV_LOG_KEEP = 20` 个，创建新实例日志时**增量剪枝**（`build_mpv_log_path()` 内）+ **启动期兜底**（`prune_logs()`）；
+  - **crash.log**：超过 `CRASH_LOG_MAX_BYTES = 1 MiB` 轮转为 `crash.log.1`；panic hook 每次追加写前亦按大小轮转，会话内自限幅（见《09-性能优化》§24）；
+  - 启动期全量清理在 `mirrorstar-boot-cleanup` **后台线程**执行，不阻塞开机壁纸应用（见《09-性能优化》§24）
 - **性能埋点**：`mirrorstar::perf` target（perf.rs），可用 `RUST_LOG=mirrorstar::perf=info` 单独过滤（见《09-性能优化》）
 
 ***

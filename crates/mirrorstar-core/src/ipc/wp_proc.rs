@@ -312,147 +312,135 @@ mod tests {
 
     // --- WpProcCommand serialization tests ---
 
+    /// 表驱动覆盖全部 7 个 `WpProcCommand` 变体的序列化契约：
+    /// 逐一断言各自的 snake_case `command` tag，以及 request_id 与变体特有字段。
+    /// SetVolume 额外保留一次序列化往返（deserialize back）断言。
     #[test]
-    fn wp_proc_command_play_serialization() {
-        let cmd = WpProcCommand::Play {
-            request_id: 1,
-            source: "https://example.com".to_string(),
-        };
-        let json = serde_json::to_string(&cmd).unwrap();
-        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
-        assert_eq!(v["command"], "play");
-        assert_eq!(v["request_id"], 1);
-        assert_eq!(v["source"], "https://example.com");
-    }
+    fn wp_proc_command_serialization_contracts() {
+        let cases: Vec<(WpProcCommand, &str)> = vec![
+            (
+                WpProcCommand::Play {
+                    request_id: 1,
+                    source: "https://example.com".to_string(),
+                },
+                "play",
+            ),
+            (WpProcCommand::Terminate { request_id: 2 }, "terminate"),
+            (
+                WpProcCommand::SetPosition {
+                    request_id: 3,
+                    x: 0,
+                    y: 0,
+                    width: 1920,
+                    height: 1080,
+                },
+                "set_position",
+            ),
+            (WpProcCommand::Pause { request_id: 5 }, "pause"),
+            (WpProcCommand::Resume { request_id: 6 }, "resume"),
+            (
+                WpProcCommand::SetVolume {
+                    request_id: 7,
+                    volume: 0.75,
+                },
+                "set_volume",
+            ),
+            (WpProcCommand::ToggleMute { request_id: 8 }, "toggle_mute"),
+        ];
 
-    #[test]
-    fn wp_proc_command_terminate_serialization() {
-        let cmd = WpProcCommand::Terminate { request_id: 2 };
-        let json = serde_json::to_string(&cmd).unwrap();
-        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
-        assert_eq!(v["command"], "terminate");
-        assert_eq!(v["request_id"], 2);
-    }
+        for (cmd, expected_tag) in &cases {
+            let json = serde_json::to_string(cmd).unwrap();
+            let v: serde_json::Value = serde_json::from_str(&json).unwrap();
 
-    #[test]
-    fn wp_proc_command_set_position_serialization() {
-        let cmd = WpProcCommand::SetPosition {
-            request_id: 3,
-            x: 0,
-            y: 0,
-            width: 1920,
-            height: 1080,
-        };
-        let json = serde_json::to_string(&cmd).unwrap();
-        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
-        assert_eq!(v["command"], "set_position");
-        assert_eq!(v["request_id"], 3);
-        assert_eq!(v["x"], 0);
-        assert_eq!(v["y"], 0);
-        assert_eq!(v["width"], 1920);
-        assert_eq!(v["height"], 1080);
-    }
+            // 每个变体都必须带正确的 snake_case command tag 与 request_id
+            assert_eq!(v["command"], *expected_tag, "命令 {:?} 的 command tag 不符", cmd);
+            assert_eq!(v["request_id"], cmd.request_id(), "命令 {:?} 的 request_id 不符", cmd);
 
-    #[test]
-    fn wp_proc_command_pause_serialization() {
-        let cmd = WpProcCommand::Pause { request_id: 5 };
-        let json = serde_json::to_string(&cmd).unwrap();
-        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
-        assert_eq!(v["command"], "pause");
-        assert_eq!(v["request_id"], 5);
-    }
-
-    #[test]
-    fn wp_proc_command_resume_serialization() {
-        let cmd = WpProcCommand::Resume { request_id: 6 };
-        let json = serde_json::to_string(&cmd).unwrap();
-        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
-        assert_eq!(v["command"], "resume");
-        assert_eq!(v["request_id"], 6);
-    }
-
-    #[test]
-    fn wp_proc_command_set_volume_serialization() {
-        let cmd = WpProcCommand::SetVolume {
-            request_id: 7,
-            volume: 0.75,
-        };
-        let json = serde_json::to_string(&cmd).unwrap();
-        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
-        assert_eq!(v["command"], "set_volume");
-        assert_eq!(v["request_id"], 7);
-        assert_eq!(v["volume"], 0.75);
-        // 反序列化往返
-        let back: WpProcCommand = serde_json::from_str(&json).unwrap();
-        match back {
-            WpProcCommand::SetVolume { volume, .. } => assert_eq!(volume, 0.75),
-            other => panic!("期望 SetVolume，实际: {:?}", other),
+            // 各变体特有的关键字段
+            match cmd {
+                WpProcCommand::Play { source, .. } => {
+                    assert_eq!(v["source"], *source);
+                }
+                WpProcCommand::SetPosition {
+                    x,
+                    y,
+                    width,
+                    height,
+                    ..
+                } => {
+                    assert_eq!(v["x"], *x);
+                    assert_eq!(v["y"], *y);
+                    assert_eq!(v["width"], *width);
+                    assert_eq!(v["height"], *height);
+                }
+                WpProcCommand::SetVolume { volume, .. } => {
+                    assert_eq!(v["volume"], *volume);
+                    // 反序列化往返：确保 volume 能被还原
+                    let back: WpProcCommand = serde_json::from_str(&json).unwrap();
+                    match back {
+                        WpProcCommand::SetVolume { volume: back_volume, .. } => {
+                            assert_eq!(back_volume, *volume)
+                        }
+                        other => panic!("期望 SetVolume，实际: {:?}", other),
+                    }
+                }
+                WpProcCommand::Terminate { .. }
+                | WpProcCommand::Pause { .. }
+                | WpProcCommand::Resume { .. }
+                | WpProcCommand::ToggleMute { .. } => {}
+            }
         }
-    }
 
-    #[test]
-    fn wp_proc_command_toggle_mute_serialization() {
-        let cmd = WpProcCommand::ToggleMute { request_id: 8 };
-        let json = serde_json::to_string(&cmd).unwrap();
-        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
-        assert_eq!(v["command"], "toggle_mute");
-        assert_eq!(v["request_id"], 8);
+        assert_eq!(cases.len(), 7, "应覆盖全部 7 个 WpProcCommand 变体");
     }
 
     // --- WpProcCommand::request_id tests ---
 
+    /// 表驱动覆盖全部 7 个变体的 `request_id()`，逐一断言返回值。
     #[test]
-    fn wp_proc_command_request_id_play() {
-        let cmd = WpProcCommand::Play {
-            request_id: 10,
-            source: "x".to_string(),
-        };
-        assert_eq!(cmd.request_id(), 10);
-    }
+    fn wp_proc_command_request_id_contracts() {
+        let cases: [(WpProcCommand, u64); 7] = [
+            (
+                WpProcCommand::Play {
+                    request_id: 10,
+                    source: "x".to_string(),
+                },
+                10,
+            ),
+            (WpProcCommand::Terminate { request_id: 20 }, 20),
+            (
+                WpProcCommand::SetPosition {
+                    request_id: 30,
+                    x: 0,
+                    y: 0,
+                    width: 1,
+                    height: 1,
+                },
+                30,
+            ),
+            (WpProcCommand::Pause { request_id: 50 }, 50),
+            (WpProcCommand::Resume { request_id: 60 }, 60),
+            (
+                WpProcCommand::SetVolume {
+                    request_id: 70,
+                    volume: 0.5,
+                },
+                70,
+            ),
+            (WpProcCommand::ToggleMute { request_id: 80 }, 80),
+        ];
 
-    #[test]
-    fn wp_proc_command_request_id_terminate() {
-        let cmd = WpProcCommand::Terminate { request_id: 20 };
-        assert_eq!(cmd.request_id(), 20);
-    }
+        for (cmd, expected) in &cases {
+            assert_eq!(
+                cmd.request_id(),
+                *expected,
+                "命令 {:?} 的 request_id 应为 {}",
+                cmd,
+                expected
+            );
+        }
 
-    #[test]
-    fn wp_proc_command_request_id_set_position() {
-        let cmd = WpProcCommand::SetPosition {
-            request_id: 30,
-            x: 0,
-            y: 0,
-            width: 1,
-            height: 1,
-        };
-        assert_eq!(cmd.request_id(), 30);
-    }
-
-    #[test]
-    fn wp_proc_command_request_id_pause() {
-        let cmd = WpProcCommand::Pause { request_id: 50 };
-        assert_eq!(cmd.request_id(), 50);
-    }
-
-    #[test]
-    fn wp_proc_command_request_id_resume() {
-        let cmd = WpProcCommand::Resume { request_id: 60 };
-        assert_eq!(cmd.request_id(), 60);
-    }
-
-    #[test]
-    fn wp_proc_command_request_id_set_volume() {
-        let cmd = WpProcCommand::SetVolume {
-            request_id: 70,
-            volume: 0.5,
-        };
-        assert_eq!(cmd.request_id(), 70);
-    }
-
-    #[test]
-    fn wp_proc_command_request_id_toggle_mute() {
-        let cmd = WpProcCommand::ToggleMute { request_id: 80 };
-        assert_eq!(cmd.request_id(), 80);
+        assert_eq!(cases.len(), 7, "应覆盖全部 7 个 WpProcCommand 变体");
     }
 
     // --- WpProcCommand::expects_response tests ---

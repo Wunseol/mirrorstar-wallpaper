@@ -306,9 +306,12 @@ impl VideoRenderer {
     /// 数据根解析失败时回退为当前目录，mpv 跳过日志文件创建，不影响正常启动。
     fn build_mpv_log_path(pipe_name: &str) -> Option<std::path::PathBuf> {
         // 便携化：mpv 日志与应用日志同目录（数据根/logs）
-        let log_dir = crate::config::data_root().join("logs");
+        let root = crate::config::data_root();
+        let log_dir = root.join("logs");
         // 确保日志目录存在（忽略创建失败，mpv 会跳过日志写入）
         let _ = std::fs::create_dir_all(&log_dir);
+        // 增长点剪枝：每次构建新实例日志路径前，best-effort 清理超出上限的旧 mpv 日志
+        crate::log_retention::prune_mpv_logs(&root, crate::log_retention::MPV_LOG_KEEP);
         // 从 "mirrorstar-mpv-<uuid>" 提取 "<uuid>" 作为文件名后缀
         let suffix = pipe_name.rsplit('-').next().unwrap_or("unknown");
         Some(log_dir.join(format!("mpv-{}.log", suffix)))

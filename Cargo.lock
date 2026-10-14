@@ -3887,7 +3887,6 @@ dependencies = [
  "image",
  "mirrorstar-core",
  "raw-window-handle",
- "serde",
  "serde_json",
  "slint",
  "slint-build",
@@ -3911,7 +3910,6 @@ dependencies = [
  "tempfile",
  "tokio",
  "tracing",
- "tracing-subscriber",
  "uuid",
  "windows 0.58.0",
 ]
@@ -3922,7 +3920,6 @@ version = "0.1.0"
 dependencies = [
  "clap",
  "mirrorstar-core",
- "serde",
  "serde_json",
  "tracing",
  "tracing-subscriber",

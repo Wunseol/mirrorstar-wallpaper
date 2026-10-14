@@ -29,7 +29,6 @@ slint = { version = "1.18", default-features = false, features = [
     "raw-window-handle-06",
 ] }
 
-serde = { workspace = true }
 serde_json = { workspace = true }
 
 # Slint 只用 `raw_window_handle_06` 命名空间、**不 re-export** 该 crate，
@@ -42,12 +41,13 @@ image = { workspace = true }
 
 # 原生文件拖入（Task 5.5）：`Win32_UI_Shell` 提供 DragAcceptFiles/DragQueryFileW/DragFinish/HDROP；
 # `Win32_System_Ole` 提供 RevokeDragDrop（winit 0.30 默认把窗口注册成 OLE 放置目标，需先撤销，
-# 否则系统不会走 WM_DROPFILES 通道）；`Win32_System_Memory` 提供 GlobalAlloc/GlobalLock，仅供
-# 单测在进程内构造合法 HDROP 以覆盖多文件读取。仅在本 crate 追加 feature，不改根 Cargo.toml。
+# 否则系统不会走 WM_DROPFILES 通道）。单测构造合法 HDROP 所需的 GlobalAlloc/GlobalLock
+# （`Win32_System_Memory`）由根 workspace 声明提供，本 crate 不再重复声明。
 #
-# Task 8 预览：`Win32_System_Com`（CoInitializeEx/CoTaskMemFree）、`Win32_System_LibraryLoader`
-# （GetModuleHandleW）、`Win32_Graphics_Gdi`（ClientToScreen）为宿主子窗口与 WebView2 所需；
-# `Win32_UI_WindowsAndMessaging` 提供 CreateWindowExW/SetWindowPos 等（与 drag&drop 共用）。
+# Task 8 预览：宿主子窗口与 WebView2 所需的 `Win32_System_Com`（CoInitializeEx/CoTaskMemFree）、
+# `Win32_System_LibraryLoader`（GetModuleHandleW）、`Win32_Graphics_Gdi`（ClientToScreen），
+# 以及 `Win32_UI_WindowsAndMessaging`（CreateWindowExW/SetWindowPos 等，与 drag&drop 共用）
+# 均由根 workspace 声明提供，本 crate 不再重复声明。
 #
 # Task 9.7.4 悬停高亮：改用自实现 OLE `IDropTarget` 以获得 DragEnter/DragLeave，故追加
 # `implement`（启用 `#[implement]` 属性宏生成 COM vtable）、`Win32_System_SystemServices`
@@ -59,12 +59,8 @@ image = { workspace = true }
 windows = { workspace = true, features = [
     "Win32_UI_Shell",
     "Win32_System_Ole",
-    "Win32_System_Memory",
-    "Win32_System_Com",
     "Win32_System_Com_StructuredStorage",
     "Win32_System_SystemServices",
-    "Win32_System_LibraryLoader",
-    "Win32_Graphics_Gdi",
     "Win32_UI_Input_KeyboardAndMouse",
     "implement",
 ] }

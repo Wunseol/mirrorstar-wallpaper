@@ -98,6 +98,8 @@ graph LR
 | 桌面集成  | WorkerW 句柄缓存，避免重复查找  | 首次 < 100ms，后续 0ms |
 | UI 渲染 | 原生 UI 子进程（Slint）按需启动 | 主窗口显示 < 500ms |
 
+> 开机自启场景的启动延迟分层归因与自启机制选型，见 §23《开机自启启动延迟优化》。
+
 ## 7. 主窗口 WebView2 懒创建 / 关闭即销毁（⚠️ 已被原生 UI 子进程方案取代，历史条目）
 
 > **已被取代**：主窗口已重构为独立原生 UI 子进程 `mirrorstar-ui.exe`（Slint 软件渲染），壳不再创建任何 WebView2 主窗口。以下 WebView2 懒创建 / 关闭即销毁策略及其数值均为历史记录，仅作演进参考；当前策略与实测数值见 **§21**。
@@ -332,7 +334,7 @@ GIF 内存预算从 200MB 降至 40MB（`MAX_GIF_MEMORY_MB`）。暂停时释放
 
 两者字段与既有 `MEM-ATTRIB` 一致（分类别工作集 / 私有提交与总计：`main_*` / `mpv_*` / `wp_proc_*` / `webview2_*` / `other_*` / `total_*`，含 `*_ws_mb` 与 `*_private_mb`），额外携带 `label` 与 `elapsed_ms`。可用 `RUST_LOG=mirrorstar::perf=info` 单独过滤。
 
-**开关**：环境变量 `MIRRORSTAR_MEM_TRACE`，值为 `0` 或 `off`（大小写不敏感、忽略首尾空白）时关闭；未设置时默认开启启动期 60 秒采集。关闭时不启动时间线线程，`mark_lifecycle` 静默无输出。采样仅做进程树枚举与 `GetProcessMemoryInfo`，不持有引擎 / 桌面锁、不阻塞主线程；60 秒后无持续高频开销。
+**开关**：环境变量 `MIRRORSTAR_MEM_TRACE`，值为 `0` 或 `off`（大小写不敏感、忽略首尾空白）时关闭；未设置时默认开启启动期 60 秒采集（**v17 Task 4 起改为默认关闭（opt-in），仅显式设为非 `0`/`off` 值才开启，见 §23**）。关闭时不启动时间线线程，`mark_lifecycle` 静默无输出。采样仅做进程树枚举与 `GetProcessMemoryInfo`，不持有引擎 / 桌面锁、不阻塞主线程；60 秒后无持续高频开销。
 
 **可归因的生命周期阶段**（`label` 与打点位置）：
 
@@ -528,6 +530,268 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass `
 ```
 
 脚本输出每维度一行 `KEY=value`（`COUNT_*` / `PRIV_*` / `WS_*` / `THREADS_*` / `HANDLES_*` / `GDI_*` / `USER_*` / `GPU_*` / `CPU_*` / `DISK_*`），可解析后填入 §22.3 矩阵。若要覆盖全部情形，需在**独占运行**下逐一切换壁纸类型与状态后重复采样。
+
+## 23. 开机自启启动延迟优化（v17，Task 4）
+
+> 本节聚焦「随 Windows 登录自启」场景下的启动延迟：先给出主流壁纸软件的自启机制调研与本项目选型，再给出可操作的延迟归因方法。本轮**不改变**默认自启机制，仅补齐**与内存无关、始终启用**的启动关键路径耗时埋点，使「登录 → 壁纸就绪」的延迟可被分层测量。
+
+### 23.1 主流开机自启设计调研对比
+
+| 方案 | 自启机制 | 启动时机 | 权限 / 可靠性 |
+|------|---------|---------|--------------|
+| Lively Wallpaper | `HKCU\Software\Microsoft\Windows\CurrentVersion\Run` 写 `Lively = <安装路径>\Lively.exe` | 登录后由 Explorer 处理 Run 项启动 | 无需提权；实现简单可靠 |
+| Wallpaper Engine（普通模式） | 设置项写入 Run 键，静默后台启动（托盘常驻） | 同上（登录后由 Explorer 拉起 Run 项） | 无需提权；与 Lively 同级 |
+| Wallpaper Engine（高优先级模式） | 注册 **Windows 服务** | 早于其它自启程序启动 | 需安装服务；**可靠性较差，易被杀软拦截** |
+| 通用可靠替代（计划任务） | **计划任务**「登录时」触发器（可设延迟等待依赖就绪） | 由任务计划程序在登录时触发，**绕过 Explorer 启动节流** | 创建当前用户任务通常**无需提权**；比服务可靠 |
+| Windows 内置启动延迟 | `HKCU\Software\Microsoft\Windows\CurrentVersion\Explorer\Serialize` 下 `StartupDelayInMSec=0` + `WaitForIdleState=0` | 作用于 Explorer 启动**所有** Run 项 | 关闭系统人为延迟；属**用户全局**设置，需谨慎 |
+
+### 23.2 本项目选型决策
+
+**默认机制保持 `HKCU\Software\Microsoft\Windows\CurrentVersion\Run`（`tauri-plugin-autostart`，对应 FR-022「写入注册表启动项，无需管理员权限」）**，理由：
+
+1. 与 Lively Wallpaper、Wallpaper Engine 普通模式对齐，属社区主流、用户可预期；
+2. 写当前用户 Run 键**无需提权**（`src-tauri/src/commands/system.rs` 的 `toggle_auto_start` / `get_auto_start_status` 直接经插件管理器读写）；
+3. 实现简单，不引入服务安装/卸载、安全软件拦截等额外故障面。
+
+**高优先级机制（Windows 服务 / 计划任务）与 `Serialize` 注册表调整列为「非目标」**：本轮不做，仅记录于此；待**真机冷启动实测**证明「OS 侧启动调度（Explorer 逐个拉起 Run 项的人为节流）」为延迟主要瓶颈后，再单独立项评估。
+
+### 23.3 启动延迟分析方法
+
+**（1）应用侧归因**：读取日志中 target `mirrorstar::perf` 的一行 `PERF-BOOT: 启动阶段耗时汇总`，逐字段比较（字段按日志输出顺序）：
+
+| 字段 | 打点位置 | 含义 |
+|------|---------|------|
+| `process_start_ms` | `src-tauri/src/lib.rs` `run()` 首语句 | 进程基线（≈0） |
+| `log_init_ms` | `run()` 日志初始化之后 | 日志系统就绪 |
+| `phase1_ready_ms` | `run()` Phase 1 完成处 | 基础设施 + runtime 就绪（即将进入 Tauri Builder） |
+| `setup_ready_ms` | `run()` setup 收尾 | 托盘 / WorkerW 兜底等 setup 尾部完成，并在此输出汇总 |
+| `scheduler_started_ms` | `run()` setup 内 `scheduler.start()` 之后 | 轮换调度器主循环已启动 |
+| `boot_wallpaper_applied_ms` | `src-tauri/src/scheduler.rs` `run_loop` `apply_boot` 之后 | 开机壁纸应用完成 |
+
+各值为相对进程基线的 `elapsed_ms`，**未到达阶段为 `-1`**；相邻阶段（按时间先后）相减即该阶段净耗时。注意日志字段顺序 ≠ 时间顺序：`scheduler_started` 与 `setup_ready` 同在 setup 内、前者略早，故 `setup_ready_ms − scheduler_started_ms` 反映 **setup 尾部（托盘创建 / WorkerW 兜底）** 耗时。据此判断瓶颈是否落在「setup 尾部」或「渲染器（mpv / WebView2 / UI 子进程）启动」：若 `setup_ready_ms` 相比 `phase1_ready_ms` 明显偏大，瓶颈在 setup 尾部；若其后（即时日志中）`boot_wallpaper_applied` 仍大幅滞后，瓶颈在渲染器启动。
+
+> 单阶段实时值亦可直接读即时日志 `PERF-BOOT: <label>`（字段 `stage` / `stage_ms`）。汇总在 setup 收尾输出，此时调度器若尚未走到 `apply_boot`，`boot_wallpaper_applied_ms` 记为 `-1`，可改读其后的 `PERF-BOOT: boot_wallpaper_applied` 即时日志。
+
+**（2）OS 侧归因**：对比**日志首行时间戳**（`PERF-BOOT: process_start`，即进程创建时刻）与**系统登录时间**（Windows 事件日志 / 任务管理器「启动」时间）。二者差值反映「用户登录 → 本进程被拉起」的间隔，即 Explorer 启动 Run 项的延迟，属 OS 侧启动调度，应用侧无法优化。
+
+**（3）内存维度（可选）**：上述启动关键路径埋点**与内存无关、始终启用**；如需同时观察启动期内存时间线，设置 `MIRRORSTAR_MEM_TRACE=1` 重新启用既有的 `MEM-MARK` / `MEM-TIMELINE`（**默认已关闭**，见 §20）。
+
+### 23.4 非目标与后续立项条件
+
+| 项 | 状态 | 立项触发条件 |
+|----|------|-------------|
+| 计划任务（「登录时」触发器，可设延迟等待依赖就绪） | 非目标 | OS 侧归因显示「登录 → 进程拉起」延迟为主要瓶颈时评估 |
+| Windows 服务（高优先级） | 非目标 | 仅当需早于其它自启程序、且能接受可靠性下降时评估 |
+| `Serialize\StartupDelayInMSec=0` / `WaitForIdleState=0` | 非目标 | 明确接受改动**用户全局**自启行为时评估；默认不触碰 |
+
+**本轮相关改动（均为「可测量化 / 去阻塞」，未产出实测数值，待真机冷启动实测）**：新增始终启用的启动关键路径埋点（`perf::mark_boot_stage` / `perf::emit_boot_summary`，target `mirrorstar::perf`）；启动期内存埋点改为默认关闭（opt-in）；非关键启动清理（`cleanup_corrupted_thumbnails` / `cleanup_webview2_cache`）从 Phase 1 主线程同步链移入后台线程（与 WorkerW 预初始化并行），`cleanup_stale_child_processes` 仍先于任何子进程 spawn。
+
+**来源**：
+
+- Wallpaper Engine 自动启动帮助页：`https://help.wallpaperengine.io/en/functionality/automaticstartup.html`
+- Microsoft Q&A：Windows 11 启动应用被人为延迟：`https://learn.microsoft.com/en-us/answers/questions/4059183/startup-apps-artificially-delayed-on-windows-11`
+- Run / RunOnce 注册表键文档：`https://learn.microsoft.com/en-us/Windows/Win32/setupapi/run-and-runonce-registry-keys`
+
+## 24. 日志保留与自动清理（v17）
+
+> 本节解决「日志目录随运行时间无限增长」的问题：应用日志按日轮转但从不清理旧文件、mpv 每个实例一个日志文件随轮换 / 多屏反复创建渲染器线性增长、`crash.log` 追加写无上限。策略集中在新增模块 `mirrorstar-core/src/log_retention.rs`，全部为 best-effort，失败仅 warn 不 panic。
+
+### 24.1 问题
+
+- **应用日志**：按日轮转，但无数量上限，长期运行后旧日志文件不断累积；
+- **mpv 日志**：每个 mpv 实例写一个 `mpv-<uuid>.log`，轮换播放 / 多屏反复创建渲染器时文件数**线性增长**，长会话下无界；
+- **crash.log**：追加写、无大小上限，反复崩溃时可持续膨胀。
+
+### 24.2 保留策略
+
+| 日志 | 保留策略 | 上限常量 | 触发时机 |
+| ---- | -------- | -------- | -------- |
+| `mirrorstar.log.<日期>` | 按日轮转 + `max_log_files` | 保留最新 `APP_LOG_KEEP = 7` 个 | 轮转时 |
+| `mpv-*.log` | 按数量保留最新 K 个 | `MPV_LOG_KEEP = 20` | 创建新实例日志时（增长点）+ 启动兜底 |
+| `crash.log` | 大小轮转 | `CRASH_LOG_MAX_BYTES = 1 MiB`，超出转 `crash.log.1` | 追加写前 + 启动时 |
+
+`PruneReport` 字段：`mpv_deleted` / `app_deleted` / `crash_rotated` / `freed_bytes`。
+
+### 24.3 调用点
+
+1. **应用日志轮转**：`mirrorstar-core/src/lib.rs` `init_logging()` 改用 `RollingFileAppender::builder().rotation(Rotation::DAILY).filename_prefix("mirrorstar.log").max_log_files(APP_LOG_KEEP + 1).build(&log_dir)`；初始化失败返回 `MirrorStarError` 而非 panic，其余语义（日志目录 `<数据根>/logs`、`RUST_LOG` 级别、返回 `WorkerGuard`）不变。`max_log_files` 传 `KEEP + 1` 为官方建议（实际保留可能略低于设定值）。
+2. **mpv 日志增长点剪枝**：`mirrorstar-core/src/wallpaper/video.rs` `build_mpv_log_path()` 在返回路径前调用 `prune_mpv_logs(&data_root, MPV_LOG_KEEP)`，使长会话（轮换 / 多屏反复创建渲染器）下 mpv 日志总数有界。
+3. **启动兜底**：`src-tauri/src/lib.rs` 既有后台线程 `mirrorstar-boot-cleanup` 内（紧随缩略图 / WebView2 缓存清理之后）调用 `prune_logs(&data_root())`，并输出一条 `tracing::info!` 统计日志（字段 `mpv_deleted` / `app_deleted` / `crash_rotated` / `freed_bytes`，message 为「启动日志清理完成」）。除启动期轮转外，panic hook（`trace_panic_info`）在每次追加写 `crash.log` **之前**亦调用 `rotate_crash_log`，使同一会话内反复崩溃（含被 `catch_unwind` 捕获、进程不终止者）时 `crash.log` 仍在会话内自限幅。
+
+### 24.4 best-effort 语义
+
+- 目录缺失 / 删除失败（Windows 文件占用）仅 `tracing::warn` 忽略，**绝不 panic**；
+- 启动期全量清理（`prune_logs`）在 detached 后台线程 `mirrorstar-boot-cleanup` 内执行，**不阻塞**开机壁纸应用。
+
+***
+
+## 25. 资源自动无限增长审查（审查结论）
+
+> 本节记录一次面向「随时间 / 事件累积、无上界、无自动回收」的资源专项审查结论（change-id `audit-resource-growth`）。审查覆盖磁盘、进程/线程/句柄、内存集合/通道三个维度，逐项给出「有界 / 无界」判定与证据；对确认的无界增长缺陷已落地修复。
+
+### 25.1 日志保留改动的正确性复核
+
+复核 `add-log-retention`（§24）改动：日志文件名仍为 `mirrorstar.log.<日期>`、`RUST_LOG` 级别控制与 `WorkerGuard` 语义未变；剪枝按 mtime 保留最新 N 个，删除失败（Windows 共享冲突）仅 `warn` 不 panic，不误删在用文件；`init_logging` 失败返回 `Err`（调用方仅打印 stderr 继续运行，不 panic）；启动期 `prune_logs` 在后台 `mirrorstar-boot-cleanup` 线程执行，不阻塞壁纸应用；`build_mpv_log_path` 内的 `prune_mpv_logs` 仅遍历 `logs/` 下少量 `mpv-*.log`，无竞态、无可感知延迟。**结论：无回归。**
+
+### 25.2 三维度有界 / 无界判定表
+
+| 维度 | 资源项 | 判定 | 上界 / 回收时机 | 证据 |
+|------|--------|------|----------------|------|
+| 磁盘 | 应用日志 `mirrorstar.log.<日期>` | 有界 | 按日轮转 + `max_log_files(8)`；启动期剪枝保留 7 | `log_retention.rs`；`lib.rs::init_logging` |
+| 磁盘 | mpv 实例日志 `mpv-*.log` | 有界 | 每次构建新路径前剪枝保留 20；启动期兜底 | `wallpaper/video.rs::build_mpv_log_path` |
+| 磁盘 | `crash.log` | 有界（修复后） | 每次追加前按 1 MiB 轮转（新增）+ 启动期轮转；最多一份 `.1` | `lib.rs::trace_panic_info`；`log_retention.rs::rotate_crash_log` |
+| 磁盘 | `thumbnails/` 缩略图 | 有界（修复后） | 移除库条目即回收 `entry.thumbnail` 与派生缓存 | `commands/wallpaper.rs::remove_wallpaper` |
+| 磁盘 | WebView2 UDF `webview2-cache/<pid>` | 有界 | 渲染器 `terminate()` / `Drop` 即回收；启动期兜底 | `wallpaper/web.rs` |
+| 磁盘 | 抽帧临时目录 / 临时文件 | 有界 | `TmpDirGuard` / `TmpFileGuard` RAII 析构即删 | `config/thumbnail.rs` |
+| 磁盘 | `config.lock` | 有界 | 孤儿锁启动期清理 | `config/manager.rs::cleanup_orphan_lock_files` |
+| 进程/线程/句柄 | mpv / wp-proc 子进程 | 有界 | Job Object `KILL_ON_JOB_CLOSE` + `terminate`；启动期清理孤儿 | `lib.rs::cleanup_stale_child_processes` |
+| 进程/线程/句柄 | 每渲染器线程（`video-pause`/`video-audio`/`web-pause`/`proc-monitor`） | 有界 | 通道 sender 全部 drop / 子进程退出后线程退出 | `wallpaper/video.rs`；`wallpaper/mod.rs::spawn_proc_exit_monitor` |
+| 进程/线程/句柄 | 全屏监控线程 + WinEvent 钩子 | 有界 | 二次启动先 `UnhookWinEvent` + `WM_QUIT` + `join` | `platform/fullscreen.rs`；`state.rs` |
+| 进程/线程/句柄 | 全屏周期复查线程 | 有界 | `RUNNING=false` + `join` | `platform/fullscreen.rs` |
+| 进程/线程/句柄 | 纯净模式输入线程 | 有界 | 退出/超时路径 `join` | `platform/pure_mode_input.rs` |
+| 进程/线程/句柄 | UI 子进程 `mirrorstar-ui.exe` | 有界 | 空闲超时退出回收 | `ui_process/mod.rs::should_exit_idle` |
+| 进程/线程/句柄 | 命名管道句柄 | 有界 | `OwnedHandle` / `File` RAII | `mirrorstar-wp-proc/src/ipc_server.rs` |
+| 进程/线程/句柄 | 缩略图任务句柄 | 有界 | 槽上限 50 + 回收已完成 | `commands/wallpaper.rs` |
+| 内存集合/通道 | `DISPLAYS_SETTING` 去重集 | 有界 | RAII `DisplaySettingGuard::Drop` 移除 | `commands/wallpaper.rs` |
+| 内存集合/通道 | 存活看护探针 map | 有界 | 每轮用当前快照整体替换收敛 | `platform/liveness_watchdog.rs` |
+| 内存集合/通道 | UI `missing_ids` / `thumb_failed_paths` | 有界 | `reconcile_references` 按库 `retain` | `mirrorstar-ui/src/store.rs` |
+| 内存集合/通道 | UI 视频缩略图 `dispatched` 去重集 | 有界 | 会话级去重；UI 进程空闲退出即释放 | `mirrorstar-ui/src/videothumb.rs` |
+| 内存集合/通道 | `pause_senders` 通道 | 有界 | 随渲染器生命周期；消费方按用户操作消费 | `wallpaper/mod.rs` |
+
+### 25.3 本次修复
+
+1. **`crash.log` 会话内自限幅**：panic hook 每次追加前调用 `rotate_crash_log`，使同一会话内反复崩溃（含被 `catch_unwind` 捕获者）时 `crash.log` 仍受 1 MiB 上界约束（原实现仅在启动期轮转）。
+2. **移除库条目时回收缩略图**：`remove_wallpaper` 不再将缩略图回收绑定在 `delete_file` 分支内——库条目移除后缩略图即为孤儿，无论是否删除源文件都回收，避免「移除库但保留文件」反复操作累积孤儿缩略图。
+
+## 26. 发布件体积构成与臃肿审查（审查结论）
+
+> 本节记录一次针对「项目臃肿与打包体积」的专项归因审查（change-id `investigate-project-bloat`），审查范围包括**体积构成**（安装包与随包载荷的字节/占比）、**依赖膨胀**（多版本依赖、未使用依赖、冗余特性）、**代码臃肿**（重复实现、过度抽象、死代码）与**测试规模**（`#[test]` / `#[ignore]` 数量与价值）四个维度。
+>
+> **落位说明**：本审查原计划将「臃肿清单与整改建议」写入 `docs/.../10-实施路线图.md` 的 §10.19.4，但**经核实本仓库不存在该文件与该章节**；既有的「全模块深度审查」结论实际分散登记于 `docs/04-优化文档/` 各模块文档的「深度审查」章节，以及《11-附录C-跨模块一致性规范》。本着「合并进既有文档、不新建重复文档」的原则，本审查的全部结论统一落到本节，并与既有登记项显式去重。
+
+### 26.1 体积构成与主因排序
+
+下表中「压缩后占安装包比例」按 NSIS 实际 LZMA 压缩后的口径估算：
+
+| 项目 | 字节 | MiB | 证据 | 压缩后占安装包比例 |
+| ---- | ---- | --- | ---- | ------------------ |
+| NSIS 安装包 | 43,020,782 B | 41.03 MiB | `target/release/bundle/nsis/MirrorStar Wallpaper_0.1.0_x64-setup.exe` | 100% |
+| 随包 `mpv/mpv.exe` | 123,164,160 B | 117.46 MiB | bundle resources | 压缩后 ≈ 34.1 MiB，≈ **83%** |
+| 随包 `mirrorstar-ui.exe` | 11,632,128 B | 11.09 MiB | bundle resources | 压缩后 ≈ 4.16 MiB，≈ **10%** |
+| 随包 `mirrorstar-wallpaper.exe` | 9,606,144 B | 9.16 MiB | bundle 主程序 | 压缩后 ≈ 2.79 MiB，≈ **7%** |
+| 随包 `mpv/license` | 19,873 B | — | bundle resources | 可忽略 |
+| **未压缩载荷合计** | **144,422,305 B** | **137.7 MiB** | 上列随包载荷求和 | — |
+
+**压缩证据**：内存内 Deflate(Optimal) 实测压缩率——`mpv.exe` 39.5%、`mirrorstar-ui.exe` 51.0%、主 `mirrorstar-wallpaper.exe` 41.4%；NSIS 采用 LZMA，实压缩比 Deflate 再优约 **26.5%**（安装包 43,020,782 / Deflate 合计 58,528,630 ≈ 0.735）。
+
+**主因排序**：
+
+1. **`mpv.exe`（绝对主因，占安装包约 80–85%）**：单个外部二进制即贡献了绝大部分压缩体积，其余所有因素相加不及其量级。
+2. **依赖树 / 自研代码（次要因素）**：`cargo metadata` 解析出 **875 个包**，两个自研 exe 压缩后合计约 **7 MiB ≈ 17%**；已做多项裁剪（见 §26.4），进一步压缩空间有限。
+3. **构建配置（几乎无剩余空间）**：`[profile.release]` 的 `lto` / `codegen-units = 1` / `strip = symbols` / `panic = abort` 已**全部启用**，无进一步压榨余地。
+
+### 26.2 增长归因（「为何越来越大」）
+
+1. **commit `06adc98`「Update」（2026-10-10）引入独立的 Slint UI 子进程**：新增 `crates/mirrorstar-ui`（Slint 1.18 renderer-software），`bundle.resources` 由 `mirrorstar-wp-proc.exe` 改为 `mirrorstar-ui.exe`，随包新增 **11.63 MiB** exe；同时 `Cargo.lock` 由 5364 行增至 8552 行（**+59%**），依赖树显著膨胀。
+2. **同一 commit 合并了 wp-proc bin 入口**：独立 `mirrorstar-wp-proc` bin 入口被删除、代码并入主壳 exe，导致**主 exe 自身增重**，但随包不再包含 `mirrorstar-wp-proc.exe`（净体积为 exe 内部增长）。
+3. **`mpv/mpv.exe` 未纳入版本控制（体积不可追溯的主要风险点）**：`.gitignore` 含 `mpv/*`，`git ls-files mpv` 仅列出 `license`，故其 **117.46 MiB** 体积变化**无法用 git 归因**——该文件属手工放置的外部二进制，任何替换/升级都不会在版本历史中留下痕迹。
+
+### 26.3 三类增长来源评估
+
+| 来源 | 结论 | 可操作性 | 风险 |
+| ---- | ---- | -------- | ---- |
+| ① 随包资源 | `mpv` 独占约 **83%** 压缩体积，`ui` 约 **10%**，`license` 可忽略 | **高杠杆**，但需功能回归（mpv 精简构建或按需下载） | Medium |
+| ② 代码 / 依赖 | 875 个包，两 exe 压缩后合计约 **17%** | 已做 `image default-features = false`、tauri feature 裁剪、wp-proc 合并，**进一步裁剪收益有限** | Low |
+| ③ 构建配置 | `lto` / `strip` / `codegen-units` / `panic = abort` 已全部启用，几无空间 | 几无可操作项（`opt-level = "z"` 收益小且有性能风险） | Low |
+
+### 26.4 依赖与二进制膨胀
+
+**关键多版本依赖**（代表性）：
+
+| 依赖 | 版本 | 来源 | 可否合并 | 风险 |
+| ---- | ---- | ---- | -------- | ---- |
+| `windows` | 0.58 / 0.61.3 / 0.62.2 | 0.58 直接；0.61 ← tauri/tao/wry/webview2-com 0.38；0.62 ← slint | **不可合并**（生态锁定） | High |
+| `webview2-com` | 0.34 / 0.38.2 | 直接 0.34 vs tauri 传递 0.38 | 不可（跨版本 `Param` trait 不互通，已有决策保留） | Medium |
+| `windows-sys` | ×4：0.52 / 0.59 / 0.60.2 / 0.61.2 | 传递依赖 | 不可 | Medium |
+| `winreg` | 0.55 / 0.10.1 | 0.10.1 经 tauri-plugin-autostart → auto-launch | 不可 | Low |
+| `thiserror` | 1.x / 2.x | 直接 + 传递 | 不可 | Low |
+| `toml` | 0.8 / 0.9 / 1.1 | 直接 + 传递 | 不可 | Low |
+| `hashbrown` | ×4 | 传递依赖 | 不可 | Low |
+| `png` / `syn` / `bitflags` / `getrandom` | 0.17·0.18 / 2·3 / 1·2 / 0.3·0.4 | 传递依赖 | 不可 | Low |
+
+> **注意**：`Cargo.toml` 注释称「对齐 winreg 0.55 避免编译两份」，但实际仍存在 `0.10.1`（链路为 tauri-plugin-autostart → auto-launch），**该目标未完全达成**，如实记录。
+
+**疑似未使用依赖（3 项，均可删，但体积收益 ≈ 0，属依赖卫生问题）**：
+
+- `crates/mirrorstar-wp-proc/Cargo.toml` 的 `serde`；
+- `src-tauri/Cargo.toml` 的 `tracing-subscriber`；
+- `crates/mirrorstar-ui/Cargo.toml` 的 `serde`。
+
+**特性审查**：
+
+- 根 `windows` 的 `Win32_System_IO` 疑似无引用（但可能被 `Win32_System_Pipes` **隐式启用**，故实际收益可能为 0）；
+- `mirrorstar-ui` 的 windows target 追加特性中 `Win32_System_Memory` / `Win32_System_Com` / `Win32_System_LibraryLoader` / `Win32_Graphics_Gdi` 与根声明**重复**（冗余，零收益）。
+
+**结论句**：真正影响体积的是 `windows` / `webview2-com` 的**三版本并存**，属高风险的生态锁定问题，维持现状更稳妥。
+
+### 26.5 代码臃肿审查（复核 + 增量）
+
+本项目已于 2026-10-10 ~ 11 完成「全模块深度审查」（覆盖 98 个受控 `.rs` 文件），跨模块重复实现与待确认项已**分散登记**于 `docs/04-优化文档/` 各模块文档的「深度审查」章节与《11-附录C》（约 15 项）。本轮为**复核 + 增量**。
+
+**本轮新增 2 项（均 Low 级「疑似」）**：
+
+1. **预览速度量程 `[0.25, 4.0]` 重复硬编码**：在 `crates/mirrorstar-ui/src/settings.rs:367-370` 与 `crates/mirrorstar-core/src/ipc/mpv_protocol.rs:211` 各硬编码一份，**无共享常量**。
+2. **三套速度校验语义不同且分散**：`core/src/wallpaper/mod.rs:810`（`> 0`）、`core/src/ipc/mpv_protocol.rs:211`（`[0.25, 4.0]`）、`core/src/config/validation.rs:29`（`(0, 10]`），跨层定义、规则不一致。
+
+**其余复核结论**：
+
+- **无新增过度抽象**：唯一自定义 trait `WallpaperRenderer` 有 4 个生产实现；泛型均 ≥ 2 处实例化；命令层单行委托属命令适配层职责，**合理**。
+- **无新增死代码**：既有死/弱引用项均已在各模块文档登记（如 `volume.rs::get_process_volume`、`mpv_protocol.rs::set_volume`、`JobObjectGuard` 的 `impl Debug` 等）。
+
+**结论句**：代码层面**未发现新的、高价值的臃肿项**，主要重复实现已在历史深度审查中登记。
+
+### 26.6 测试规模与价值评估
+
+| crate | `#[test]` | `#[ignore]` | ignore 占比 | LOC |
+| ----- | --------- | ----------- | ----------- | --- |
+| `mirrorstar-core` | 754 | 30 | 4.0% | ~35.9k |
+| `mirrorstar-ui` | 178 | 0 | 0 | ~11.3k |
+| `mirrorstar-wp-proc` | 128 | 0 | 0 | ~5.3k |
+| `src-tauri` | 217 | 38 | 17.5% | ~14.6k |
+| **合计** | **1,277** | **68** | **≈ 5.3%** | — |
+
+**关键澄清**：`cargo build --release` **不编译** `#[cfg(test)]`，因此**测试对发布件体积与发布构建时间零影响**；仅 `cargo test` / `cargo check --all-targets` 才会编译全部 1,277 个测试。
+
+**抽样证据（每类 ≥ 2 例）**：
+
+- **重复**：速度/音量校验规则在约 **6 处**被重测——`core/config/validation.rs` 为唯一定义，却在 `core/wallpaper/gif.rs:1512-1564`、`core/config/settings.rs:804-859`、`core/ipc/mpv_protocol.rs:310-332`、`ui/settings.rs:373`、`ui/preview/video.rs:714`、`src-tauri/commands/wallpaper.rs:1827` 各自重测同一规则。
+- **样板**：`core/src/ipc/wp_proc.rs:315-399` 七个 `wp_proc_command_*_serialization` 逐枚举变体手写；`:404-456` 七个仅断言 getter 的用例。本可参数化却手写展开。
+- **低价值**：`core/wallpaper/manager.rs:2688/2723/2744/2754` 默认值与 setter 断言；`src-tauri/commands/wallpaper.rs:1385-1404` 三例纯映射。
+- **`#[ignore]`**：68 处**全部为环境门控**（需真机 COM / 音频 / 注册表 / 开发者模式符号链接等），**无长期失效未清理**，但仍参与编译、成为纯开销。
+
+**判定**：存在**局部、可控的过度测试**（约 90% 为有价值的行为/回归测试），最突出的是 `core`（样板簇 + 重复校验），`src-tauri` 次之（高 ignore 比、低 CI 信号却高编译成本）。预计经表驱动/参数化合并与删除薄包装重测，可削减约 **40 个**测试而不损覆盖。
+
+**反例（高价值、勿删）**：
+
+- `core/ui_proto/framing.rs`；
+- `core` 的 GIF 解码 / 内存安全回归测试；
+- `wp-proc/webview.rs` 的 `javascript:` 拒绝与 `parse_rect` 边界；
+- `ui/protocol.rs::validate_hello` 与 `store.rs` 空 payload / 未知事件鲁棒性；
+- `src-tauri` 的 `validate_wallpaper_file_path`（符号链接 / 父目录）与 `fullscreen.rs` 的 `is_rect_covering_monitor` / `should_trigger_resume`（修复真实缺陷）。
+
+### 26.7 整改建议（分两档）
+
+**零风险可落地**（含预期收益 / 风险 / 验证；整改进度见 change-id `apply-zero-risk-cleanups`）：
+
+1. **删除 3 项未使用依赖**（wp-proc `serde`、src-tauri `tracing-subscriber`、ui `serde`）——收益：依赖卫生（体积/时长 ≈ 0）；风险 Low；验证：`cargo check --workspace` + `cargo clippy --workspace --all-targets`。**已完成**（change-id `apply-zero-risk-cleanups`）。
+2. **收敛预览速度量程为单一共享常量**（对应 §26.5 新增项 1）——收益：消除跨 crate 字面量漂移；风险 Low。**已完成**（change-id `apply-zero-risk-cleanups`）：`core` 的 `ipc/mpv_protocol.rs` 定义 `SPEED_MIN`/`SPEED_MAX`，ui `settings.rs` 改为别名引用。
+3. **清理 `windows` 冗余/疑似多余 feature**（`Win32_System_IO` + ui target 4 项重复）——收益：清单准确（**体积收益可能为 0**）；风险 Low。**部分完成并修订**（change-id `apply-zero-risk-cleanups`）：ui target 的 4 项重复 feature 已移除；但根 `Win32_System_IO` 经编译验证证实**非冗余**（`ConnectNamedPipe` 门控于该 feature，`Win32_System_Pipes` 不隐含它），已回退保留。
+4. **测试表驱动化/参数化合并、删除薄包装重测**（预计削减约 40 个）——收益：降低 `cargo test` 编译时长与维护面；风险 Low（**须保留 §26.6 反例**）。**部分完成**（change-id `apply-zero-risk-cleanups`）：本轮仅合并 `core/src/ipc/wp_proc.rs` 的 7 个序列化测试 + 7 个 `request_id` 测试（14 → 2 个表驱动测试），其余留待后续。
+
+**需权衡（本轮不动）**：
+
+5. **`mpv.exe` 体积治理**（精简构建 / 按需下载 / 版本治理）——收益最高（潜在减少安装包约 **80%**）；风险 Medium（功能回归 + 分发策略变更 + mpv 未纳入 VCS 的不可追溯问题）。
+6. **`windows`（0.58 / 0.61 / 0.62）与 `webview2-com`（0.34 / 0.38）版本收敛**——收益：体积 / 编译时长；风险 **High**（跨 3 个 minor 的 API 改名风险，维持现状更稳妥）。
 
 ***
 

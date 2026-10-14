@@ -804,8 +804,35 @@ pub async fn remove_wallpaper(
     // remove_wallpaper 仅标记 dirty，命令返回前 flush_library 确保立即持久化
     let removed = state.config_manager.remove_wallpaper(&wallpaper_id)?;
     state.config_manager.flush_library()?;
-    if delete_file {
-        if let Some(entry) = removed {
+    if let Some(entry) = removed {
+        // 修复：缩略图回收不再受 delete_file 约束——库条目已移除，缩略图即为孤儿，
+        // 无论是否删除源文件都应回收，避免「移除库但保留文件」反复操作累积孤儿缩略图。
+        //
+        // 删除对应缩略图（若有），同样先做 data_dir 边界校验防越界删除。
+        // 缩略图按含 uuid 的源路径 hash 命名，逐 id 删除安全，不会误删其他壁纸。
+        if !entry.thumbnail.is_empty()
+            && validate_path_within_data_dir(&entry.thumbnail).await.is_ok()
+        {
+            if let Err(e) = tokio::fs::remove_file(&entry.thumbnail).await {
+                tracing::warn!(error = %e, path = %entry.thumbnail, "删除缩略图失败（配置已移除）");
+            }
+        }
+        // 清理由 file_path 确定性推导的缩略图缓存（UI 按需生成的缓存不会写入配置字段，
+        // 仅凭 entry.thumbnail 无法清理，会留孤儿）。与 entry.thumbnail 相同时跳过，避免重复删除。
+        if let Some(cache_path) = mirrorstar_core::config::thumbnail_cache_path(&entry.file_path) {
+            let cache_path = cache_path.to_string_lossy().into_owned();
+            if cache_path != entry.thumbnail
+                && validate_path_within_data_dir(&cache_path).await.is_ok()
+            {
+                if let Err(e) = tokio::fs::remove_file(&cache_path).await {
+                    // NotFound 属预期（缓存可能本就不存在），不记日志避免噪声。
+                    if e.kind() != std::io::ErrorKind::NotFound {
+                        tracing::warn!(error = %e, path = %cache_path, "删除缩略图缓存失败（配置已移除）");
+                    }
+                }
+            }
+        }
+        if delete_file {
             // 删除前校验路径位于 data_dir 内，防配置篡改导致任意文件删除。
             // 仅校验文件路径合法性（validate_wallpaper_file_path）不足以防范配置篡改，
             // 攻击者可指向合法存在的系统文件。追加 is_path_within_data_dir 边界校验，
@@ -818,34 +845,6 @@ pub async fn remove_wallpaper(
             // （DeleteFileW 系统调用在文件被占用或含重解析点时可能阻塞数十毫秒）
             if let Err(e) = tokio::fs::remove_file(&entry.file_path).await {
                 tracing::warn!(error = %e, path = %entry.file_path, "删除壁纸文件失败（配置已移除）");
-            }
-            // 删除对应缩略图（若有），同样先做 data_dir 边界校验防越界删除。
-            // 缩略图按含 uuid 的源路径 hash 命名，逐 id 删除安全，不会误删其他壁纸。
-            if !entry.thumbnail.is_empty()
-                && validate_path_within_data_dir(&entry.thumbnail)
-                    .await
-                    .is_ok()
-            {
-                if let Err(e) = tokio::fs::remove_file(&entry.thumbnail).await {
-                    tracing::warn!(error = %e, path = %entry.thumbnail, "删除缩略图失败（配置已移除）");
-                }
-            }
-            // 清理由 file_path 确定性推导的缩略图缓存（UI 按需生成的缓存不会写入配置字段，
-            // 仅凭 entry.thumbnail 无法清理，会留孤儿）。与 entry.thumbnail 相同时跳过，避免重复删除。
-            if let Some(cache_path) =
-                mirrorstar_core::config::thumbnail_cache_path(&entry.file_path)
-            {
-                let cache_path = cache_path.to_string_lossy().into_owned();
-                if cache_path != entry.thumbnail
-                    && validate_path_within_data_dir(&cache_path).await.is_ok()
-                {
-                    if let Err(e) = tokio::fs::remove_file(&cache_path).await {
-                        // NotFound 属预期（缓存可能本就不存在），不记日志避免噪声。
-                        if e.kind() != std::io::ErrorKind::NotFound {
-                            tracing::warn!(error = %e, path = %cache_path, "删除缩略图缓存失败（配置已移除）");
-                        }
-                    }
-                }
             }
             // 删除 wallpapers/{id} 空目录（精确构造路径，勿从 file_path 推断父目录，
             // 因源文件可能原本就在 data_dir 内而非 uuid 子目录下）。

@@ -7,7 +7,7 @@
 //! 设计原则：测量驱动，避免盲目优化。埋点本身开销极小（一次 Instant 取值
 //! + 少量整数累加），不影响被测路径性能；报告仅在达到阈值时输出一次日志。
 
-use std::sync::OnceLock;
+use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use serde::Serialize;
@@ -408,7 +408,8 @@ pub fn spawn_memory_attribution_sampler(interval: Duration) -> Option<std::threa
 
 /// 启动期埋点开关环境变量名：值为 `0` 或 `off`（大小写不敏感、忽略首尾空白）时关闭。
 ///
-/// 未设置时默认开启，仅启动期前 60 秒采集，之后回落到既有 60 秒周期采样。
+/// **默认关闭（opt-in）**：仅当显式设为非 `0` / `off` 值时才开启，用于启动期前 60 秒
+/// 采集内存时间线；未设置时不做任何启动期内存采样。
 const MEM_TRACE_ENV: &str = "MIRRORSTAR_MEM_TRACE";
 
 /// 进程启动基准时刻，惰性初始化：首次调用任意埋点 API 时记录。
@@ -428,19 +429,73 @@ pub fn startup_elapsed_ms() -> u128 {
     startup_instant().elapsed().as_millis()
 }
 
-/// 解析内存埋点开关：`0` / `off`（大小写不敏感、允许首尾空白）关闭，其余（含未设置）
-/// 开启。抽为纯函数便于单测"关闭时不输出"的判定逻辑。
+// ── 启动关键路径阶段耗时埋点（与内存采样完全无关，始终启用） ────────────────────
+
+/// 启动关键路径阶段打点记录：(阶段标签, 相对进程基线耗时 ms)，按记录顺序追加。
+///
+/// 供 [`emit_boot_summary`] 汇总时检索；锁中毒等异常场景静默跳过，不影响启动。
+static BOOT_STAGES: Mutex<Vec<(String, u128)>> = Mutex::new(Vec::new());
+
+/// 记录一个启动关键路径阶段并立即输出一条可检索日志（target `mirrorstar::perf`）。
+///
+/// 相对进程基线（由首次调用惰性建立，见 [`startup_instant`]）取耗时，因此进程内
+/// 首个调用（约定为 `run()` 开头的 `process_start`）耗时约为 0。**与内存采样完全
+/// 无关**：不做进程树枚举、不调用 [`sample_memory_report`] / [`log_mem_trace`]，仅一次
+/// `Instant` 取值 + 一次短锁追加，开销极小、非阻塞。**始终启用**，不受
+/// [`MEM_TRACE_ENV`] 控制；失败不 panic。
+pub fn mark_boot_stage(label: &str) {
+    let elapsed_ms = startup_elapsed_ms();
+    if let Ok(mut stages) = BOOT_STAGES.lock() {
+        stages.push((label.to_string(), elapsed_ms));
+    }
+    tracing::info!(
+        target: "mirrorstar::perf",
+        stage = label,
+        stage_ms = elapsed_ms,
+        "PERF-BOOT: {}",
+        label
+    );
+}
+
+/// 启动关键路径各阶段耗时汇总：输出**一条**汇总日志（target `mirrorstar::perf`）。
+///
+/// 字段名稳定、可检索，便于从日志提取各阶段耗时：`process_start_ms`、`log_init_ms`、
+/// `phase1_ready_ms`、`setup_ready_ms`、`scheduler_started_ms`、`boot_wallpaper_applied_ms`。
+/// 汇总时尚未到达的阶段记 `-1`。与 [`mark_boot_stage`] 一样**始终启用**、非阻塞、失败不 panic。
+pub fn emit_boot_summary() {
+    let stages = BOOT_STAGES.lock().map(|s| s.clone()).unwrap_or_default();
+    let stage_ms = |label: &str| -> i64 {
+        stages
+            .iter()
+            .find(|(l, _)| l == label)
+            .map(|(_, ms)| *ms as i64)
+            .unwrap_or(-1)
+    };
+    tracing::info!(
+        target: "mirrorstar::perf",
+        process_start_ms = stage_ms("process_start"),
+        log_init_ms = stage_ms("log_init"),
+        phase1_ready_ms = stage_ms("phase1_ready"),
+        setup_ready_ms = stage_ms("setup_ready"),
+        scheduler_started_ms = stage_ms("scheduler_started"),
+        boot_wallpaper_applied_ms = stage_ms("boot_wallpaper_applied"),
+        "PERF-BOOT: 启动阶段耗时汇总"
+    );
+}
+
+/// 解析内存埋点开关：未设置时**默认关闭**；显式设为 `0` / `off`（大小写不敏感、允许
+/// 首尾空白）同样关闭，显式设为其它任意值才开启。抽为纯函数便于单测判定逻辑。
 fn parse_mem_trace_enabled(value: Option<&str>) -> bool {
     match value {
         Some(v) => {
             let v = v.trim().to_ascii_lowercase();
             !matches!(v.as_str(), "0" | "off")
         }
-        None => true,
+        None => false,
     }
 }
 
-/// 读取 [`MEM_TRACE_ENV`] 环境变量判定内存埋点是否开启。
+/// 读取 [`MEM_TRACE_ENV`] 环境变量判定内存埋点是否开启（未设置 / `0` / `off` 时关闭）。
 fn mem_trace_enabled() -> bool {
     parse_mem_trace_enabled(std::env::var(MEM_TRACE_ENV).ok().as_deref())
 }
@@ -508,7 +563,8 @@ fn timeline_should_continue(elapsed: Duration, total: Duration) -> bool {
 /// - 到达 `total` 后线程自行结束，不影响既有 60 秒周期采样（`spawn_memory_attribution_sampler`）
 /// - 返回 `JoinHandle` 供调用方按需持有；直接丢弃即 detached 线程。线程创建失败返回
 ///   `None`，不 panic
-/// - 受 [`MEM_TRACE_ENV`] 开关控制：关闭时不启动线程，直接返回 `None`
+/// - 受 [`MEM_TRACE_ENV`] 开关控制（**默认关闭**）：未设置或为 `0` / `off` 时不启动线程，
+///   直接返回 `None`
 pub fn spawn_startup_memory_timeline(
     total: Duration,
     interval: Duration,
@@ -552,7 +608,8 @@ fn spawn_startup_memory_timeline_when(
 /// 立即采集一次并输出生命周期事件打点（target `mirrorstar::perf`，message 前缀 `MEM-MARK`）。
 ///
 /// 字段：事件标签 `label` + 相对启动耗时 `elapsed_ms` + 分类别内存。非阻塞、best-effort：
-/// 内部采样失败不 panic；受 [`MEM_TRACE_ENV`] 开关控制，关闭时不输出任何日志。
+/// 内部采样失败不 panic；受 [`MEM_TRACE_ENV`] 开关控制，**默认关闭**（未设置 / `0` / `off`
+/// 时不输出任何日志）。
 pub fn mark_lifecycle(label: &str) {
     if !mem_trace_enabled() {
         return;
@@ -912,12 +969,17 @@ mod tests {
 
     // ── 启动期时间线 / 事件打点单元测试 ──
 
-    /// 开关解析：未设置默认开启；`0` / `off`（含大小写与空白差异）关闭
+    /// 开关解析：未设置默认关闭（opt-in）；显式设为非 `0` / `off` 值才开启，`0` / `off`
+    /// （含大小写与空白差异）关闭
     #[test]
-    fn mem_trace_switch_defaults_on_and_off_values_disable() {
-        assert!(parse_mem_trace_enabled(None), "未设置时默认开启");
-        assert!(parse_mem_trace_enabled(Some("1")));
-        assert!(parse_mem_trace_enabled(Some("on")));
+    fn mem_trace_switch_defaults_off_and_explicit_values_enable() {
+        assert!(!parse_mem_trace_enabled(None), "未设置时默认关闭");
+        assert!(parse_mem_trace_enabled(Some("1")), "显式设为 1 应开启");
+        assert!(parse_mem_trace_enabled(Some("on")), "显式设为 on 应开启");
+        assert!(
+            parse_mem_trace_enabled(Some("true")),
+            "显式设为 true 应开启"
+        );
         assert!(!parse_mem_trace_enabled(Some("0")), "值 0 应关闭");
         assert!(!parse_mem_trace_enabled(Some("off")), "值 off 应关闭");
         assert!(!parse_mem_trace_enabled(Some("OFF")), "大小写不敏感");
@@ -962,5 +1024,14 @@ mod tests {
         let a = startup_elapsed_ms();
         let b = startup_elapsed_ms();
         assert!(b >= a, "相对启动耗时不应倒退：{a} -> {b}");
+    }
+
+    /// 启动阶段打点对异常输入不 panic，汇总输出不 panic（始终启用，不受内存开关影响）
+    #[test]
+    fn mark_boot_stage_and_summary_do_not_panic() {
+        mark_boot_stage("process_start");
+        mark_boot_stage("");
+        mark_boot_stage(&"y".repeat(10_000));
+        emit_boot_summary();
     }
 }

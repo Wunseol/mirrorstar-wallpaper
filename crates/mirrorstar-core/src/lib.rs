@@ -3,6 +3,7 @@ pub mod config;
 pub mod desktop;
 pub mod ipc;
 pub mod layout;
+pub mod log_retention;
 pub mod perf;
 pub mod process;
 pub mod pure_mode;
@@ -205,7 +206,13 @@ pub fn init_logging() -> Result<tracing_appender::non_blocking::WorkerGuard> {
 
     std::fs::create_dir_all(&log_dir)?;
 
-    let file_appender = tracing_appender::rolling::daily(log_dir, "mirrorstar.log");
+    // 按日轮转并限制应用日志文件数（保留 APP_LOG_KEEP 个历史文件，传 m+1）
+    let file_appender = tracing_appender::rolling::RollingFileAppender::builder()
+        .rotation(tracing_appender::rolling::Rotation::DAILY)
+        .filename_prefix("mirrorstar.log")
+        .max_log_files(crate::log_retention::APP_LOG_KEEP + 1)
+        .build(&log_dir)
+        .map_err(|e| MirrorStarError::Io(std::io::Error::other(e.to_string())))?;
     let (non_blocking, guard) = tracing_appender::non_blocking(file_appender);
 
     let env_filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
