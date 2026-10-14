@@ -9,7 +9,7 @@
 # Rust 构建产物（cargo build 输出，包含 deps / incremental / .fingerprint 等）
 # workspace 根 target/ 统一收纳所有 crate 的构建产物
 /target/
-# CI 验证用的临时 target 目录（CARGO_TARGET_DIR 指向自建目录时产生，勿入库）
+# 本地全量验证用的临时 target 目录（CARGO_TARGET_DIR 指向自建目录时产生，勿入库）
 .ci-verify-target/
 # rustfmt 备份文件（仅 nightly rustfmt 在格式化失败时生成）
 **/*.rs.bk

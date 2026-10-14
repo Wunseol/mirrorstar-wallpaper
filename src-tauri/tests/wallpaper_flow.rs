@@ -780,7 +780,7 @@ fn test_toggle_interaction_multiple_toggles_alternate() {
 
 /// 测试 get_displays 命令等价路径：返回显示器列表
 /// 注：get_displays 命令调用 desktop.enumerate_displays()，返回 Vec<DisplayInfo>。
-/// 无显示器环境（如无头 CI）返回空 Vec 也算合法；有显示器时验证结构合法性。
+/// 无显示器环境（如无头环境）返回空 Vec 也算合法；有显示器时验证结构合法性。
 #[ignore = "需 Windows 真机 COM/音频环境"]
 #[test]
 fn test_get_displays_returns_list() {

@@ -284,7 +284,7 @@ mod tests {
     /// 创建测试用 WallpaperEngine
     ///
     /// 初始化 COM（MTA 模式）并构造真实的 `DesktopIntegrator` 和 `VolumeControl`。
-    /// 如果 COM 环境不可用（如无音频设备的 CI 环境），返回 `None` 让调用方跳过测试。
+    /// 如果 COM 环境不可用（如无音频设备的环境），返回 `None` 让调用方跳过测试。
     ///
     /// 注意：不调用 `CoUninitialize`，由测试线程退出时自动清理 COM 引用计数。
     fn create_test_engine() -> Option<WallpaperEngine> {

@@ -22,7 +22,7 @@ git-fetch-with-cli = true
 # TaskDialogIndirect）→ 启动即 `0xC0000139`（入口点未找到）崩溃。
 #
 # 通过统一注入 /MANIFESTDEPENDENCY 修复：MSVC 链接器把该依赖合并进默认 manifest。
-# 仅对 windows 目标生效（linux/mac CI 不受影响）；MSVC 专属（本仓库仅在 MSVC 工具链构建）。
+# 仅对 windows 目标生效（linux/mac 目标不受影响）；MSVC 专属（本仓库仅在 MSVC 工具链构建）。
 [target.'cfg(windows)']
 rustflags = [
   "-C", "link-arg=/MANIFESTDEPENDENCY:type='win32' name='Microsoft.Windows.Common-Controls' version='6.0.0.0' processorArchitecture='*' publicKeyToken='6595b64144ccf1df' language='*'",

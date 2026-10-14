@@ -1104,7 +1104,7 @@ mod tests {
     /// 4. 断言新 PID != 旧 PID，且 `start()` 返回 `Ok`
     ///
     /// 注意：PID 复用是 OS 行为，理论上 50ms 后内核仍可能复用同一 PID（虽极罕见），
-    /// 故标注 `#[ignore]` 防止 CI flaky。本地运行：
+    /// 故标注 `#[ignore]` 防止环境抖动导致 flaky。本地运行：
     /// `cargo test -p mirrorstar-core --lib process::manager::tests -- --ignored
     /// start_after_stop_immediate_does_not_reuse_pid`
     #[ignore]

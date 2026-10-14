@@ -471,7 +471,7 @@ mod tests {
     /// 创建测试用 WallpaperEngine
     ///
     /// 初始化 COM（MTA 模式）并构造真实的 `DesktopIntegrator` 和 `VolumeControl`。
-    /// 如果 COM 环境不可用（如无音频设备的 CI 环境），返回 `None` 让调用方跳过测试。
+    /// 如果 COM 环境不可用（如无音频设备的环境），返回 `None` 让调用方跳过测试。
     fn create_test_engine() -> Option<WallpaperEngine> {
         let _ = unsafe { CoInitializeEx(None, COINIT_MULTITHREADED) };
 
@@ -777,7 +777,7 @@ mod tests {
     //
     // 以下测试验证 pause_all_fast 的 W06 修复：bit 在 drop(reasons) 前设置，
     // 关闭 TOCTOU 窗口；发送失败时回滚 bit。使用 VolumeControl::new_disabled()
-    // 避免 COM/WASAPI 依赖，可在任意 Windows 环境（含无音频 CI）运行。
+    // 避免 COM/WASAPI 依赖，可在任意 Windows 环境（含无音频环境）运行。
 
     /// 创建不依赖 COM/音频环境的测试 WallpaperEngine（W06 测试专用）
     fn create_test_engine_no_com() -> WallpaperEngine {

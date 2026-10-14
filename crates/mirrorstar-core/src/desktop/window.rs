@@ -232,7 +232,7 @@ mod tests {
     // 获取真实 Progman 窗口（FindWindowW 搜索 "Progman"），调用各公开函数验证不 panic。
     //
     // 标记 #[ignore] 因为这些测试会修改真实 Progman 窗口的样式位，可能影响
-    // 桌面外观（虽然 Progman 重启后会恢复），不适合在 CI 中运行。本地手动运行：
+    // 桌面外观（虽然 Progman 重启后会恢复），不适合在自动化测试中运行。本地手动运行：
     // `cargo test -p mirrorstar-core --lib desktop::window:: -- --ignored`
 
     /// D-010: 验证 make_borderless 对真实 Progman 窗口不 panic

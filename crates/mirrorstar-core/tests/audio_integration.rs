@@ -4,8 +4,8 @@
 //! - 有音频设备环境：`VolumeControl::new()` 成功，`set_process_volume` 不报错
 //! - 无音频设备环境：`VolumeControl::new()` 返回 Err，`new_disabled()` 工作
 //!
-//! 常规 `cargo test` 跳过本文件，通过 `cargo test --workspace -- --ignored` 运行
-//! （CI 中由 [New]-11.9 的 `Run ignored tests` 步骤定期执行）。
+//! 常规 `cargo test` 跳过本文件，需在 Windows 真机环境通过
+//! `cargo test --workspace -- --ignored` 运行。
 
 #![cfg(windows)]
 
@@ -25,7 +25,7 @@ where
 }
 
 #[test]
-#[ignore = "A-003: 需要真实 Windows 音频设备，CI 跳过"]
+#[ignore = "A-003: 需要真实 Windows 音频设备"]
 fn volume_control_real_wasapi_end_to_end() {
     with_com_mta(|| {
         match VolumeControl::new() {

@@ -2675,7 +2675,7 @@ mod tests {
     /// 创建测试用 WallpaperEngine（不依赖 COM/音频设备）
     ///
     /// 使用 `VolumeControl::new_disabled()` 避免 COM/WASAPI 依赖，使测试可在
-    /// 任意 Windows 环境（含无音频 CI）运行。`DesktopIntegrator::new()` 仅读取
+    /// 任意 Windows 环境（含无音频环境）运行。`DesktopIntegrator::new()` 仅读取
     /// 系统壁纸路径（只读 Win32），与 `desktop/mod.rs` 的测试一致，安全。
     fn create_test_engine() -> WallpaperEngine {
         let desktop = Arc::new(Mutex::new(DesktopIntegrator::new()));

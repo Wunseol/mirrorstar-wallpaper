@@ -281,7 +281,7 @@ mod tests {
     //
     // 这部分测试 set_native_wallpaper 事务流程中"缩放模式 → 注册表字符串"的映射逻辑。
     // set_native_wallpaper 本身与 Win32 API（SystemParametersInfoW、注册表操作）紧耦合，
-    // 无法在 CI 单元测试中直接调用（会修改系统状态：写入真实注册表、替换桌面壁纸），
+    // 无法在单元测试中直接调用（会修改系统状态：写入真实注册表、替换桌面壁纸），
     // 因此遵循 worker_w.rs 中 compute_retry_wait_ms 的既有测试范式：
     // 将可纯函数化的逻辑提取出来单独覆盖，Win32 耦合部分通过 #[ignore] 集成测试
     // 由开发者本地手动运行。
@@ -334,7 +334,7 @@ mod tests {
 
     /// 事务回滚契约的数据流文档化测试
     ///
-    /// 由于 set_native_wallpaper 调用 Win32 API，无法在 CI 直接测试其回滚行为。
+    /// 由于 set_native_wallpaper 调用 Win32 API，无法直接测试其回滚行为。
     /// 此测试验证回滚决策所依赖的数据类型契约：
     /// - `read_wallpaper_style` 返回 `Option<(String, String)>`：Some=有旧值可回滚，None=无旧值
     /// - 新值由 `scaling_mode_to_style` 计算
@@ -382,7 +382,7 @@ mod tests {
     /// `cargo test -p mirrorstar-core read_wallpaper_style_live -- --ignored --nocapture`
     ///
     /// 此测试标记为 #[ignore] 因为它会读取真实系统注册表（虽然只读、无副作用），
-    /// 不适合在 CI 中运行（CI 环境的注册表状态不可控）。
+    /// 不适合在自动化测试中运行（受限环境的注册表状态不可控）。
     #[test]
     #[cfg(windows)]
     #[ignore = "需要 Windows 环境且读取真实注册表，仅本地手动运行"]
@@ -423,7 +423,7 @@ mod tests {
     ///
     /// 此测试标记为 #[ignore] 因为它会临时修改真实系统注册表（写入新值后回滚）。
     /// 在回滚成功的情况下，注册表最终状态与调用前一致；但若回滚本身失败（极罕见），
-    /// 注册表可能停留在新值。仅适合开发者本地手动运行，不适合 CI。
+    /// 注册表可能停留在新值。仅适合开发者本地手动运行，不适合自动化测试。
     ///
     /// 验证场景：
     /// - `set_wallpaper_image` 失败时函数返回 `Err`
@@ -525,7 +525,7 @@ mod tests {
     /// 使用 RegistryGuard 在测试结束（即使断言 panic）时恢复用户原始注册表值。
     ///
     /// 标记 #[ignore] 因为会修改真实系统注册表（HKCU\Control Panel\Desktop），
-    /// 不适合在 CI 中运行。本地手动运行：
+    /// 不适合在自动化测试中运行。本地手动运行：
     /// `cargo test -p mirrorstar-core wallpaper_style_round_trip -- --ignored --nocapture`
     #[test]
     #[cfg(windows)]
@@ -590,7 +590,7 @@ mod tests {
     /// write_wallpaper_style 执行两步注册表写入（WallPaperStyle + TileWallpaper，
     /// 底层均为 RegSetValueExW），两步非原子：第一步成功但第二步失败时注册表
     /// 处于不一致状态，本函数不回滚第一步。由于 RegSetValueExW 失败需 mock
-    /// Win32 API（CI 中不可行），此处通过 include_str! 模式断言源码包含契约说明，
+    /// Win32 API（自动化测试中不可行），此处通过 include_str! 模式断言源码包含契约说明，
     /// 与 D-004/D-005/D-007/D-014 的文档化测试风格一致。
     #[test]
     fn v41_d004_write_wallpaper_style_documents_non_atomic_contract() {

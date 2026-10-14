@@ -1076,7 +1076,7 @@ mod tests {
     ///
     /// embed_wallpaper 内部调用 worker_w::embed_wallpaper，后者执行多步骤 Win32
     /// 操作（make_borderless / SetParent / SetWindowPos）。这些操作非原子，
-    /// 中间失败时不回滚前序操作。由于无法在 CI 中可靠 mock Win32 API 失败，
+    /// 中间失败时不回滚前序操作。由于无法在单元测试中可靠 mock Win32 API 失败，
     /// 此处通过 include_str! 模式断言源码包含契约说明，与 D-004/D-005/D-007/D-014
     /// 的文档化测试风格一致。
     #[test]
@@ -1104,7 +1104,7 @@ mod tests {
 
     /// v41-D-002: 验证 SetParent 失败时 active_wallpapers 条目保留的契约。
     ///
-    /// SetParent 失败需要 mock Win32 API（CI 中不可行），此处采用混合策略：
+    /// SetParent 失败需要 mock Win32 API（单元测试中不可行），此处采用混合策略：
     /// 1. 文档化测试：断言源码包含 v41-D-002 契约说明（SetParent 失败保留条目返回 Err）
     /// 2. 行为测试：验证无效 HWND 路径（IsWindow=false）仍正确移除条目返回 Ok
     /// 3. 行为测试：验证不存在的 display_id 返回 Ok 且不 panic
@@ -1158,7 +1158,7 @@ mod tests {
     ///
     /// 契约要求：SendMessageTimeoutW 已设置 SMTO_ABORTIFHUNG flag 缩短超时，
     /// 避免持锁调用方长时间阻塞。由于 ensure_workerw_ready 依赖真实 Windows
-    /// 桌面环境（FindWindowW/EnumWindows/SendMessageTimeoutW），无法在 CI 中
+    /// 桌面环境（FindWindowW/EnumWindows/SendMessageTimeoutW），无法在单元测试中
     /// 可靠触发 SendMessageTimeoutW 超时分支，此处采用混合策略：
     /// 1. 文档化测试：断言源码包含 v41-D-003 契约说明
     /// 2. 行为测试：调用 ensure_initialized（内部调用 ensure_workerw_ready），

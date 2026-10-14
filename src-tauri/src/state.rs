@@ -956,7 +956,7 @@ mod tests {
     // - 锁被持有时：try_lock_with_timeout 在超时后返回 None（而非无限阻塞）
     //
     // 使用泛型 `tokio::sync::Mutex<()>` 测试，无需 Windows COM/音频环境，
-    // 可在任意平台 CI 执行。这覆盖了 T04 修复的核心逻辑：避免 shutdown 因
+    // 可在任意平台执行。这覆盖了 T04 修复的核心逻辑：避免 shutdown 因
     // engine 锁长时间持有而无限阻塞。
 
     /// 测试 try_lock_with_timeout：锁可用时返回 Some
@@ -1001,7 +1001,7 @@ mod tests {
             "锁被持有时应超时返回 None（T04 强制退出）"
         );
         // 验证确实等待了接近超时时长（而非立即返回 None）
-        // 使用 100ms 下限容忍调度抖动，避免 CI 环境的 timing flake
+        // 使用 100ms 下限容忍调度抖动，避免机器调度抖动导致的 timing flake
         assert!(
             elapsed >= std::time::Duration::from_millis(100),
             "应等待接近超时时长（{}ms），实际: {:?}",

@@ -1309,8 +1309,8 @@ pub async fn set_speed(
 /// 校验音量值范围（T-004 + ST-007）
 ///
 /// 接受 [0.0, 1.0] 范围内的有限值，拒绝 NaN / Infinity / 越界值。
-/// 提取为独立纯函数以便在 CI 中通过单元测试覆盖校验逻辑
-/// （原内联校验仅在 #[ignore] 集成测试中通过模拟覆盖，CI 不执行）。
+/// 提取为独立纯函数以便通过无需真机环境的单元测试覆盖校验逻辑
+/// （原内联校验仅在 #[ignore] 集成测试中通过模拟覆盖，常规测试不执行）。
 pub fn validate_volume(volume: f32) -> Result<(), mirrorstar_core::MirrorStarError> {
     mirrorstar_core::config::validation::validate_volume(volume)
 }
@@ -1409,10 +1409,10 @@ mod tests {
         );
     }
 
-    // ── validate_wallpaper_file_path 单元测试（ST-007：非 #[ignore]，CI 可执行） ──
+    // ── validate_wallpaper_file_path 单元测试（ST-007：非 #[ignore]，无需真机环境） ──
     //
     // 覆盖 validate_wallpaper_file_path 的 3 种失败路径（不绝对/遍历/不存在）+ 成功路径。
-    // 这些测试不需要 Windows COM/音频环境，可在任意平台 CI 执行。
+    // 这些测试不需要 Windows COM/音频环境，可在任意平台执行。
 
     #[tokio::test]
     async fn test_validate_wallpaper_file_path_relative_rejected() {
@@ -1821,8 +1821,8 @@ mod tests {
 
     // ── validate_volume / validate_speed / parse_scaling_mode 单元测试 ──────────
     //
-    // 覆盖参数校验的边界值与非法值，原仅通过 #[ignore] 集成测试模拟覆盖，CI 不执行。
-    // ST-007：提取为纯函数后可在 CI 中直接测试校验条件本身。
+    // 覆盖参数校验的边界值与非法值，原仅通过 #[ignore] 集成测试模拟覆盖，常规测试不执行。
+    // ST-007：提取为纯函数后可直接测试校验条件本身。
 
     #[test]
     fn test_validate_volume_accepts_valid_range() {

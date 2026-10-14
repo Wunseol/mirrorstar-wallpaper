@@ -579,7 +579,7 @@ mod tests {
         // refresh_session_manager 是 &self 方法（A-001 方案 B 后改为内部可变性）。
         // A-001: session_manager 为 None 时尝试 COM 重新初始化：
         //   - 有 COM 环境：恢复成功，返回 Ok(())
-        //   - 无 COM 环境（CI）：恢复失败返回 Err，但不 panic
+        //   - 无 COM 环境：恢复失败返回 Err，但不 panic
         let vc = VolumeControl {
             session_manager: RefCell::new(None),
             session_cache: RefCell::new(HashMap::new()),
@@ -622,7 +622,7 @@ mod tests {
     fn test_disabled_instance_refresh_session_manager_ok() {
         // A-001: 降级实例的 refresh_session_manager 现会尝试 COM 重新初始化。
         // - 有 COM 环境（真机）：恢复成功，返回 Ok(())，session_manager 被填充
-        // - 无 COM 环境（CI）：恢复失败返回 Err，但不 panic，session_manager 保持 None
+        // - 无 COM 环境：恢复失败返回 Err，但不 panic，session_manager 保持 None
         let vc = VolumeControl::new_disabled();
         let result = vc.refresh_session_manager();
         // 关键是不 panic；返回 Ok/Err 取决于测试环境 COM 可用性
@@ -792,7 +792,7 @@ mod tests {
         // - 有 COM 环境（真机）：恢复成功，session_manager 被填充为 Some
         //   （不再走降级路径）。后续 set_process_volume
         //   不再静默返回 Ok，但可能因测试进程无音频会话返回 Err（正常）。
-        // - 无 COM 环境（CI）：恢复失败返回 Err，但不 panic，
+        // - 无 COM 环境：恢复失败返回 Err，但不 panic，
         //   session_manager 保持 None（允许后续重试）。
         let vc = VolumeControl::new_disabled();
         // 初始状态：session_manager 为 None
@@ -816,7 +816,7 @@ mod tests {
                 let _ = vc.set_process_volume(std::process::id(), 0.5);
             }
             Err(_) => {
-                // 恢复失败（CI 环境正常）：session_manager 应保持 None
+                // 恢复失败（无 COM 环境）：session_manager 应保持 None
                 assert!(
                     vc.session_manager.borrow().is_none(),
                     "COM 恢复失败后 session_manager 应保持 None（允许后续重试）"
@@ -830,7 +830,7 @@ mod tests {
         // A-001: 多次调用 refresh_session_manager，验证：
         // - 每次都不 panic
         // - 每次都在合理时间内返回（不阻塞）
-        // - CI 环境（COM 不可用）下每次都返回 Err，session_manager 保持 None
+        // - 无 COM 环境下每次都返回 Err，session_manager 保持 None
         // - 真机环境下，首次恢复成功后 session_manager 被填充，后续调用跳过恢复路径
         let vc = VolumeControl::new_disabled();
         for i in 0..3 {
@@ -855,7 +855,7 @@ mod tests {
                     // 后续调用应跳过恢复路径（session_manager 已 Some，不再调用 CoInitializeEx）
                 }
                 Err(_) => {
-                    // CI 环境：恢复失败，session_manager 应保持 None
+                    // 无 COM 环境：恢复失败，session_manager 应保持 None
                     assert!(
                         vc.session_manager.borrow().is_none(),
                         "第 {} 次恢复失败后 session_manager 应保持 None",
@@ -880,7 +880,7 @@ mod tests {
         //   及 `with_session_once` 均为 private 方法，亦无法从外部直接驱动。
         //   因此本测试采用以下降级方案：
         //
-        // 1. CI 环境（COM 不可用）：`VolumeControl::new()` 返回 `Err`，
+        // 1. 无 COM 环境：`VolumeControl::new()` 返回 `Err`，
         //    降级实例（`new_disabled()`）的 `set_process_volume` 在 `session_manager`
         //    为 `None` 时静默返回 `Ok(())`，不进入 `with_session` 失败路径。
         //    本测试仅验证不 panic、降级路径返回 `Ok`。
@@ -904,7 +904,7 @@ mod tests {
                 // 日志含 `attempted` 字段为手动验证项（见上方降级说明）。
             }
             Err(_) => {
-                // CI 环境：VolumeControl::new() 失败（无音频设备 / 无 COM）。
+                // 无 COM 环境：VolumeControl::new() 失败（无音频设备 / 无 COM）。
                 // 降级实例不进入 with_session 失败路径，仅验证不 panic、返回 Ok。
                 let vc = VolumeControl::new_disabled();
                 assert!(
@@ -927,7 +927,7 @@ mod tests {
         //   端到端验证需真实音频会话，标记为 `#[ignore]` 由真机环境手动运行
         //   （见 `v41_a003_real_com_cache_hit_miss_e2e`）。
         //
-        // 本测试验证可在 CI 环境下运行的不变量：
+        // 本测试验证可在无 COM 环境下运行的不变量：
         // 1. 降级实例初始 `session_cache` 为空
         // 2. 降级模式下 `set_process_volume` 不进入 `with_session`，不填充 cache
         // 3. cache hit 路径的 PID 复核逻辑（C-103/C-026 回归防护）：
@@ -946,7 +946,7 @@ mod tests {
             "降级模式下 session_cache 不应被填充（未进入 with_session）"
         );
 
-        // cache hit 路径需真实 COM 接口实例，CI 环境下无法覆盖。
+        // cache hit 路径需真实 COM 接口实例，无 COM 环境下无法覆盖。
         // 手动验证：在有音频设备的 Windows 上运行
         //   `cargo test -- --ignored v41_a003_real_com_cache_hit_miss_e2e`
         // 该测试通过同一 PID 两次调用 set_process_volume：
@@ -956,10 +956,10 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "A-003: 需要真实 Windows 音频设备与音频会话，CI 跳过"]
+    #[ignore = "A-003: 需要真实 Windows 音频设备与音频会话"]
     fn v41_a003_real_com_cache_hit_miss_e2e() {
         // A-003 端到端测试：验证 cache hit/miss 路径。
-        // 标记 `#[ignore]` 避免无音频设备的 CI 失败。
+        // 标记 `#[ignore]` 避免无音频设备环境下失败。
         //
         // 前置条件：
         //   - Windows 真机
@@ -1006,7 +1006,7 @@ mod tests {
         //    无论恢复成败，session_cache 都应被清空（refresh_session_manager
         //    在恢复失败路径与成功路径均调用 `session_cache.clear()`）
         // 2. 恢复成功路径：session_manager 被填充为 Some，session_cache 被清空
-        // 3. 恢复失败路径（CI 环境）：session_manager 保持 None，
+        // 3. 恢复失败路径（无 COM 环境）：session_manager 保持 None，
         //    session_cache 仍被清空（允许后续重试）
         //
         // 注：cache 在 refresh_session_manager 失败路径下也被清空，是因为
@@ -1047,7 +1047,7 @@ mod tests {
                 );
             }
             Err(_) => {
-                // CI 环境：COM 恢复失败
+                // 无 COM 环境：COM 恢复失败
                 assert!(
                     vc.session_manager.borrow().is_none(),
                     "恢复失败后 session_manager 应保持 None"
@@ -1102,7 +1102,7 @@ mod tests {
         // **降级说明（mock 难度）**：
         //   `session_cache` 存储 `IAudioSessionControl2`（具体 COM 接口类型），
         //   无法在无 COM 环境下构造有效实例填充缓存。完整的"预填充 → 失败 → 清理"
-        //   端到端验证需真实音频会话，此处仅验证可在 CI 环境下运行的不变量：
+        //   端到端验证需真实音频会话，此处仅验证可在无 COM 环境下运行的不变量：
         //
         // 1. 降级实例（session_manager = None）调用 with_session_once 必返回 Err
         //    （session_manager 未初始化）

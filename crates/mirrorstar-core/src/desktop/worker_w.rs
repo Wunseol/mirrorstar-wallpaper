@@ -934,7 +934,7 @@ mod tests {
     ///
     /// 契约要求：EnumWindows 失败时（返回 Err）向上传播 `MirrorStarError::DesktopIntegration`，
     /// 而非仅记录 warn 日志后继续走 None 分支降级。由于 EnumWindows 在真实 Windows
-    /// 环境下几乎不会失败（需损坏的 GDI 子系统），无法在 CI 中可靠触发失败分支，
+    /// 环境下几乎不会失败（需损坏的 GDI 子系统），无法在单元测试中可靠触发失败分支，
     /// 此处采用混合策略：
     /// 1. 文档化测试：断言源码包含 v41-D-005 契约说明与 return Err 标记
     /// 2. 行为测试：调用 find_workerw_no_retry 验证不 panic（Ok 或 Err 均合法）
