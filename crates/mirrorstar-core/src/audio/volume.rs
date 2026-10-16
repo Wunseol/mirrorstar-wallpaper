@@ -1,17 +1,24 @@
 use std::cell::RefCell;
 use std::collections::HashMap;
-use windows::core::Interface;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::{channel, Receiver, RecvTimeoutError, Sender};
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
+use windows::core::{implement, Interface, PCWSTR, Result as WinResult};
 use windows::Win32::Foundation::{CloseHandle, HANDLE, STILL_ACTIVE};
 use windows::Win32::Media::Audio::*;
 use windows::Win32::System::Com::*;
 use windows::Win32::System::Threading::{
     GetExitCodeProcess, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
 };
+use windows::Win32::UI::Shell::PropertiesSystem::PROPERTYKEY;
 
 // 修复历史与 A-TD 技术债明细见 docs/04-优化文档/05-audio-ipc-process模块.md §2.1
 
-// TODO(A-001): 未实现 IMMNotificationClient 主动监听；A-001 后 `refresh_session_manager`
-// 在 WASAPI 调用失败时尝试 COM 重新初始化 + 设备重连，作为惰性自愈方案。
+// A-001：已实现 `IMMNotificationClient` 主动监听默认渲染端点变更（`OnDefaultDeviceChanged`）。
+// 回调线程只置原子标志 + 通过 channel 唤醒专用工作线程；由该工作线程（持有 COM 的拥有者侧）
+// 串行执行「重建会话管理器 + 重下发用户音量/静音设定」，避免在 WASAPI 回调中加锁/阻塞。
+// `refresh_session_manager` 的惰性自愈继续保留，作为监听注册失败或时序竞态下的兜底。
 
 /// 音量控制器，通过 Windows Audio Session API 控制指定进程的音量
 ///
@@ -35,6 +42,41 @@ pub struct VolumeControl {
     ///
     /// Drop 契约（A-004）见下方 `unsafe impl Send` 的 SAFETY 注释。
     session_cache: RefCell<HashMap<u32, IAudioSessionControl2>>,
+    /// A-001：默认渲染端点枚举器（`RegisterEndpointNotificationCallback` 的挂载点）。
+    ///
+    /// 需保活至 `Drop` 中完成 `UnregisterEndpointNotificationCallback`，故显式持有。
+    device_enumerator: Option<IMMDeviceEnumerator>,
+    /// A-001：注册到枚举器的设备变更通知客户端（注销前需保活）。
+    notification_client: Option<IMMNotificationClient>,
+    /// A-001：唤醒设备变更工作线程的发送端。
+    ///
+    /// `Drop` 时丢弃该端（连同通知客户端内持有的 clone），使工作线程的下一次 `recv`
+    /// 返回 `Disconnected` 从而优雅退出。
+    wake_tx: Option<Sender<()>>,
+    /// A-001：设备变更工作线程句柄，`Drop` 时 `join` 避免线程残留。
+    watcher: Option<std::thread::JoinHandle<()>>,
+    /// A-001：默认渲染端点已变更标志。由回调线程置位，由 `with_session` 消费以决定
+    /// 「未找到会话」时是否额外刷新重试（修复设备迁移导致的静默失败）。
+    device_changed: Arc<AtomicBool>,
+    /// A-001：工作线程退出标志。
+    shutdown: Arc<AtomicBool>,
+    /// A-001：最近一次用户设定的音量/静音态（跨线程共享，供设备变更后重下发）。
+    cached_setting: Arc<Mutex<CachedUserSetting>>,
+}
+
+/// A-001：最近一次用户设定的音量与静音态。
+///
+/// 在 `set_process_volume` / `set_process_mute` **成功**后更新（失败不更新以避免脏值）。
+/// 设备变更后由工作线程据此向目标进程的新会话重下发（Windows 新建会话默认回到系统音量，
+/// 仅重建会话管理器不足以恢复用户设定）。
+#[derive(Clone, Copy, Default)]
+struct CachedUserSetting {
+    /// 最近一次被操作的目标进程 PID。
+    pid: Option<u32>,
+    /// 最近一次成功下发的音量。
+    volume: Option<f32>,
+    /// 最近一次成功下发的静音态。
+    mute: Option<bool>,
 }
 
 // SAFETY (Task 9.1.3 soundness 论证):
@@ -68,37 +110,69 @@ pub struct VolumeControl {
 // 结论：`Send` 在 WASAPI free-threaded 语义 + 调用方线程已初始化 COM 的前提下 sound。
 //      `!Sync` 是正确的保守选择。
 //
-// Drop 契约（A-004）：
-//   - `VolumeControl` 不实现显式 `impl Drop`，依赖 COM 接口
-//     （`IAudioSessionManager2`、`IAudioSessionControl2`）的自动 `Release()`。
+// Drop 契约（A-004 / A-001）：
+//   - 依赖 COM 接口（`IAudioSessionManager2`、`IAudioSessionControl2`）的自动 `Release()`。
 //     `HashMap` 的 Drop 会逐个 drop 其值（`IAudioSessionControl2`），
 //     由 `windows` crate 生成的 Drop 实现调用 `Release()`。
+//   - A-001 起新增显式 `impl Drop`：注销设备变更通知回调、置退出标志并 `join` 工作线程，
+//     避免监听线程在 `VolumeControl` 释放后残留（best-effort，失败只告警不 panic）。
 //   - 由于通过 `Arc<Mutex<VolumeControl>>` 共享（见 src-tauri/src/lib.rs），
-//     最后一个 `Arc clone` 的 drop 会触发 `VolumeControl` 字段的 drop。
+//     最后一个 `Arc clone` 的 drop 会触发 `VolumeControl` 的 `Drop`。
 //   - 该 drop 必须发生在已初始化 COM 的线程（与 Send SAFETY 的调用方契约一致，
 //     见上方"调用方契约"段）。跨 apartment 释放风险由调用方确保 drop 线程
 //     已初始化 COM 来规避。
-//   - 如未来需改进，可增加显式 `impl Drop for VolumeControl` 调用
-//     `session_cache.clear()`，让 Release 调用集中在显式 Drop 路径上，
-//     便于在此处插入跨 apartment 释放的规避逻辑（如 marshal 到创建线程释放）。
 unsafe impl Send for VolumeControl {}
+
+impl Drop for VolumeControl {
+    fn drop(&mut self) {
+        // A-001：通知工作线程退出（best-effort）。
+        self.shutdown.store(true, Ordering::SeqCst);
+        // 注销设备变更回调：需在 enumerator 与 client 都存活时进行。
+        if let (Some(enumerator), Some(client)) = (
+            self.device_enumerator.as_ref(),
+            self.notification_client.as_ref(),
+        ) {
+            if let Err(error) = unsafe { enumerator.UnregisterEndpointNotificationCallback(client) }
+            {
+                tracing::warn!(error = %error, "注销 IMMNotificationClient 失败");
+            }
+        }
+        // 丢弃通知客户端与发送端：工作线程的 `recv` 随即返回 `Disconnected` 并退出。
+        self.notification_client = None;
+        self.wake_tx = None;
+        // join 避免线程残留在 Drop 之后（工作线程仅阻塞在 `recv`，退出信号已送达）。
+        if let Some(handle) = self.watcher.take() {
+            let _ = handle.join();
+        }
+    }
+}
 
 impl VolumeControl {
     /// 创建新的 VolumeControl，缓存 COM 接口
     ///
     /// 调用方需确保当前线程已初始化 COM（由 Tauri/tao 在主线程自动完成）
     pub fn new() -> Result<Self, crate::MirrorStarError> {
-        unsafe {
+        let mut control = unsafe {
             let enumerator: IMMDeviceEnumerator =
                 CoCreateInstance(&MMDeviceEnumerator, None, CLSCTX_ALL)?;
             let device = enumerator.GetDefaultAudioEndpoint(eRender, eMultimedia)?;
             let manager: IAudioSessionManager2 = device.Activate(CLSCTX_ALL, None)?;
 
-            Ok(Self {
+            Self {
                 session_manager: RefCell::new(Some(manager)),
                 session_cache: RefCell::new(HashMap::new()),
-            })
-        }
+                device_enumerator: Some(enumerator),
+                notification_client: None,
+                wake_tx: None,
+                watcher: None,
+                device_changed: Arc::new(AtomicBool::new(false)),
+                shutdown: Arc::new(AtomicBool::new(false)),
+                cached_setting: Arc::new(Mutex::new(CachedUserSetting::default())),
+            }
+        };
+        // A-001：启动主动监听（失败仅降级为「无监听 + 惰性自愈」，不阻断构造）。
+        control.start_device_watch();
+        Ok(control)
     }
 
     /// 创建 no-op 降级实例（T-008 优雅降级）
@@ -116,14 +190,75 @@ impl VolumeControl {
         Self {
             session_manager: RefCell::new(None),
             session_cache: RefCell::new(HashMap::new()),
+            // 降级实例不注册监听：COM 不可用时无法注册，且不应启动工作线程。
+            device_enumerator: None,
+            notification_client: None,
+            wake_tx: None,
+            watcher: None,
+            device_changed: Arc::new(AtomicBool::new(false)),
+            shutdown: Arc::new(AtomicBool::new(false)),
+            cached_setting: Arc::new(Mutex::new(CachedUserSetting::default())),
+        }
+    }
+
+    /// A-001：启动设备变更主动监听。
+    ///
+    /// 先启动工作线程（保证回调送达时接收端已就绪），再向 enumerator 注册
+    /// `IMMNotificationClient`。任一步骤失败都降级为「无监听 + 保留既有惰性自愈」，
+    /// 打印 warn，不 panic、不阻断启动。
+    fn start_device_watch(&mut self) {
+        let Some(enumerator) = self.device_enumerator.as_ref() else {
+            return;
+        };
+
+        let (wake_tx, wake_rx) = channel::<()>();
+        let cached = Arc::clone(&self.cached_setting);
+        let shutdown = Arc::clone(&self.shutdown);
+        match std::thread::Builder::new()
+            .name("mirrorstar-audio-devwatch".to_string())
+            .spawn(move || device_watch_loop(wake_rx, cached, shutdown))
+        {
+            Ok(handle) => self.watcher = Some(handle),
+            Err(error) => {
+                tracing::warn!(
+                    error = %error,
+                    "启动音频设备变更监听线程失败，降级为惰性自愈（A-001）"
+                );
+                return;
+            }
+        }
+
+        // 回调只置位 `device_changed` + 唤醒工作线程，不在回调线程内加锁/调用 WASAPI。
+        let client: IMMNotificationClient = DeviceNotificationClient {
+            device_changed: Arc::clone(&self.device_changed),
+            wake: wake_tx.clone(),
+        }
+        .into();
+        match unsafe { enumerator.RegisterEndpointNotificationCallback(&client) } {
+            Ok(()) => {
+                self.notification_client = Some(client);
+                self.wake_tx = Some(wake_tx);
+            }
+            Err(error) => {
+                // 注册失败：丢弃 client 与 sender 使工作线程退出，降级为惰性自愈。
+                tracing::warn!(
+                    error = %error,
+                    "注册 IMMNotificationClient 失败，降级为惰性自愈（A-001）"
+                );
+                drop(client);
+                drop(wake_tx);
+                if let Some(handle) = self.watcher.take() {
+                    let _ = handle.join();
+                }
+            }
         }
     }
 
     /// 重新创建 session manager（音频设备变更时调用）。
     ///
-    /// **A-001 方案 B 惰性重试**：仅在 `set_process_volume` 等 WASAPI 操作失败时
-    /// 由 `with_session` 内部调用，不主动监听设备变更事件。未来可升级为
-    /// `IMMNotificationClient` 主动监听以实现设备切换即时响应。
+    /// **A-001 惰性自愈**：由 `with_session` 在 WASAPI 操作失败时调用，
+    /// 作为监听注册失败或设备变更时序竞态下的兜底。设备变更的**主动**响应由
+    /// `IMMNotificationClient` 回调驱动的 `device_watch_loop` 完成（见 `start_device_watch`）。
     ///
     /// **A-001 降级恢复**：当 `session_manager` 为 `None`（降级实例）时，
     /// 先尝试 `CoInitializeEx` 重新初始化 COM，再创建 enumerator 刷新 session。
@@ -162,8 +297,21 @@ impl VolumeControl {
                     }
                 };
 
-            let device = enumerator.GetDefaultAudioEndpoint(eRender, eMultimedia)?;
-            let manager: IAudioSessionManager2 = device.Activate(CLSCTX_ALL, None)?;
+            let device = match enumerator.GetDefaultAudioEndpoint(eRender, eMultimedia) {
+                Ok(device) => device,
+                Err(e) => {
+                    // 与 CoCreateInstance 失败分支保持一致：设备变更/刷新失败后缓存失效。
+                    self.session_cache.borrow_mut().clear();
+                    return Err(e.into());
+                }
+            };
+            let manager: IAudioSessionManager2 = match device.Activate(CLSCTX_ALL, None) {
+                Ok(manager) => manager,
+                Err(e) => {
+                    self.session_cache.borrow_mut().clear();
+                    return Err(e.into());
+                }
+            };
             *self.session_manager.borrow_mut() = Some(manager);
         }
 
@@ -178,13 +326,18 @@ impl VolumeControl {
 
     /// 遍历音频会话，找到匹配 PID 的会话并执行操作。
     ///
-    /// **A-001 方案 B 惰性重试**：若首次 WASAPI 调用失败（可能是设备切换导致
+    /// **A-001 惰性重试**：若首次 WASAPI 调用失败（可能是设备切换导致
     /// `session_manager` 指向已移除的设备），自动调用 `refresh_session_manager`
     /// 重新绑定当前默认渲染设备后重试一次。重试仍失败则返回原错误。
     ///
     /// **消除警报风暴**：若首次失败是被分类为 [`MirrorStarError::AudioSessionNotFound`]
     /// 的"未找到音频会话"错误（静音视频无音轨，或会话尚未注册），则这不是设备错误，
     /// 直接静默返回该错误——不刷新、不重试、不打 WARN，避免终端警报刷屏。
+    ///
+    /// **A-001 例外（设备变更）**：当 [`AudioSessionNotFound`](crate::MirrorStarError::AudioSessionNotFound)
+    /// 且默认渲染端点已变更（`device_changed` 置位）时，目标会话可能已被系统迁移到新端点、
+    /// 而仍绑定旧设备的 `session_manager` 枚举不到它。此时额外刷新一次并重试，修复设备切换后
+    /// 音量设定静默失效；该标志在本次处置后消费，正常路径的"未找到"仍保持安静。
     ///
     /// **A-002 日志增强**：所有 session 均失败时（首次 + 重试均未命中），
     /// 在返回 `Err` 前记录 `tracing::warn!(pid, attempted = n, "all sessions failed")`，
@@ -203,18 +356,27 @@ impl VolumeControl {
         // 消除 WASAPI 音量控制警报风暴：若首次失败是因为"未找到音频会话"
         // （静音视频无音轨，或会话尚未注册），这不是设备错误，refresh_session_manager
         // 无帮助且会触发重建 + 多重 WARN 刷屏。此时静默返回，不刷新、不重试、不 WARN。
-        if matches!(
+        //
+        // **A-001 例外**：若已发生默认渲染端点变更，目标会话可能已被系统迁移到新端点，
+        // 而仍绑定旧设备的 `session_manager` 枚举不到它。此时（且仅此时）额外刷新一次并重试，
+        // 修复设备切换后音量设定静默失效。正常路径的"未找到"仍保持安静。
+        let is_not_found = matches!(
             first_attempt.as_ref().err(),
             Some(crate::MirrorStarError::AudioSessionNotFound { .. })
-        ) {
+        );
+        // 消费"设备已变更"标志：本轮无论走静默还是刷新分支，该事件均已处置。
+        let device_changed = self.device_changed.swap(false, Ordering::SeqCst);
+        if is_not_found && !device_changed {
             tracing::trace!(pid, "未找到音频会话，跳过 refresh_session_manager 重试");
             return first_attempt;
         }
 
-        // A-001 惰性重试：WASAPI 操作失败可能是设备切换导致 session_manager 失效。
-        // 调用 refresh_session_manager 重新绑定当前默认渲染设备，清空缓存后重试一次。
+        // A-001 惰性重试：WASAPI 操作失败（或设备变更后未找到会话）可能是设备切换导致
+        // session_manager 失效。调用 refresh_session_manager 重新绑定当前默认渲染设备，
+        // 清空缓存后重试一次。
         tracing::warn!(
             pid = pid,
+            device_changed = device_changed,
             error = ?first_attempt.as_ref().err(),
             "WASAPI 操作失败，触发 refresh_session_manager 后重试"
         );
@@ -307,60 +469,28 @@ impl VolumeControl {
 
         // v12.0: 将 WASAPI 枚举逻辑封装在闭包中，便于在单一出口处添加失败路径清理。
         // 闭包内的 `?` 提前返回会从闭包返回（而非外层函数），使所有失败路径汇聚到
-        // 闭包调用后的统一清理点。
-        let result = (|| {
+        // 闭包调用后的统一清理点。枚举本身复用 `find_session_control`（A-001：与设备变更
+        // 重下发共用同一查找逻辑）。
+        let found = (|| {
             // 借用 session_manager 用于本次枚举。借用在闭包返回时释放，
             // 不会与 with_session 重试路径中的 refresh_session_manager（borrow_mut）冲突。
             let manager_ref = self.session_manager.borrow();
             let manager = manager_ref.as_ref().ok_or_else(|| {
                 crate::MirrorStarError::AudioControl("Session manager 未初始化".to_string())
             })?;
-
-            unsafe {
-                let session_enum = manager.GetSessionEnumerator()?;
-
-                let count = session_enum.GetCount()?;
-                let mut result = Err(crate::MirrorStarError::AudioSessionNotFound { pid });
-
-                for i in 0..count {
-                    // A-002: 统计本次枚举尝试的 session 数量，
-                    // 供 with_session 在所有 session 失败时输出聚合日志。
-                    *attempted += 1;
-                    // A-002: GetSession/cast 也改为 continue 容错，与 GetProcessId 保持一致。
-                    // 会话列表动态变更时，单个会话的瞬态错误不应中止整个枚举。
-                    let control: IAudioSessionControl = match session_enum.GetSession(i) {
-                        Ok(s) => s,
-                        Err(e) => {
-                            tracing::trace!(index = i, error = ?e, "GetSession 失败，跳过该会话");
-                            continue;
-                        }
-                    };
-                    let control: IAudioSessionControl2 = match control.cast() {
-                        Ok(c) => c,
-                        Err(e) => {
-                            tracing::trace!(index = i, error = ?e, "cast IAudioSessionControl2 失败，跳过该会话");
-                            continue;
-                        }
-                    };
-                    // A-001 枚举容错：跳过无法获取 PID 的会话而非中止整个枚举。
-                    // 某些会话（如系统会话、已退出的进程会话）GetProcessId 会返回错误，
-                    // 此前用 `?` 传播会导致整个枚举中止，进而丢失后续可能匹配的会话。
-                    let session_pid = match control.GetProcessId() {
-                        Ok(pid) => pid,
-                        Err(_) => continue,
-                    };
-
-                    if session_pid == pid {
-                        // 命中后存入缓存，后续调用可直接复用
-                        self.session_cache.borrow_mut().insert(pid, control.clone());
-                        result = f(control);
-                        break;
-                    }
-                }
-
-                result
-            }
+            find_session_control(manager, pid, attempted)
         })();
+
+        let result = match found {
+            Ok(Some(control)) => {
+                // 命中后存入缓存，后续调用可直接复用
+                self.session_cache.borrow_mut().insert(pid, control.clone());
+                f(control)
+            }
+            Ok(None) => Err(crate::MirrorStarError::AudioSessionNotFound { pid }),
+            // 传播枚举过程的错误（如 GetSessionEnumerator 失败），保持原语义
+            Err(err) => Err(err),
+        };
 
         // v12.0: WASAPI 调用失败时检查进程是否已退出，若退出则清理 session_cache 条目
         if result.is_err() && !is_process_alive(pid) {
@@ -386,13 +516,21 @@ impl VolumeControl {
             tracing::debug!("VolumeControl 处于降级模式，跳过 set_process_volume");
             return Ok(());
         }
-        unsafe {
+        let result = unsafe {
             self.with_session(pid, |control| {
                 let simple_volume: ISimpleAudioVolume = control.cast()?;
                 simple_volume.SetMasterVolume(volume, std::ptr::null())?;
                 Ok(())
             })
+        };
+        // A-001：仅在成功下发后更新缓存（失败不更新以避免脏值），
+        // 供设备变更后向新端点上的会话重下发用户设定。
+        if result.is_ok() {
+            let mut cached = self.cached_setting.lock().unwrap_or_else(|e| e.into_inner());
+            cached.pid = Some(pid);
+            cached.volume = Some(volume);
         }
+        result
     }
 
     /// 设置指定进程的静音状态
@@ -403,13 +541,20 @@ impl VolumeControl {
             tracing::debug!("VolumeControl 处于降级模式，跳过 set_process_mute");
             return Ok(());
         }
-        unsafe {
+        let result = unsafe {
             self.with_session(pid, |control| {
                 let simple_volume: ISimpleAudioVolume = control.cast()?;
                 simple_volume.SetMute(mute, std::ptr::null())?;
                 Ok(())
             })
+        };
+        // A-001：仅在成功下发后更新缓存（失败不更新以避免脏值）。
+        if result.is_ok() {
+            let mut cached = self.cached_setting.lock().unwrap_or_else(|e| e.into_inner());
+            cached.pid = Some(pid);
+            cached.mute = Some(mute);
         }
+        result
     }
 
     /// 获取指定进程的音量 (0.0 ~ 1.0)
@@ -446,6 +591,225 @@ impl VolumeControl {
                 Ok(mute.as_bool())
             })
         }
+    }
+}
+
+// ── A-001：设备变更主动监听 ─────────────────────────────────────────────────
+
+/// 判定某次默认设备变更是否需要重下发（仅「默认渲染端点 + 多媒体角色」）。
+///
+/// Windows 对单次默认设备切换会按 `eConsole` / `eMultimedia` / `eCommunications`
+/// 各回调一次；本模块音量控制始终基于 `GetDefaultAudioEndpoint(eRender, eMultimedia)`，
+/// 故仅响应 `eMultimedia`，避免单次切换触发 3 次冗余重下发。
+fn should_redispatch_on_default_change(flow: EDataFlow, role: ERole) -> bool {
+    flow == eRender && role == eMultimedia
+}
+
+/// A-001：`IMMNotificationClient` 实现，仅在默认**渲染**端点的多媒体角色（`eMultimedia`）
+/// 变更时置标志并唤醒工作线程。
+///
+/// 回调来自 MMDeviceAPI 的工作线程，因此本实现**严禁**获取 `VolumeControl` 的内在状态锁或
+/// 执行阻塞式 COM/WASAPI 调用——只做 `AtomicBool` 置位与 `mpsc::Sender::send`（无界通道，
+/// 不阻塞）。实际刷新由 [`device_watch_loop`] 在专用线程内串行执行。
+#[implement(IMMNotificationClient)]
+struct DeviceNotificationClient {
+    /// 默认渲染端点已变更标志（供 `with_session` 消费）。
+    device_changed: Arc<AtomicBool>,
+    /// 唤醒设备变更工作线程的发送端。
+    wake: Sender<()>,
+}
+
+impl IMMNotificationClient_Impl for DeviceNotificationClient_Impl {
+    fn OnDeviceStateChanged(&self, _device_id: &PCWSTR, _new_state: DEVICE_STATE) -> WinResult<()> {
+        Ok(())
+    }
+
+    fn OnDeviceAdded(&self, _device_id: &PCWSTR) -> WinResult<()> {
+        Ok(())
+    }
+
+    fn OnDeviceRemoved(&self, _device_id: &PCWSTR) -> WinResult<()> {
+        Ok(())
+    }
+
+    fn OnDefaultDeviceChanged(
+        &self,
+        flow: EDataFlow,
+        role: ERole,
+        _default_device_id: &PCWSTR,
+    ) -> WinResult<()> {
+        // 仅关注默认渲染端点的多媒体角色（eMultimedia）；其余角色（eConsole/eCommunications）
+        // 及捕获端点与视频壁纸音量无关。
+        if should_redispatch_on_default_change(flow, role) {
+            self.device_changed.store(true, Ordering::SeqCst);
+            // 无界通道 send 不会阻塞；接收端已断开（已 Drop）时忽略错误。
+            let _ = self.wake.send(());
+        }
+        Ok(())
+    }
+
+    fn OnPropertyValueChanged(&self, _device_id: &PCWSTR, _key: &PROPERTYKEY) -> WinResult<()> {
+        Ok(())
+    }
+}
+
+/// A-001：设备变更工作线程主循环（拥有者侧串行执行）。
+///
+/// 阻塞等待唤醒信号；收到后重建默认渲染端点上的会话管理器并向目标进程重下发用户设定。
+/// 线程退出条件：`Drop` 置位 `shutdown` 且丢弃所有 `Sender`（`recv` 返回 `Disconnected`），
+/// 避免在 `VolumeControl` 释放后残留。
+fn device_watch_loop(
+    wake_rx: Receiver<()>,
+    cached: Arc<Mutex<CachedUserSetting>>,
+    shutdown: Arc<AtomicBool>,
+) {
+    // 工作线程自行初始化 COM（MTA）；失败时仍继续等待，仅在实际重下发时告警。
+    let co_result = unsafe { CoInitializeEx(None, COINIT_MULTITHREADED) };
+    let need_couninit = co_result.is_ok();
+    if !need_couninit {
+        tracing::warn!(error = ?co_result, "设备变更监听线程 COM 初始化失败，重下发将跳过");
+    }
+
+    // 以有限超时阻塞：正常情况下由回调 `send` 唤醒；`Drop` 置位 `shutdown` 后最迟一个
+    // 超时周期内退出；所有 `Sender` 丢弃后 `recv_timeout` 立即返回 `Disconnected`。
+    // 使用超时（而非无限 `recv`）可避免注销失败导致发送端引用泄漏时的 `join` 挂起。
+    while !shutdown.load(Ordering::SeqCst) {
+        match wake_rx.recv_timeout(Duration::from_millis(500)) {
+            Ok(()) => redispatch_after_device_change(&cached),
+            Err(RecvTimeoutError::Timeout) => continue,
+            Err(RecvTimeoutError::Disconnected) => break,
+        }
+    }
+
+    if need_couninit {
+        unsafe { CoUninitialize() };
+    }
+    tracing::debug!("音频设备变更监听线程退出");
+}
+
+/// A-001：默认渲染端点变更后，向目标进程会话重下发缓存的用户音量/静音设定。
+///
+/// 在专用工作线程（已初始化 COM）内执行，**不**依赖 `VolumeControl` 的内部状态
+/// （`session_manager` 的惰性刷新由 `with_session` 另行完成），从而避免跨线程共享
+/// 非 `Sync` 的可变状态。会话不存在（mpv 尚未创建音频会话）时放弃本次重下发但不报错。
+fn redispatch_after_device_change(cached: &Mutex<CachedUserSetting>) {
+    let setting = *cached.lock().unwrap_or_else(|e| e.into_inner());
+    let Some(pid) = setting.pid else {
+        return;
+    };
+    if setting.volume.is_none() && setting.mute.is_none() {
+        return;
+    }
+
+    let manager: IAudioSessionManager2 = unsafe {
+        let enumerator: IMMDeviceEnumerator =
+            match CoCreateInstance(&MMDeviceEnumerator, None, CLSCTX_ALL) {
+                Ok(enumerator) => enumerator,
+                Err(error) => {
+                    tracing::warn!(error = %error, "设备变更重下发：创建设备枚举器失败");
+                    return;
+                }
+            };
+        let device = match enumerator.GetDefaultAudioEndpoint(eRender, eMultimedia) {
+            Ok(device) => device,
+            Err(error) => {
+                tracing::warn!(error = %error, "设备变更重下发：获取默认渲染端点失败");
+                return;
+            }
+        };
+        match device.Activate(CLSCTX_ALL, None) {
+            Ok(manager) => manager,
+            Err(error) => {
+                tracing::warn!(error = %error, "设备变更重下发：激活会话管理器失败");
+                return;
+            }
+        }
+    };
+
+    let mut attempted = 0usize;
+    let control = match find_session_control(&manager, pid, &mut attempted) {
+        Ok(Some(control)) => control,
+        Ok(None) => {
+            // 设备刚切换时 mpv 的新会话可能尚未注册：放弃本次重下发，但不报错。
+            tracing::debug!(
+                pid,
+                "设备变更重下发：目标进程音频会话尚不存在，跳过本次重下发"
+            );
+            return;
+        }
+        Err(error) => {
+            tracing::warn!(error = %error, pid, "设备变更重下发：枚举会话失败");
+            return;
+        }
+    };
+
+    unsafe {
+        let Ok(simple_volume) = control.cast::<ISimpleAudioVolume>() else {
+            tracing::warn!(pid, "设备变更重下发：会话不支持 ISimpleAudioVolume");
+            return;
+        };
+        if let Some(volume) = setting.volume {
+            if let Err(error) = simple_volume.SetMasterVolume(volume, std::ptr::null()) {
+                tracing::warn!(pid, error = %error, "设备变更重下发音量失败");
+            }
+        }
+        if let Some(mute) = setting.mute {
+            if let Err(error) = simple_volume.SetMute(mute, std::ptr::null()) {
+                tracing::warn!(pid, error = %error, "设备变更重下发静音态失败");
+            }
+        }
+    }
+    tracing::info!(pid, "默认音频端点变更后已重下发用户音量/静音设定");
+}
+
+/// A-001：在给定会话管理器中查找指定 PID 的音频会话。
+///
+/// 返回 (命中的会话控制接口, 本次枚举尝试的会话数)。供
+/// [`VolumeControl::with_session_once`] 与 [`redispatch_after_device_change`] 共用，
+/// 避免设备变更重下发重复一套枚举逻辑。
+fn find_session_control(
+    manager: &IAudioSessionManager2,
+    pid: u32,
+    attempted: &mut usize,
+) -> Result<Option<IAudioSessionControl2>, crate::MirrorStarError> {
+    unsafe {
+        let session_enum = manager.GetSessionEnumerator()?;
+        let count = session_enum.GetCount()?;
+
+        for i in 0..count {
+            // A-002: 统计本次枚举尝试的 session 数量，
+            // 供 with_session 在所有 session 失败时输出聚合日志。
+            *attempted += 1;
+            // A-002: GetSession/cast 也改为 continue 容错，与 GetProcessId 保持一致。
+            // 会话列表动态变更时，单个会话的瞬态错误不应中止整个枚举。
+            let control: IAudioSessionControl = match session_enum.GetSession(i) {
+                Ok(s) => s,
+                Err(e) => {
+                    tracing::trace!(index = i, error = ?e, "GetSession 失败，跳过该会话");
+                    continue;
+                }
+            };
+            let control: IAudioSessionControl2 = match control.cast() {
+                Ok(c) => c,
+                Err(e) => {
+                    tracing::trace!(index = i, error = ?e, "cast IAudioSessionControl2 失败，跳过该会话");
+                    continue;
+                }
+            };
+            // A-001 枚举容错：跳过无法获取 PID 的会话而非中止整个枚举。
+            // 某些会话（如系统会话、已退出的进程会话）GetProcessId 会返回错误，
+            // 此前用 `?` 传播会导致整个枚举中止，进而丢失后续可能匹配的会话。
+            let session_pid = match control.GetProcessId() {
+                Ok(pid) => pid,
+                Err(_) => continue,
+            };
+
+            if session_pid == pid {
+                return Ok(Some(control));
+            }
+        }
+
+        Ok(None)
     }
 }
 
@@ -575,15 +939,12 @@ mod tests {
 
     #[test]
     fn test_refresh_session_manager_no_panic() {
-        // 手动构造空实例（绕过 new()，因为它需要 COM 环境）。
-        // refresh_session_manager 是 &self 方法（A-001 方案 B 后改为内部可变性）。
+        // 手动构造空实例（用 new_disabled 绕过 new()，因为它需要 COM 环境）。
+        // refresh_session_manager 是 &self 方法（A-001 后改为内部可变性）。
         // A-001: session_manager 为 None 时尝试 COM 重新初始化：
         //   - 有 COM 环境：恢复成功，返回 Ok(())
         //   - 无 COM 环境：恢复失败返回 Err，但不 panic
-        let vc = VolumeControl {
-            session_manager: RefCell::new(None),
-            session_cache: RefCell::new(HashMap::new()),
-        };
+        let vc = VolumeControl::new_disabled();
         let result = vc.refresh_session_manager();
         // 关键是不 panic；返回 Ok/Err 取决于测试环境 COM 可用性
         let _ = result;
@@ -1009,10 +1370,9 @@ mod tests {
         // 3. 恢复失败路径（无 COM 环境）：session_manager 保持 None，
         //    session_cache 仍被清空（允许后续重试）
         //
-        // 注：cache 在 refresh_session_manager 失败路径下也被清空，是因为
-        // refresh_session_manager 在 CoCreateInstance 失败时显式清空 cache 后返回 Err
-        // （保持与原行为一致：设备变更后缓存失效）。GetDefaultAudioEndpoint/Activate
-        // 失败时由 `?` 提前返回，不清空 cache——与原代码行为一致。
+        // 注：refresh_session_manager 的**所有**失败路径（CoCreateInstance /
+        // GetDefaultAudioEndpoint / Activate）都会先清空 cache 再返回 Err
+        // （设备变更/刷新失败后缓存失效），成功路径末尾亦清空 cache。
         let vc = VolumeControl::new_disabled();
 
         // 初始状态：所有字段为 None/空
@@ -1128,5 +1488,32 @@ mod tests {
             !vc.session_cache.borrow().contains_key(&dead_pid),
             "失败路径清理后 session_cache 不应包含失效 PID"
         );
+    }
+
+    #[test]
+    fn only_multimedia_render_role_triggers_redispatch() {
+        // 真：默认渲染端点的多媒体角色（Windows 单次切换的主要通知）
+        assert!(should_redispatch_on_default_change(eRender, eMultimedia));
+        // 假：同一次切换附带的另外两个角色
+        assert!(!should_redispatch_on_default_change(eRender, eConsole));
+        assert!(!should_redispatch_on_default_change(eRender, eCommunications));
+        // 假：捕获端点（与视频壁纸音量无关）
+        assert!(!should_redispatch_on_default_change(eCapture, eMultimedia));
+    }
+
+    #[test]
+    fn single_default_change_yields_exactly_one_redispatch() {
+        // Windows 对单次默认设备切换按角色回调三次（eConsole / eMultimedia /
+        // eCommunications）；过滤后应恰好只有一次命中，即单次切换只重下发一次。
+        let sequence = [
+            (eRender, eConsole),
+            (eRender, eMultimedia),
+            (eRender, eCommunications),
+        ];
+        let hits = sequence
+            .iter()
+            .filter(|(flow, role)| should_redispatch_on_default_change(*flow, *role))
+            .count();
+        assert_eq!(hits, 1, "单次默认设备切换应只触发一次重下发（原为三次）");
     }
 }

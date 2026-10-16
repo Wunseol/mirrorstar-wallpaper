@@ -260,14 +260,17 @@ component PreviewPlayButton inherits Rectangle {
     }
 }
 
-// ── 预览控制条速度按钮（Task 2）：文本显示当前倍速，点击循环切换 ──────────────
+// ── 预览底部带速度按钮：点击切换底部带内联档位条（展开态由父级 `preview-speed-open` 驱动）──
 component PreviewSpeedButton inherits Rectangle {
     in property <string> label: "1×";
+    in property <bool> expanded: false;
     callback clicked();
 
-    width: 40px;
+    width: 52px;
     height: 28px;
     border-radius: Theme.radius-md;
+    border-width: root.expanded ? 1px : 0px;
+    border-color: Theme.accent;
     background: speed-hit.pressed
         ? Theme.button-pressed
         : (speed-hit.has-hover ? Theme.button-hover : Theme.button-bg);
@@ -277,13 +280,105 @@ component PreviewSpeedButton inherits Rectangle {
     }
 
     Text {
-        width: 100%;
-        height: 100%;
+        x: 4px;
+        y: 0;
+        width: parent.width - 18px;
+        height: parent.height;
         text: root.label;
         color: Theme.button-text;
         font-size: 11px;
         horizontal-alignment: center;
         vertical-alignment: center;
+        overflow: elide;
+    }
+
+    // 指示箭头：内联矢量绘制，档位条展开时翻转（与设置面板 Dropdown 一致）。
+    Path {
+        x: parent.width - 14px;
+        y: (parent.height - 10px) / 2;
+        width: 10px;
+        height: 10px;
+        viewbox-width: 12;
+        viewbox-height: 12;
+        stroke: #7f9bc4;
+        stroke-width: 1.5px;
+        stroke-line-cap: round;
+        stroke-line-join: round;
+        fill: transparent;
+        commands: root.expanded ? "M 2 8 L 6 4 L 10 8" : "M 2 4 L 6 8 L 10 4";
+    }
+}
+
+// ── 预览控制条 ±5s 快退/快进按钮：双三角矢量 + 小号 5 字，无弧线与字形回退依赖 ──
+component PreviewSeekStepButton inherits Rectangle {
+    in property <bool> forward: false;
+    callback clicked();
+
+    width: 28px;
+    height: 28px;
+    border-radius: Theme.radius-md;
+    background: seek-hit.pressed
+        ? Theme.button-pressed
+        : (seek-hit.has-hover ? Theme.button-hover : Theme.button-bg);
+
+    seek-hit := TouchArea {
+        clicked => { root.clicked(); }
+    }
+
+    // 双三角 10×9 + 数字「5」8×9：整体 20px 宽，在 28×28 内精确居中（三角 x=4、数字 x=16）。
+    Path {
+        x: 4px;
+        y: (parent.height - 9px) / 2;
+        width: 10px;
+        height: 9px;
+        viewbox-width: 10;
+        viewbox-height: 9;
+        fill: Theme.button-text;
+        commands: root.forward
+            ? "M 5 0 L 10 4.5 L 5 9 Z M 0 0 L 5 4.5 L 0 9 Z"
+            : "M 5 0 L 0 4.5 L 5 9 Z M 10 0 L 5 4.5 L 10 9 Z";
+    }
+    Text {
+        x: 16px;
+        y: 0;
+        width: 8px;
+        height: parent.height;
+        text: "5";
+        color: Theme.button-text;
+        font-size: 9px;
+        horizontal-alignment: center;
+        vertical-alignment: center;
+    }
+}
+
+// ── 预览底部带内联速度档位 chip（16 档）：active 用 1px accent 描边（与速度按钮展开态一致）──
+component PreviewSpeedChip inherits Rectangle {
+    in property <string> label: "";
+    in property <bool> active: false;
+    callback clicked();
+
+    width: 34px;
+    height: 20px;
+    border-radius: Theme.radius-md;
+    border-width: root.active ? 1px : 0px;
+    border-color: Theme.accent;
+    background: chip-hit.pressed
+        ? Theme.button-pressed
+        : (chip-hit.has-hover ? Theme.button-hover : Theme.button-bg);
+
+    chip-hit := TouchArea {
+        clicked => { root.clicked(); }
+    }
+
+    Text {
+        width: 100%;
+        height: 100%;
+        text: root.label;
+        color: Theme.button-text;
+        font-size: 10px;
+        horizontal-alignment: center;
+        vertical-alignment: center;
+        overflow: elide;
     }
 }
 
@@ -343,19 +438,19 @@ component PreviewVolumeSlider inherits Rectangle {
     // 轨道
     Rectangle {
         x: 0;
-        y: (parent.height - 6px) / 2;
+        y: (parent.height - 4px) / 2;
         width: parent.width;
-        height: 6px;
-        border-radius: 3px;
+        height: 4px;
+        border-radius: 2px;
         background: Theme.text-muted;
     }
     // 已设音量填充
     Rectangle {
         x: 0;
-        y: (parent.height - 6px) / 2;
+        y: (parent.height - 4px) / 2;
         width: parent.width * (root.value / 100);
-        height: 6px;
-        border-radius: 3px;
+        height: 4px;
+        border-radius: 2px;
         background: Theme.accent;
     }
     // 拖柄：随值移动
@@ -775,7 +870,6 @@ export component MainWindow inherits Window {
     in property <string> preview-id: "";
     in property <string> preview-title: "";
     in property <int> preview-kind: 0;
-    in property <string> preview-note: "";
     // 图片预览图像 / GIF 当前帧（关闭时 Rust 显式清空，释放软件渲染器常驻位图）。
     in property <image> preview-image;
     in property <image> preview-frame;
@@ -788,10 +882,30 @@ export component MainWindow inherits Window {
     in property <float> preview-progress: 0;
     in property <string> preview-pos-text: "0:00";
     in property <string> preview-dur-text: "0:00";
-    // 播放倍速：`preview-speed-index` 为 `preview-speed-steps` 的下标（默认 1 = 1×）。
-    in-out property <int> preview-speed-index: 1;
-    property <[float]> preview-speed-steps: [0.5, 1.0, 1.25, 1.5, 2.0];
-    property <[string]> preview-speed-labels: ["0.5×", "1×", "1.25×", "1.5×", "2×"];
+    // 播放倍速（底部带内联档位条选择）：0.25×–4.0× 共 16 档、相邻间隔恒 0.25×；preview-speed-index 为 preview-speed-options 的下标（1× 为默认档，仍为下标 3）。
+    in-out property <int> preview-speed-index: 3;
+    // 底部带速度档位条展开态：Slint 内点击切换、Rust 在打开预览/隐藏 chrome 时防御性复位。
+    in-out property <bool> preview-speed-open: false;
+    property <[OptionItem]> preview-speed-options: [
+        { value: "0.25", label: "0.25×" },
+        { value: "0.5", label: "0.5×" },
+        { value: "0.75", label: "0.75×" },
+        { value: "1.0", label: "1×" },
+        { value: "1.25", label: "1.25×" },
+        { value: "1.5", label: "1.5×" },
+        { value: "1.75", label: "1.75×" },
+        { value: "2.0", label: "2×" },
+        { value: "2.25", label: "2.25×" },
+        { value: "2.5", label: "2.5×" },
+        { value: "2.75", label: "2.75×" },
+        { value: "3.0", label: "3×" },
+        { value: "3.25", label: "3.25×" },
+        { value: "3.5", label: "3.5×" },
+        { value: "3.75", label: "3.75×" },
+        { value: "4.0", label: "4×" }
+    ];
+    // 默认档位（1×）在档位表中的下标：作为唯一来源供 Rust 复位时读取。
+    out property <int> preview-speed-default-index: 3;
     // 预览音量（0..100，mpv 标度）/ 静音（Task 3，由 Rust 种子化并回写）。
     in-out property <float> preview-volume: 50;
     in-out property <bool> preview-muted: false;
@@ -807,15 +921,17 @@ export component MainWindow inherits Window {
     property <length> dlg-h: root.preview-fullscreen ? root.height : min(640px, root.height - 80px);
     property <length> dlg-x: root.preview-fullscreen ? 0px : (root.width - root.dlg-w) / 2;
     property <length> dlg-y: root.preview-fullscreen ? 0px : (root.height - root.dlg-h) / 2;
-    // 预览控制条高度：视频 44px / GIF 40px / 图片与网页 0（行为不变）。视频原生子窗口
-    // 只覆盖缩小后的内容区，控制条位于其下方故不被遮挡。
-    property <length> controls-h: root.preview-kind == 1 ? 44px : (root.preview-kind == 2 ? 40px : 0px);
+    // 预览控制带高度：视频 76px（上内边距 6 + 进度行 24 + 间隔 6 + 控制行 34 + 下内边距 6）/
+    // GIF 40px / 图片与网页 0（行为不变）。视频原生子窗口只覆盖缩小后的内容区，控制带位于其下方故不被遮挡。
+    property <length> controls-h: root.preview-kind == 1 ? 76px : (root.preview-kind == 2 ? 40px : 0px);
     // chrome 隐藏态（Task 9）：全屏且控制条自动隐藏时，内容铺满整屏、不占位控制条。
     property <bool> chrome-hidden: root.preview-fullscreen && !root.preview-chrome-visible;
     out property <length> preview-x: root.dlg-x + (root.chrome-hidden ? 0px : 12px);
     out property <length> preview-y: root.dlg-y + (root.chrome-hidden ? 0px : 58px);
     out property <length> preview-w: root.dlg-w - (root.chrome-hidden ? 0px : 24px);
-    out property <length> preview-h: root.dlg-h - (root.chrome-hidden ? 0px : (104px + root.controls-h));
+    // 控制带贴弹窗底缘：底部预留归零（58 = 顶部 chrome 58 + 底部 0），内容区再释放 16px。
+    // 带底边 = dlg-h，靠弹窗自身 `clip: true` + 10px 圆角收边，不留任何空白条。
+    out property <length> preview-h: root.dlg-h - (root.chrome-hidden ? 0px : (58px + root.controls-h));
     // 控制条高度投影给 Rust：用于几何守卫（宿主子窗口底边不得侵入控制条区）。
     out property <length> preview-controls-h: root.chrome-hidden ? 0px : root.controls-h;
 
@@ -845,6 +961,8 @@ export component MainWindow inherits Window {
     // 播放控制（Task 2）：切换播放/暂停；seek 参数为 0..1 比例。
     callback preview-toggle-play();
     callback preview-seek(float);
+    // 预览 ±5s 相对跳转：参数为秒增量，复用 Rust `seek_relative`。
+    callback preview-seek-relative(float);
     // 播放倍速（Task 2）：参数为倍速数值，Rust 写入 mpv `speed`。
     callback preview-set-speed(float);
     // 预览音量/静音（Task 3）：set 为拖动中实时下发，commit 为释放后持久化。
@@ -902,7 +1020,7 @@ export component MainWindow inherits Window {
     callback open-repo();
 
     // ── 下拉浮层（单例）：展开 / 收起与选择回派，纯 UI 内部回调）────────────────
-    // id 约定：1=目标显示器、2=缩放模式、3=多屏排列、4=全屏时处置、5=采样算法、
+    // id 约定：1=目标显示器、2=缩放模式、3=多屏排列、4=全屏时处置、5=采样算法，
     // 100+i=「单元配置」第 i 行单元的激活壁纸池下拉（位于 `for` 循环内，按行号区分身份）。
     callback dd-toggle(id: int, x: length, y: length, w: length, index: int);
     callback dd-choose(id: int, index: int);
@@ -1060,6 +1178,13 @@ export component MainWindow inherits Window {
         capture-key-pressed(event) => {
             // 预览打开：Esc 关闭；Tab/Backtab 陷阱在弹窗内；白名单动作转发；其余交回原生子窗口。
             if (root.preview-id != "") {
+                // 预览内下拉展开时，Esc 先收起下拉（不关闭预览、不退出全屏）。
+                if (root.dd-open) {
+                    if (event.text == Key.Escape) {
+                        root.dd-open = false;
+                        return accept;
+                    }
+                }
                 if (event.text == Key.Escape) {
                     root.key-command("dismiss");
                     return accept;
@@ -1799,9 +1924,11 @@ export component MainWindow inherits Window {
                 height: 100%;
             }
 
+            // 标题与右上按钮统一在 58px 顶栏内垂直居中（6 + 46 + 6 = 58），
+            // 避免内容整体贴顶、头部下方留出比上方更宽的空白。
             Text {
                 x: 16px;
-                y: 0;
+                y: 6px;
                 width: parent.width - 100px;
                 height: 46px;
                 text: root.preview-title;
@@ -1816,7 +1943,7 @@ export component MainWindow inherits Window {
             // 全屏 / 退出全屏（Task 7）：右上角、关闭按钮左侧，对所有预览类型可见。
             PreviewIconButton {
                 x: parent.width - 44px - 34px;
-                y: 9px;
+                y: 15px;
                 fullscreen: root.preview-fullscreen;
                 visible: root.preview-chrome-visible || !root.preview-fullscreen;
                 clicked => { root.preview-toggle-fullscreen(); }
@@ -1824,7 +1951,7 @@ export component MainWindow inherits Window {
 
             Rectangle {
                 x: parent.width - 44px;
-                y: 9px;
+                y: 15px;
                 width: 30px;
                 height: 28px;
                 border-radius: Theme.radius-md;
@@ -1913,7 +2040,176 @@ export component MainWindow inherits Window {
                     background: Theme.border;
                 }
 
-                HorizontalLayout {
+                // 视频（kind==1）：两行式播放器带 —— 进度行紧贴内容区下缘，控制行在其下。
+                // 上内边距 6 + 进度行 24 + 间隔 6 + 控制行 34 + 下内边距 6 = 76px（与 controls-h 一致）。
+                if (root.preview-kind == 1) : VerticalLayout {
+                    padding-top: 6px;
+                    padding-bottom: 6px;
+                    padding-left: 6px;
+                    padding-right: 6px;
+                    spacing: 6px;
+
+                    // ── 进度行（24px）：当前时间 ｜ 进度条（stretch）｜ 总时长；展开档位条时原位替换 ──
+                    if (!root.preview-speed-open) : HorizontalLayout {
+                        spacing: 8px;
+                        cross-axis-alignment: center;
+
+                        Text {
+                            text: root.preview-pos-text;
+                            color: Theme.text-secondary;
+                            font-size: 11px;
+                            width: 40px;
+                            horizontal-alignment: center;
+                            vertical-alignment: center;
+                        }
+
+                        Rectangle {
+                            horizontal-stretch: 1;
+                            height: 24px;
+                            background: transparent;
+
+                            // 命中区先声明：下方视觉件要引用它的悬停/按下态；覆盖整行 24px 高度，保证 4px 细轨道也易于抓取。
+                            seek-hit := TouchArea {
+                                width: 100%;
+                                height: 100%;
+                                moved => {
+                                    root.preview-seek(Math.max(0.0, Math.min(1.0,
+                                        self.mouse-x / Math.max(self.width, 1px))));
+                                }
+                                clicked => {
+                                    root.preview-seek(Math.max(0.0, Math.min(1.0,
+                                        self.mouse-x / Math.max(self.width, 1px))));
+                                }
+                            }
+
+                            // 轨道：常态 4px 细轨道，悬停/拖动增高到 6px（对齐主流「静态干净」原则）。
+                            Rectangle {
+                                x: 0;
+                                y: (parent.height - self.height) / 2;
+                                width: parent.width;
+                                height: (seek-hit.has-hover || seek-hit.pressed) ? 6px : 4px;
+                                border-radius: 2px;
+                                background: Theme.text-muted;
+
+                                animate height { duration: 120ms; easing: ease-in-out; }
+                            }
+                            // 已播放填充（与轨道同步增高）
+                            Rectangle {
+                                x: 0;
+                                y: (parent.height - self.height) / 2;
+                                width: parent.width * root.preview-progress;
+                                height: (seek-hit.has-hover || seek-hit.pressed) ? 6px : 4px;
+                                border-radius: 2px;
+                                background: Theme.accent;
+
+                                animate height { duration: 120ms; easing: ease-in-out; }
+                            }
+                            // 拖柄：默认不可见，悬停/拖动才出现。
+                            Rectangle {
+                                x: root.preview-progress * (parent.width - 12px);
+                                y: (parent.height - 12px) / 2;
+                                width: 12px;
+                                height: 12px;
+                                border-radius: 6px;
+                                background: Theme.accent;
+                                opacity: (seek-hit.has-hover || seek-hit.pressed) ? 1.0 : 0.0;
+
+                                animate opacity { duration: 120ms; easing: ease-in-out; }
+                            }
+                        }
+
+                        Text {
+                            text: root.preview-dur-text;
+                            color: Theme.text-secondary;
+                            font-size: 11px;
+                            width: 40px;
+                            horizontal-alignment: center;
+                            vertical-alignment: center;
+                        }
+                    }
+
+                    // ── 档位条（24px）：展开时原位替换进度行；与进度行等高，展开/收起不引起控制行跳动 ──
+                    if (root.preview-speed-open) : Rectangle {
+                        height: 24px;
+                        background: transparent;
+
+                        HorizontalLayout {
+                            alignment: center;
+                            spacing: 2px;
+                            cross-axis-alignment: center;
+
+                            for idx in root.preview-speed-options.length : PreviewSpeedChip {
+                                label: root.preview-speed-options[idx].label;
+                                active: idx == root.preview-speed-index;
+                                clicked => {
+                                    root.preview-speed-index = idx;
+                                    root.preview-set-speed(root.preview-speed-options[idx].value.to-float());
+                                    root.preview-speed-open = false;
+                                }
+                            }
+                        }
+                    }
+
+                    // ── 控制行（34px）：传输簇绝对居中 + 右侧组绝对贴右缘 ──────────────────────
+                    //
+                    // 两个铺满整行的覆盖层（子件互不重叠，故命中区不冲突）：
+                    // 若改用单一水平布局 + 左右弹性空白，右侧空白会因承载右组内容而获得更大的
+                    // 首选宽度（实测比左侧宽 168px），导致播放键整体左偏 84px；覆盖层写法与
+                    // 右组宽度解耦，传输簇恒与弹窗中线重合。
+                    Rectangle {
+                        height: 34px;
+                        background: transparent;
+
+                        // 传输簇：铺满整行后按中心对齐
+                        HorizontalLayout {
+                            width: 100%;
+                            height: 100%;
+                            alignment: center;
+                            spacing: 8px;
+                            cross-axis-alignment: center;
+
+                            PreviewSeekStepButton {
+                                forward: false;
+                                clicked => { root.preview-seek-relative(-5.0); }
+                            }
+                            PreviewPlayButton {
+                                playing: controls-playing;
+                                clicked => { root.preview-toggle-play(); }
+                            }
+                            PreviewSeekStepButton {
+                                forward: true;
+                                clicked => { root.preview-seek-relative(5.0); }
+                            }
+                        }
+
+                        // 右侧组：同样铺满整行后按尾部对齐，不参与传输簇居中
+                        HorizontalLayout {
+                            width: 100%;
+                            height: 100%;
+                            alignment: end;
+                            spacing: 8px;
+                            cross-axis-alignment: center;
+
+                            PreviewSpeedButton {
+                                label: root.preview-speed-options[root.preview-speed-index].label;
+                                expanded: root.preview-speed-open;
+                                clicked => { root.preview-speed-open = !root.preview-speed-open; }
+                            }
+                            SpeakerIconButton {
+                                muted: root.preview-muted;
+                                clicked => { root.preview-toggle-mute(); }
+                            }
+                            PreviewVolumeSlider {
+                                value <=> root.preview-volume;
+                                changed(v) => { root.preview-set-volume(v); }
+                                committed(v) => { root.preview-commit-volume(v); }
+                            }
+                        }
+                    }
+                }
+
+                // GIF（kind==2）：结构保持现状 —— 单行、仅播放/暂停按钮。
+                if (root.preview-kind == 2) : HorizontalLayout {
                     padding-left: 6px;
                     padding-right: 6px;
                     spacing: 8px;
@@ -1923,108 +2219,7 @@ export component MainWindow inherits Window {
                         playing: controls-playing;
                         clicked => { root.preview-toggle-play(); }
                     }
-
-                    // 仅视频显示时间 / 进度条（GIF 只留播放按钮）。
-                    if (root.preview-kind == 1) : Text {
-                        text: root.preview-pos-text;
-                        color: Theme.text-secondary;
-                        font-size: 11px;
-                        width: 36px;
-                        horizontal-alignment: center;
-                        vertical-alignment: center;
-                    }
-
-                    if (root.preview-kind == 1) : Rectangle {
-                        horizontal-stretch: 1;
-                        height: 20px;
-                        background: transparent;
-
-                        // 轨道（高对比中性色，保证 progress==0 时仍清晰可辨）
-                        Rectangle {
-                            x: 0;
-                            y: (parent.height - 8px) / 2;
-                            width: parent.width;
-                            height: 8px;
-                            border-radius: 4px;
-                            background: Theme.text-muted;
-                        }
-                        // 已播放填充
-                        Rectangle {
-                            x: 0;
-                            y: (parent.height - 8px) / 2;
-                            width: parent.width * root.preview-progress;
-                            height: 8px;
-                            border-radius: 4px;
-                            background: Theme.accent;
-                        }
-                        // 拖柄：随进度水平移动，始终落在 [0, width-12px] 内
-                        Rectangle {
-                            x: root.preview-progress * (parent.width - 12px);
-                            y: (parent.height - 12px) / 2;
-                            width: 12px;
-                            height: 12px;
-                            border-radius: 6px;
-                            background: Theme.accent;
-                        }
-                        // 命中区：拖动 / 释放都按比例 seek（命中区高于视觉轨道，便于点击）。
-                        seek-hit := TouchArea {
-                            width: 100%;
-                            height: 100%;
-                            moved => {
-                                root.preview-seek(Math.max(0.0, Math.min(1.0,
-                                    self.mouse-x / Math.max(self.width, 1px))));
-                            }
-                            clicked => {
-                                root.preview-seek(Math.max(0.0, Math.min(1.0,
-                                    self.mouse-x / Math.max(self.width, 1px))));
-                            }
-                        }
-                    }
-
-                    if (root.preview-kind == 1) : Text {
-                        text: root.preview-dur-text;
-                        color: Theme.text-secondary;
-                        font-size: 11px;
-                        width: 36px;
-                        horizontal-alignment: center;
-                        vertical-alignment: center;
-                    }
-
-                    // 速度按钮（仅视频）：循环切换 0.5× / 1× / 1.25× / 1.5× / 2×。
-                    if (root.preview-kind == 1) : PreviewSpeedButton {
-                        label: root.preview-speed-labels[root.preview-speed-index];
-                        clicked => {
-                            root.preview-speed-index = root.preview-speed-index >= 4
-                                ? 0
-                                : root.preview-speed-index + 1;
-                            root.preview-set-speed(root.preview-speed-steps[root.preview-speed-index]);
-                        }
-                    }
-
-                    // 静音按钮 / 音量滑块（仅视频，Task 3）。
-                    if (root.preview-kind == 1) : SpeakerIconButton {
-                        muted: root.preview-muted;
-                        clicked => { root.preview-toggle-mute(); }
-                    }
-                    if (root.preview-kind == 1) : PreviewVolumeSlider {
-                        value <=> root.preview-volume;
-                        changed(v) => { root.preview-set-volume(v); }
-                        committed(v) => { root.preview-commit-volume(v); }
-                    }
                 }
-            }
-
-            Text {
-                x: 16px;
-                y: parent.height - 34px;
-                width: parent.width - 32px;
-                height: 24px;
-                text: root.preview-note;
-                color: Theme.text-secondary;
-                font-size: 11px;
-                vertical-alignment: center;
-                overflow: elide;
-                visible: !root.preview-fullscreen;
             }
         }
     }

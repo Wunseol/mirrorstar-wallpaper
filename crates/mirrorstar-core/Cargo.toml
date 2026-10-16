@@ -22,5 +22,11 @@ fs2 = { workspace = true }
 winreg = { workspace = true }
 uuid = { workspace = true }
 
+# A-001：`#[implement(IMMNotificationClient)]` 生成的代码以 `::windows_core::…` 绝对路径
+# 引用运行时 crate，故需把 `windows-core` 作为直接依赖引入（版本与 `windows` 0.58 对齐）。
+# 移除该依赖编译实测报 E0433: cannot find `windows_core` in the crate root。
+[target.'cfg(windows)'.dependencies.windows-core]
+version = "0.58"
+
 [dev-dependencies]
 tempfile = "3"

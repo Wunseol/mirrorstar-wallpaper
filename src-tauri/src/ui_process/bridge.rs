@@ -1,5 +1,5 @@
 //! 协议桥：把 `ui_proto` 的请求映射到**现有** `commands::*` 实现（业务逻辑零复制），
-//! 并把壳侧 13 个既有事件转发为协议推送。
+//! 并把壳侧 14 个既有事件转发为协议推送。
 //!
 //! # 命令桥
 //!
@@ -16,8 +16,8 @@
 //!
 //! # 事件桥
 //!
-//! 壳侧在各处直接 `app.emit(...)`（共 13 个发射点）。本模块**不逐个改动发射点**，而是
-//! 在 setup 中通过 [`install_event_forwarding`] 用 `app.listen(...)` 订阅这 13 个事件名，
+//! 壳侧在各处直接 `app.emit(...)`（共 14 个发射点）。本模块**不逐个改动发射点**，而是
+//! 在 setup 中通过 [`install_event_forwarding`] 用 `app.listen(...)` 订阅这 14 个事件名，
 //! 再转发为协议推送 [`UiMessage::Event`]。转发为**惰性**：UI 进程未运行时直接返回，
 //! 不产生序列化与 IO 开销。
 
@@ -31,7 +31,7 @@ use mirrorstar_core::MirrorStarError;
 
 use super::UiProcessManager;
 
-/// 需要转发到 UI 进程的壳侧事件全集（13 个，与 `alignment.md` 表 2 逐字一致）。
+/// 需要转发到 UI 进程的壳侧事件全集（14 个）。
 ///
 /// 该常量是事件桥的**唯一事实来源**：新增壳侧事件时在此追加一项即可被转发；
 /// 测试 [`tests::forwarded_events_cover_alignment_table`] 断言集合完整且无重复。
@@ -49,6 +49,9 @@ pub const FORWARDED_EVENTS: &[&str] = &[
     "config-load-error",
     "desktop-status-changed",
     "audio-disabled",
+    // 显示器热插拔（`scheduler.rs` 的 `Why::DisplayCheck` 分支每 3s 轮询，
+    // 仅集合真变化时发射）；UI 侧 `store.rs::apply_event` 已消费该事件。
+    "displays-changed",
 ];
 
 /// 订阅全部 [`FORWARDED_EVENTS`] 并转发为协议推送（setup 中调用一次）。
@@ -329,12 +332,12 @@ mod tests {
 
     #[test]
     fn forwarded_events_cover_alignment_table() {
-        // 13 个事件：数量、无重复、与 alignment.md 表 2 集合逐字一致。
-        assert_eq!(FORWARDED_EVENTS.len(), 13, "事件桥应覆盖 13 个壳侧事件");
+        // 14 个事件：数量、无重复、与壳侧各发射点集合逐字一致。
+        assert_eq!(FORWARDED_EVENTS.len(), 14, "事件桥应覆盖 14 个壳侧事件");
         let mut sorted = FORWARDED_EVENTS.to_vec();
         sorted.sort_unstable();
         sorted.dedup();
-        assert_eq!(sorted.len(), 13, "事件名不得重复");
+        assert_eq!(sorted.len(), 14, "事件名不得重复");
 
         for expected in [
             "wallpaper-added",
@@ -350,10 +353,11 @@ mod tests {
             "config-load-error",
             "desktop-status-changed",
             "audio-disabled",
+            "displays-changed",
         ] {
             assert!(
                 FORWARDED_EVENTS.contains(&expected),
-                "事件桥缺少 {}（alignment.md 表 2）",
+                "事件桥缺少 {}",
                 expected
             );
         }

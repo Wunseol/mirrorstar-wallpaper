@@ -86,7 +86,7 @@
 |---------|----------|--------|------|
 | FR-011 | 多显示器识别 | P0 | 自动检测并列出系统中所有连接的显示器（`enumerate_displays`，带 5s TTL 缓存） |
 | FR-012 | 独立壁纸设置 | P0 | 支持为每个显示器独立设置不同的壁纸 |
-| FR-013 | 显示器热插拔 | P1 | **已实现**：调度器 `src-tauri/src/scheduler.rs` 每 3 秒轮询检测显示器集合变化（`display_set_changed`）并发出 `displays-changed` 事件、重建布局；GDI 渲染器处理 `WM_DISPLAYCHANGE` 重新查询实际屏幕尺寸并调整壁纸窗口定位（`gdi_base.rs` / `invalidate_screen_size_cache`）。**已知缺陷**：`src-tauri/src/ui_process/bridge.rs::FORWARDED_EVENTS`（13 个事件）**不含** `displays-changed`，UI 进程实际收不到该事件（UI 侧 `store.rs` 已具备处理逻辑，属转发断链） |
+| FR-013 | 显示器热插拔 | P1 | **已实现**：调度器 `src-tauri/src/scheduler.rs` 每 3 秒轮询检测显示器集合变化（`display_set_changed`，顺序无关、同值短路）并发出 `displays-changed` 事件、重建布局；GDI 渲染器处理 `WM_DISPLAYCHANGE` 重新查询实际屏幕尺寸并调整壁纸窗口定位（`gdi_base.rs` / `invalidate_screen_size_cache`）。UI 侧同步：`src-tauri/src/ui_process/bridge.rs::FORWARDED_EVENTS`（14 个事件）**已含** `displays-changed`，UI 进程（`crates/mirrorstar-ui/src/store.rs::apply_event`）收到后刷新显示器选择卡列表、清理已消失显示器的缩放记忆（保留 `"all"` 键）并收敛失效的当前选择；转发断链已修复并经注入式端到端验证 |
 | FR-014 | 跨显示器壁纸 | P2 | **已实现**：通过 `Arrangement::Span`（跨屏拉伸，单一跨屏渲染器贯通虚拟桌面）支持将单个壁纸跨所有显示器显示。相关排列见 FR-046 |
 
 ### 5.4 暂停与恢复
@@ -166,5 +166,5 @@
 | FR-045 | 纯净壁纸模式（Pure Mode） | P2 | 隐藏桌面图标与任务栏，仅呈现壁纸，营造沉浸式桌面；进入后按任意键（或再次触发）退出。底层由 `crates/mirrorstar-core/src/pure_mode/`（进程级活跃标志、置顶窗口注册/断言、临时顶层呈现窗口 `lift_window_to_rect`）与 `src-tauri/src/platform/{pure_mode.rs, pure_mode_input.rs, liveness_watchdog.rs}`（输入监听、存活看护）实现；入口为托盘菜单"纯净壁纸（按任意键退出）"勾选项 |
 | FR-046 | 多屏排列 | P1 | 支持三种多屏排列方式（`Arrangement`，`config/settings.rs`，`src-tauri/src/scheduler.rs` 编排）：**每屏独立（PerMonitor）** / **全部相同（AllSame）** / **跨屏拉伸（Span）**。UI 设置面板提供"多屏排列"下拉（`mirrorstar-ui` `settings.rs`），非 PerMonitor 排列下"目标显示器"选择置灰 |
 | FR-047 | 壁纸拖拽排序 | P2 | 支持在壁纸库网格中拖拽卡片调整顺序（`mirrorstar-ui`：`on_drag_started` / `on_drag_insert_index` / `on_drag_commit`，`dnd::reorder_ids` 计算新顺序，本地先行 `reorder_local` 后下发 `reorder_wallpapers` 命令持久化）。拖拽中冻结列数重算，含拖拽幽灵图（drag ghost） |
-| FR-048 | 预览播放器控制 | P2 | 预览弹窗内提供播放控制条：**播放/暂停**、视频**进度拖动 seek**（含时间显示）、**播放速度**切换（视频，见 FR-049/循环档位）、**音量滑块**与**静音**切换（实时下发，释放后持久化）、**全屏/退出全屏**、**ESC 关闭**（预览态 ESC 语义关闭弹窗，Tab/Backtab 在弹窗内循环）。GIF 仅提供播放/暂停；图片与网页无控制条 |
-| FR-049 | 播放速度精细化 | P2 | 设置面板"播放速度"行提供内联 **−/+ 微调按钮**（步长 **0.01×**，先量化到 0.01 再 clamp，避免浮点漂移），滑块量程 0.25×~4.0×；按钮在滑块达到边界时**置灰**（`minus-enabled` / `plus-enabled`）。预览控制条另提供循环档位速度按钮：0.5× / 1× / 1.25× / 1.5× / 2× |
+| FR-048 | 预览播放器控制 | P2 | 预览弹窗内提供**两行式播放器带**（高 **76px**，上下内边距**对称各 6px**：6 + 进度行 24 + 间隔 6 + 控制行 34 + 6）：**上层进度行**紧贴内容区下缘独占一行，含**当前时间 / 进度条可拖动 seek / 总时长**，进度条为 **4px 细轨道（圆角 2px）、悬停或拖动时增高至 6px**，拖柄为 12px 圆点、**默认隐藏、悬停或拖动时才出现**（命中区仍覆盖整行高度，拖动/点击 seek 逻辑与比例换算不变）；**下层控制行**为居中传输簇 `−5s / 播放暂停 / +5s`，右侧 `播放速度 / 静音 / 音量滑块`，**控制带下方不再有常驻说明文字**（原小字说明已移除，释放的高度归还视频内容区）。其中 **−5s / +5s** 为相对跳转按钮（复用 `preview::seek_relative`，时长元数据未就绪时为 no-op），**播放/暂停**、**音量滑块**与**静音**（实时下发，释放后持久化）、**全屏/退出全屏**、**ESC 关闭**（预览态 ESC 语义关闭弹窗，Tab/Backtab 在弹窗内循环）能力均保留（播放速度见 FR-049）。GIF 仅提供单行播放/暂停；图片与网页无控制带 |
+| FR-049 | 播放速度精细化 | P2 | 设置面板"播放速度"行提供内联 **−/+ 微调按钮**（步长 **0.01×**，先量化到 0.01 再 clamp，避免浮点漂移），滑块量程 0.25×~4.0×；按钮在滑块达到边界时**置灰**（`minus-enabled` / `plus-enabled`）。预览底部带另提供**内联横向档位条**，覆盖 **0.25×–4.0× 共 16 档、相邻档位间隔恒为 0.25×**（0.25× / 0.5× / 0.75× / 1× / 1.25× / 1.5× / 1.75× / 2× / 2.25× / 2.5× / 2.75× / 3× / 3.25× / 3.5× / 3.75× / 4×），展开时**原位替换进度行** |

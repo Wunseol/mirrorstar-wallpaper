@@ -58,15 +58,6 @@ fn kind_of(wallpaper_type: WallpaperType) -> i32 {
     }
 }
 
-fn note_for(kind: i32) -> &'static str {
-    match kind {
-        KIND_IMAGE => "图片预览 · 原生解码，按比例完整显示",
-        KIND_VIDEO => "视频预览 · 独立 mpv 子窗口，循环播放",
-        KIND_GIF => "GIF 预览 · 自研逐帧播放",
-        _ => "网页预览 · 按需创建临时 WebView2",
-    }
-}
-
 /// 取路径末段作为预览标题（兼容 `/` 与 `\`）。
 fn display_name(path: &str) -> String {
     path.rsplit(['\\', '/']).next().unwrap_or(path).to_string()
@@ -131,6 +122,12 @@ pub fn reset_chrome_tracking(ui: &MainWindow) {
 fn set_chrome_visible(ui: &MainWindow, visible: bool) {
     if ui.get_preview_chrome_visible() == visible {
         return;
+    }
+    if !visible {
+        // chrome 自动隐藏时同步收起根级下拉与底部带速度档位条：避免再次显示时残留展开态。
+        // 值未变化时不产生副作用。
+        ui.set_dd_open(false);
+        ui.set_preview_speed_open(false);
     }
     ui.set_preview_chrome_visible(visible);
     CONTROLLER.with(|c| {
@@ -288,6 +285,15 @@ pub fn install_handlers(ui: &MainWindow) {
         ui.on_preview_seek(move |fraction| {
             if let Some(ui) = ui_weak.upgrade() {
                 seek(&ui, fraction);
+            }
+        });
+    }
+    // ±5s 相对跳转（Task 1/2）：参数为秒增量，复用 `seek_relative`（时长元数据未就绪时内部 no-op）。
+    {
+        let ui_weak = ui.as_weak();
+        ui.on_preview_seek_relative(move |delta| {
+            if let Some(ui) = ui_weak.upgrade() {
+                seek_relative(&ui, delta as f64);
             }
         });
     }
@@ -528,7 +534,6 @@ impl PreviewController {
 
         ui.set_preview_kind(kind);
         ui.set_preview_title(SharedString::from(display_name(file_path)));
-        ui.set_preview_note(SharedString::from(note_for(kind)));
         ui.set_preview_image(Image::default());
         ui.set_preview_frame(Image::default());
         ui.set_preview_pending(false);
@@ -540,9 +545,11 @@ impl PreviewController {
         ui.set_preview_pos_text(SharedString::from("0:00"));
         ui.set_preview_dur_text(SharedString::from("0:00"));
         // 播放倍速 / 全屏复位：打开新预览一律回到 1× 与默认尺寸（不继承上一次的全屏）。
+        // 默认档位下标由 Slint 的 `preview-speed-default-index` 提供（唯一来源），避免 Rust 硬编码档位下标。
         ui.window().set_fullscreen(false);
         ui.set_preview_fullscreen(false);
-        ui.set_preview_speed_index(1);
+        ui.set_preview_speed_index(ui.get_preview_speed_default_index());
+        ui.set_preview_speed_open(false);
         // 预览音量/静音：无条件按会话态种子化（会话内用户改动优先，seed 为幂等）。
         let (session_v, session_m) = session_audio();
         ui.set_preview_volume(session_v);
@@ -643,6 +650,8 @@ impl PreviewController {
         if visible {
             ui.set_preview_id(SharedString::default());
         }
+        // 程序化关闭预览（热插拔 / 在别处应用壁纸 / 切换预览等）后强制复位根级下拉状态，杜绝孤儿下拉。
+        ui.set_dd_open(false);
     }
 
     fn sync_geometry_inner(&mut self, ui: &MainWindow) {

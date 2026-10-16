@@ -58,26 +58,31 @@
 > 严重级别分布：Critical 0 / High 3 / Medium 7 / Low 12
 > 维度分布：架构 1 | 并发 4 | 资源 4 | 错误 4 | 性能 2 | 安全 3 | 可维护性 4
 
-> **状态汇总（已对照真实代码核验，2026-09 更新）**：22 项中 **21 项已修复（✅）**，仅 **A-001 仍未完成**（⚠️ 部分缓解，主动监听未实现；详见各条「修复状态」及文末 §3.2 交集汇总）。
+> **状态汇总（已对照真实代码核验，2026-10 更新）**：22 项中 **22 项已修复（✅）**，含最初列为唯一的 **A-001 已完成**（主动监听 `IMMNotificationClient` 已落地并有真机验证；详见各条「修复状态」及文末 §3.2 交集汇总）。
 
 ### 审查重点说明
 
-三个模块经过 v3.0→v3.5→v4.0→v4.1 多轮修复后整体质量较高：audio 的缓存失效防护（C-103/C-026/A03）与优雅降级（T-008）及 v41-A-001 COM 自愈；ipc 的 OOM 防护（I02）、指数退避（C-113）与 I-001 `total_avail` 超时盲区修复；process 的 STILL_ACTIVE 误判修复（P01）、`stop_immediate` 立即终止路径（v41-P-002）与 Job Object 配置。v4.0 的三项 High 优先项中 **I-001、P-001 已修复**，仅 **A-001（音频设备主动变更监听）仍未实现**。
+三个模块经过 v3.0→v3.5→v4.0→v4.1 多轮修复后整体质量较高：audio 的缓存失效防护（C-103/C-026/A03）与优雅降级（T-008）及 v41-A-001 COM 自愈；ipc 的 OOM 防护（I02）、指数退避（C-113）与 I-001 `total_avail` 超时盲区修复；process 的 STILL_ACTIVE 误判修复（P01）、`stop_immediate` 立即终止路径（v41-P-002）与 Job Object 配置。v4.0 的三项 High 优先项 **I-001、P-001、A-001 均已修复**（A-001 的主动设备变更监听于 2026-10 落地）。
 
 ### audio 模块 findings（6 项）
 
-#### [A-001] [High] [架构设计] volume.rs:92, 14 — `refresh_session_manager` 无生产调用方，音频设备变更完全无感知 ⚠️ 部分缓解（主动监听未实现）
+#### [A-001] [High] [架构设计] volume.rs — 音频设备变更无主动感知 ✅ 已修复于 2026-10（方案 A 主动监听已落地）
 
-**描述**：`VolumeControl` 持有 `device_enumerator: Option<IMMDeviceEnumerator>`（L14），其唯一 post-construction 消费者是 `refresh_session_manager`（L92-103）。模块未实现 `IMMNotificationClient`（`IMMDeviceEnumerator::RegisterEndpointNotificationCallback`）来监听默认音频端点变更事件，因此当用户切换默认音频设备后，`session_manager` 仍指向旧设备的会话枚举器，`set_process_volume` 对新设备上的 mpv 进程可能失效。
+**描述（原始问题）**：`VolumeControl` 未实现 `IMMNotificationClient`（`IMMDeviceEnumerator::RegisterEndpointNotificationCallback`）来监听默认音频端点变更事件。因此当用户切换默认音频设备（如插入耳机、切 HDMI）后，进程的音频会话会迁移到新端点并以系统默认值（100%）新建，而 `session_manager` 仍指向旧端点：① `set_process_volume` 对新端点上的 mpv 会话可能失效；② 用户先前设定的音量被丢失，体感「插耳机就哑了 / 音量跳回 100%」。此外 `with_session` 在「枚举不到会话」时**不会**触发 `refresh_session_manager` 重试，导致失败静默无上报。
 
-**修复 / 现状（v41-A-001，部分缓解）**：
-- ✅ **方案 B 自愈重试已实现**：`with_session` 在 WASAPI 调用失败时自动触发 `refresh_session_manager` 重试一次（L199-206），`refresh_session_manager`（L129-170）已具备 COM 重新初始化 + 设备重连能力，缓存清理并允许后续重试。
-- ⚠️ **主动监听仍未实现**：`volume.rs:13` 顶部仍保留 `// TODO(A-001): 未实现 IMMNotificationClient 主动监听`；`device_enumerator` 字段、`refresh_session_manager` 在设备切换瞬间仍无法主动感知（仅失败后惰性自愈）。
-- 对应 v6.0 技术债 **A-TD-001**（死字段 + 主动监听未实现，见 v6 技术债清单）。
+**修复 / 现状（2026-10 已全部落地）**：
+- ✅ **方案 A 主动监听已实现**：`volume.rs` 新增 `#[implement(IMMNotificationClient)] struct DeviceNotificationClient`，`VolumeControl` 新增 `device_enumerator` / `notification_client` / `wake_tx` / `watcher` 字段；构造时 `RegisterEndpointNotificationCallback`，`Drop` 时成对 `UnregisterEndpointNotificationCallback`（失败仅 warn）；注册失败降级为「无监听 + 保留既有惰性自愈」，不 panic、不阻断启动。
+- ✅ **回调线程模型**：`OnDefaultDeviceChanged`（仅 `eRender` + `eMultimedia` 角色实质处理，其余方法/角色返回 `S_OK`）内只置 `AtomicBool` + 投递无界 channel，不取 `VolumeControl` 内在锁、不做阻塞 COM 调用；由专用工作线程 `device_watch_loop`（自带 `CoInitializeEx(MTA)`，`recv_timeout` 500ms 轮询 `shutdown`）串行执行重下发，避免回调线程重入死锁。
+- ✅ **设备变更后重下发**：`VolumeControl` 缓存「最近一次用户设定的音量 / 静音态」（`set_process_volume` / `set_process_mute` 成功路径更新，失败不更新）；`redispatch_after_device_change` 在设备变更后重建 enumerator → 取新默认渲染端点 → 新会话管理器 → 查到 pid 会话即重下发缓存值（成功记 `info` 日志）。
+- ✅ **静默失败已修正**：`with_session` 的「枚举不到会话」重试条件改为 `is_not_found && !device_changed` —— 即**设备刚变更时**必定触发一次 `refresh_session_manager` 重试，而非静默跳过。
+- ✅ **真机验证**：以真实 mpv 音频会话 + `IPolicyConfig` 实际切换默认播放端点复现，确认 ① 注册回调成功 ② 每次变更后重下发执行（日志 `默认音频端点变更后已重下发用户音量/静音设定`）③ 会话音量保持用户设定值 30% ④ `Drop` 注销与线程回收约 0.9ms 完成、无悬挂。原 `// TODO(A-001)` 注释已移除。
+- 关联技术债 **A-TD-001 已消解**（`device_enumerator` 字段重新引入并真实服务于监听注册，不再是死字段）。
 
-**建议**：
-- 方案 A（推荐）：实现 `IMMNotificationClient`，在 `OnDefaultDeviceChanged` 回调中触发 `refresh_session_manager`，注意回调来自 WASAPI 线程，需通过 channel/poster 转发，避免回调中直接加锁死锁。
-- 方案 B（已部分落地）：维持惰性自愈，同时按 A-TD-001 清理建议评估移除 `device_enumerator` 死字段或补齐主动监听。
+**建议（已采纳）**：
+- 方案 A（已落地）：实现 `IMMNotificationClient`，回调经 channel 转发给工作线程，避免回调中直接加锁死锁 —— 与本条原先的推荐一致。
+- ✅ 冗余回调已收敛（2026-10 落地）：原「`OnDefaultDeviceChanged` 按角色各回调一次（`eConsole` / `eMultimedia` / `eCommunications`），单次设备切换触发 3 次重下发」的遗留项已修复 —— 现按角色过滤，仅处理默认渲染端点的多媒体角色（`eMultimedia`）；判定抽为纯函数 `should_redispatch_on_default_change(flow, role)`，单次切换的重下发次数由 3 次降为 1 次，并由单测覆盖「3 次角色回调 → 恰好 1 次命中」。
+- ✅ 缓存清理一致性已修正（2026-10 落地）：`refresh_session_manager` 中 `GetDefaultAudioEndpoint` / `Activate` 失败原经 `?` 提前返回、跳过 `session_cache.clear()`，与 `CoCreateInstance` 失败分支行为不一致；现改为显式 `match` 收口，**任一失败路径都清空缓存**，避免设备失效后残留脏会话指针（错误类型与调用方契约不变，降级实例 `warn!` 文案不变）。
+- 已审查并**保持现状**（2026-10 复核，遵循「零行为变更」约定）：① **COM 引导序列重复** —— 「创建枚举器 → 取默认渲染端点 → 激活会话管理器」在 `new` / `refresh_session_manager` / `redispatch_after_device_change` 三处重复，因各调用点错误文案与 `warn!` 日志字段不同（重下发路径区分「创建设备枚举器 / 获取默认渲染端点 / 激活会话管理器」失败），合并会改变日志语义，故**不合并**；② **`wake_tx` 字段** 为防御性双持发送端（`notification_client` 已持一份 `Sender` 克隆），改动收益极低，**保留**。
 
 #### [A-002] [Medium] [代码逻辑] volume.rs:161 — `with_session` 枚举路径 `GetSession`/`cast` 失败用 `?` 中止 ✅ 已修复于 v4.0 Wave 2H
 
@@ -394,7 +399,7 @@
 |---|---|---|---|---|
 | I-TD-002 + I-TD-007 + I-TD-008 | ipc | 移除 `NamedPipeIpcClient` trait + 3 个 impl 块 + `pub use` + 关联 Drop 重复 | 2 h | 中（影响公共 API 表面） |
 | I-TD-004 | ipc | 评估并移除 `MpvEvent` 死结构体 | 30 min | 低（仅 mpv 侧） |
-| A-TD-001 | audio | 二选一：移除 `device_enumerator` 字段或真正实现 IMMNotificationClient | 1 day | 中（影响 v41-A-001 恢复路径） |
+| A-TD-001 | audio | 二选一：移除 `device_enumerator` 字段或真正实现 IMMNotificationClient | — | ✅ 已消解（2026-10 选择「真正实现」：字段回归并服务于监听注册） |
 | A-TD-003 | audio | 迁移 `session_cache` 字段下的「Drop 契约」段到 SAFETY 块 | 30 min | 低 |
 | P-TD-001 + P-TD-002 | process | 评估 `#[ignore]` 测试去留，合并重复的 P-001 句柄泄漏测试 | 1 h | 低 |
 
@@ -415,7 +420,7 @@
 
 ### 3.2 v4.0 优先修复项当前状态（交集）
 
-> v4.0 的 3 项 High 优先级修复当前状态（与 §2 findings 各项「状态」一致）：**A-001 音频设备变更监听** ⚠️ 未完成（`IMMNotificationClient` 主动监听仍为 `TODO(A-001)`，建议按 A-TD-001 评估实现或移除死字段）；**I-001 超时机制理论盲区** ✅ 已修复（`total_avail` 限流方案 B + v41-I-001 UTF-8 截断处理）；**P-001 句柄泄漏** ✅ 已修复（`start()` 开头无条件 `stop_immediate()` 清理旧句柄）。
+> v4.0 的 3 项 High 优先级修复当前状态（与 §2 findings 各项「状态」一致）：**A-001 音频设备变更监听** ✅ 已修复于 2026-10（`IMMNotificationClient` 主动监听已落地：注册/注销成对、回调只投递、工作线程串行重下发缓存音量/静音态；`is_not_found && !device_changed` 静默失败亦已修正；见 §2.1 A-001）；**I-001 超时机制理论盲区** ✅ 已修复（`total_avail` 限流方案 B + v41-I-001 UTF-8 截断处理）；**P-001 句柄泄漏** ✅ 已修复（`start()` 开头无条件 `stop_immediate()` 清理旧句柄）。
 
 ### 3.3 优化机会
 
@@ -445,7 +450,7 @@ process 子模块的 1 个 `#[ignore]` 测试（P-TD-001）从未在 CI 中执�
 
 | v6 ID | v4.0 finding ID | v4.0 决策 | v6 状态 |
 |---|---|---|---|
-| A-TD-001 | A-001（High 架构设计） | 方案 B 惰性重试 + 保留 `device_enumerator` 字段为未来方案 A 留余地 | 字段仍未使用，技术债持续 |
+| A-TD-001 | A-001（High 架构设计） | 方案 B 惰性重试 + 保留 `device_enumerator` 字段为未来方案 A 留余地 | ✅ 已消解：2026-10 落地方案 A，字段回归并真实使用（见 §2.1 A-001） |
 | I-TD-004 | I-004（Low 可维护性） | 保留 `MpvEvent` + `#[allow(dead_code)]` | 仍未使用，技术债持续 |
 | I-TD-012 | I-007（Low 资源管理） | 保留外层 Drop + 注释说明幂等性 | 注释承认冗余但保留 |
 | I-TD-015 | I-006（Low 可维护性） | 在 `ipc/mod.rs` 添加超时对照表 | 表格重复且部分失准 |
@@ -506,7 +511,7 @@ v5.0 性能优化已应用，v6 仅记录其修复痕迹（注释中的历史标
 ### 8.4 文档一致性
 | 编号 | 位置 | 不一致点 | 级别 | 处置 |
 |---|---|---|---|---|
-| F-1 | 本文档 §1.1 / §2.1 A-001 / A-TD-001 | 文档仍称 `VolumeControl` 持有 `device_enumerator` 字段；实测 `volume.rs:22-38` 只有 `session_manager` 与 `session_cache`，全仓 `device_enumerator` 仅存在于文档 | High | 记录（历史章节未回写；A-TD-001 已随之失效） |
+| F-1 | 本文档 §1.1 / §2.1 A-001 / A-TD-001 | 曾记录「文档称 `VolumeControl` 持有 `device_enumerator` 字段、实测只有 `session_manager` 与 `session_cache`」 | High | ✅ 已消解（2026-10）：方案 A 落地后该字段**重新回到代码**并由监听注册真实使用，文档与代码重新一致（见 §2.1 A-001 / §8.7） |
 | F-2 | 本文档 §1.2 / §1.3 | `volume.rs` 行数记 1030（实测 1131）、测试数记 19（实测 24，含 1 个 `#[ignore]`） | Low | 已校正（见本次数字更新） |
 | F-3 | 本文档 §2.1 A-TD-003 | 所述「约 23 行 Drop 契约段嵌入字段定义」已不存在——契约现集中在 `volume.rs:40-83` 的 SAFETY 块 | Low | 记录 |
 | F-4 | `wallpaper/video.rs:22`（`should_invoke_wasapi` 注释「（非降级实例）」） | `has_volume_control` 仅判 `Option::is_some()`，而 `manager.rs:2224` 传入的可能是 `lib.rs:531` 的 `new_disabled()` 降级实例（`is_some()=true`），注释与行为不符（由降级实例内部 self-guard 静默返回 `Ok`，行为安全） | Low | 待确认（仅注释措辞） |
@@ -521,7 +526,7 @@ v5.0 性能优化已应用，v6 仅记录其修复痕迹（注释中的历史标
 D-1、D-2；R-1 ~ R-7；F-4；以及既有登记契约 A-001 / A-TD-001 / A-TD-002 / A-TD-003 / F24 —— 均涉及运行时行为、公开 API 语义或跨模块契约，本轮**只记录不实施**。
 
 ### 8.7 已消解 / 失效的历史 finding
-- **A-TD-001（`device_enumerator` 死字段）已消解**：该字段已从代码中删除（`VolumeControl` 现仅 `session_manager` + `session_cache`），文档 §2.1 未同步（见 F-1）。
+- **A-TD-001（`device_enumerator` 死字段）已消解（2026-10）**：该字段一度被删除，方案 A 落地后**重新引入**并真实服务于 `RegisterEndpointNotificationCallback`，不再是死字段；本文档 §2.1 A-001 已同步，F-1 一并关闭。
 - **A-TD-003（字段定义内嵌 Drop 契约段）已失效**：注释结构已调整，现契约集中于 `volume.rs:40-83`（见 F-3）。
 
 ## 深度审查：死代码 / 冗余 / 过度抽象（2026-10-11）
