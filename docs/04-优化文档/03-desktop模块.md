@@ -110,11 +110,11 @@ desktop 模块经过 v3.0→v3.5 共 5 轮修复（D01-D12），事务回滚契�
 
 **修复状态**：✅ 已修复于 v4.0 Wave 3B。现补充 3 个对真实 Progman 窗口的 no-panic 烟雾测试（window.rs:239-271，均标记 `#[ignore = "需要 Windows 环境且修改 Progman 窗口样式"]`），参照 `worker_w.rs::try_find_sibling_workerw_helper_no_panic` 范式。
 
-### [D-011] [Low] [逻辑] window.rs — `set_mouse_passthrough(false)` 保留 `WS_EX_LAYERED` 但契约未文档化
+### [D-011] [High] [逻辑] window.rs — `set_mouse_passthrough` 写入 `WS_EX_LAYERED` 导致壁纸呈现停止
 
-**描述**：`set_mouse_passthrough(enabled=false)` 分支仅移除 `WS_EX_TRANSPARENT`、保守保留 `WS_EX_LAYERED`，但窗口需要 `SetLayeredWindowAttributes` 配置才能正常渲染，契约未文档化。
+**描述**：`set_mouse_passthrough` 曾对 `enabled=true` 分支 OR 上 `WS_EX_LAYERED | WS_EX_TRANSPARENT`，`enabled=false` 分支仅移除 `WS_EX_TRANSPARENT` 而保留 `WS_EX_LAYERED`。壁纸窗口（mpv 视频输出窗口、图片 GDI 窗口）从未调用 `SetLayeredWindowAttributes`，一旦被写入 `WS_EX_LAYERED` 即进入「分层但无分层属性」的非合成状态，画面停止更新——表现为开关「鼠标交互模式」时视频壁纸被"暂停"，且关闭后因 `WS_EX_LAYERED` 未清除而不恢复。真实呈现状态可在 mpv 日志中确认无 `pause="yes"`（即解码未真正暂停）。
 
-**修复状态**：✅ 已修复于 v4.0 Wave 3B。函数 doc comment（window.rs:73-93）现显式声明"分层属性契约"：调用方需确保窗口已通过 `SetLayeredWindowAttributes` 配置分层属性，本函数仅切换 `WS_EX_TRANSPARENT` 位；`false` 时保留 `WS_EX_LAYERED`（D-011）。
+**修复状态**：✅ 已修复于 v41-D-013。此前 v4.0 Wave 3B 仅补齐 doc comment 声明"分层属性契约"，未消除非合成态风险。现 `set_mouse_passthrough` 绝不写入 `WS_EX_LAYERED`：`enabled=true` 仅 OR `WS_EX_TRANSPARENT`；`enabled=false` 幂等清除 `WS_EX_TRANSPARENT` 与遗留的 `WS_EX_LAYERED`（并输出 info 诊断日志）。样式计算抽取为纯函数 `passthrough_ex_style` 并补单测（window.rs）。
 
 ### [D-012] [Low] [可维护性] worker_w.rs — `SendMessageTimeoutW` 超时参数 200ms 为内联魔法数
 

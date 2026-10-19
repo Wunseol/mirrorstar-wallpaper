@@ -21,7 +21,7 @@ pub fn make_borderless(hwnd: HWND) -> Result<(), MirrorStarError> {
             "无法设置 GWL_STYLE 窗口样式",
         )?;
 
-        // Remove extended styles（保守保留 WS_EX_LAYERED，避免影响后续分层窗口/穿透等绘制行为）
+        // Remove extended styles（不动 WS_EX_LAYERED：由 set_mouse_passthrough 的关闭分支负责幂等清除）
         let ex_style = GetWindowLongPtrW(hwnd, GWL_EXSTYLE) as u32;
         let new_ex_style = WINDOW_EX_STYLE(ex_style)
             & !(WS_EX_DLGMODALFRAME
@@ -68,23 +68,38 @@ pub fn remove_from_taskbar(hwnd: HWND) {
     }
 }
 
+/// 计算鼠标穿透切换后的扩展样式位。
+///
+/// - `enabled = true`：仅 OR `WS_EX_TRANSPARENT`
+/// - `enabled = false`：清除 `WS_EX_TRANSPARENT` 与 `WS_EX_LAYERED`
+///
+/// 绝不写入 `WS_EX_LAYERED`：壁纸窗口（mpv 视频输出窗口、图片 GDI 窗口）从未调用
+/// `SetLayeredWindowAttributes`，一旦被写入 `WS_EX_LAYERED` 就会进入「分层但无分层属性」
+/// 的非合成状态，画面停止更新（视频壁纸表现为「暂停」）且切回后不恢复。
+pub(crate) fn passthrough_ex_style(current: isize, enabled: bool) -> isize {
+    if enabled {
+        current | (WS_EX_TRANSPARENT.0 as isize)
+    } else {
+        current & !(WS_EX_TRANSPARENT.0 as isize) & !(WS_EX_LAYERED.0 as isize)
+    }
+}
+
 /// 设置鼠标穿透模式
 ///
-/// # 分层属性契约
+/// # 扩展样式契约
 ///
-/// 调用方需确保窗口已通过 `SetLayeredWindowAttributes` 配置分层属性。本函数仅修改
-/// `WS_EX_TRANSPARENT` 标志，不配置分层属性。`enabled=false` 时仅移除 `WS_EX_TRANSPARENT`，
-/// 保留 `WS_EX_LAYERED`，但不调用 `SetLayeredWindowAttributes`（D-011）。
+/// 本函数只切换 `WS_EX_TRANSPARENT`：
+/// - `enabled=true`：仅 OR 上 `WS_EX_TRANSPARENT`，保留其它已设扩展样式位；
+/// - `enabled=false`：移除 `WS_EX_TRANSPARENT` 并**幂等清除**可能遗留的 `WS_EX_LAYERED`。
 ///
-/// v41-D-013: 当前以文档化契约约束调用顺序（接受现状，不引入 `LayeredWindow` newtype 重构）。
-/// 调用方必须按以下顺序操作：
+/// 本函数**绝不写入 `WS_EX_LAYERED`**，也不调用 `SetLayeredWindowAttributes`（v41-D-013 修订）。
 ///
-/// 1. 先调用 `SetLayeredWindowAttributes` 配置分层属性（颜色键或 alpha）
-/// 2. 再调用本函数切换 `WS_EX_TRANSPARENT`
+/// # 根因
 ///
-/// 若颠倒顺序，窗口可能进入"透明但无分层属性"的不可见状态。
-/// 长期重构方向为引入 `LayeredWindow` newtype 包装，仅 `LayeredWindow` 实例可调用
-/// `set_mouse_passthrough`，以类型系统强制契约。
+/// 壁纸窗口（mpv 视频输出窗口、图片 GDI 窗口）从未调用 `SetLayeredWindowAttributes`。
+/// 一旦被写入 `WS_EX_LAYERED`，窗口即进入「分层但无分层属性」的非合成状态，画面停止更新
+/// ——视频壁纸表现为「暂停」；且关闭时若保留 `WS_EX_LAYERED`，切回后也不会恢复呈现。
+/// `enabled=false` 分支清除该位用于自愈旧版本遗留的非合成状态。
 ///
 /// # 错误处理契约
 ///
@@ -94,13 +109,11 @@ pub fn remove_from_taskbar(hwnd: HWND) {
 pub fn set_mouse_passthrough(hwnd: HWND, enabled: bool) {
     unsafe {
         let ex_style = GetWindowLongPtrW(hwnd, GWL_EXSTYLE);
-        let new_style = if enabled {
-            // OR 上 WS_EX_LAYERED | WS_EX_TRANSPARENT，保留其它已设的扩展样式位
-            ex_style | (WS_EX_LAYERED.0 | WS_EX_TRANSPARENT.0) as isize
-        } else {
-            // 仅移除 WS_EX_TRANSPARENT，保守保留 WS_EX_LAYERED（避免影响其它绘制行为）
-            ex_style & !(WS_EX_TRANSPARENT.0 as isize)
-        };
+        // 关闭分支：若当前样式确实带 WS_EX_LAYERED（旧版本遗留），记录可诊断日志
+        if !enabled && (ex_style & (WS_EX_LAYERED.0 as isize)) != 0 {
+            tracing::info!(hwnd = ?hwnd, "旧版本遗留的 WS_EX_LAYERED 已被清除，壁纸呈现将恢复正常");
+        }
+        let new_style = passthrough_ex_style(ex_style, enabled);
         // 失败仅 warn，不向上传播（见函数级错误处理契约）
         let _ = set_window_long_with_error(
             hwnd,
@@ -258,13 +271,60 @@ mod tests {
         // Progman 找不到时（极端情况）跳过，不 panic 即通过
     }
 
+    // ── v41-D-013: passthrough_ex_style 纯函数单元测试 ──────────────────
+
+    /// enabled=true 仅 OR WS_EX_TRANSPARENT，绝不写入 WS_EX_LAYERED。
+    #[test]
+    fn passthrough_ex_style_enabled_never_sets_layered() {
+        let result = passthrough_ex_style(0, true);
+        assert_eq!(
+            result & (WS_EX_LAYERED.0 as isize),
+            0,
+            "enabled=true 不得写入 WS_EX_LAYERED"
+        );
+        assert_ne!(
+            result & (WS_EX_TRANSPARENT.0 as isize),
+            0,
+            "enabled=true 应包含 WS_EX_TRANSPARENT"
+        );
+    }
+
+    /// enabled=false 从 LAYERED|TRANSPARENT|TOOLWINDOW 出发仅保留 TOOLWINDOW。
+    #[test]
+    fn passthrough_ex_style_disabled_clears_layered_and_transparent() {
+        let current = (WS_EX_LAYERED.0 | WS_EX_TRANSPARENT.0 | WS_EX_TOOLWINDOW.0) as isize;
+        assert_eq!(
+            passthrough_ex_style(current, false),
+            WS_EX_TOOLWINDOW.0 as isize,
+        );
+    }
+
+    /// 开→关往返终态等于初始 current（其它位原样保留）。
+    #[test]
+    fn passthrough_ex_style_roundtrip_restores_initial() {
+        let current = (WS_EX_TOOLWINDOW.0 | WS_EX_NOACTIVATE.0) as isize;
+        let result = passthrough_ex_style(passthrough_ex_style(current, true), false);
+        assert_eq!(result, current);
+    }
+
+    /// enabled=true 不破坏既有其它位（如 WS_EX_NOACTIVATE）。
+    #[test]
+    fn passthrough_ex_style_enabled_preserves_other_bits() {
+        let current = WS_EX_NOACTIVATE.0 as isize;
+        assert_eq!(
+            passthrough_ex_style(current, true) & current,
+            current,
+            "enabled=true 应原样保留已有的其它扩展样式位"
+        );
+    }
+
     /// D-010: 验证 set_mouse_passthrough 对真实 Progman 窗口不 panic
     #[test]
     #[ignore = "需要 Windows 环境且修改 Progman 窗口样式"]
     fn set_mouse_passthrough_no_panic_on_progman() {
         let progman = unsafe { FindWindowW(windows::core::w!("Progman"), None) };
         if let Ok(hwnd) = progman {
-            // 测试 enabled=true 分支（OR 上 WS_EX_LAYERED | WS_EX_TRANSPARENT）
+            // 测试 enabled=true 分支（仅 OR 上 WS_EX_TRANSPARENT，绝不写入 WS_EX_LAYERED）
             set_mouse_passthrough(hwnd, true);
         }
         // Progman 找不到时（极端情况）跳过，不 panic 即通过

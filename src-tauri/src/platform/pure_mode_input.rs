@@ -212,6 +212,8 @@ impl InputHook {
         // 标志仍活跃，若误报会触发并发的退出编排）。
         EXPLICIT_SHUTDOWN.store(true, Ordering::Release);
         // 尊重尚未到期的吞掉窗口：等触发输入（尤其 Win 键 keyup）被钩子吞掉后再卸载
+        // 临时诊断埋点：等待剩余吞掉窗口耗时
+        let trace_swallow = Instant::now();
         let remain = remaining_swallow_ms();
         if remain > 0 {
             tracing::debug!(
@@ -220,15 +222,19 @@ impl InputHook {
             );
             std::thread::sleep(Duration::from_millis(remain));
         }
+        tracing::info!(target: "mirrorstar::exit_trace", "EXIT-TRACE ph=hook_swallow_wait ms={}", trace_swallow.elapsed().as_millis());
         // 线程若已自然退出，此处投递失败，仅记录（不视为错误）
         if let Err(e) = unsafe { PostThreadMessageW(self.thread_id, WM_QUIT, WPARAM(0), LPARAM(0)) }
         {
             tracing::debug!(error = %e, "PostThreadMessageW(WM_QUIT) 未送达（线程可能已自然退出）");
         }
         if let Some(handle) = self.handle.take() {
+            // 临时诊断埋点：join 捕获线程耗时
+            let trace_join = Instant::now();
             if handle.join().is_err() {
                 tracing::warn!("纯净壁纸模式输入捕获线程 join 失败（线程内部 panic）");
             }
+            tracing::info!(target: "mirrorstar::exit_trace", "EXIT-TRACE ph=hook_join ms={}", trace_join.elapsed().as_millis());
         }
         tracing::info!("纯净壁纸模式输入捕获已卸载");
     }

@@ -665,8 +665,9 @@ impl WallpaperEngine {
             return Ok(());
         }
         for renderer in self.wallpapers.values_mut() {
+            // 各渲染器的 set_interaction_mode 内部已映射为 set_mouse_passthrough(!enabled)，
+            // 故仅需单次下发，避免重复切换穿透。
             renderer.set_interaction_mode(enabled);
-            renderer.set_mouse_passthrough(!enabled);
         }
         tracing::info!(enabled, "切换交互模式");
         Ok(())
@@ -2015,6 +2016,8 @@ impl WallpaperEngine {
     /// 3. 按 `interaction_mode` 还原鼠标穿透（`set_mouse_passthrough(!interaction_mode)`）
     /// 4. `clear_lifted()` → `set_active(false)`（**标志清除晚于回嵌完成**）
     pub fn exit_pure_mode(&mut self) -> Result<(), MirrorStarError> {
+        // 临时诊断埋点：整个 exit_pure_mode 总耗时起点
+        let trace_total = Instant::now();
         let Some(state) = self.pure_mode.take() else {
             return Ok(());
         };
@@ -2024,6 +2027,8 @@ impl WallpaperEngine {
         } = state;
 
         // 1. 嵌回 WorkerW（沿用进入时的排列方式，D1 的几何由 embed_wallpaper 重新计算）
+        // 临时诊断埋点：回嵌 lifted 窗口耗时
+        let trace_reattach = Instant::now();
         for (display_id, hwnd) in &lifted {
             let reattach_result = {
                 let mut desktop = self.desktop.lock().unwrap_or_else(|e| e.into_inner());
@@ -2041,15 +2046,30 @@ impl WallpaperEngine {
                 );
             }
         }
+        tracing::info!(target: "mirrorstar::exit_trace", "EXIT-TRACE ph=reattach ms={}", trace_reattach.elapsed().as_millis());
 
         // 2. 销毁临时呈现渲染器（不注册进权威状态，直接终止）。
         // 架构 D1：视频显示器的原窗口全程留在 WorkerW、未被搬动（不进入 `lifted`），其
         // 纯净模式呈现由这里 drain 的"临时顶层覆盖渲染器"承担；销毁覆盖窗口后原视频窗口
         // 即原样显露并继续播放，无需回嵌/重建。
         for (display_id, mut renderer) in self.pure_mode_temp.drain(..) {
+            // 临时诊断埋点：单个临时渲染器终止耗时（视频渲染器走 3s/8s 子进程停止路径）
+            let trace_temp = Instant::now();
+            let kind = if renderer.process_pid().is_some() {
+                "video"
+            } else {
+                "image"
+            };
             if let Err(e) = renderer.terminate() {
                 tracing::warn!(display_id, error = %e, "退出纯净壁纸模式：终止临时渲染器失败");
             }
+            tracing::info!(
+                target: "mirrorstar::exit_trace",
+                "EXIT-TRACE ph=temp_terminate ms={} id={} kind={}",
+                trace_temp.elapsed().as_millis(),
+                display_id,
+                kind
+            );
         }
 
         // 3. 还原穿透：配置为穿透模式时恢复穿透，交互模式下保持非穿透
@@ -2064,6 +2084,8 @@ impl WallpaperEngine {
         crate::pure_mode::clear_lifted();
         crate::pure_mode::set_active(false);
 
+        // 临时诊断埋点：整个 exit_pure_mode 总耗时
+        tracing::info!(target: "mirrorstar::exit_trace", "EXIT-TRACE ph=exit_pure_mode_total ms={}", trace_total.elapsed().as_millis());
         tracing::info!(displays = lifted.len(), "已退出纯净壁纸模式");
         Ok(())
     }
@@ -3071,7 +3093,7 @@ mod tests {
 
     #[test]
     fn set_interaction_mode_true_updates_engine_and_renderer() {
-        // 启用交互模式：engine.interaction_mode = true，渲染器收到 enabled=true + passthrough=false
+        // 启用交互模式：engine.interaction_mode = true，渲染器仅经 set_interaction_mode 收到 enabled=true
         let mut engine = create_test_engine();
         let (renderer, shared) = MockRenderer::new();
         let source = WallpaperSource::File("/test.gif".to_string());
@@ -3090,12 +3112,13 @@ mod tests {
 
         let state = shared.lock().unwrap();
         assert_eq!(state.interaction_mode_calls, vec![true]);
-        assert_eq!(state.passthrough_calls, vec![false]); // !true = false
+        // 收敛后不再重复下发穿透：仅通过 set_interaction_mode 单次生效
+        assert!(state.passthrough_calls.is_empty());
     }
 
     #[test]
     fn set_interaction_mode_false_updates_engine_and_renderer() {
-        // 禁用交互模式：engine.interaction_mode = false，渲染器收到 enabled=false + passthrough=true
+        // 禁用交互模式：engine.interaction_mode = false，渲染器仅经 set_interaction_mode 收到 enabled=false
         let mut engine = create_test_engine();
         let (renderer, shared) = MockRenderer::new();
         let source = WallpaperSource::File("/test.gif".to_string());
@@ -3114,7 +3137,8 @@ mod tests {
 
         let state = shared.lock().unwrap();
         assert_eq!(state.interaction_mode_calls, vec![false]);
-        assert_eq!(state.passthrough_calls, vec![true]); // !false = true
+        // 收敛后不再重复下发穿透：仅通过 set_interaction_mode 单次生效
+        assert!(state.passthrough_calls.is_empty());
     }
 
     #[test]

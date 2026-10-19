@@ -29,6 +29,7 @@
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
+use std::time::Instant;
 
 use tauri::{AppHandle, Manager};
 
@@ -396,6 +397,8 @@ pub(crate) async fn exit_orchestration(app: AppHandle) {
     }
     // 无论正常结束、提前返回还是 panic，均在 Drop 时复位标志
     let _guard = OrchestrationGuard(&EXIT_IN_PROGRESS);
+    // 临时诊断埋点：整个退出编排总耗时起点
+    let trace_total = Instant::now();
 
     // 1. 先恢复桌面（回嵌 WorkerW）：必须在卸载钩子之前，否则会出现"无钩子但壁纸仍置顶"的窗口
     match app
@@ -403,24 +406,39 @@ pub(crate) async fn exit_orchestration(app: AppHandle) {
         .map(|state| state.wallpaper_engine.clone())
     {
         Some(engine) => {
-            if let Err(e) = engine.lock().await.exit_pure_mode() {
+            // 临时诊断埋点：取引擎锁等待耗时
+            let trace_lock = Instant::now();
+            let mut guard = engine.lock().await;
+            tracing::info!(target: "mirrorstar::exit_trace", "EXIT-TRACE ph=lock_wait ms={}", trace_lock.elapsed().as_millis());
+            // 临时诊断埋点：exit_pure_mode（回嵌桌面 + 销毁临时覆盖窗）耗时
+            let trace_step1 = Instant::now();
+            if let Err(e) = guard.exit_pure_mode() {
                 tracing::warn!(error = %e, "退出纯净壁纸模式时引擎返回错误（继续卸载钩子并补跑判定）");
             }
+            tracing::info!(target: "mirrorstar::exit_trace", "EXIT-TRACE ph=step1_exit_pure_mode ms={}", trace_step1.elapsed().as_millis());
         }
         None => tracing::warn!("AppState 不可用，跳过引擎回嵌（无法执行 exit_pure_mode）"),
     }
 
     // 2. 卸载输入钩子线程（阻塞：PostThreadMessageW + join，必须在阻塞线程池执行）
+    // 临时诊断埋点：卸载输入钩子耗时
+    let trace_step2 = Instant::now();
     if let Err(e) = tokio::task::spawn_blocking(shutdown_input_hook).await {
         tracing::warn!(error = %e, "卸载输入钩子任务 join 失败");
     }
+    tracing::info!(target: "mirrorstar::exit_trace", "EXIT-TRACE ph=step2_input_hook ms={}", trace_step2.elapsed().as_millis());
 
     // 3. 取消勾选（内部 spawn_blocking，非阻塞）
     //    勾选态代表"模式是否活跃"，回嵌 + 卸载钩子完成后模式已实际退出；提前同步可避免
     //    后续存活校验/自愈（可能持续数秒）期间勾选态滞后，且校验失败也不影响勾选态一致性。
+    // 临时诊断埋点：取消勾选耗时
+    let trace_step3 = Instant::now();
     set_checked(&app, false);
+    tracing::info!(target: "mirrorstar::exit_trace", "EXIT-TRACE ph=step3_set_checked ms={}", trace_step3.elapsed().as_millis());
 
     // 4. 补跑全屏 / 电源判定，纠正模式期间冻结的状态漂移（两处均为阻塞 Win32 查询/处置）
+    // 临时诊断埋点：补跑全屏/电源判定耗时
+    let trace_step4 = Instant::now();
     let reevaluate = tokio::task::spawn_blocking(move || {
         crate::platform::fullscreen::reevaluate_now();
         crate::platform::power::reevaluate_now();
@@ -429,20 +447,29 @@ pub(crate) async fn exit_orchestration(app: AppHandle) {
     if let Err(e) = reevaluate {
         tracing::warn!(error = %e, "补跑全屏/电源判定任务 join 失败");
     }
+    tracing::info!(target: "mirrorstar::exit_trace", "EXIT-TRACE ph=step4_reevaluate ms={}", trace_step4.elapsed().as_millis());
 
     // 5. 视频渲染器存活校验 + 自愈（本次 bug 主修复）
     //
     // 放在补跑判定之后：补跑可能按用户配置（fullscreen_action）终止壁纸，先判定再校验，
     // 避免"刚自愈又被终止"；放在唤醒调度器之前：保证退出完成时画面是活的。
     // 失败/停滞自愈失败均不阻断后续步骤（内部仅记日志）。
+    // 临时诊断埋点：存活校验 + 自愈耗时
+    let trace_step5 = Instant::now();
     liveness_check_and_heal(&app).await;
+    tracing::info!(target: "mirrorstar::exit_trace", "EXIT-TRACE ph=step5_liveness ms={}", trace_step5.elapsed().as_millis());
 
     // 6. 唤醒调度器重算轮换 deadline（模式期间排期被抑制，退出后需重新计算）
+    // 临时诊断埋点：唤醒调度器耗时
+    let trace_step6 = Instant::now();
     match app.try_state::<AppState>() {
         Some(state) => state.scheduler.wake.notify_waiters(),
         None => tracing::warn!("AppState 不可用，无法唤醒调度器重算轮换 deadline"),
     }
+    tracing::info!(target: "mirrorstar::exit_trace", "EXIT-TRACE ph=step6_notify ms={}", trace_step6.elapsed().as_millis());
 
+    // 临时诊断埋点：退出编排总耗时
+    tracing::info!(target: "mirrorstar::exit_trace", "EXIT-TRACE ph=total ms={}", trace_total.elapsed().as_millis());
     tracing::info!("纯净壁纸模式退出编排完成");
 }
 

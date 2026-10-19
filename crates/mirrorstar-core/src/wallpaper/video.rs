@@ -1,4 +1,5 @@
 use std::sync::{Arc, Mutex};
+use std::time::Instant;
 use windows::Win32::Foundation::HWND;
 use windows::Win32::System::Com::{CoInitializeEx, CoUninitialize, COINIT_MULTITHREADED};
 use windows::Win32::UI::WindowsAndMessaging::SetWindowPos;
@@ -904,6 +905,8 @@ impl WallpaperRenderer for VideoRenderer {
         }
 
         // 1. 通过 IPC 请求 mpv 退出
+        // 临时诊断埋点：IPC quit 调用耗时
+        let trace_quit = Instant::now();
         {
             let mut ipc = self.ipc.lock().unwrap_or_else(|e| e.into_inner());
             if let Some(ref mut ipc) = *ipc {
@@ -912,9 +915,13 @@ impl WallpaperRenderer for VideoRenderer {
                 }
             }
         }
+        tracing::info!(target: "mirrorstar::exit_trace", "EXIT-TRACE ph=video_ipc_quit ms={}", trace_quit.elapsed().as_millis());
 
         // 2. 停止进程（会等待退出，超时后强制终止）
+        // 临时诊断埋点：停止 mpv 子进程耗时（优雅 3s + 强杀 5s 路径，最关键）
+        let trace_stop = Instant::now();
         self.base.stop_process()?;
+        tracing::info!(target: "mirrorstar::exit_trace", "EXIT-TRACE ph=video_stop_process ms={}", trace_stop.elapsed().as_millis());
 
         // 3. 断开 IPC
         {
