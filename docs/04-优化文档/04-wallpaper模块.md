@@ -56,7 +56,7 @@
 | 入口 | 职责 | 幂等语义 |
 |---|---|---|
 | `enter_pure_mode()` | 把正在播放的壁纸窗口摘出 WorkerW 并置顶全屏（`HWND_TOPMOST`，保持当前矩形零 resize）；**视频显示器例外**（架构 D1）：不搬动原窗口，改由临时顶层覆盖渲染器呈现 | 已处于模式（`pure_mode.is_some()`）→ 直接 `Ok(())`；无任何壁纸（`wallpaper_mode` 为空）→ `Err(InvalidArgument)` 且**不置位**进程级标志 |
-| `exit_pure_mode()` | 把 `lifted` 中的窗口按进入时记录的排列嵌回 WorkerW（视频显示器不在 `lifted`，仅销毁其临时覆盖窗、原窗口不搬动）、终止全部临时渲染器、按 `interaction_mode` 还原鼠标穿透 | `pure_mode` 为 `None` → 直接 `Ok(())`（连续两次退出第二次为 no-op） |
+| `exit_pure_mode()` | 把 `lifted` 中的窗口按进入时记录的排列嵌回 WorkerW（视频显示器不在 `lifted`，仅销毁其临时覆盖窗、原窗口不搬动）、终止全部临时渲染器、按 `interaction_mode` 还原鼠标穿透。终止前遍历 `pure_mode_temp`，先对每个临时覆盖窗执行 `hide_window_for_pure_mode_exit`（best-effort 同步隐藏），再调用 `renderer.terminate()`，使桌面在 mpv 退出等待期间立即恢复可见 | `pure_mode` 为 `None` → 直接 `Ok(())`（连续两次退出第二次为 no-op） |
 | `abort_pure_mode()` | 应用退出路径专用：只终止临时呈现渲染器 + 清置顶窗口注册表 + 清进程级标志，**不回嵌** | 无状态时为无副作用的 safe 调用（可重复调用） |
 | `is_pure_mode_active()` | 供 src-tauri 编排层查询权威运行态（`pure_mode.is_some()`） | 只读 |
 

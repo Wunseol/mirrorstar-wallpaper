@@ -517,11 +517,21 @@ impl UiProcessManager {
             let _ = running.child.kill();
             let _ = running.child.wait();
             self.mark_shown();
-            tracing::warn!(
-                pid = running.pid,
-                status = ?status,
-                "UI 进程已退出（连接断开），等待下次按需拉起"
-            );
+            // 关闭主窗口是常态操作（管道断开时进程可能仍在收尾，由壳回收句柄），
+            // 只有非 0 退出码才视为异常，避免正常关闭刷 WARN。
+            if matches!(status, Some(s) if !s.success()) {
+                tracing::warn!(
+                    pid = running.pid,
+                    status = ?status,
+                    "UI 进程异常退出（连接断开），等待下次按需拉起"
+                );
+            } else {
+                tracing::info!(
+                    pid = running.pid,
+                    status = ?status,
+                    "UI 进程已退出（连接断开），等待下次按需拉起"
+                );
+            }
         }
     }
 }
@@ -561,7 +571,9 @@ fn pump_loop(
             Ok(_) => {}
             Err(MirrorStarError::IpcTimeout(_)) => continue,
             Err(e) => {
-                tracing::warn!(error = %e, "UI 协议泵读取结束");
+                // 连接断开是 UI 进程退出时的正常路径，细节降 DEBUG；
+                // 进程退出/异常判定统一由 on_pump_exit 记录。
+                tracing::debug!(error = %e, "UI 协议泵读取结束");
                 break;
             }
         }

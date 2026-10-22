@@ -122,7 +122,29 @@ impl MpvIpcClient {
     /// 注意：调用方无法感知 mpv 是否成功执行命令。若命令失败，mpv 仍会异步返回 error 响应，
     /// 但本方法不读取该响应——后续的 `send_command_with_timeout` 调用可能会读到这条延迟 error 响应
     /// 并因 request_id 不匹配而跳过。对于关键命令（如 get_property），仍应使用同步路径。
+    ///
+    /// 根因修复：mpv 会向同一条双向管道持续推送事件（loop 播放时的 start-file /
+    /// file-loaded / playback-restart / end-file）与命令 ack。fire-and-forget 命令只写
+    /// 不读，长时间播放后内核管道缓冲区被填满，mpv 的 IPC 线程阻塞在 write 上，无法
+    /// 继续读取客户端命令，导致后续命令（尤其 quit）永远不被处理，上层只能超时强杀。
+    /// 因此写命令前先 best-effort 丢弃管道中残留的未读数据，保证 mpv 侧仍有空间写入、
+    /// IPC 线程不被阻塞。丢弃失败只记录 warn 并继续发送命令（不阻断命令）；
+    /// 丢弃量大于 0 时记录 info 日志（默认日志过滤器为 info，便于从用户日志确认管道积压）。
     pub fn send_command_no_wait(&mut self, command: &[&str]) -> Result<(), crate::MirrorStarError> {
+        // 写前清理残留出向数据：best-effort，失败不阻断后续命令发送
+        match self.inner.discard_pending_output() {
+            Ok(discarded) if discarded > 0 => {
+                tracing::info!(
+                    discarded_bytes = discarded,
+                    "发送命令前丢弃 mpv 管道残留数据"
+                );
+            }
+            Ok(_) => {}
+            Err(e) => {
+                tracing::warn!(error = %e, "丢弃 mpv 管道残留数据失败，继续发送命令");
+            }
+        }
+
         let req_id = self.inner.next_request_id();
         let cmd = MpvCommand {
             command,
@@ -215,9 +237,15 @@ impl MpvIpcClient {
     }
 
     /// 断开连接
+    ///
+    /// 仅在断开前确实处于已连接状态时记录 info 日志：显式 `disconnect()` 后对象
+    /// 析构会再次调用本方法（`Drop` 幂等），否则同一条连接会打印两条日志。
     pub fn disconnect(&mut self) {
+        let was_connected = self.inner.is_connected();
         self.inner.disconnect();
-        tracing::info!("已断开 mpv IPC 连接: {}", self.inner.pipe_path());
+        if was_connected {
+            tracing::info!("已断开 mpv IPC 连接: {}", self.inner.pipe_path());
+        }
     }
 
     /// 获取管道路径

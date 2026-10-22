@@ -76,7 +76,8 @@ use windows::Win32::Graphics::Gdi::{
 };
 use windows::Win32::UI::HiDpi::{GetDpiForMonitor, MDT_EFFECTIVE_DPI};
 use windows::Win32::UI::WindowsAndMessaging::{
-    GetAncestor, IsWindow, SetParent, ShowWindow, GA_PARENT, MONITORINFOF_PRIMARY, SW_HIDE,
+    GetAncestor, IsWindow, IsWindowVisible, SetParent, ShowWindow, GA_PARENT,
+    MONITORINFOF_PRIMARY, SW_HIDE,
 };
 
 use crate::config::settings::Arrangement;
@@ -110,6 +111,29 @@ pub(crate) fn hide_window_on_reattach_failure(
         error = %error,
         "嵌回失败，已隐藏该窗口以免其继续置顶/漂浮遮挡桌面"
     );
+}
+
+/// 退出纯净壁纸模式时同步隐藏临时覆盖窗（best-effort）。
+///
+/// 临时顶层覆盖窗由 `pure_mode_temp` 持有，`terminate()` 内部走 IPC quit 并最多等待
+/// mpv 若干秒；等待期间覆盖窗仍置顶可见并可被拖动，持续遮挡桌面图标。故退出时先调用
+/// 本函数同步隐藏，使桌面立即显露，不依赖子进程退出。
+///
+/// 注意：`ShowWindow` 的返回值是"窗口此前是否可见"而非成败，因此不能据此判断隐藏
+/// 是否成功；这里在调用后用 `IsWindowVisible` 复核，仍可见才补一条 `warn`。隐藏失败
+/// 不影响调用方流程（不返回错误）。
+pub(crate) fn hide_window_for_pure_mode_exit(display_id: &str, hwnd: HWND) {
+    if !unsafe { IsWindow(hwnd).as_bool() } {
+        return;
+    }
+    // 返回值是"窗口此前是否可见"，与成败无关，故忽略
+    let _ = unsafe { ShowWindow(hwnd, SW_HIDE) };
+    if unsafe { IsWindowVisible(hwnd).as_bool() } {
+        tracing::warn!(
+            display_id,
+            "退出纯净壁纸模式：临时覆盖窗隐藏失败，窗口可能继续置顶遮挡桌面"
+        );
+    }
 }
 
 /// 桌面集成器，负责将壁纸窗口嵌入 Windows 桌面的 WorkerW 层

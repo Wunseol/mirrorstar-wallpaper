@@ -421,7 +421,7 @@ pub(crate) fn try_pause_all_fast(reason: PauseReason) -> Option<Vec<String>> {
     let engine = match engine.try_lock() {
         Ok(e) => e,
         Err(e) => {
-            tracing::warn!(
+            tracing::debug!(
                 error = ?e,
                 reason = ?reason,
                 "engine 锁忙，跳过 pause_all_fast（事件会重复触发，可容忍偶发跳过）"
@@ -446,7 +446,7 @@ pub(crate) fn try_resume_all_fast(reason: PauseReason) -> Option<Vec<String>> {
     let mut engine = match engine.try_lock() {
         Ok(e) => e,
         Err(e) => {
-            tracing::warn!(
+            tracing::debug!(
                 error = ?e,
                 reason = ?reason,
                 "engine 锁忙，跳过 resume_all_fast（事件会重复触发，可容忍偶发跳过）"
@@ -533,7 +533,7 @@ pub(crate) fn try_terminate_all_fast(reason: PauseReason) -> Option<Vec<String>>
     let mut engine = match engine.try_lock() {
         Ok(e) => e,
         Err(e) => {
-            tracing::warn!(
+            tracing::debug!(
                 error = ?e,
                 reason = ?reason,
                 "engine 锁忙，跳过 terminate_all_fast（事件会重复触发，可容忍偶发跳过）"

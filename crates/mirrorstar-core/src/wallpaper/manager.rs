@@ -2049,6 +2049,16 @@ impl WallpaperEngine {
         for (display_id, mut renderer) in self.pure_mode_temp.drain(..) {
             // 临时诊断埋点：单个临时渲染器终止耗时（视频渲染器走 3s/8s 子进程停止路径）
             let trace_temp = Instant::now();
+            // 先同步隐藏临时覆盖窗：video 的 terminate() 会 IPC quit 并最多等待 mpv 若干秒，
+            // 等待期间覆盖窗仍置顶可见且可被鼠标拖动、持续遮挡桌面图标。隐藏不依赖 mpv 退出。
+            if let Some(hwnd) = renderer.hwnd() {
+                crate::desktop::hide_window_for_pure_mode_exit(&display_id, hwnd);
+                tracing::info!(
+                    target: "mirrorstar::exit_trace",
+                    "EXIT-TRACE ph=hide_temp_window display_id={}",
+                    display_id
+                );
+            }
             let kind = if renderer.process_pid().is_some() {
                 "video"
             } else {
@@ -4369,6 +4379,18 @@ mod tests {
         assert!(
             !exit_body.contains(&dead_skip),
             "exit_pure_mode 不应再包含 {dead_skip}（视频跳过回嵌死代码应已删除）"
+        );
+
+        // 退出链路防回归：临时覆盖窗必须先隐藏再 terminate，桌面可见性不得依赖 mpv 退出。
+        let hide_temp_at = exit_body
+            .find("hide_window_for_pure_mode_exit(")
+            .expect("exit_pure_mode 应在 terminate 前隐藏临时覆盖窗");
+        let terminate_at = exit_body
+            .find("renderer.terminate()")
+            .expect("exit_pure_mode 应调用 renderer.terminate()");
+        assert!(
+            hide_temp_at < terminate_at,
+            "hide_window_for_pure_mode_exit 须位于 renderer.terminate() 之前（覆盖窗隐藏不依赖 mpv 退出）"
         );
     }
 

@@ -329,7 +329,8 @@ fn log_fullscreen_context(level: FullscreenLevel) {
         let mut pid: u32 = 0;
         let _ = GetWindowThreadProcessId(fg, Some(&mut pid));
         let parent = GetParent(fg);
-        tracing::info!(
+        // 前台窗口切换频繁，完整上下文只在排查时用 DEBUG 观察，避免 INFO 日志刷屏。
+        tracing::debug!(
             level = ?level,
             hwnd = ?fg,
             title = %String::from_utf16_lossy(&title[..tlen as usize]),

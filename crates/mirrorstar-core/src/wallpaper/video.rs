@@ -144,10 +144,13 @@ fn vd_queue_max_bytes(video_w: u64, video_h: u64) -> u64 {
 
 /// 解析 mpv `video-params/w` / `video-params/h` 属性值。
 ///
-/// mpv JSON IPC 的 `get_property` 对这两个子属性以字符串返回（如 `"1920"`）。
-/// 非字符串或解析失败（含非数字、负数、溢出）返回 `None`，调用方跳过队列调优。
+/// mpv JSON IPC 的 `get_property` 对这两个子属性返回 JSON 数字（如 `3840`，
+/// 已用随包 mpv 实测确认）；字符串分支仅为兼容历史形态保留。
+/// 非数字/非字符串或解析失败（含非整数、负数、溢出）返回 `None`，调用方跳过队列调优。
 fn parse_dimension(value: &serde_json::Value) -> Option<u64> {
-    value.as_str()?.parse::<u64>().ok()
+    value
+        .as_u64()
+        .or_else(|| value.as_str()?.parse::<u64>().ok())
 }
 
 /// 视频探测结果，用于调用方决定是否需要在 video-params 未就绪时有界重试。
@@ -368,6 +371,12 @@ impl VideoRenderer {
             // panscan/keepaspect 控制，互不冲突。
             "--scale=ewa_lanczossharp".to_string(),
             "--input-vo-keyboard=no".to_string(),
+            // 根因：mpv 的 --window-dragging 默认为 yes，允许在视频区域按住鼠标拖动窗口。
+            // 纯净壁纸模式下 mpv 临时覆盖窗在退出等待期间仍处于置顶状态，此时用户拖动
+            // 会让窗口跟随移动（表现为"动态壁纸可以被拖动"），并进入 Win32 模态移动
+            // 循环，阻塞 mpv 的 IPC 事件处理 → IPC quit 无法及时生效。壁纸窗口不需要
+            // 也不应支持拖动，故显式关闭。
+            "--window-dragging=no".to_string(),
             "--no-osc".to_string(),
             "--no-osd-bar".to_string(),
             "--title=MirrorStarVideo".to_string(),
@@ -1556,6 +1565,8 @@ mod tests {
         );
         // 根因 D：--d3d11-flip=no 强制 bitblt 呈现模式，避免嵌入 WorkerW 后 flip-model 纹理创建失败黑屏
         assert!(args.contains(&"--d3d11-flip=no".to_string()));
+        // 壁纸窗口不应支持拖动：否则退出等待期间拖动会进入 Win32 模态移动循环并阻塞 IPC quit
+        assert!(args.contains(&"--window-dragging=no".to_string()));
         // 根因 C：--demuxer-max-bytes=0 会把解复用器缓冲清零导致 mpv 无媒体数据可播（黑屏+设置失败），必须禁止出现
         assert!(
             !args.iter().any(|a| a.starts_with("--demuxer-max-bytes=")),
@@ -1708,6 +1719,12 @@ mod tests {
         // 极端输入不 panic：0 尺寸 / 超大尺寸（saturating 溢出保护）均安全。
         assert_eq!(vd_queue_max_bytes(0, 0), 16 * 1024 * 1024);
         assert_eq!(vd_queue_max_bytes(u64::MAX, u64::MAX), u64::MAX);
+        // 3840×2160：单帧 12,441,600 字节 → max(16MB, 帧×3) = 37,324,800。
+        // 「单帧未超 16MB 不调优」的判定在 probe_video_size_and_tune_queue 中完成，
+        // 本函数只负责放大值的计算。
+        assert_eq!(vd_queue_max_bytes(3840, 2160), 37_324_800);
+        // 7680×4320（8K）：单帧 49,766,400 字节 > 16MB，放大为单帧×3
+        assert_eq!(vd_queue_max_bytes(7680, 4320), 7680 * 4320 * 3 / 2 * 3);
     }
 
     // ========== clarity-first-upscale：parse_dimension 宽高解析测试 ==========
@@ -1715,15 +1732,19 @@ mod tests {
     #[test]
     fn parse_dimension_success_and_failure() {
         use serde_json::json;
-        // 成功：mpv get_property 对 video-params 子属性以字符串返回
+        // 成功：mpv JSON IPC 对 video-params 子属性返回 JSON 数字（随包 mpv 实测）
+        assert_eq!(parse_dimension(&json!(3840)), Some(3840));
+        assert_eq!(parse_dimension(&json!(2160)), Some(2160));
+        // 成功（兼容分支）：历史字符串形态
         assert_eq!(parse_dimension(&json!("1920")), Some(1920));
         assert_eq!(parse_dimension(&json!("2160")), Some(2160));
-        // 失败：非数字字符串 / 小数 / 负数 / Null / 数字形式（非字符串）均跳过
+        // 失败：非数字字符串 / 小数 / 负数 / Null / 浮点数字 / 负数数字均跳过
         assert_eq!(parse_dimension(&json!("abc")), None);
         assert_eq!(parse_dimension(&json!("12.5")), None);
         assert_eq!(parse_dimension(&json!("-1")), None);
         assert_eq!(parse_dimension(&serde_json::Value::Null), None);
-        assert_eq!(parse_dimension(&json!(3840)), None);
+        assert_eq!(parse_dimension(&json!(12.5)), None);
+        assert_eq!(parse_dimension(&json!(-1)), None);
         // 失败：超出 u64 范围的超大数字字符串
         assert_eq!(parse_dimension(&json!("18446744073709551616")), None);
     }

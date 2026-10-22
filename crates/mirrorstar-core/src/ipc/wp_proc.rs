@@ -317,9 +317,15 @@ impl WpProcIpcClient {
     }
 
     /// 断开连接
+    ///
+    /// 仅在断开前确实处于已连接状态时记录 info 日志，避免显式 `disconnect()`
+    /// 与对象析构触发的重复日志。
     pub fn disconnect(&mut self) {
+        let was_connected = self.inner.is_connected();
         self.inner.disconnect();
-        tracing::info!("已断开 wp-proc IPC 连接: {}", self.inner.pipe_path());
+        if was_connected {
+            tracing::info!("已断开 wp-proc IPC 连接: {}", self.inner.pipe_path());
+        }
     }
 
     /// 获取管道路径

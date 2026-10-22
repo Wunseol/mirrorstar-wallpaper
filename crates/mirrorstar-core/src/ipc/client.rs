@@ -15,7 +15,7 @@
 //! 具体的协议客户端（如 `MpvIpcClient`、`WpProcIpcClient`）以薄封装形式基于此基类
 //! 实现协议特定的命令构造与响应解析逻辑，从而消除 DRY 违反。
 
-use std::io::{BufRead, BufReader, BufWriter, Write};
+use std::io::{BufRead, BufReader, BufWriter, Read, Write};
 use std::marker::PhantomData;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
@@ -86,6 +86,15 @@ impl<T> NamedPipeClient<T> {
         drop(self.reader.take());
     }
 
+    /// 是否处于已连接状态（读写端已建立）。
+    ///
+    /// 供协议封装层在 `disconnect` 时判断是否需要记录日志：显式 `disconnect()`
+    /// 之后对象析构还会再次调用 `disconnect()`（基类 Drop 幂等），若无此判定，
+    /// 同一条连接会被记录两次断开日志。
+    pub fn is_connected(&self) -> bool {
+        self.writer.is_some()
+    }
+
     /// 获取管道路径
     pub fn pipe_path(&self) -> &str {
         &self.pipe_path
@@ -106,6 +115,82 @@ impl<T> NamedPipeClient<T> {
             .as_mut()
             .ok_or_else(|| MirrorStarError::IpcNotConnected("IPC 未连接".to_string()))?;
         write_json_line(writer, json)
+    }
+
+    /// 丢弃管道中已到达但尚未读取的数据（非阻塞，best-effort）
+    ///
+    /// 用于 fire-and-forget 命令写前清理：对端（如 mpv）会向同一条双向管道持续推送
+    /// 事件与 ack，若长期无人读取，内核管道缓冲区会被填满，对端的写线程随之阻塞，
+    /// 无法继续读取客户端命令。本方法在写命令前清空这类残留数据，为非阻塞设计：
+    /// - `reader` 为 None（未连接）时直接返回 `Ok(0)`
+    /// - 先消费 `BufReader` 内部已缓冲但未读的字节（`PeekNamedPipe` 看不到这部分）
+    /// - 再用 `PeekNamedPipe` 查询内核管道可用字节，为 0 时立即结束，绝不阻塞
+    /// - 有数据时用 `reader.get_mut()` 直接从底层 `File` 读取至多 8192 字节并丢弃，
+    ///   循环直到可用字节为 0（只读 peek 报告的量，因此不会阻塞）
+    ///
+    /// 为防止异常管道（如对端持续高速写入）导致无限循环，总量上限 4 MiB、
+    /// 轮次上限 1024 次。`PeekNamedPipe` 或读取真实报错时返回
+    /// `MirrorStarError::IpcError`，由调用方决定是否忽略。
+    ///
+    /// 返回值为本次丢弃的字节总数。
+    ///
+    /// # Blocking
+    ///
+    /// 本方法不会阻塞等待数据（只读取已可用数据），但会执行同步系统调用，
+    /// 在 async 上下文中调用时应通过 `tokio::task::spawn_blocking` 包裹。
+    pub(crate) fn discard_pending_output(&mut self) -> Result<u64, crate::MirrorStarError> {
+        use std::os::windows::io::AsRawHandle;
+
+        let reader = match self.reader.as_mut() {
+            Some(reader) => reader,
+            None => return Ok(0),
+        };
+
+        // 单次读取块大小 / 总丢弃上限 / 最大循环轮次，防止异常管道导致无限循环
+        const READ_CHUNK_BYTES: usize = 8192;
+        const MAX_DISCARD_BYTES: u64 = 4 * 1024 * 1024;
+        const MAX_DISCARD_ITERATIONS: usize = 1024;
+
+        let mut discarded: u64 = 0;
+
+        // 先消费 BufReader 内部已缓冲但未读的字节：这部分不在内核管道中，
+        // PeekNamedPipe 不会报告，必须单独计入。
+        let buffered_len = reader.buffer().len();
+        if buffered_len > 0 {
+            reader.consume(buffered_len);
+            discarded += buffered_len as u64;
+        }
+
+        let handle = HANDLE(reader.get_ref().as_raw_handle());
+        let mut buf = [0u8; READ_CHUNK_BYTES];
+
+        for _ in 0..MAX_DISCARD_ITERATIONS {
+            if discarded >= MAX_DISCARD_BYTES {
+                break;
+            }
+            // 查询内核管道当前可用字节；为 0 立即结束，避免任何阻塞读取
+            let mut avail: u32 = 0;
+            unsafe { PeekNamedPipe(handle, None, 0, None, Some(&mut avail), None) }.map_err(|e| {
+                MirrorStarError::IpcError(format!("丢弃管道残留数据时 PeekNamedPipe 失败: {}", e))
+            })?;
+            if avail == 0 {
+                break;
+            }
+            // 只读取 peek 报告的可用量，因此底层 File 读取不会阻塞
+            let to_read = (avail as usize)
+                .min(READ_CHUNK_BYTES)
+                .min((MAX_DISCARD_BYTES - discarded) as usize);
+            let n = reader
+                .get_mut()
+                .read(&mut buf[..to_read])
+                .map_err(|e| MirrorStarError::IpcError(format!("丢弃管道残留数据时读取失败: {}", e)))?;
+            if n == 0 {
+                break;
+            }
+            discarded += n as u64;
+        }
+
+        Ok(discarded)
     }
 
     /// 读取一行响应（自定义超时，跳过空行），返回去除首尾空白后的内容
@@ -647,8 +732,16 @@ mod tests {
     fn named_pipe_client_disconnect_when_not_connected_is_safe() {
         let mut client: NamedPipeClient<()> = NamedPipeClient::new("test-pipe");
         // 未连接时 disconnect 应安全无 panic
+        assert!(!client.is_connected());
         client.disconnect();
+        assert!(!client.is_connected());
         client.disconnect();
+    }
+
+    #[test]
+    fn named_pipe_client_is_connected_false_when_new() {
+        let client: NamedPipeClient<()> = NamedPipeClient::new("test-pipe");
+        assert!(!client.is_connected());
     }
 
     // ── Backoff（C-113 指数退避）单元测试 ──────────────────────────────────
@@ -1129,5 +1222,242 @@ mod tests {
             String::from_utf8(line).is_err(),
             "截断字节应无法解码为 UTF-8"
         );
+    }
+
+    // ── discard_pending_output（mpv 出向数据积压根因修复）单元测试 ──────────
+    //
+    // 通过 windows API 构造本地命名管道服务端，验证：
+    //   1. 无待读数据时立即返回 0，不阻塞等待后续数据
+    //   2. 管道中已有数据时全部丢弃并返回正确字节数
+    // 服务端使用 pid + 时间戳生成唯一管道名，避免并行测试互相干扰。
+
+    use std::os::windows::io::FromRawHandle;
+    use windows::core::HSTRING;
+    use windows::Win32::Foundation::ERROR_PIPE_CONNECTED;
+    use windows::Win32::Storage::FileSystem::PIPE_ACCESS_DUPLEX;
+    use windows::Win32::System::Pipes::{
+        ConnectNamedPipe, CreateNamedPipeW, PIPE_READMODE_BYTE, PIPE_TYPE_BYTE, PIPE_WAIT,
+    };
+
+    /// 启动本地命名管道服务端：创建管道 → 等待客户端连接 → 可选写入 → 通知测试线程
+    /// → 等待测试线程完成信号后关闭管道。
+    ///
+    /// `written_rx` 在数据写入完成（无数据场景为连接完成）后收到信号；
+    /// 测试结束前必须发送 `done_tx`，否则服务端线程最多等待 5s 后自行退出。
+    fn spawn_pipe_server(
+        payload: Option<Vec<u8>>,
+    ) -> (
+        String,
+        std::sync::mpsc::Receiver<()>,
+        std::sync::mpsc::Sender<()>,
+        std::thread::JoinHandle<()>,
+    ) {
+        let unique_name = format!(
+            "mirrorstar-test-discard-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        );
+        let pipe_name = unique_name.clone();
+        let (written_tx, written_rx) = std::sync::mpsc::channel();
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let join = std::thread::spawn(move || {
+            let pipe_path = format!(r"\\.\pipe\{}", unique_name);
+            let path_h = HSTRING::from(&pipe_path);
+            let pipe = unsafe {
+                CreateNamedPipeW(
+                    &path_h,
+                    PIPE_ACCESS_DUPLEX,
+                    PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT,
+                    1,    // 单实例
+                    4096, // 输出缓冲区
+                    4096, // 输入缓冲区
+                    0,    // 默认超时
+                    None,
+                )
+            };
+            assert!(!pipe.is_invalid(), "创建测试命名管道失败");
+            // 客户端可能先于 ConnectNamedPipe 连接，此时返回 ERROR_PIPE_CONNECTED 属正常
+            if let Err(e) = unsafe { ConnectNamedPipe(pipe, None) } {
+                let win32_code = (e.code().0 as u32) & 0xFFFF;
+                assert_eq!(
+                    win32_code, ERROR_PIPE_CONNECTED.0,
+                    "ConnectNamedPipe 失败: {}",
+                    e
+                );
+            }
+            // 转换为 std::fs::File：由 File 的 Drop 关闭句柄，避免泄漏
+            let mut file = unsafe {
+                std::fs::File::from_raw_handle(pipe.0 as std::os::windows::io::RawHandle)
+            };
+            if let Some(data) = payload {
+                file.write_all(&data).expect("测试服务端写入失败");
+                file.flush().expect("测试服务端 flush 失败");
+            }
+            let _ = written_tx.send(());
+            // 保持管道打开直到客户端完成，避免服务端提前关闭导致 PeekNamedPipe 报 EOF
+            let _ = done_rx.recv_timeout(Duration::from_secs(5));
+        });
+        (pipe_name, written_rx, done_tx, join)
+    }
+
+    #[test]
+    fn discard_pending_output_returns_zero_when_not_connected() {
+        // 未连接（reader 为 None）时应直接返回 Ok(0)
+        let mut client: NamedPipeClient<()> = NamedPipeClient::new("test-pipe-discard-none");
+        let discarded = client.discard_pending_output().expect("未连接时不应报错");
+        assert_eq!(discarded, 0);
+    }
+
+    #[test]
+    fn discard_pending_output_does_not_block_when_no_data() {
+        // 已连接但管道无任何待读数据：应立即返回 0，不阻塞等待后续数据
+        let (pipe_name, written_rx, done_tx, join) = spawn_pipe_server(None);
+        let mut client: NamedPipeClient<()> = NamedPipeClient::new(&pipe_name);
+        client.connect(200, 20).expect("连接测试管道失败");
+        written_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("等待服务端就绪超时");
+
+        let started = std::time::Instant::now();
+        let discarded = client
+            .discard_pending_output()
+            .expect("空管道丢弃不应报错");
+        let elapsed = started.elapsed();
+
+        assert_eq!(discarded, 0, "空管道不应丢弃任何字节");
+        assert!(
+            elapsed < Duration::from_secs(2),
+            "无数据时不应阻塞，实际耗时 {:?}",
+            elapsed
+        );
+
+        let _ = done_tx.send(());
+        join.join().expect("服务端线程 panic");
+    }
+
+    #[test]
+    fn discard_pending_output_drains_real_pipe_data() {
+        // 服务端写入 64 字节后，客户端应一次性丢弃全部数据并返回 >= 64
+        let payload = vec![b'x'; 64];
+        let (pipe_name, written_rx, done_tx, join) = spawn_pipe_server(Some(payload));
+        let mut client: NamedPipeClient<()> = NamedPipeClient::new(&pipe_name);
+        client.connect(200, 20).expect("连接测试管道失败");
+        written_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("等待服务端写入超时");
+
+        let discarded = client
+            .discard_pending_output()
+            .expect("丢弃真实管道数据失败");
+        assert!(
+            discarded >= 64,
+            "应丢弃至少 64 字节，实际: {}",
+            discarded
+        );
+
+        let _ = done_tx.send(());
+        join.join().expect("服务端线程 panic");
+    }
+
+    // ── quit 命令写前排空的端到端回归测试 ──────────────────────────────────
+    //
+    // 复现缺陷场景：mpv 的 IPC 写线程因管道输出缓冲被事件/ack 填满而阻塞在 write 上，
+    // 无法继续读取客户端命令，quit 因此长期不被处理。用本地命名管道模拟：服务端
+    // 先写入远大于 4096 输出缓冲的 1 MiB 数据并阻塞，只有客户端在发送 quit 前排空
+    // 残留数据，服务端才能写完并读取到该命令。
+
+    /// 启动"阻塞写入"命名管道服务端：先写 1 MiB（远大于 4096 输出缓冲，使写线程
+    /// 阻塞），写完后读取一行客户端命令并通过 channel 回传。
+    ///
+    /// 返回 (管道名, 行接收 channel, 结束通知 sender, JoinHandle)。
+    fn spawn_blocking_writer_pipe_server() -> (
+        String,
+        std::sync::mpsc::Receiver<String>,
+        std::sync::mpsc::Sender<()>,
+        std::thread::JoinHandle<()>,
+    ) {
+        let unique_name = format!(
+            "mirrorstar-test-quit-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        );
+        let pipe_name = unique_name.clone();
+        let (line_tx, line_rx) = std::sync::mpsc::channel();
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let join = std::thread::spawn(move || {
+            let pipe_path = format!(r"\\.\pipe\{}", unique_name);
+            let path_h = HSTRING::from(&pipe_path);
+            let pipe = unsafe {
+                CreateNamedPipeW(
+                    &path_h,
+                    PIPE_ACCESS_DUPLEX,
+                    PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT,
+                    1,    // 单实例
+                    4096, // 输出缓冲区
+                    4096, // 输入缓冲区
+                    0,    // 默认超时
+                    None,
+                )
+            };
+            assert!(!pipe.is_invalid(), "创建测试命名管道失败");
+            // 客户端可能先于 ConnectNamedPipe 连接，此时返回 ERROR_PIPE_CONNECTED 属正常
+            if let Err(e) = unsafe { ConnectNamedPipe(pipe, None) } {
+                let win32_code = (e.code().0 as u32) & 0xFFFF;
+                assert_eq!(
+                    win32_code, ERROR_PIPE_CONNECTED.0,
+                    "ConnectNamedPipe 失败: {}",
+                    e
+                );
+            }
+            let mut file = unsafe {
+                std::fs::File::from_raw_handle(pipe.0 as std::os::windows::io::RawHandle)
+            };
+            // 1 MiB 远大于 4096 输出缓冲：客户端未排空残留数据时该写入会一直阻塞，
+            // 服务端线程无法执行到下面的读取命令处。
+            let payload = vec![b'x'; 1024 * 1024];
+            file.write_all(&payload).expect("测试服务端写入失败");
+            file.flush().expect("测试服务端 flush 失败");
+
+            let mut reader = BufReader::new(file);
+            let mut line = String::new();
+            if reader.read_line(&mut line).is_ok() && !line.is_empty() {
+                let _ = line_tx.send(line);
+            }
+            // 保持管道打开直到测试线程确认完成
+            let _ = done_rx.recv_timeout(Duration::from_secs(5));
+        });
+        (pipe_name, line_rx, done_tx, join)
+    }
+
+    #[test]
+    fn quit_is_delivered_after_draining_full_output_buffer() {
+        let (pipe_name, line_rx, done_tx, join) = spawn_blocking_writer_pipe_server();
+        let mut client = crate::ipc::mpv_protocol::MpvIpcClient::new(&pipe_name);
+        client.connect(200, 20).expect("连接测试管道失败");
+
+        // 等待服务端写满 4096 输出缓冲并阻塞在 1 MiB 写入上
+        std::thread::sleep(Duration::from_millis(200));
+
+        // quit → send_command_no_wait → 写前 discard_pending_output 排空残留。
+        // 若不排空，服务端将一直阻塞在写操作上，永远读不到 quit 命令。
+        client.quit().expect("发送 quit 失败");
+
+        let line = line_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("quit 命令未被送达：服务端仍阻塞在写入（排空逻辑未生效）");
+        assert!(
+            line.contains("quit"),
+            "服务端收到的命令应包含 quit，实际: {}",
+            line
+        );
+
+        let _ = done_tx.send(());
+        join.join().expect("服务端线程 panic");
     }
 }

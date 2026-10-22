@@ -163,6 +163,7 @@ mpv.exe --idle=yes \
   --hwdec=auto \
   --vo=gpu \
   --input-vo-keyboard=no \
+  --window-dragging=no \
   --no-osc \
   --no-osd-bar \
   --title=MirrorStarVideo \
@@ -186,6 +187,7 @@ mpv.exe --idle=yes \
 - `--idle=yes`：初始不加载文件（配合 IPC `loadfile`，见上方竞态说明）
 - `--loop-file`：循环播放；`--hwdec=auto` + `--vo=gpu`：硬件加速
 - `--input-ipc-server`：暴露命名管道，供 `MpvIpcClient` 发送 mpv 原生 JSON 协议命令
+- `--window-dragging=no`：禁用 mpv 自带的窗口拖动；否则用户在视频区域按下并拖动会进入 Win32 模态移动循环，导致 mpv 命令处理停摆、退出延迟（纯净模式退出时临时覆盖窗仍置顶，表现为"壁纸可被拖动"）
 - **内存优化（5 个参数）**：`--cache=no`（禁用 demuxer 缓存，节省 ~75MB）、`--vd-queue-max-bytes=16777216`（视频解码队列上限 16MB）、`--ad-queue-max-bytes=4194304`（音频解码队列上限 4MB）、`--demuxer-max-back-bytes=0`（禁用后退缓冲）、`--cache-secs=0`（禁用时间缓存）
   > 注意：勿加 `--demuxer-max-bytes=0`，该参数会导致 demuxer 无法缓冲而立即 EOF 退出（桌面黑屏）。
 - `--d3d11-flip=no`：强制 bitblt 呈现模式，与 SetParent 重父化兼容，降低嵌入后 swapchain 重配置失败概率（双保险）
