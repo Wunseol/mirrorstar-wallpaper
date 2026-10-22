@@ -54,7 +54,7 @@ use mirrorstar_core::scheduler::{
 };
 use mirrorstar_core::{
     build_new_renderer, wait_new_ready, AppConfig, Arrangement, AtomicSwapPrepare, BuildOutcome,
-    ConfigManager, DesktopIntegrator, MirrorStarError, ScalingMode, SwapOutcome, WallpaperEngine,
+    ConfigManager, DesktopIntegrator, MirrorStarError, ScalingMode, WallpaperEngine,
     WallpaperRenderer, WallpaperSource, WallpaperType, ATOMIC_SWAP_IN_PROGRESS,
     ATOMIC_SWAP_READY_TIMEOUT,
 };
@@ -1213,14 +1213,8 @@ async fn apply_to_display(
                     }
                     // 阶段 C（锁内）：一次换槽 old→new + 补发暂停（DR-20）+ terminate 旧。
                     let mut eng = engine.lock().await;
-                    match eng.commit_atomic_swap(
-                        renderer,
-                        display_id,
-                        &commit_source,
-                        wallpaper_type,
-                    )? {
-                        SwapOutcome::Committed => Ok(ApplyOutcome::Swapped),
-                    }
+                    eng.commit_atomic_swap(renderer, display_id, &commit_source, wallpaper_type)?;
+                    Ok(ApplyOutcome::Swapped)
                 }
                 Err(e) => Err(e),
             }

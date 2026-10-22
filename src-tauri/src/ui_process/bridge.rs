@@ -4,9 +4,8 @@
 //! # 命令桥
 //!
 //! - 命令名与 Tauri 命令名逐字一致（`snake_case`），见 `commands::*` 与 [`alignment.md`]。
-//! - 参数键名沿用前端现有 **camelCase**（如 `filePath` / `displayId`，Tauri v2 会自动把
-//!   前端 camelCase 反序列化为后端 snake_case 形参）。本模块用 [`Params`] 同时接受
-//!   camelCase 与 snake_case 两种键，避免因书写风格差异导致解析失败。
+//! - 参数键名统一为 **`snake_case`**（如 `file_path` / `display_id`），与原生 UI 请求
+//!   负载一致。当前原生 UI 是唯一客户端。
 //! - 在非命令上下文复用命令实现：`State<'_, AppState>` 由 `app.state::<AppState>()` 取到，
 //!   `AppHandle` 直接 `app.clone()`；异步命令在本模块的异步分发函数内 `.await`。
 //!   返回的 `Result<T, MirrorStarError>` 序列化为响应 `data`，错误经
@@ -267,7 +266,7 @@ async fn dispatch(
     }
 }
 
-/// 协议参数读取器：同时接受 camelCase（前端既有风格）与 snake_case（Rust 形参名）。
+/// 协议参数读取器：仅接受 snake_case 键（与原生 UI 请求负载一致）。
 struct Params<'a> {
     value: &'a Value,
 }
@@ -277,14 +276,12 @@ impl<'a> Params<'a> {
         Self { value }
     }
 
-    /// 按 snake_case 名取原始值：先查同名字段，再查其 camelCase 形式。
+    /// 按 snake_case 名取原始值。
     fn raw(&self, name: &str) -> Option<&'a Value> {
         if !self.value.is_object() {
             return None;
         }
-        self.value
-            .get(name)
-            .or_else(|| self.value.get(snake_to_camel(name)))
+        self.value.get(name)
     }
 
     /// 取可选参数：字段缺失或为 `null` → `Ok(None)`。
@@ -306,23 +303,6 @@ impl<'a> Params<'a> {
                 reason: format!("缺少必需参数 `{}`", name),
             })
     }
-}
-
-/// `snake_case` → `camelCase`（`member_ids` → `memberIds`）。
-fn snake_to_camel(name: &str) -> String {
-    let mut out = String::with_capacity(name.len());
-    let mut upper_next = false;
-    for c in name.chars() {
-        if c == '_' {
-            upper_next = true;
-        } else if upper_next {
-            out.extend(c.to_uppercase());
-            upper_next = false;
-        } else {
-            out.push(c);
-        }
-    }
-    out
 }
 
 #[cfg(test)]
@@ -363,29 +343,18 @@ mod tests {
         }
     }
 
-    #[test]
-    fn snake_to_camel_converts_multi_segment_names() {
-        assert_eq!(snake_to_camel("file_path"), "filePath");
-        assert_eq!(snake_to_camel("display_id"), "displayId");
-        assert_eq!(snake_to_camel("member_ids"), "memberIds");
-        assert_eq!(snake_to_camel("id"), "id");
-    }
-
     #[derive(Serialize, Deserialize, PartialEq, Debug)]
     struct Sample {
         value: u32,
     }
 
     #[test]
-    fn params_accept_camel_case_keys() {
-        // 前端既有风格：camelCase 键。
+    fn params_reject_camel_case_keys() {
+        // camelCase 键不再被别名解析：仅 snake_case 有效。
         let params = serde_json::json!({ "filePath": "a.mp4", "displayId": "d1" });
         let p = Params::new(&params);
-        assert_eq!(p.require::<String>("file_path").unwrap(), "a.mp4");
-        assert_eq!(
-            p.get::<String>("display_id").unwrap().as_deref(),
-            Some("d1")
-        );
+        assert!(p.require::<String>("file_path").is_err());
+        assert!(p.get::<String>("display_id").unwrap().is_none());
     }
 
     #[test]
@@ -397,7 +366,7 @@ mod tests {
 
     #[test]
     fn params_treat_missing_and_null_as_none() {
-        let params = serde_json::json!({ "displayId": null });
+        let params = serde_json::json!({ "display_id": null });
         let p = Params::new(&params);
         assert_eq!(p.get::<String>("display_id").unwrap(), None);
         assert_eq!(p.get::<String>("wallpaper_id").unwrap(), None);

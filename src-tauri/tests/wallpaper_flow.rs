@@ -862,15 +862,15 @@ fn test_set_volume_command_layer_invalid_range() {
 /// 而非通过 format!() 字符串匹配模拟命令层校验逻辑。
 #[test]
 fn test_set_speed_command_layer_invalid_range() {
-    // 非法值（NaN / Infinity / 非正值 / 超上限）应被拒绝
-    let invalid_values: [f32; 5] = [f32::NAN, f32::INFINITY, 0.0, -1.0, 10.1];
+    // 非法值（NaN / Infinity / 低于下限 / 超上限）应被拒绝
+    let invalid_values: [f32; 6] = [f32::NAN, f32::INFINITY, 0.0, -1.0, 0.1, 4.1];
     for v in invalid_values {
         let err = validate_speed(v).unwrap_err();
         match err {
             MirrorStarError::InvalidArgument { reason } => {
                 assert!(
-                    reason.contains("播放速度必须在 0.0-10.0 之间且大于 0"),
-                    "速度 {} 的错误消息应包含「播放速度必须在 0.0-10.0 之间且大于 0」，实际: {}",
+                    reason.contains("播放速度必须在 0.25-4 之间"),
+                    "速度 {} 的错误消息应包含「播放速度必须在 0.25-4 之间」，实际: {}",
                     v,
                     reason
                 );
@@ -879,8 +879,8 @@ fn test_set_speed_command_layer_invalid_range() {
         }
     }
 
-    // 边界合法值（含上限 10.0，不含 0.0）应被接受
-    for v in [0.25_f32, 1.0, 4.0, 10.0] {
+    // 边界合法值（含上下限 0.25 / 4.0）应被接受
+    for v in [0.25_f32, 1.0, 4.0] {
         assert!(validate_speed(v).is_ok(), "速度 {} 应被校验接受", v);
     }
 }

@@ -10,8 +10,8 @@ use crate::wallpaper::subprocess_base::{
     SubprocessRendererBase, MPV_CONNECT_INTERVAL_MS, MPV_CONNECT_RETRIES,
 };
 use crate::wallpaper::{
-    create_pause_channel, spawn_proc_exit_monitor, validate_renderer_speed, LivenessProbe,
-    OwnedProcHandle, PauseCommand, ScalingMode, WallpaperRenderer, WallpaperState,
+    create_pause_channel, validate_renderer_speed, LivenessProbe, PauseCommand, ScalingMode,
+    WallpaperRenderer, WallpaperState,
 };
 
 /// 判断是否应调用 WASAPI 音量操作（W11 COM 降级纯辅助函数）
@@ -894,15 +894,9 @@ impl WallpaperRenderer for VideoRenderer {
     }
 
     fn terminate(&mut self) -> Result<(), crate::MirrorStarError> {
-        // 0. 先置终止状态（先于进程退出）——同步 base.state 与 shared_state：
-        //    退出监听线程读取 shared_state（create_pause_sender 内
-        //    spawn_proc_exit_monitor 回调），若进程退出时仍为 Playing/Paused，
-        //    会误报"mpv 子进程异常退出"并触发多余状态变更事件。先置位可彻底
-        //    关闭该竞态；子进程真正崩溃（state != Terminated）时原异常路径不变。
-        self.base.set_state(WallpaperState::Terminated);
-        if let Some(sender) = &self.base.pause_sender {
-            sender.set_state(WallpaperState::Terminated);
-        }
+        // 0. 先置终止状态（先于进程退出）——同步 base.state 与 shared_state，
+        //    避免退出监听线程在进程退出时读到旧状态误报"mpv 子进程异常退出"。
+        self.base.mark_terminated();
 
         // 1. 通过 IPC 请求 mpv 退出
         // 临时诊断埋点：IPC quit 调用耗时
@@ -920,7 +914,7 @@ impl WallpaperRenderer for VideoRenderer {
         // 2. 停止进程（会等待退出，超时后强制终止）
         // 临时诊断埋点：停止 mpv 子进程耗时（优雅 3s + 强杀 5s 路径，最关键）
         let trace_stop = Instant::now();
-        self.base.stop_process()?;
+        let _ = self.base.stop_process_for_terminate()?;
         tracing::info!(target: "mirrorstar::exit_trace", "EXIT-TRACE ph=video_stop_process ms={}", trace_stop.elapsed().as_millis());
 
         // 3. 断开 IPC
@@ -1216,45 +1210,15 @@ impl WallpaperRenderer for VideoRenderer {
         // 异常退出时（state != Terminated）通过 PauseSender::notify_state_changed
         // 通知 engine 更新状态，与 web.rs 的 wp-proc 退出监听机制统一。
         //
-        // 使用 DuplicateHandle 复制句柄，避免监听线程的 wait 与 terminate() 中的
-        // CloseHandle 产生竞争（Win32 文档明确指出在 wait 期间关闭同一句柄会导致
-        // 未定义行为）。监听线程拥有独立句柄，退出时自行 CloseHandle。
-        //
-        // 正常退出路径：terminate() 先通过 IPC 请求 mpv 退出，再调用 stop_process()
-        // 等待退出。此时监听线程的 wait 也会返回，但 state 已被 terminate() 流程
-        // 标记为 Terminated（或即将标记），监听线程检查到 state == Terminated 后
-        // 不发通知，避免对正常退出产生冗余通知。
-        //
-        // [Consistency]-12.2 修复：调用共享 `spawn_proc_exit_monitor` 收敛 video.rs
-        // 与 web.rs 的实现差异。`OwnedProcHandle` RAII 管理句柄生命周期，
-        // spawn 失败时由共享函数统一 `warn` 并通过 `OwnedProcHandle::drop` 关闭句柄。
-        if let Some(proc_handle) = self.base.duplicate_process_handle() {
-            // 使用 OwnedProcHandle RAII 包装器：spawn 失败时闭包被 drop，包装器自动
-            // 调用 CloseHandle，不泄漏句柄；pause 通道已建立成功，仅 warn 不返回 None。
-            let owned = OwnedProcHandle::new(proc_handle);
-            spawn_proc_exit_monitor(owned, move || {
-                // 检查是否为异常退出：state != Terminated 表示非 terminate() 触发
-                let state = monitor_shared
-                    .read()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .state;
-                if state != WallpaperState::Terminated {
-                    tracing::warn!(
-                        display_id = %monitor_display_id,
-                        state = ?state,
-                        "mpv 子进程异常退出，通知 engine 更新状态"
-                    );
-                    // 更新共享状态为 Terminated，使 any_playing 等查询返回正确结果
-                    monitor_shared
-                        .write()
-                        .unwrap_or_else(|e| e.into_inner())
-                        .state = WallpaperState::Terminated;
-                    // 通知 Tauri 层 emit wallpaper-state-changed 事件刷新 UI
-                    monitor_sender.notify_state_changed(&monitor_display_id);
-                }
-                tracing::debug!("VideoRenderer 进程监听线程退出");
-            });
-        }
+        // 收敛：公共的句柄复制、RAII 包装、状态检查与通知流程下沉到
+        // `SubprocessRendererBase::spawn_exit_monitor`，仅保留 mpv 专用日志文案。
+        self.base.spawn_exit_monitor(
+            monitor_display_id,
+            monitor_shared,
+            monitor_sender,
+            "mpv 子进程异常退出，通知 engine 更新状态",
+            "VideoRenderer",
+        );
 
         self.base.set_pause_sender(Some(sender.clone()));
         Some(sender)
@@ -1308,6 +1272,7 @@ impl Drop for VideoRenderer {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::wallpaper::OwnedProcHandle;
     use windows::Win32::Foundation::CloseHandle;
 
     fn create_renderer(mode: ScalingMode) -> VideoRenderer {

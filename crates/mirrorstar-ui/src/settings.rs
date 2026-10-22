@@ -113,6 +113,15 @@ pub fn arrangement_value(arrangement: Arrangement) -> &'static str {
     }
 }
 
+/// `Arrangement` → 设置面板中文标签（与 [`ARRANGEMENT_LABELS`] 同源）。
+pub fn arrangement_label(arrangement: Arrangement) -> &'static str {
+    let index = index_of(&ARRANGEMENTS, arrangement_value(arrangement));
+    ARRANGEMENT_LABELS
+        .get(index as usize)
+        .copied()
+        .unwrap_or(ARRANGEMENT_LABELS[0])
+}
+
 /// 线格式值 → `Arrangement`（供下拉回调窄化）。
 pub fn arrangement_from_value(value: &str) -> Option<Arrangement> {
     match value {
@@ -159,6 +168,15 @@ pub fn order_value(order: Order) -> &'static str {
         Order::ShuffleBag => "shuffle_bag",
         Order::PseudoRandom => "pseudo_random",
     }
+}
+
+/// `Order` → 设置面板中文标签（与 [`ORDER_LABELS`] 同源）。
+pub fn order_label(order: Order) -> &'static str {
+    let index = index_of(&ORDERS, order_value(order));
+    ORDER_LABELS
+        .get(index as usize)
+        .copied()
+        .unwrap_or(ORDER_LABELS[0])
 }
 
 /// 线格式值 → `Order`。
@@ -334,27 +352,42 @@ pub struct UnitKey {
 }
 
 /// 依据多屏排列列出调度单元：PerMonitor 每屏一个，AllSame/Span 唯全局单元 `"all"`。
+///
+/// 单元划分规则（key 列表）由 `mirrorstar_core::layout` 的 [`plan`] / [`unit_keys`]
+/// 唯一提供，本函数只负责拼装展示标签（`[主] ` 前缀 / 显示器名称 / 全局单元文案）。
+///
+/// [`plan`]: mirrorstar_core::layout::plan
+/// [`unit_keys`]: mirrorstar_core::layout::unit_keys
 pub fn unit_keys_for_arrangement(
     arrangement: Arrangement,
     displays: &[DisplayInfo],
 ) -> Vec<UnitKey> {
-    match arrangement {
-        Arrangement::PerMonitor => displays
-            .iter()
-            .map(|d| UnitKey {
-                key: d.id.clone(),
-                label: if d.is_primary {
-                    format!("[主] {}", d.name)
-                } else {
-                    d.name.clone()
+    let monitors: Vec<mirrorstar_core::layout::LayoutMonitor> =
+        displays.iter().map(Into::into).collect();
+    let plane = mirrorstar_core::layout::plan(arrangement, &monitors);
+    let keys = mirrorstar_core::layout::unit_keys(&plane);
+    // 展示层兜底：全局编排下 core 在无显示器时返回空列表，但设置面板仍需展示唯一全局单元
+    // （否则单元列表变空、开关无处可操作）；PerMonitor 无显示器则仍返回空（显示空态）。
+    let keys = if keys.is_empty() && arrangement != Arrangement::PerMonitor {
+        vec![mirrorstar_core::layout::ALL_UNIT_KEY.to_string()]
+    } else {
+        keys
+    };
+    keys.into_iter()
+        .map(|key| {
+            let label = match arrangement {
+                // PerMonitor：展示层只补 `[主] ` 前缀与显示器名称。
+                Arrangement::PerMonitor => match displays.iter().find(|d| d.id == key) {
+                    Some(d) if d.is_primary => format!("[主] {}", d.name),
+                    Some(d) => d.name.clone(),
+                    // 理论上不会命中（key 来自同一显示器拓扑）；退化时直接显示 key。
+                    None => key.clone(),
                 },
-            })
-            .collect(),
-        Arrangement::AllSame | Arrangement::Span => vec![UnitKey {
-            key: "all".to_string(),
-            label: "全部屏幕".to_string(),
-        }],
-    }
+                Arrangement::AllSame | Arrangement::Span => "全部屏幕".to_string(),
+            };
+            UnitKey { key, label }
+        })
+        .collect()
 }
 
 // ── 数值 sanitize ─────────────────────────────────────────────────────────────
@@ -672,6 +705,14 @@ mod tests {
         let span = unit_keys_for_arrangement(Arrangement::Span, &[]);
         assert_eq!(
             span,
+            vec![UnitKey {
+                key: "all".into(),
+                label: "全部屏幕".into()
+            }]
+        );
+        // 全局编排无显示器：core 返回空 → UI 展示层兜底为唯一全局单元（两种全局编排一致）。
+        assert_eq!(
+            unit_keys_for_arrangement(Arrangement::AllSame, &[]),
             vec![UnitKey {
                 key: "all".into(),
                 label: "全部屏幕".into()

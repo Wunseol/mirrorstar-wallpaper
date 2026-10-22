@@ -86,7 +86,7 @@ const DRAG_GHOST_RADIUS: u32 = 8;
 const DRAG_GHOST_OPACITY: f32 = 0.85;
 
 /// 项目仓库地址：关于面板「项目仓库」链接的唯一来源。
-const REPO_URL: &str = "https://github.com/mirrorstar-wallpaper/mirrorstar-wallpaper";
+const REPO_URL: &str = "https://github.com/Wunseol/mirrorstar-wallpaper";
 
 /// 在系统默认浏览器中打开 `url`（best-effort：失败仅记日志，不 panic）。
 #[cfg(windows)]

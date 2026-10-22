@@ -8,8 +8,8 @@ use crate::wallpaper::subprocess_base::{
     SubprocessRendererBase, WP_PROC_CONNECT_INTERVAL_MS, WP_PROC_CONNECT_RETRIES,
 };
 use crate::wallpaper::{
-    create_pause_channel, get_screen_size, spawn_proc_exit_monitor, OwnedProcHandle, PauseCommand,
-    ScalingMode, WallpaperRenderer, WallpaperState,
+    create_pause_channel, get_screen_size, PauseCommand, ScalingMode, WallpaperRenderer,
+    WallpaperState,
 };
 
 /// 某个 wp-proc 实例的 WebView2 UserDataFolder 路径（**路径约定的唯一来源**）。
@@ -253,10 +253,7 @@ impl WallpaperRenderer for WebRenderer {
     fn terminate(&mut self) -> Result<(), crate::MirrorStarError> {
         // 0. 先置终止状态（先于进程退出）——同步 base.state 与 shared_state，
         //    避免退出监听线程在进程退出时读到旧状态误报"异常退出"（同 video.rs）。
-        self.base.set_state(WallpaperState::Terminated);
-        if let Some(sender) = &self.base.pause_sender {
-            sender.set_state(WallpaperState::Terminated);
-        }
+        self.base.mark_terminated();
 
         // 1. 通过 IPC 请求子进程退出
         {
@@ -269,10 +266,9 @@ impl WallpaperRenderer for WebRenderer {
         }
 
         // 2. 停止进程（会等待退出，超时后强制终止）
-        //    回收 WebView2 UserDataFolder 必须在子进程退出后进行，而 stop_process 会
-        //    清空 ProcessManager 的 pid，故先保存 pid 再停止。
-        let pid = self.base.process_pid();
-        self.base.stop_process()?;
+        //    回收 WebView2 UserDataFolder 必须在子进程退出后进行，故由
+        //    `stop_process_for_terminate` 返回停止前的 PID。
+        let pid = self.base.stop_process_for_terminate()?;
 
         // 2.1 进程已确认退出 → 回收本实例的 WebView2 UserDataFolder（尽力而为、幂等）。
         //     在"资源变为垃圾"的准确时刻回收，由拥有生命周期的组件负责；
@@ -431,46 +427,15 @@ impl WallpaperRenderer for WebRenderer {
         // 异常退出时（state != Terminated）通过 PauseSender::notify_state_changed
         // 通知 engine 更新状态，与 video.rs 的 mpv 退出恢复机制统一。
         //
-        // 使用 DuplicateHandle 复制句柄，避免监听线程的 wait 与 terminate() 中的
-        // CloseHandle 产生竞争（Win32 文档明确指出在 wait 期间关闭同一句柄会导致
-        // 未定义行为）。监听线程拥有独立句柄，退出时自行 CloseHandle。
-        //
-        // 正常退出路径：terminate() 先通过 IPC 请求子进程退出，再调用 stop_process()
-        // 等待退出。此时监听线程的 wait 也会返回，但 state 已被 terminate() 流程
-        // 标记为 Terminated（或即将标记），监听线程检查到 state == Terminated 后
-        // 不发通知，避免对正常退出产生冗余通知。
-        //
-        // [Consistency]-12.2 修复：调用共享 `spawn_proc_exit_monitor` 收敛 web.rs
-        // 与 video.rs 的实现差异。`OwnedProcHandle` RAII 管理句柄生命周期，
-        // spawn 失败时由共享函数统一 `warn` 并通过 `OwnedProcHandle::drop` 关闭句柄。
-        if let Some(proc_handle) = self.base.duplicate_process_handle() {
-            // 修复：使用 RAII 包装器独占持有复制的句柄，确保无论 spawn 成败
-            // 都不会泄漏。spawn 成功时共享函数内 `take()` 取出句柄使用；spawn 失败时
-            // 闭包被 drop，`OwnedProcHandle::drop` 自动调用 `CloseHandle`。
-            let owned = OwnedProcHandle::new(proc_handle);
-            spawn_proc_exit_monitor(owned, move || {
-                // 检查是否为异常退出：state != Terminated 表示非 terminate() 触发
-                let state = monitor_shared
-                    .read()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .state;
-                if state != WallpaperState::Terminated {
-                    tracing::warn!(
-                        display_id = %monitor_display_id,
-                        state = ?state,
-                        "wp-proc 子进程异常退出，通知 engine 更新状态"
-                    );
-                    // 更新共享状态为 Terminated，使 any_playing 等查询返回正确结果
-                    monitor_shared
-                        .write()
-                        .unwrap_or_else(|e| e.into_inner())
-                        .state = WallpaperState::Terminated;
-                    // 通知 Tauri 层 emit wallpaper-state-changed 事件刷新 UI
-                    monitor_sender.notify_state_changed(&monitor_display_id);
-                }
-                tracing::debug!("WebRenderer 进程监听线程退出");
-            });
-        }
+        // 收敛：公共的句柄复制、RAII 包装、状态检查与通知流程下沉到
+        // `SubprocessRendererBase::spawn_exit_monitor`，仅保留 wp-proc 专用日志文案。
+        self.base.spawn_exit_monitor(
+            monitor_display_id,
+            monitor_shared,
+            monitor_sender,
+            "wp-proc 子进程异常退出，通知 engine 更新状态",
+            "WebRenderer",
+        );
 
         self.base.set_pause_sender(Some(sender.clone()));
         Some(sender)

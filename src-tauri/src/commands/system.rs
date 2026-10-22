@@ -55,9 +55,9 @@ pub fn report_lifecycle_mark(label: String) -> Result<(), mirrorstar_core::Mirro
 //
 // # 调用方使用约定（前端 invoke 指导）
 //
-// 此命令当前未被前端主动调用（WorkerW 失效检测由后台 `workerw_check.rs`
-// 5 分钟间隔兜底 + Explorer 重启 `TaskbarCreated` 事件驱动覆盖），
-// 作为前端在收到 `desktop-status-changed` 事件后的补救轮询入口。
+// 此命令作为前端在收到 `desktop-status-changed` 事件后的补救轮询入口
+//（WorkerW 失效检测另有后台 `workerw_check.rs` 5 分钟间隔兜底 +
+// Explorer 重启 `TaskbarCreated` 事件驱动覆盖）；UI 侧 `main.rs` 已按此约定调用。
 //
 // ## 建议轮询频率
 //

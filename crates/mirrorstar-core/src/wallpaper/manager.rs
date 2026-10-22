@@ -5,6 +5,7 @@ use std::time::{Duration, Instant};
 use windows::Win32::Foundation::HWND;
 
 use crate::audio::volume::VolumeControl;
+use crate::config::normalize_path_key;
 use crate::config::settings::Arrangement;
 use crate::desktop::native_wallpaper;
 use crate::desktop::DesktopIntegrator;
@@ -140,13 +141,6 @@ pub enum BuildOutcome {
     Ready(Box<dyn WallpaperRenderer>),
     /// 新图与旧图相同（id 一致），无需更换——短路跳过整个 swap
     Skip,
-}
-
-/// `commit_atomic_swap` 的返回值
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum SwapOutcome {
-    /// 换槽完成（old→new）
-    Committed,
 }
 
 /// 纯净壁纸模式的运行态快照（D7）。
@@ -1395,14 +1389,14 @@ impl WallpaperEngine {
     /// 5. terminate 旧渲染器（失败则强毁旧 hwnd 兜底）
     ///
     /// 任何失效步骤在换槽前返回 `Err` 并 terminate 新渲染器；旧壁纸全程在 map、未动，
-    /// 无需重嵌回滚。换槽后无 `Err` 路径，返回 `SwapOutcome::Committed`。
+    /// 无需重嵌回滚。换槽后无 `Err` 路径，返回 `Ok(())`。
     pub fn commit_atomic_swap(
         &mut self,
         mut new_renderer: Box<dyn WallpaperRenderer>,
         display_id: &str,
         source: &WallpaperSource,
         wallpaper_type: WallpaperType,
-    ) -> Result<SwapOutcome, MirrorStarError> {
+    ) -> Result<(), MirrorStarError> {
         // DR-40 commit 前校验：新窗父窗口仍为当前 WorkerW，否则放弃 commit（terminate 新窗）。
         // 校验必须先于换槽：若先 remove 旧窗，校验失败路径上 old_renderer 随函数返回被 Drop，
         // Drop 会终止旧壁纸进程（VideoRenderer::drop），导致屏幕空白且轮换永不提交。
@@ -1448,7 +1442,7 @@ impl WallpaperEngine {
         }
 
         tracing::info!(display_id, "原子交换：换槽完成（old→new）");
-        Ok(SwapOutcome::Committed)
+        Ok(())
     }
 
     /// 按当前全局暂停原因位图，对指定显示器的渲染器补发暂停命令（DR-20）。
@@ -1540,14 +1534,14 @@ impl WallpaperEngine {
     /// 避免 `C:/a/b.mp4` 与 `c:\a\b.mp4` 因大小写/分隔符差异无法匹配。
     /// 不使用 `std::fs::canonicalize` 因其要求文件存在（删除场景文件可能已不存在）。
     pub fn close_wallpaper_by_path(&mut self, path: &str) -> Result<(), MirrorStarError> {
-        let normalized_target = normalize_path_for_compare(path);
+        let normalized_target = normalize_path_key(path);
         // 查找使用该文件路径的显示器
         let display_id_to_close: Option<String> =
             self.wallpaper_sources
                 .iter()
                 .find_map(|(display_id, (source, _))| {
                     if let WallpaperSource::File(p) = source {
-                        if normalize_path_for_compare(p) == normalized_target {
+                        if normalize_path_key(p) == normalized_target {
                             return Some(display_id.clone());
                         }
                     }
@@ -2396,14 +2390,6 @@ pub fn wait_new_ready(
             ));
         }
     }
-}
-
-/// 规范化路径用于比较（W13 修复）
-///
-/// 将路径转换为小写并将 `/` 替换为 `\\`，使 `C:/a/b.mp4` 与 `c:\a\b.mp4` 视为相等。
-/// 不使用 `std::fs::canonicalize` 因其要求文件存在（删除场景文件可能已不存在）。
-fn normalize_path_for_compare(p: &str) -> String {
-    p.to_lowercase().replace('/', "\\")
 }
 
 /// 确保 WorkerW 就绪（释放 desktop 锁后 sleep 重试）
@@ -3856,33 +3842,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn normalize_path_for_compare_lowercases_and_unifies_separators() {
-        // W13: 直接测试 normalize_path_for_compare 辅助函数
-        // 大写 → 小写
-        assert_eq!(
-            normalize_path_for_compare("C:\\Users\\Test\\File.mp4"),
-            "c:\\users\\test\\file.mp4"
-        );
-        // 正斜杠 → 反斜杠
-        assert_eq!(
-            normalize_path_for_compare("C:/Users/Test/File.mp4"),
-            "c:\\users\\test\\file.mp4"
-        );
-        // 混合分隔符
-        assert_eq!(
-            normalize_path_for_compare("C:/Users\\Test/File.mp4"),
-            "c:\\users\\test\\file.mp4"
-        );
-        // 已规范化的路径保持不变
-        assert_eq!(
-            normalize_path_for_compare("c:\\users\\test\\file.mp4"),
-            "c:\\users\\test\\file.mp4"
-        );
-        // 空路径
-        assert_eq!(normalize_path_for_compare(""), "");
-    }
-
     // ========== 原子交换三段式（B1 / DR-33 / P1-5）==========
 
     #[test]
@@ -3915,11 +3874,8 @@ mod tests {
         );
 
         // 阶段 C（锁内换槽）：一次换槽 → 新登记、旧 terminate。
-        assert_eq!(
-            eng.commit_atomic_swap(new, "d1", &src, WallpaperType::Video)
-                .unwrap(),
-            SwapOutcome::Committed
-        );
+        eng.commit_atomic_swap(new, "d1", &src, WallpaperType::Video)
+            .unwrap();
         assert!(eng.wallpapers.contains_key("d1"), "换槽后新窗应在 map");
         assert!(
             old_shared.lock().unwrap().terminated,
@@ -3962,11 +3918,8 @@ mod tests {
 
         let (new, new_shared) = MockRenderer::new();
         let new = eng.embed_atomic_into(Box::new(new), "d1").unwrap();
-        assert_eq!(
-            eng.commit_atomic_swap(new, "d1", &src, WallpaperType::Gif)
-                .unwrap(),
-            SwapOutcome::Committed
-        );
+        eng.commit_atomic_swap(new, "d1", &src, WallpaperType::Gif)
+            .unwrap();
         assert!(eng.wallpapers.contains_key("d1"));
         assert!(old_shared.lock().unwrap().terminated, "旧窗应 terminate");
         assert!(

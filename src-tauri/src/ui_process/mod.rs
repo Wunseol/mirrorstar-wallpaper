@@ -7,7 +7,7 @@
 //!
 //! - [`UiProcessManager`]：spawn / 握手 / stdio 接线 / 异常退出处理 / 空闲退出 / 单实例。
 //! - [`bridge`]：命令桥（`ui_proto` 请求 → 现有 `commands::*`，业务逻辑零复制）与
-//!   事件桥（壳侧 13 个事件 → 协议推送，惰性转发）。
+//!   事件桥（壳侧 [`bridge::FORWARDED_EVENTS`] 中登记的事件 → 协议推送，惰性转发）。
 //!
 //! # 唯一主窗口（Task 10）
 //!
@@ -53,7 +53,7 @@
 //! - 实现：`crates/mirrorstar-ui/build.rs`（`/MANIFEST:EMBED` +
 //!   `/MANIFESTINPUT:<app.manifest>`，清单见同目录 `app.manifest`）。
 //! - Tauri 侧（本 crate）自身清单由 `tauri-build` 自动注入（`build.rs` 调用
-//!   `tauri_build::build()`），已满足要求，无需手工处理。
+//!   `tauri_build::try_build()`），已满足要求，无需手工处理。
 
 mod bridge;
 mod paths;

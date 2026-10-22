@@ -39,7 +39,7 @@ use mirrorstar_core::ipc::mpv_protocol::MpvIpcClient;
 use mirrorstar_core::process::manager::ProcessManager;
 use mirrorstar_core::wallpaper::subprocess_base::SubprocessRendererBase;
 
-use super::host_child::{self, PhysRect};
+use super::host_child::{PhysRect, PreviewHost};
 use crate::protocol::log;
 
 /// UI 线程 → 后台控制线程的播放控制消息。
@@ -63,10 +63,8 @@ static PREVIEW_PIPE_SEQ: AtomicU64 = AtomicU64::new(0);
 /// 一个正在播放的视频预览。
 pub struct MpvPreview {
     manager: ProcessManager,
-    host: HWND,
+    host: PreviewHost,
     pid: u32,
-    /// 宿主子窗口是否已显式显示（隐藏创建 → 就绪后显示，避免打开时残影）。
-    shown: bool,
     /// 首帧就绪态（控制线程置位，UI 线程读取）：`vo-configured` 或 `duration/time-pos>0`。
     ready: Arc<AtomicBool>,
     /// 打开时刻，用于首帧就绪超时兜底（避免 mpv 异常时宿主永不显示）。
@@ -85,18 +83,9 @@ impl MpvPreview {
         self.pid
     }
 
-    /// 宿主子窗口句柄（供上层"先隐藏后销毁"）。
-    pub fn host(&self) -> HWND {
-        self.host
-    }
-
     /// 显式显示宿主子窗口（幂等）。
     pub fn show(&mut self) {
-        if self.shown {
-            return;
-        }
-        host_child::show_host(self.host);
-        self.shown = true;
+        self.host.show();
     }
 
     /// 首帧就绪门控显示：仅当 mpv 已输出首帧（`ready`）或超过兜底上限时调用 [`Self::show`]。
@@ -109,7 +98,7 @@ impl MpvPreview {
         const FALLBACK: Duration = Duration::from_millis(1200);
         let ready = self.ready.load(Ordering::Relaxed);
         let elapsed = self.opened_at.elapsed();
-        if should_show(self.shown, ready, elapsed, FALLBACK) {
+        if should_show(self.host.is_shown(), ready, elapsed, FALLBACK) {
             if !ready {
                 log(format!(
                     "视频预览首帧未在 {}ms 内就绪，按兜底上限强制显示（pid={}）",
@@ -123,7 +112,7 @@ impl MpvPreview {
 
     /// 预览区尺寸变化时重排宿主子窗口（mpv 随宿主 `--wid` 自动铺满）。
     pub fn resize(&self, rect: PhysRect) {
-        host_child::move_host(self.host, rect);
+        self.host.move_to(rect);
     }
 
     /// 切换播放/暂停（发送失败忽略：关闭竞态下线程可能已退出）。
@@ -172,12 +161,11 @@ impl Drop for MpvPreview {
         if let Some(worker) = self.worker.take() {
             let _ = worker.join();
         }
-        // 立即终止（TerminateProcess + 关闭 Job 句柄，触发 KILL_ON_JOB_CLOSE 兜底），
-        // 随后销毁宿主子窗口，确保关闭预览后不留 mpv 进程与窗口。
+        // 立即终止（TerminateProcess + 关闭 Job 句柄，触发 KILL_ON_JOB_CLOSE 兜底）。
+        // 宿主子窗口由 `host` 字段 Drop 先隐藏再销毁，确保关闭预览后不留 mpv 进程与窗口。
         if let Err(e) = self.manager.stop_immediate() {
             log(format!("终止预览 mpv 失败（pid={}）：{e}", self.pid));
         }
-        host_child::destroy_host(self.host);
     }
 }
 
@@ -193,7 +181,7 @@ pub fn open(
     volume: f32,
     muted: bool,
 ) -> Result<MpvPreview, String> {
-    let host = host_child::create_host_child(parent, rect)?;
+    let host = PreviewHost::create(parent, rect)?;
     let exe = SubprocessRendererBase::find_bundled_executable(Some("mpv"), "mpv.exe", "mpv");
     // 进程 id + 自增序号保证唯一：管道名不含 `\\.\pipe\` 前缀（由 MpvIpcClient 内部补全）。
     let pipe_name = format!(
@@ -201,7 +189,7 @@ pub fn open(
         std::process::id(),
         PREVIEW_PIPE_SEQ.fetch_add(1, Ordering::Relaxed)
     );
-    let args = build_mpv_args(host, &pipe_name, video, volume, muted);
+    let args = build_mpv_args(host.hwnd(), &pipe_name, video, volume, muted);
     let mut manager = ProcessManager::new(exe);
     match manager.start(args) {
         Ok(pid) => {
@@ -221,7 +209,6 @@ pub fn open(
                 manager,
                 host,
                 pid,
-                shown: false,
                 ready,
                 opened_at,
                 control_tx: Some(tx),
@@ -229,10 +216,8 @@ pub fn open(
                 worker: Some(worker),
             })
         }
-        Err(e) => {
-            host_child::destroy_host(host);
-            Err(format!("启动 mpv 失败: {e}"))
-        }
+        // 启动失败：`host` 随作用域 Drop 先隐藏再销毁。
+        Err(e) => Err(format!("启动 mpv 失败: {e}")),
     }
 }
 

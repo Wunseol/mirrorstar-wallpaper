@@ -132,6 +132,68 @@ pub fn destroy_host(host: HWND) {
     }
 }
 
+/// 预览宿主子窗口：隐藏创建 → 首帧就绪后显示 → 先隐藏再销毁。
+///
+/// 收敛 mpv 预览、网页创建状态机与已就绪网页预览三处重复的
+/// `shown` 标记 + 幂等显隐样板。句柄无效时全部操作 no-op。
+pub struct PreviewHost {
+    hwnd: HWND,
+    /// 是否已显式显示（`show` 幂等；隐藏创建后首帧就绪前不得显示）。
+    shown: bool,
+}
+
+impl PreviewHost {
+    /// 创建隐藏的承载子窗口（就绪前不可见）。
+    pub fn create(parent: HWND, rect: PhysRect) -> Result<Self, String> {
+        Ok(Self {
+            hwnd: create_host_child(parent, rect)?,
+            shown: false,
+        })
+    }
+
+    /// 宿主句柄。
+    pub fn hwnd(&self) -> HWND {
+        self.hwnd
+    }
+
+    /// 是否已显式显示。
+    pub fn is_shown(&self) -> bool {
+        self.shown
+    }
+
+    /// 显式显示（幂等；不激活、不抢焦点）。
+    pub fn show(&mut self) {
+        if self.shown {
+            return;
+        }
+        show_host(self.hwnd);
+        self.shown = true;
+    }
+
+    /// 隐藏（幂等；供"先隐藏后销毁"）。
+    pub fn hide(&mut self) {
+        if !self.shown {
+            return;
+        }
+        hide_host(self.hwnd);
+        self.shown = false;
+    }
+
+    /// 重新定位 / 缩放（不改变可见性）。
+    pub fn move_to(&self, rect: PhysRect) {
+        move_host(self.hwnd, rect);
+    }
+}
+
+impl Drop for PreviewHost {
+    fn drop(&mut self) {
+        // 先隐藏再销毁：关闭/切换预览时杜绝残留可见子窗口。
+        self.hide();
+        destroy_host(self.hwnd);
+        self.hwnd = HWND::default();
+    }
+}
+
 /// 逻辑像素矩形 × 缩放因子 → 物理像素矩形（纯函数，便于单测）。
 ///
 /// 宽高设下限 64px：避免预览刚打开、布局尚未稳定时拿到退化尺寸导致子窗口不可见。

@@ -7,6 +7,7 @@
 //! 校验失败返回 [`MirrorStarError::InvalidArgument`]；配置层调用方可按需
 //! 映射为 `InvalidConfig`。
 
+use crate::ipc::mpv_protocol::{SPEED_MAX, SPEED_MIN};
 use crate::MirrorStarError;
 
 /// 校验音量值范围：`[0.0, 1.0]` 有限值。
@@ -22,14 +23,19 @@ pub fn validate_volume(value: f32) -> Result<(), MirrorStarError> {
     Ok(())
 }
 
-/// 校验播放速度范围：`(0.0, 10.0]` 有限值。
+/// 校验播放速度范围：`[SPEED_MIN, SPEED_MAX]`（即 `[0.25, 4.0]`）有限值。
 ///
-/// 配置文件中 `video.speed` 与 `set_speed` 命令参数均使用此范围。
+/// 配置文件中 `video.speed` 与 `set_speed` 命令参数均使用此范围，
+/// 上下限直接复用 [`crate::ipc::mpv_protocol::SPEED_MIN`] /
+/// [`crate::ipc::mpv_protocol::SPEED_MAX`]，避免多处定义漂移。
 /// 越界或 NaN/Inf 返回 `InvalidArgument`。
 pub fn validate_speed(value: f32) -> Result<(), MirrorStarError> {
-    if !value.is_finite() || value <= 0.0 || value > 10.0 {
+    if !value.is_finite() || !(SPEED_MIN..=SPEED_MAX).contains(&value) {
         return Err(MirrorStarError::InvalidArgument {
-            reason: format!("播放速度必须在 0.0-10.0 之间且大于 0，实际: {}", value),
+            reason: format!(
+                "播放速度必须在 {}-{} 之间，实际: {}",
+                SPEED_MIN, SPEED_MAX, value
+            ),
         });
     }
     Ok(())

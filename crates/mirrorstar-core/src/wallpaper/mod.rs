@@ -583,6 +583,82 @@ pub fn create_pause_sender_with_state(
     (sender, rx)
 }
 
+/// Image/GIF 渲染器共用的 `create_pause_sender` 构建流程。
+///
+/// 复用 `play()` 中提前创建的 `pre_shared_state` / `pre_state_changed`
+/// （take 语义：首次取出后置 `None`，后续调用回退并记录 warn），同步
+/// `shared_state.state` 后基于 [`create_pause_sender_with_state`] 创建
+/// `PauseSender` + rx，并启动 pause 转发线程。
+///
+/// 各渲染器的差异通过参数传入：线程名、渲染器名、唤醒消息、Pause/Resume
+/// 命令构造闭包与 spawn 失败日志文案。失败时返回 `None`（与两个渲染器原实现一致）。
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn create_gdi_pause_sender<C: Send + 'static>(
+    base: &mut gdi_base::GdiRendererBase,
+    pre_shared_state: &mut Option<Arc<RwLock<RendererState>>>,
+    pre_state_changed: &mut Option<tokio::sync::broadcast::Sender<String>>,
+    display_id_lock: &std::sync::OnceLock<String>,
+    display_id: &str,
+    cmd_tx: std::sync::mpsc::Sender<C>,
+    thread_name: &str,
+    renderer_name: &'static str,
+    spawn_error_msg: &str,
+    wake_msg: u32,
+    make_pause: impl Fn() -> C + Send + 'static,
+    make_resume: impl Fn() -> C + Send + 'static,
+) -> Option<PauseSender> {
+    // W-003 修复：复用 play() 中提前创建的 shared_state 和 state_changed，
+    // 使壁纸线程在 Resume 失败时能通过 shared_state 回滚状态并通知前端
+    let shared_state = pre_shared_state.take().unwrap_or_else(|| {
+        tracing::warn!("pre_shared_state 已被消费，回退到 create_pause_channel");
+        let (_, _, s) = create_pause_channel();
+        s
+    });
+    let state_changed = pre_state_changed.take().unwrap_or_else(|| {
+        tracing::warn!("pre_state_changed 已被消费，回退到新 broadcast channel");
+        tokio::sync::broadcast::channel::<String>(16).0
+    });
+
+    // 设置 display_id_lock，使壁纸线程在 Resume 失败时能读取 display_id 通知前端
+    let _ = display_id_lock.set(display_id.to_string());
+
+    // 同步 shared_state.state 为当前 base.state()
+    {
+        let mut s = shared_state.write().unwrap_or_else(|e| e.into_inner());
+        s.state = base.state();
+    }
+
+    // 使用已有的 shared_state 和 state_changed 创建 PauseSender + rx
+    let (sender, rx) = create_pause_sender_with_state(shared_state.clone(), state_changed);
+
+    // HWND 不是 Send，将原始值存储为 isize 跨线程传递
+    let hwnd_raw = base.hwnd().map(|h| h.0 as isize);
+    // clone sender 与 display_id 传入 spawn_pause_forwarder，
+    // 状态变更后通过 notify_state_changed 通知 Tauri 层 emit 事件
+    let state_sender = sender.clone();
+    let display_id = display_id.to_string();
+
+    if let Err(e) = gdi_base::spawn_pause_forwarder(
+        thread_name,
+        renderer_name,
+        cmd_tx,
+        hwnd_raw,
+        wake_msg,
+        make_pause,
+        make_resume,
+        rx,
+        shared_state,
+        state_sender,
+        display_id,
+    ) {
+        tracing::error!(error = %e, "{}", spawn_error_msg);
+        return None;
+    }
+
+    base.set_pause_sender(Some(sender.clone()));
+    Some(sender)
+}
+
 /// 暂停原因位掩码，用于协调 fullscreen / power / tray 多状态机
 ///
 /// 当多个暂停原因同时存在时，仅当全部原因都清除后才真正恢复壁纸。
@@ -1268,7 +1344,65 @@ mod tests {
         // 无断言：仅验证不 panic
     }
 
-    // ========== [Consistency]-12.2 修复测试：spawn_proc_exit_monitor 共享函数 ==========
+    // ========== spawn_proc_exit_monitor 共享函数测试 ==========
+
+    /// `spawn_proc_exit_monitor` 回调触发测试的共享步骤。
+    ///
+    /// 启动 `cmd.exe /c <child_cmd>` 短生命周期占位进程，复制句柄并包装为
+    /// `OwnedProcHandle`，调用共享函数后轮询等待回调（最多 10s），最后 join 监听
+    /// 线程并清理进程。两个测试仅子进程命令、管道名与失败文案不同，故收敛到此。
+    fn assert_exit_monitor_invokes_callback(pipe_name: &str, child_cmd: &str, failure_msg: &str) {
+        use std::path::PathBuf;
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        use crate::wallpaper::subprocess_base::SubprocessRendererBase;
+
+        // 定位 cmd.exe（优先使用 SystemRoot 环境变量，回退到 WINDIR）
+        let system_root = std::env::var("SystemRoot")
+            .or_else(|_| std::env::var("WINDIR"))
+            .expect("SystemRoot/WINDIR 环境变量应存在");
+        let cmd_path = PathBuf::from(system_root).join("System32").join("cmd.exe");
+        assert!(cmd_path.exists(), "cmd.exe 应存在于 {}", cmd_path.display());
+
+        let mut base =
+            SubprocessRendererBase::new(cmd_path, pipe_name.to_string(), ScalingMode::Fill);
+        base.start_process(vec!["/c".to_string(), child_cmd.to_string()])
+            .expect("启动测试占位进程应成功");
+
+        // 复制进程句柄（与 create_pause_sender 中的模式一致）
+        let proc_handle = base
+            .duplicate_process_handle()
+            .expect("duplicate_process_handle 应返回 Some");
+        let owned = OwnedProcHandle::new(proc_handle);
+
+        let callback_invoked = Arc::new(AtomicBool::new(false));
+        let callback_flag = callback_invoked.clone();
+
+        let monitor_handle = spawn_proc_exit_monitor(owned, move || {
+            callback_flag.store(true, Ordering::SeqCst);
+        })
+        .expect("spawn_proc_exit_monitor 应成功 spawn 监听线程");
+
+        // 轮询等待回调被调用（最多 10s）
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            if callback_invoked.load(Ordering::SeqCst) {
+                break;
+            }
+            if std::time::Instant::now() > deadline {
+                panic!("{}", failure_msg);
+            }
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+
+        assert!(callback_invoked.load(Ordering::SeqCst), "{}", failure_msg);
+
+        // 等待监听线程退出（callback 执行完毕后线程应立即退出）
+        monitor_handle.join().expect("监听线程应正常退出");
+
+        // 清理子进程（stop_process 对已退出进程会立即返回）
+        let _ = base.stop_process();
+    }
 
     /// 验证 `spawn_proc_exit_monitor` 在子进程退出时调用回调。
     ///
@@ -1286,66 +1420,11 @@ mod tests {
     /// 此测试覆盖 web.rs 与 video.rs 共享的崩溃检测路径，确保重构后行为不变。
     #[test]
     fn consistency_12_2_spawn_proc_exit_monitor_invokes_callback_on_exit() {
-        use std::path::PathBuf;
-        use std::sync::atomic::{AtomicBool, Ordering};
-
-        use crate::wallpaper::subprocess_base::SubprocessRendererBase;
-
-        // 定位 cmd.exe（优先使用 SystemRoot 环境变量，回退到 WINDIR）
-        let system_root = std::env::var("SystemRoot")
-            .or_else(|_| std::env::var("WINDIR"))
-            .expect("SystemRoot/WINDIR 环境变量应存在");
-        let cmd_path = PathBuf::from(system_root).join("System32").join("cmd.exe");
-        assert!(cmd_path.exists(), "cmd.exe 应存在于 {}", cmd_path.display());
-
-        // 启动短生命周期进程：ping -n 2 127.0.0.1（~1s 后退出）
-        let mut base = SubprocessRendererBase::new(
-            cmd_path,
-            "test-consistency-12-2-pipe".to_string(),
-            ScalingMode::Fill,
+        assert_exit_monitor_invokes_callback(
+            "test-consistency-12-2-pipe",
+            "ping -n 2 127.0.0.1",
+            "子进程退出后 callback 应被调用，但等待 10s 后仍未调用",
         );
-        base.start_process(vec!["/c".to_string(), "ping -n 2 127.0.0.1".to_string()])
-            .expect("启动测试占位进程应成功");
-
-        // 复制进程句柄（与 create_pause_sender 中的模式一致）
-        let proc_handle = base
-            .duplicate_process_handle()
-            .expect("duplicate_process_handle 应返回 Some");
-        let owned = OwnedProcHandle::new(proc_handle);
-
-        // 回调标志：标记 callback 是否被调用
-        let callback_invoked = Arc::new(AtomicBool::new(false));
-        let callback_flag = callback_invoked.clone();
-
-        // 调用共享函数 spawn 监听线程
-        let monitor_handle = spawn_proc_exit_monitor(owned, move || {
-            callback_flag.store(true, Ordering::SeqCst);
-        })
-        .expect("spawn_proc_exit_monitor 应成功 spawn 监听线程");
-
-        // 轮询等待回调被调用（最多 10s）
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
-        loop {
-            if callback_invoked.load(Ordering::SeqCst) {
-                break;
-            }
-            if std::time::Instant::now() > deadline {
-                panic!("子进程退出后 callback 应被调用，但等待 10s 后仍未调用");
-            }
-            std::thread::sleep(std::time::Duration::from_millis(100));
-        }
-
-        // 验证回调已被调用
-        assert!(
-            callback_invoked.load(Ordering::SeqCst),
-            "子进程退出后 callback 应被调用"
-        );
-
-        // 等待监听线程退出（callback 执行完毕后线程应立即退出）
-        monitor_handle.join().expect("监听线程应正常退出");
-
-        // 清理子进程（stop_process 对已退出进程会立即返回）
-        let _ = base.stop_process();
     }
 
     // ========== v41-W-001 修复测试：spawn_proc_exit_monitor 全分支 match ==========
@@ -1361,66 +1440,11 @@ mod tests {
     /// 因难以稳定复现（关闭句柄后 OS 可能复用句柄值）仅在文档中说明。
     #[test]
     fn v41_w001_wait_object_0_path_invokes_callback() {
-        use std::path::PathBuf;
-        use std::sync::atomic::{AtomicBool, Ordering};
-
-        use crate::wallpaper::subprocess_base::SubprocessRendererBase;
-
-        // 定位 cmd.exe
-        let system_root = std::env::var("SystemRoot")
-            .or_else(|_| std::env::var("WINDIR"))
-            .expect("SystemRoot/WINDIR 环境变量应存在");
-        let cmd_path = PathBuf::from(system_root).join("System32").join("cmd.exe");
-        assert!(cmd_path.exists(), "cmd.exe 应存在于 {}", cmd_path.display());
-
-        // 启动短生命周期进程：cmd /c "exit 0"（立即退出，触发 WAIT_OBJECT_0）
-        let mut base = SubprocessRendererBase::new(
-            cmd_path,
-            "test-v41-w001-pipe".to_string(),
-            ScalingMode::Fill,
+        assert_exit_monitor_invokes_callback(
+            "test-v41-w001-pipe",
+            "exit 0",
+            "v41-W-001: WAIT_OBJECT_0 路径下 callback 应被调用，但等待 10s 后仍未调用",
         );
-        base.start_process(vec!["/c".to_string(), "exit 0".to_string()])
-            .expect("启动测试占位进程应成功");
-
-        // 复制进程句柄
-        let proc_handle = base
-            .duplicate_process_handle()
-            .expect("duplicate_process_handle 应返回 Some");
-        let owned = OwnedProcHandle::new(proc_handle);
-
-        // 回调标志
-        let callback_invoked = Arc::new(AtomicBool::new(false));
-        let callback_flag = callback_invoked.clone();
-
-        // spawn 监听线程
-        let monitor_handle = spawn_proc_exit_monitor(owned, move || {
-            callback_flag.store(true, Ordering::SeqCst);
-        })
-        .expect("spawn_proc_exit_monitor 应成功 spawn 监听线程");
-
-        // 轮询等待回调被调用（最多 10s）
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
-        loop {
-            if callback_invoked.load(Ordering::SeqCst) {
-                break;
-            }
-            if std::time::Instant::now() > deadline {
-                panic!("v41-W-001: WAIT_OBJECT_0 路径下 callback 应被调用，但等待 10s 后仍未调用");
-            }
-            std::thread::sleep(std::time::Duration::from_millis(100));
-        }
-
-        // 验证 WAIT_OBJECT_0 路径下 callback 已被调用
-        assert!(
-            callback_invoked.load(Ordering::SeqCst),
-            "v41-W-001: WAIT_OBJECT_0 路径下 callback 应被调用"
-        );
-
-        // 等待监听线程退出
-        monitor_handle.join().expect("监听线程应正常退出");
-
-        // 清理子进程
-        let _ = base.stop_process();
     }
 
     // ========== v41-W-002 修复测试：OwnedProcHandle::Drop is_invalid 守卫 ==========

@@ -162,7 +162,7 @@ impl PlaybackStore {
         }
     }
 
-    /// 将播放状态原子写盘（临时文件 + fsync + rename）。失败仅记录 `tracing::warn!`，不 panic（PS1）。
+    /// 将播放状态原子写盘（临时文件 + fsync + rename）。失败返回错误给调用方处理，不 panic（PS1）。
     pub fn save(&self, state: &PlaybackState) -> Result<(), MirrorStarError> {
         let content = toml::to_string_pretty(state)?;
         super::manager::atomic_write(&self.path, &content)

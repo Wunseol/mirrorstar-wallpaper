@@ -7,14 +7,13 @@ use windows::Win32::Graphics::Gdi::*;
 use windows::Win32::UI::WindowsAndMessaging::*;
 
 use crate::wallpaper::{
-    create_pause_channel, create_pause_sender_with_state, validate_renderer_speed,
-    GifMemoryStrategy, RendererState, ScalingMode, WallpaperRenderer, WallpaperState,
-    DEFAULT_BALANCED_KEEP_FRAMES,
+    validate_renderer_speed, GifMemoryStrategy, RendererState, ScalingMode, WallpaperRenderer,
+    WallpaperState, DEFAULT_BALANCED_KEEP_FRAMES,
 };
 
 use super::gdi_base::{
     create_wallpaper_window, get_initial_window_rect, paint_with_double_buffer,
-    register_window_class_once, spawn_pause_forwarder, try_handle_common_messages, GdiRendererBase,
+    register_window_class_once, try_handle_common_messages, GdiRendererBase,
 };
 use super::gdi_cache::GdiCache;
 use super::gif_decode::{
@@ -431,57 +430,20 @@ impl WallpaperRenderer for GifRenderer {
     }
 
     fn create_pause_sender(&mut self, display_id: &str) -> Option<crate::wallpaper::PauseSender> {
-        // W-003 修复：复用 play() 中提前创建的 shared_state 和 state_changed，
-        // 使壁纸线程在 Resume 失败时能通过 shared_state 回滚状态并通知前端
-        let shared_state = self.pre_shared_state.take().unwrap_or_else(|| {
-            tracing::warn!("pre_shared_state 已被消费，回退到 create_pause_channel");
-            let (_, _, s) = create_pause_channel();
-            s
-        });
-        let state_changed = self.pre_state_changed.take().unwrap_or_else(|| {
-            tracing::warn!("pre_state_changed 已被消费，回退到新 broadcast channel");
-            tokio::sync::broadcast::channel::<String>(16).0
-        });
-
-        // 设置 display_id_lock，使壁纸线程在 Resume 失败时能读取 display_id 通知前端
-        let _ = self.display_id_lock.set(display_id.to_string());
-
-        // 同步 shared_state.state 为当前 base.state()
-        {
-            let mut s = shared_state.write().unwrap_or_else(|e| e.into_inner());
-            s.state = self.base.state();
-        }
-
-        // 使用已有的 shared_state 和 state_changed 创建 PauseSender + rx
-        let (sender, rx) = create_pause_sender_with_state(shared_state.clone(), state_changed);
-
-        let cmd_tx = self.cmd_tx.clone();
-        // HWND 不是 Send，将原始值存储为 isize 跨线程传递
-        let hwnd_raw = self.base.hwnd.map(|h| h.0 as isize);
-        // clone sender 与 display_id 传入 spawn_pause_forwarder，
-        // 状态变更后通过 notify_state_changed 通知 Tauri 层 emit 事件
-        let state_sender = sender.clone();
-        let display_id = display_id.to_string();
-
-        if let Err(e) = spawn_pause_forwarder(
+        crate::wallpaper::create_gdi_pause_sender(
+            &mut self.base,
+            &mut self.pre_shared_state,
+            &mut self.pre_state_changed,
+            &self.display_id_lock,
+            display_id,
+            self.cmd_tx.clone(),
             "mirrorstar-gif-pause",
             "GifRenderer",
-            cmd_tx,
-            hwnd_raw,
+            "创建 GifRenderer pause 线程失败",
             WM_GIF_COMMAND,
             || GifCommand::Pause,
             || GifCommand::Resume,
-            rx,
-            shared_state,
-            state_sender,
-            display_id,
-        ) {
-            tracing::error!(error = %e, "创建 GifRenderer pause 线程失败");
-            return None;
-        }
-
-        self.base.set_pause_sender(Some(sender.clone()));
-        Some(sender)
+        )
     }
 
     /// 首帧就绪判定（原子交换 DR-33 阶段 B）：等待首次 WM_PAINT 实际绘制完成。

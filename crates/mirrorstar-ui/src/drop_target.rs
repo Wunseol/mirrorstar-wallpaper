@@ -161,6 +161,10 @@ pub fn install(
 }
 
 /// 取出共享回调表并调用其中的投放回调（先克隆 `Arc`，避免持锁期间回调重入）。
+///
+/// 回调会穿越 OLE `IDropTarget::Drop` / `WM_DROPFILES` 窗口过程的 FFI 边界，
+/// 因此用 `catch_unwind` 隔离 panic，避免其在 unwind 构建中展开越过 COM/Win32 边界。
+/// 注意：release 构建启用 `panic = "abort"`，panic 会直接终止进程，无法被捕获。
 fn dispatch_drop(shared: &SharedHandlers, paths: Vec<String>) {
     let callback = {
         let guard = shared
@@ -168,10 +172,14 @@ fn dispatch_drop(shared: &SharedHandlers, paths: Vec<String>) {
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         Arc::clone(&guard.drop)
     };
-    callback(paths);
+    // 锁已释放，且 `paths` 在捕获 panic 后不再使用，可安全移入闭包。
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| callback(paths)));
+    if result.is_err() {
+        log("拖入投放回调 panic 已被捕获，防止穿越 FFI 硬崩溃");
+    }
 }
 
-/// 取出共享回调表并调用其中的悬停回调。
+/// 取出共享回调表并调用其中的悬停回调（同样隔离 panic，防止穿越 FFI 边界）。
 fn dispatch_hover(shared: &SharedHandlers, over: bool) {
     let callback = {
         let guard = shared
@@ -179,7 +187,10 @@ fn dispatch_hover(shared: &SharedHandlers, over: bool) {
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         Arc::clone(&guard.hover)
     };
-    callback(over);
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| callback(over)));
+    if result.is_err() {
+        log("拖入悬停回调 panic 已被捕获，防止穿越 FFI 硬崩溃");
+    }
 }
 
 // ── OLE IDropTarget 实现 ────────────────────────────────────────────────────
@@ -359,6 +370,7 @@ unsafe fn read_paths(hdrop: HDROP) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use windows::Win32::System::Memory::{GlobalAlloc, GlobalLock, GlobalUnlock, GMEM_MOVEABLE};
 
     /// 在**本进程**构造一个合法的 `DROPFILES` 全局内存块并调用 [`read_paths`]，
@@ -399,5 +411,64 @@ mod tests {
             let expected: Vec<String> = expected.iter().map(|s| s.to_string()).collect();
             assert_eq!(got, expected);
         }
+    }
+
+    /// 投放回调 panic 必须被 `dispatch_drop` 吞掉：它会穿越 OLE/`WM_DROPFILES` 的
+    /// FFI 边界，unwind 越界会直接 abort 进程。
+    #[test]
+    fn dispatch_swallows_panicking_drop_callback() {
+        let shared: SharedHandlers = Arc::new(Mutex::new(Handlers {
+            drop: Arc::new(|_paths: Vec<String>| panic!("投放回调故意 panic")),
+            hover: Arc::new(|_over: bool| {}),
+        }));
+
+        // 若 panic 未被捕获，测试线程会 unwind，测试失败。
+        dispatch_drop(&shared, vec![r"C:\tmp\alpha.png".to_string()]);
+    }
+
+    /// 悬停回调 panic 同样必须被 `dispatch_hover` 吞掉。
+    #[test]
+    fn dispatch_swallows_panicking_hover_callback() {
+        let shared: SharedHandlers = Arc::new(Mutex::new(Handlers {
+            drop: Arc::new(|_paths: Vec<String>| {}),
+            hover: Arc::new(|_over: bool| panic!("悬停回调故意 panic")),
+        }));
+
+        dispatch_hover(&shared, true);
+        dispatch_hover(&shared, false);
+    }
+
+    /// panic 隔离后回调表仍可用：锁未被中毒、无状态残留，替换后的回调能正常收到路径。
+    #[test]
+    fn dispatch_recovers_after_panicking_drop_callback() {
+        let shared: SharedHandlers = Arc::new(Mutex::new(Handlers {
+            drop: Arc::new(|_paths: Vec<String>| panic!("投放回调故意 panic")),
+            hover: Arc::new(|_over: bool| {}),
+        }));
+
+        dispatch_drop(&shared, vec![r"C:\tmp\alpha.png".to_string()]);
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        let seen = Arc::new(Mutex::new(Vec::<String>::new()));
+        let calls_in_cb = Arc::clone(&calls);
+        let seen_in_cb = Arc::clone(&seen);
+        shared
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .drop = Arc::new(move |paths: Vec<String>| {
+                calls_in_cb.fetch_add(1, Ordering::SeqCst);
+                *seen_in_cb
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner()) = paths;
+            });
+
+        dispatch_drop(&shared, vec![r"C:\tmp\beta.jpg".to_string()]);
+
+        assert_eq!(calls.load(Ordering::SeqCst), 1, "panic 后新回调应被调用一次");
+        assert_eq!(
+            *seen.lock().unwrap_or_else(|poisoned| poisoned.into_inner()),
+            vec![r"C:\tmp\beta.jpg".to_string()],
+            "panic 后回调仍应收到正确路径"
+        );
     }
 }

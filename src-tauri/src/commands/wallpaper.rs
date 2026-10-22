@@ -1284,7 +1284,7 @@ pub async fn set_speed(
     display_id: Option<String>,
     speed: f32,
 ) -> Result<(), mirrorstar_core::MirrorStarError> {
-    // T-004: 校验播放速度范围 (0.0, 10.0]，拒绝 NaN/Infinity
+    // T-004: 校验播放速度范围 [0.25, 4.0]，拒绝 NaN/Infinity
     validate_speed(speed)?;
 
     // ST-005: 改为同步执行（与 set_volume 一致），避免 fire-and-forget JoinHandle
@@ -1317,7 +1317,7 @@ pub fn validate_volume(volume: f32) -> Result<(), mirrorstar_core::MirrorStarErr
 
 /// 校验播放速度范围（T-004 + ST-007）
 ///
-/// 接受 (0.0, 10.0] 范围内的有限值，拒绝 NaN / Infinity / 非正值 / 超上限值。
+/// 接受 [0.25, 4.0] 范围内的有限值，拒绝 NaN / Infinity / 越界值（< 0.25 或 > 4.0）。
 pub fn validate_speed(speed: f32) -> Result<(), mirrorstar_core::MirrorStarError> {
     mirrorstar_core::config::validation::validate_speed(speed)
 }
@@ -1853,23 +1853,23 @@ mod tests {
 
     #[test]
     fn test_validate_speed_accepts_valid_range() {
-        // 边界合法值（含上限 10.0，不含 0.0）
-        for v in [0.25_f32, 1.0, 4.0, 10.0] {
+        // 边界合法值（含上下限 0.25 / 4.0）
+        for v in [0.25_f32, 1.0, 4.0] {
             assert!(validate_speed(v).is_ok(), "速度 {} 应被接受", v);
         }
     }
 
     #[test]
     fn test_validate_speed_rejects_invalid() {
-        // NaN / Infinity / 非正值 / 超上限值
-        let invalid_values: [f32; 5] = [f32::NAN, f32::INFINITY, 0.0, -1.0, 10.1];
+        // NaN / Infinity / 低于下限 / 超上限值
+        let invalid_values: [f32; 6] = [f32::NAN, f32::INFINITY, 0.0, -1.0, 0.1, 4.1];
         for v in invalid_values {
             let err = validate_speed(v).unwrap_err();
             match err {
                 mirrorstar_core::MirrorStarError::InvalidArgument { reason } => {
                     assert!(
-                        reason.contains("播放速度必须在 0.0-10.0 之间且大于 0"),
-                        "错误消息应包含「播放速度必须在 0.0-10.0 之间且大于 0」，实际: {}",
+                        reason.contains("播放速度必须在 0.25-4 之间"),
+                        "错误消息应包含「播放速度必须在 0.25-4 之间」，实际: {}",
                         reason
                     );
                 }

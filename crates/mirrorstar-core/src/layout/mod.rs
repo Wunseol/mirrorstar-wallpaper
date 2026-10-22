@@ -5,9 +5,9 @@
 //! 不再各自实现"编排 → 单元"映射（此前该规则在 `scheduler::reconcile_and_align` 与
 //! `commands::rotation::validate_unit_key` 两处重复、零单测，已收敛到本模块）。
 //!
-//! 注：`crates/mirrorstar-ui/src/settings.rs::unit_keys_for_arrangement` 仍保留一份等价
-//! 独立实现（同 workspace 且已依赖 `mirrorstar-core`，本可消费本模块函数），按同一规则
-//! 维护、待后续统一；本模块仍是权威规则来源。
+//! 注：`crates/mirrorstar-ui/src/settings.rs::unit_keys_for_arrangement` 已改为消费本模块
+//! 的 [`plan`] / [`unit_keys`]，只保留展示标签拼装（UI 展示层差异：全局编排且无显示器时
+//! 回退为 `all` 以维持设置面板可操作）。本模块仍是权威规则来源。
 //!
 //! ## 纯函数约束
 //!

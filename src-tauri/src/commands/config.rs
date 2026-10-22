@@ -107,7 +107,7 @@ fn validate_config_fields(config: &AppConfig) -> Result<(), MirrorStarError> {
         }
     }
 
-    // video.speed: f32，合法范围 (0.0, 10.0]，且必须为有限值
+    // video.speed: f32，合法范围 [0.25, 4.0]，且必须为有限值
     if let Err(e) = mirrorstar_core::config::validation::validate_speed(config.video.speed) {
         match e {
             MirrorStarError::InvalidArgument { reason } => {

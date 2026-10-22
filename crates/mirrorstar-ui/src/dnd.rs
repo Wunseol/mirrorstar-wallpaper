@@ -6,39 +6,21 @@
 
 use std::collections::HashSet;
 
-use mirrorstar_core::config::WallpaperEntry;
+use mirrorstar_core::config::{detect_wallpaper_type, normalize_path_key, WallpaperEntry};
 
 use crate::grid::GridGeometry;
-
-/// 旧前端 `utils.ts` 的图片扩展名集合（小写，不含点）。
-const IMAGE_EXTENSIONS: &[&str] = &["jpg", "jpeg", "png", "bmp", "webp"];
-/// 视频扩展名集合。
-const VIDEO_EXTENSIONS: &[&str] = &["mp4", "avi", "mkv", "webm", "mov"];
-/// GIF 扩展名集合。
-const GIF_EXTENSIONS: &[&str] = &["gif"];
-/// 网页壁纸扩展名集合。
-const HTML_EXTENSIONS: &[&str] = &["html", "htm"];
 
 /// 取路径末段作为显示名（兼容 `/` 与 `\`）。
 ///
 /// 与 `settings::file_name` 逐字符相同，故直接复用共享实现，避免多处副本漂移。
 pub(crate) use crate::settings::file_name;
 
-/// 小写扩展名（不含点）；无扩展名返回空串。
-pub fn file_extension(path: &str) -> String {
-    match file_name(path).rsplit_once('.') {
-        Some((_, ext)) if !ext.is_empty() => ext.to_ascii_lowercase(),
-        _ => String::new(),
-    }
-}
-
-/// 是否为受支持的壁纸文件（与旧前端 `isSupportedFile` 语义一致）。
+/// 是否为受支持的壁纸文件。
+///
+/// 以 core 的 [`detect_wallpaper_type`] 为**单一来源**：UI 与 core 的扩展名白名单不再各自维护，
+/// 避免漂移（如 `.tif`/`.ico` 或 `.flv`/`.wmv`/`.m4v`/`.ts` 被一侧拒绝）。
 pub fn is_supported_file(path: &str) -> bool {
-    let ext = file_extension(path);
-    IMAGE_EXTENSIONS.contains(&ext.as_str())
-        || VIDEO_EXTENSIONS.contains(&ext.as_str())
-        || GIF_EXTENSIONS.contains(&ext.as_str())
-        || HTML_EXTENSIONS.contains(&ext.as_str())
+    detect_wallpaper_type(path).is_some()
 }
 
 /// 由指针位置反算插入位（**间隙语义**：返回值 ∈ `[0, item_count]`，`k` 表示插到原第 `k`
@@ -137,25 +119,23 @@ pub struct DropMerge {
 
 /// 合并一次拖入的路径：过滤不支持的类型、去重（与库内已有路径及批内之前项比较）。
 pub fn merge_drop_paths(dropped: &[String], existing_paths: &[String]) -> DropMerge {
-    let mut seen: HashSet<String> = existing_paths.iter().map(|p| normalize_path(p)).collect();
+    let mut seen: HashSet<String> = existing_paths
+        .iter()
+        .map(|p| normalize_path_key(p))
+        .collect();
     let mut merged = DropMerge::default();
     for path in dropped {
         if !is_supported_file(path) {
             merged.unsupported.push(path.clone());
             continue;
         }
-        if !seen.insert(normalize_path(path)) {
+        if !seen.insert(normalize_path_key(path)) {
             merged.duplicate.push(path.clone());
             continue;
         }
         merged.accepted.push(path.clone());
     }
     merged
-}
-
-/// 路径归一化（Windows 不区分大小写与斜杠方向）。
-fn normalize_path(path: &str) -> String {
-    path.replace('/', "\\").to_lowercase()
 }
 
 #[cfg(test)]
@@ -311,12 +291,18 @@ mod tests {
 
     #[test]
     fn extension_and_file_name_helpers() {
-        assert_eq!(file_extension("C:/a/B.PNG"), "png");
-        assert_eq!(file_extension("C:/a/noext"), "");
-        assert_eq!(file_extension("C:/a/."), "");
         assert_eq!(file_name("C:/a/b/c.mp4"), "c.mp4");
         assert_eq!(file_name("C:\\a\\b\\c.mp4"), "c.mp4");
+        // 支持的类型以 core 的 detect_wallpaper_type 为准（原先 UI 白名单缺失的类型）
+        assert!(is_supported_file("C:/a/x.tif"));
+        assert!(is_supported_file("C:/a/x.ico"));
+        assert!(is_supported_file("C:/a/x.flv"));
+        assert!(is_supported_file("C:/a/x.wmv"));
+        assert!(is_supported_file("C:/a/x.m4v"));
+        assert!(is_supported_file("C:/a/x.ts"));
+        // 不支持的类型
         assert!(!is_supported_file("C:/a/x.psd"));
+        assert!(!is_supported_file("C:/a/noext"));
         assert!(!is_supported_file(""));
     }
 

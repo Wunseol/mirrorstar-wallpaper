@@ -1,4 +1,5 @@
 use std::path::PathBuf;
+use std::sync::{Arc, RwLock};
 
 use windows::Win32::Foundation::{DuplicateHandle, DUPLICATE_SAME_ACCESS, HANDLE, HWND};
 use windows::Win32::System::Threading::GetCurrentProcess;
@@ -7,7 +8,10 @@ use windows::Win32::UI::WindowsAndMessaging::{
 };
 
 use crate::process::manager::{JobObjectGuard, ProcessManager};
-use crate::wallpaper::{PauseSender, ScalingMode, WallpaperState};
+use crate::wallpaper::{
+    spawn_proc_exit_monitor, OwnedProcHandle, PauseSender, RendererState, ScalingMode,
+    WallpaperState,
+};
 
 // ── Connection constants（v41-W-010：集中子进程渲染器连接/重试参数）─────────
 //
@@ -289,6 +293,76 @@ impl SubprocessRendererBase {
     /// 存储 pause sender
     pub fn set_pause_sender(&mut self, sender: Option<PauseSender>) {
         self.pause_sender = sender;
+    }
+
+    /// 终止流程第 0 步：先置终止状态（先于进程退出）——同步 base.state 与 shared_state。
+    ///
+    /// 退出监听线程读取 shared_state（`spawn_exit_monitor` 的回调），若进程退出时
+    /// 仍为 Playing/Paused，会误报"子进程异常退出"并触发多余状态变更事件。先置位
+    /// 可彻底关闭该竞态；子进程真正崩溃（state != Terminated）时异常路径不变。
+    ///
+    /// video.rs / web.rs 的 `terminate()` 共用此步骤，差异仅在随后的 IPC 退出请求。
+    pub fn mark_terminated(&mut self) {
+        self.set_state(WallpaperState::Terminated);
+        if let Some(sender) = &self.pause_sender {
+            sender.set_state(WallpaperState::Terminated);
+        }
+    }
+
+    /// 终止流程第 2 步：记录停止前的 PID 并停止子进程（等待退出，超时后强制终止）。
+    ///
+    /// 返回停止前的 PID，供调用方在进程确认退出后回收按 PID 命名的资源
+    /// （如 web.rs 的 WebView2 UserDataFolder）；`stop_process` 会清空 PID。
+    pub fn stop_process_for_terminate(&mut self) -> Result<Option<u32>, crate::MirrorStarError> {
+        let pid = self.process_pid();
+        self.stop_process()?;
+        Ok(pid)
+    }
+
+    /// 启动子进程退出监听（video.rs / web.rs 共用）。
+    ///
+    /// 使用 `DuplicateHandle` 复制句柄，避免监听线程的 wait 与 `terminate()` 中的
+    /// `CloseHandle` 产生竞争（Win32 文档明确指出在 wait 期间关闭同一句柄会导致
+    /// 未定义行为）。监听线程拥有独立句柄，由 `OwnedProcHandle` / 监听函数负责关闭。
+    ///
+    /// 正常退出路径：`terminate()` 先置 Terminated，再请求/等待子进程退出；
+    /// 监听线程读到 Terminated 后不发通知。异常退出（state != Terminated）时
+    /// 更新共享状态为 Terminated 并通知前端。
+    ///
+    /// `abnormal_exit_msg` / `renderer_name` 仅用于保留各渲染器的日志文案。
+    pub fn spawn_exit_monitor(
+        &self,
+        display_id: String,
+        shared_state: Arc<RwLock<RendererState>>,
+        sender: PauseSender,
+        abnormal_exit_msg: &'static str,
+        renderer_name: &'static str,
+    ) {
+        if let Some(proc_handle) = self.duplicate_process_handle() {
+            // 使用 OwnedProcHandle RAII 包装器：spawn 失败时闭包被 drop，包装器自动
+            // 调用 CloseHandle，不泄漏句柄；pause 通道已建立成功，仅 warn 不返回 None。
+            let owned = OwnedProcHandle::new(proc_handle);
+            spawn_proc_exit_monitor(owned, move || {
+                // 检查是否为异常退出：state != Terminated 表示非 terminate() 触发
+                let state = shared_state.read().unwrap_or_else(|e| e.into_inner()).state;
+                if state != WallpaperState::Terminated {
+                    tracing::warn!(
+                        display_id = %display_id,
+                        state = ?state,
+                        "{}",
+                        abnormal_exit_msg
+                    );
+                    // 更新共享状态为 Terminated，使 any_playing 等查询返回正确结果
+                    shared_state
+                        .write()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .state = WallpaperState::Terminated;
+                    // 通知 Tauri 层 emit wallpaper-state-changed 事件刷新 UI
+                    sender.notify_state_changed(&display_id);
+                }
+                tracing::debug!("{} 进程监听线程退出", renderer_name);
+            });
+        }
     }
 
     /// 在应用目录下查找捆绑的可执行文件，回退到 PATH 查找

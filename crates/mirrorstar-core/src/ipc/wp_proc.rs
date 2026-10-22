@@ -148,6 +148,11 @@ impl WpProcIpcClient {
     /// 生产代码应使用 [`send_command`](Self::send_command)（固定 15s）。
     ///
     /// 与 `MpvIpcClient::send_command_with_timeout` 结构对称，差异仅在命令/响应类型。
+    ///
+    /// I04 总体超时：`timeout` 是整个命令-响应往返（含多次读取循环）的总预算，
+    /// 而非每行单次读取的超时。循环外记录 deadline，每轮将剩余时间传给
+    /// `read_response_line_with_timeout`，剩余时间为 0 时返回 `IpcTimeout`，
+    /// 防止子进程持续输出空行/不匹配响应导致累计无限阻塞。
     pub fn send_command_with_timeout(
         &mut self,
         command: WpProcCommand,
@@ -160,11 +165,40 @@ impl WpProcIpcClient {
             .map_err(|e| crate::MirrorStarError::IpcError(format!("命令序列化失败: {}", e)))?;
         self.inner.send_line(&cmd_json)?;
 
-        // I04: 使用调用方指定的超时（生产路径为 15s，测试路径可缩短）。
-        // 总体超时由 read_response_line_with_timeout 内部的 deadline 机制保证
-        // （循环跳过空行/不匹配行时累计不超过 timeout）。
+        let inner = &mut self.inner;
+        Self::await_matching_response(req_id, timeout, |remaining| {
+            inner.read_response_line_with_timeout(remaining)
+        })
+    }
+
+    /// 读取并解析响应，跳过空行/不可解析行/request_id 不匹配行（总体 deadline 语义）。
+    ///
+    /// `read_line` 以闭包注入：生产路径传入
+    /// [`NamedPipeClient::read_response_line_with_timeout`]，测试可注入假读取器
+    /// 返回噪声行，验证 deadline 不会在每轮循环中被重置。
+    fn await_matching_response<F>(
+        req_id: u64,
+        timeout: Duration,
+        mut read_line: F,
+    ) -> Result<WpProcResponse, crate::MirrorStarError>
+    where
+        F: FnMut(Duration) -> Result<String, crate::MirrorStarError>,
+    {
+        // I04 总体超时：deadline 为整个命令-响应往返的硬性截止时刻。
+        // 每轮读取前检查剩余时间，剩余为 0 时立即返回 IpcTimeout，
+        // 防止子进程持续输出空行或不匹配响应导致 read_response_line_with_timeout
+        // 单次不超时但累计无限阻塞。
+        let deadline = std::time::Instant::now() + timeout;
+
         loop {
-            let line = self.inner.read_response_line_with_timeout(timeout)?;
+            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+            if remaining.is_zero() {
+                return Err(crate::MirrorStarError::IpcTimeout(format!(
+                    "wp-proc 命令等待响应超时 (request_id={})",
+                    req_id
+                )));
+            }
+            let line = read_line(remaining)?;
 
             // 尝试解析为响应
             if let Ok(response) = serde_json::from_str::<WpProcResponse>(&line) {
@@ -784,5 +818,48 @@ mod tests {
         // PLAY_COMMAND_TIMEOUT 为 15s，与 connect 的 20s 兜底匹配，
         // 覆盖 WebView2 初始化（进程启动 + 运行时下载等）的慢速场景。
         assert_eq!(PLAY_COMMAND_TIMEOUT, Duration::from_secs(15));
+    }
+
+    /// 回归测试：子进程持续输出噪声行（空行 / request_id 不匹配的响应）时，
+    /// 总体 deadline 不得被逐轮读取重置，必须在指定 timeout 内返回 IpcTimeout。
+    ///
+    /// 通过 `await_matching_response` 注入的 `read_line` 闭包模拟读取器：
+    /// 交替返回空行与 request_id=999 的响应，读取几乎瞬时完成。修复前每轮都会
+    /// 重新获得完整的 `timeout` 预算，循环永不结束；修复后由循环外的 deadline
+    /// 兜底，约 200ms 后返回 IpcTimeout。无需真实 mpv/wp-proc 子进程。
+    #[test]
+    fn wp_proc_overall_deadline_is_not_reset_by_noise_lines() {
+        let timeout = Duration::from_millis(200);
+        let mut read_count = 0usize;
+        let start = Instant::now();
+
+        let result = WpProcIpcClient::await_matching_response(1, timeout, |_remaining| {
+            read_count += 1;
+            Ok(if read_count % 2 == 0 {
+                // 空行（不可解析，应被跳过）
+                String::new()
+            } else {
+                // request_id 不匹配的响应（可能是之前命令的延迟响应）
+                r#"{"request_id":999,"status":"ok"}"#.to_string()
+            })
+        });
+        let elapsed = start.elapsed();
+
+        assert!(
+            matches!(result, Err(MirrorStarError::IpcTimeout(_))),
+            "持续噪声行应返回 IpcTimeout，实际: {:?}",
+            result
+        );
+        assert!(
+            read_count > 1,
+            "应连续读取多行噪声后才超时，实际读取 {} 行",
+            read_count
+        );
+        assert!(
+            elapsed <= timeout + Duration::from_millis(500),
+            "总体超时应约在 {:?}，实际 {:?}（deadline 不应被逐轮重置）",
+            timeout,
+            elapsed
+        );
     }
 }

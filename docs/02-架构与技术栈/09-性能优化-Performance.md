@@ -289,6 +289,7 @@ GIF 内存预算从 200MB 降至 40MB（`MAX_GIF_MEMORY_MB`）。暂停时释放
 `src/scripts/ui/preview-modal.ts` 的预览媒体按类型区分呈现，**不再统一静态化**：
 
 - **视频（Video）：真实 `<video>` 流式播放**（`showVideoPreview`）。`video.src = convertFileSrc(wp.file_path, "wpfile")`，并设 `preload="metadata"`、`playsInline=true`、`loop=false`；有缩略图时设 `video.poster`，无缩略图时 `removeAttribute("poster")`。关闭预览或切换预览时 `resetMedia` 调用 `releaseVideoElement` 清空 `src` 并同时清理 poster，释放媒体引用。
+
 - **GIF：保持静态缩略图并显示显式降级提示**（`showGifStaticPreview`）。优先使用 `wp.thumbnail`（320x180 JPEG 缩略图）作为 `<img>` 显示，无缩略图时回退为类型图标占位（`typeIcon`，容器为 `index.html` 的 `#preview-placeholder`），同时显示「动图预览暂不可用，当前显示缩略图」提示（`index.html` 的 `#preview-gif-note`，样式 `.preview-gif-note` 见 `src/styles/main.css`）。
 
 **视频「内存有界」的依据**：`wpfile://` 自定义协议已支持 HTTP Range 流式读取（`src-tauri/src/lib.rs` 的 `wpfile` handler）——视频播放器按需请求字节范围，handler 返回 `206 Partial Content` 并携带 `Accept-Ranges: bytes`，且单次 Range 被限制为最多 1MB（`MAX_RANGE_LEN`）；HEAD 请求仅返回 `Content-Length`/`Accept-Ranges` 供播放器探测文件大小。因此 `<video>` 是**按需流式解码、内存有界**，而非一次性拉取并解码整段视频。据此，Task 6「`<video>` 会二次解码整段视频、应统一静态化」的优化前提不成立（且已构成「视频预览功能消失」的功能回归），故本轮（变更 `restore-video-preview-playback`）恢复视频真实播放。
@@ -675,14 +676,16 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass `
 
 | 项目 | 字节 | MiB | 证据 | 压缩后占安装包比例 |
 | ---- | ---- | --- | ---- | ------------------ |
-| NSIS 安装包 | 43,020,782 B | 41.03 MiB | `target/release/bundle/nsis/MirrorStar Wallpaper_0.1.0_x64-setup.exe` | 100% |
+| NSIS 安装包 | 43,035,835 B | 41.04 MiB | `target/release/bundle/nsis/MirrorStar Wallpaper_0.1.1_x64-setup.exe` | 100% |
 | 随包 `mpv/mpv.exe` | 123,164,160 B | 117.46 MiB | bundle resources | 压缩后 ≈ 34.1 MiB，≈ **83%** |
-| 随包 `mirrorstar-ui.exe` | 11,632,128 B | 11.09 MiB | bundle resources | 压缩后 ≈ 4.16 MiB，≈ **10%** |
-| 随包 `mirrorstar-wallpaper.exe` | 9,606,144 B | 9.16 MiB | bundle 主程序 | 压缩后 ≈ 2.79 MiB，≈ **7%** |
+| 随包 `mirrorstar-ui.exe` | 11,672,576 B | 11.13 MiB | bundle resources | 压缩后 ≈ 4.16 MiB，≈ **10%** |
+| 随包 `mirrorstar-wallpaper.exe` | 9,632,256 B | 9.19 MiB | bundle 主程序 | 压缩后 ≈ 2.79 MiB，≈ **7%** |
 | 随包 `mpv/license` | 19,873 B | — | bundle resources | 可忽略 |
-| **未压缩载荷合计** | **144,422,305 B** | **137.7 MiB** | 上列随包载荷求和 | — |
+| **未压缩载荷合计** | **144,488,865 B** | **137.8 MiB** | 上列随包载荷求和 | — |
 
-**压缩证据**：内存内 Deflate(Optimal) 实测压缩率——`mpv.exe` 39.5%、`mirrorstar-ui.exe` 51.0%、主 `mirrorstar-wallpaper.exe` 41.4%；NSIS 采用 LZMA，实压缩比 Deflate 再优约 **26.5%**（安装包 43,020,782 / Deflate 合计 58,528,630 ≈ 0.735）。
+**压缩证据**：内存内 Deflate(Optimal) 实测压缩率——`mpv.exe` 39.5%、`mirrorstar-ui.exe` 51.0%、主 `mirrorstar-wallpaper.exe` 41.4%；NSIS 采用 LZMA，实压缩比 Deflate 再优约 **26.5%**（安装包 43,035,835 / Deflate 合计 58,528,630 ≈ 0.735）。
+
+> **版本复核（v0.1.1，2026-10-19）**：上表的安装包与随包 exe 字节数已按 `MirrorStar Wallpaper_0.1.1_x64-setup.exe` 重新打包后复核更新；`mpv.exe` 与 `mpv/license` 未变（未纳入版本控制，体积不可由 git 追溯）。
 
 **主因排序**：
 

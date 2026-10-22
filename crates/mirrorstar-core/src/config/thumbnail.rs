@@ -159,8 +159,8 @@ fn path_to_hex(source_path: &Path) -> String {
 /// # 算法
 ///
 /// `thumb_{hex}.jpg`，其中 `hex` 是路径字节（`Path::as_os_str().as_encoded_bytes()`）
-/// 的十六进制编码（每字节 2 个 hex 字符）。同一路径每次调用生成相同文件名，
-/// 不同路径生成不同文件名（除非路径字节完全相同）。
+/// 的 64 位 FNV-1a 哈希（固定 16 个 hex 字符）。同一路径每次调用生成相同文件名；
+/// 不同路径理论上存在哈希碰撞可能，但实际碰撞概率可忽略。
 fn thumbnail_name_from_path(source_path: &Path) -> String {
     format!("thumb_{}.jpg", path_to_hex(source_path))
 }

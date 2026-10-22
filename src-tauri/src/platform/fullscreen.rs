@@ -171,9 +171,9 @@ unsafe extern "system" fn foreground_event_callback(
     _id_event_thread: u32,
     _dwms_event_time: u32,
 ) {
-    // 用 catch_unwind 包裹整个回调体，防止回调内部 panic 穿越 FFI 边界（Win32 回调）
-    // 导致的栈展开 UB 或硬崩溃。回调运行于 DispatchMessageW 消息循环上下文，
-    // 任何 panic 若未被捕获都会跨越 extern "system" 边界造成未定义行为。
+    // 用 catch_unwind 包裹整个回调体，避免回调内部 panic 在 unwind 构建中展开
+    // 并越过 extern "system" 边界（Win32 回调）。注意 release 构建启用
+    // panic = "abort"，panic 会直接终止进程，本保护仅在 dev/test 构建生效。
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(handle_foreground_event));
 
     // catch_unwind 返回 Err(_)：回调内部发生 panic，已被捕获，防止穿越 FFI 硬崩溃
@@ -303,7 +303,8 @@ fn handle_foreground_event() {
 pub(crate) fn reevaluate_now() {
     tracing::info!("纯净壁纸模式退出后补跑一次前台全屏判定");
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(handle_foreground_event));
-    // 与 foreground_event_callback 一致：panic 已捕获，仅记录，不穿越调用边界
+    // 与 foreground_event_callback 一致：panic 已捕获，仅记录，避免 panic 穿越
+    // FFI 边界导致进程 abort（硬崩溃）
     if result.is_err() {
         tracing::error!("全屏补跑判定 panic 已被捕获，防止穿越 FFI 硬崩溃");
     }
@@ -362,33 +363,9 @@ pub(crate) fn start_fullscreen_monitor(
             }
         }
         // 2. take 旧 thread_id 并 PostThreadMessage WM_QUIT 唤醒
-        if let Some(old_tid) = FULLSCREEN_MONITOR_THREAD_ID
-            .lock()
-            .ok()
-            .and_then(|mut t| t.take())
-        {
-            unsafe {
-                if windows::Win32::UI::WindowsAndMessaging::PostThreadMessageW(
-                    old_tid,
-                    windows::Win32::UI::WindowsAndMessaging::WM_QUIT,
-                    windows::Win32::Foundation::WPARAM(0),
-                    windows::Win32::Foundation::LPARAM(0),
-                )
-                .is_err()
-                {
-                    tracing::warn!("PostThreadMessageW 失败：WM_QUIT 未送达（线程可能已退出）");
-                }
-            }
-        }
+        crate::state::signal_thread_exit(&FULLSCREEN_MONITOR_THREAD_ID);
         // 3. take 旧 JoinHandle 并 join 等待旧线程退出
-        if let Some(old_handle) = FULLSCREEN_MONITOR_THREAD
-            .lock()
-            .ok()
-            .and_then(|mut h| h.take())
-        {
-            // 重启清理路径：join 失败（线程 panic）仅记录，无法传播
-            let _ = old_handle.join();
-        }
+        crate::state::join_monitor_thread(&FULLSCREEN_MONITOR_THREAD);
         // 4. 停止旧周期复查线程（循环检查 RUNNING 标志，join 在 2s 内完成）
         FULLSCREEN_REVIEW_RUNNING.store(false, Ordering::SeqCst);
         if let Some(handle) = FULLSCREEN_REVIEW_THREAD

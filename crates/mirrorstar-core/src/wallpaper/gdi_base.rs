@@ -321,26 +321,40 @@ pub fn create_wallpaper_window(
     }
 }
 
-/// 执行双缓冲绘制：填充黑色背景 → HALFTONE 缩放 → StretchDIBits → BitBlt 到屏幕 DC。
+/// 双缓冲绘制的公共准备结果：已确保尺寸匹配的 GDI 缓存、客户区与缩放区域。
+struct DoubleBufferPrep<'a> {
+    /// 已创建/重建完成的 GDI 缓存（内存 DC + 位图）
+    cache: &'a GdiCache,
+    /// 窗口客户区矩形
+    client_rect: RECT,
+    /// 客户区宽度
+    client_w: i32,
+    /// 客户区高度
+    client_h: i32,
+    /// `calculate_scaling` 计算出的绘制矩形 (x, y, w, h)
+    draw_rect: (i32, i32, i32, i32),
+}
+
+/// 双缓冲绘制的公共准备阶段：GetClientRect → 确保 GdiCache 可用且尺寸匹配 →
+/// 计算缩放区域。
 ///
-/// 调用者负责 `BeginPaint` / `EndPaint` 以及从 `GWLP_USERDATA` 取出窗口数据，
-/// 并传入待绘制图像的宽度、高度、RGBA 像素数据与缩放模式（GDI 通过 BI_BITFIELDS
-/// 掩码直接解释 RGBA，无需调用方做 BGRA 转换）。
-/// `gdi_cache` 为窗口数据中缓存的 GDI 对象，首次绘制或尺寸变化时自动创建/重建。
+/// 返回 `None` 表示 `GdiCache` 创建/resize 失败（已记录日志），调用方应跳过本次绘制
+/// ——与两个绘制函数原实现中 `if let Some(ref cache) = gdi_cache` 的失败路径一致。
+///
+/// 黑底填充不在此处：`paint_with_double_buffer`（按绘制矩形是否覆盖全屏决定是否填充）
+/// 与 `paint_image_with_double_buffer`（总是填充）存在既有差异，由各自保留。
 ///
 /// # Safety
 ///
 /// 调用者必须确保 `hwnd` 是有效窗口、`hdc` 是有效的 paint DC。
-/// 此函数迁移自原 `wallpaper_wnd_proc` / `gif_wnd_proc` 的 WM_PAINT 分支，行为不变。
-pub unsafe fn paint_with_double_buffer(
+unsafe fn prepare_double_buffer<'a>(
     hwnd: HWND,
     hdc: HDC,
-    gdi_cache: &mut Option<GdiCache>,
+    gdi_cache: &'a mut Option<GdiCache>,
     img_w: u32,
     img_h: u32,
-    pixels: &[u8],
     scaling_mode: ScalingMode,
-) {
+) -> Option<DoubleBufferPrep<'a>> {
     // 获取窗口客户区大小
     let mut client_rect = RECT::default();
     if let Err(e) = GetClientRect(hwnd, &mut client_rect) {
@@ -375,91 +389,126 @@ pub unsafe fn paint_with_double_buffer(
         }
     }
 
-    // 使用缓存的 GDI 对象进行渲染
-    if let Some(ref cache) = gdi_cache {
-        // 计算缩放区域（先算绘制矩形，再决定是否需要黑底填充）
-        let (draw_x, draw_y, draw_w, draw_h) =
-            super::calculate_scaling(img_w, img_h, client_w as u32, client_h as u32, scaling_mode);
+    let cache = gdi_cache.as_ref()?;
+    let draw_rect =
+        super::calculate_scaling(img_w, img_h, client_w as u32, client_h as u32, scaling_mode);
+    Some(DoubleBufferPrep {
+        cache,
+        client_rect,
+        client_w,
+        client_h,
+        draw_rect,
+    })
+}
 
-        // #6: 仅当绘制矩形未完全覆盖客户区（存在黑边）或无像素可绘时才填充黑色背景。
-        // Fill/Stretch 等覆盖模式下绘制矩形完全覆盖客户区，StretchDIBits 会覆写全部像素，
-        // 此前 FillRect 的全屏黑底会被完全覆盖 → 跳过以省一次全屏 GDI 填充。
-        // Fit/Center/Tile 等留黑边模式仍需 FillRect 填充 letterbox 区域。
-        let will_draw = img_w > 0 && img_h > 0 && !pixels.is_empty();
-        let covers_full = will_draw
-            && super::draw_rect_covers_full(draw_x, draw_y, draw_w, draw_h, client_w, client_h);
-        if !covers_full {
-            let black_brush = GetStockObject(BLACK_BRUSH);
-            if FillRect(cache.mem_dc(), &client_rect, HBRUSH(black_brush.0)) == 0 {
-                tracing::warn!("FillRect 失败：无法填充黑色背景");
-            }
+/// 执行双缓冲绘制：填充黑色背景 → HALFTONE 缩放 → StretchDIBits → BitBlt 到屏幕 DC。
+///
+/// 调用者负责 `BeginPaint` / `EndPaint` 以及从 `GWLP_USERDATA` 取出窗口数据，
+/// 并传入待绘制图像的宽度、高度、RGBA 像素数据与缩放模式（GDI 通过 BI_BITFIELDS
+/// 掩码直接解释 RGBA，无需调用方做 BGRA 转换）。
+/// `gdi_cache` 为窗口数据中缓存的 GDI 对象，首次绘制或尺寸变化时自动创建/重建。
+///
+/// # Safety
+///
+/// 调用者必须确保 `hwnd` 是有效窗口、`hdc` 是有效的 paint DC。
+/// 此函数迁移自原 `wallpaper_wnd_proc` / `gif_wnd_proc` 的 WM_PAINT 分支，行为不变。
+pub unsafe fn paint_with_double_buffer(
+    hwnd: HWND,
+    hdc: HDC,
+    gdi_cache: &mut Option<GdiCache>,
+    img_w: u32,
+    img_h: u32,
+    pixels: &[u8],
+    scaling_mode: ScalingMode,
+) {
+    // 公共准备阶段：客户区尺寸 + GdiCache + 缩放区域
+    let Some(prep) = prepare_double_buffer(hwnd, hdc, gdi_cache, img_w, img_h, scaling_mode) else {
+        return;
+    };
+    let DoubleBufferPrep {
+        cache,
+        client_rect,
+        client_w,
+        client_h,
+        draw_rect: (draw_x, draw_y, draw_w, draw_h),
+    } = prep;
+
+    // #6: 仅当绘制矩形未完全覆盖客户区（存在黑边）或无像素可绘时才填充黑色背景。
+    // Fill/Stretch 等覆盖模式下绘制矩形完全覆盖客户区，StretchDIBits 会覆写全部像素，
+    // 此前 FillRect 的全屏黑底会被完全覆盖 → 跳过以省一次全屏 GDI 填充。
+    // Fit/Center/Tile 等留黑边模式仍需 FillRect 填充 letterbox 区域。
+    let will_draw = img_w > 0 && img_h > 0 && !pixels.is_empty();
+    let covers_full = will_draw
+        && super::draw_rect_covers_full(draw_x, draw_y, draw_w, draw_h, client_w, client_h);
+    if !covers_full {
+        let black_brush = GetStockObject(BLACK_BRUSH);
+        if FillRect(cache.mem_dc(), &client_rect, HBRUSH(black_brush.0)) == 0 {
+            tracing::warn!("FillRect 失败：无法填充黑色背景");
         }
+    }
 
-        // v5.0 W-PERF-002: SetStretchBltMode(HALFTONE) 与 SetBrushOrgEx(0,0) 已移至
-        // GdiCache::new 中一次性设置——DC 状态在 mem_dc 生命周期内持续有效，
-        // 不会被 BitBlt/StretchDIBits/SelectObject(bitmap) 重置。
+    // v5.0 W-PERF-002: SetStretchBltMode(HALFTONE) 与 SetBrushOrgEx(0,0) 已移至
+    // GdiCache::new 中一次性设置——DC 状态在 mem_dc 生命周期内持续有效，
+    // 不会被 BitBlt/StretchDIBits/SelectObject(bitmap) 重置。
 
-        // 将图片绘制到内存 DC
-        if img_w > 0 && img_h > 0 && !pixels.is_empty() {
-            // BI_BITFIELDS + RGB 掩码：GDI 直接解释 RGBA 字节序，无需 BGRA swap
-            let bmi = BitmapInfoBitfields::new(img_w as i32, img_h as i32);
+    // 将图片绘制到内存 DC
+    if img_w > 0 && img_h > 0 && !pixels.is_empty() {
+        // BI_BITFIELDS + RGB 掩码：GDI 直接解释 RGBA 字节序，无需 BGRA swap
+        let bmi = BitmapInfoBitfields::new(img_w as i32, img_h as i32);
 
-            if scaling_mode == ScalingMode::Tile {
-                // 平铺模式：按 img_w×img_h 网格把图片重复绘制铺满客户区（不缩放、原点对齐）
-                let img_w_i32 = img_w as i32;
-                let img_h_i32 = img_h as i32;
-                let mut ty = 0i32;
-                while ty < client_h {
-                    let mut tx = 0i32;
-                    while tx < client_w {
-                        if StretchDIBits(
-                            cache.mem_dc(),
-                            tx,
-                            ty,
-                            img_w_i32,
-                            img_h_i32,
-                            0,
-                            0,
-                            img_w_i32,
-                            img_h_i32,
-                            Some(pixels.as_ptr() as *const _),
-                            &bmi as *const BitmapInfoBitfields as *const BITMAPINFO,
-                            DIB_RGB_COLORS,
-                            SRCCOPY,
-                        ) == 0
-                        {
-                            tracing::error!(
-                                "StretchDIBits 失败：图片绘制到内存 DC 失败（可能黑屏）"
-                            );
-                        }
-                        tx += img_w_i32;
+        if scaling_mode == ScalingMode::Tile {
+            // 平铺模式：按 img_w×img_h 网格把图片重复绘制铺满客户区（不缩放、原点对齐）
+            let img_w_i32 = img_w as i32;
+            let img_h_i32 = img_h as i32;
+            let mut ty = 0i32;
+            while ty < client_h {
+                let mut tx = 0i32;
+                while tx < client_w {
+                    if StretchDIBits(
+                        cache.mem_dc(),
+                        tx,
+                        ty,
+                        img_w_i32,
+                        img_h_i32,
+                        0,
+                        0,
+                        img_w_i32,
+                        img_h_i32,
+                        Some(pixels.as_ptr() as *const _),
+                        &bmi as *const BitmapInfoBitfields as *const BITMAPINFO,
+                        DIB_RGB_COLORS,
+                        SRCCOPY,
+                    ) == 0
+                    {
+                        tracing::error!("StretchDIBits 失败：图片绘制到内存 DC 失败（可能黑屏）");
                     }
-                    ty += img_h_i32;
+                    tx += img_w_i32;
                 }
-            } else if StretchDIBits(
-                cache.mem_dc(),
-                draw_x,
-                draw_y,
-                draw_w,
-                draw_h,
-                0,
-                0,
-                img_w as i32,
-                img_h as i32,
-                Some(pixels.as_ptr() as *const _),
-                &bmi as *const BitmapInfoBitfields as *const BITMAPINFO,
-                DIB_RGB_COLORS,
-                SRCCOPY,
-            ) == 0
-            {
-                tracing::error!("StretchDIBits 失败：图片绘制到内存 DC 失败（可能黑屏）");
+                ty += img_h_i32;
             }
+        } else if StretchDIBits(
+            cache.mem_dc(),
+            draw_x,
+            draw_y,
+            draw_w,
+            draw_h,
+            0,
+            0,
+            img_w as i32,
+            img_h as i32,
+            Some(pixels.as_ptr() as *const _),
+            &bmi as *const BitmapInfoBitfields as *const BITMAPINFO,
+            DIB_RGB_COLORS,
+            SRCCOPY,
+        ) == 0
+        {
+            tracing::error!("StretchDIBits 失败：图片绘制到内存 DC 失败（可能黑屏）");
         }
+    }
 
-        // 一次性 BitBlt 到屏幕 DC，消除闪烁
-        if BitBlt(hdc, 0, 0, client_w, client_h, cache.mem_dc(), 0, 0, SRCCOPY).is_err() {
-            tracing::error!("BitBlt 失败：内存 DC 合成到屏幕失败（可能黑屏）");
-        }
+    // 一次性 BitBlt 到屏幕 DC，消除闪烁
+    if BitBlt(hdc, 0, 0, client_w, client_h, cache.mem_dc(), 0, 0, SRCCOPY).is_err() {
+        tracing::error!("BitBlt 失败：内存 DC 合成到屏幕失败（可能黑屏）");
     }
 }
 
@@ -517,115 +566,86 @@ pub unsafe fn paint_image_with_double_buffer(
     image_bitmap: HBITMAP,
     scaling_mode: ScalingMode,
 ) {
-    // 获取窗口客户区大小
-    let mut client_rect = RECT::default();
-    if let Err(e) = GetClientRect(hwnd, &mut client_rect) {
-        tracing::warn!(error = %e, "GetClientRect 失败，客户区尺寸将为 0");
-    }
-    let client_w = client_rect.right - client_rect.left;
-    let client_h = client_rect.bottom - client_rect.top;
+    // 公共准备阶段：客户区尺寸 + GdiCache + 缩放区域
+    let Some(prep) = prepare_double_buffer(hwnd, hdc, gdi_cache, img_w, img_h, scaling_mode) else {
+        return;
+    };
+    let DoubleBufferPrep {
+        cache,
+        client_rect,
+        client_w,
+        client_h,
+        draw_rect: (draw_x, draw_y, draw_w, draw_h),
+    } = prep;
 
-    // 确保缓存的 GDI 对象可用且尺寸匹配（与 paint_with_double_buffer 一致）
-    let needs_create = gdi_cache.is_none();
-    let needs_resize = gdi_cache.as_ref().is_some_and(|c| {
-        let (w, h) = c.dimensions();
-        w != client_w || h != client_h
-    });
-
-    if needs_create {
-        *gdi_cache = match GdiCache::new(hdc, client_w, client_h) {
-            Ok(cache) => Some(cache),
-            Err(e) => {
-                tracing::error!(error = %e, "GdiCache 创建失败，跳过本次渲染");
-                None
-            }
-        };
-    } else if needs_resize {
-        if let Some(ref mut cache) = gdi_cache {
-            if let Err(e) = cache.resize(hdc, client_w, client_h) {
-                tracing::error!(error = %e, "GdiCache resize 失败，丢弃缓存（下次 WM_PAINT 重建）");
-                *gdi_cache = None;
-            }
-        }
+    // 填充黑色背景（Image 渲染器与像素路径不同：无论绘制矩形是否覆盖全屏都填充）
+    let black_brush = GetStockObject(BLACK_BRUSH);
+    if FillRect(cache.mem_dc(), &client_rect, HBRUSH(black_brush.0)) == 0 {
+        tracing::warn!("FillRect 失败：无法填充黑色背景");
     }
 
-    // 使用缓存的 GDI 对象进行渲染
-    if let Some(ref cache) = gdi_cache {
-        // 填充黑色背景
-        let black_brush = GetStockObject(BLACK_BRUSH);
-        if FillRect(cache.mem_dc(), &client_rect, HBRUSH(black_brush.0)) == 0 {
-            tracing::warn!("FillRect 失败：无法填充黑色背景");
-        }
-
-        // 计算缩放区域
-        let (draw_x, draw_y, draw_w, draw_h) =
-            super::calculate_scaling(img_w, img_h, client_w as u32, client_h as u32, scaling_mode);
-
-        // v8.0: 使用缓存的 image_bitmap 通过 StretchBlt 绘制到内存 DC
-        // 创建临时源 DC，选入 image_bitmap，StretchBlt 到 mem_dc，最后清理
-        if img_w > 0 && img_h > 0 {
-            let src_dc = CreateCompatibleDC(hdc);
-            if src_dc != HDC::default() {
-                let old_obj = SelectObject(src_dc, image_bitmap);
-                // HALFTONE 模式已由 mem_dc 的 SetStretchBltMode 设置（GdiCache::new 中），
-                // StretchBlt 使用目标 DC 的拉伸模式
-                if scaling_mode == ScalingMode::Tile {
-                    // 平铺模式：按 img_w×img_h 网格把图片重复绘制铺满客户区（不缩放、原点对齐）
-                    let img_w_i32 = img_w as i32;
-                    let img_h_i32 = img_h as i32;
-                    let mut ty = 0i32;
-                    while ty < client_h {
-                        let mut tx = 0i32;
-                        while tx < client_w {
-                            if !StretchBlt(
-                                cache.mem_dc(),
-                                tx,
-                                ty,
-                                img_w_i32,
-                                img_h_i32,
-                                src_dc,
-                                0,
-                                0,
-                                img_w_i32,
-                                img_h_i32,
-                                SRCCOPY,
-                            )
-                            .as_bool()
-                            {
-                                tracing::error!(
-                                    "StretchBlt 失败：图片绘制到内存 DC 失败（可能黑屏）"
-                                );
-                            }
-                            tx += img_w_i32;
+    // v8.0: 使用缓存的 image_bitmap 通过 StretchBlt 绘制到内存 DC
+    // 创建临时源 DC，选入 image_bitmap，StretchBlt 到 mem_dc，最后清理
+    if img_w > 0 && img_h > 0 {
+        let src_dc = CreateCompatibleDC(hdc);
+        if src_dc != HDC::default() {
+            let old_obj = SelectObject(src_dc, image_bitmap);
+            // HALFTONE 模式已由 mem_dc 的 SetStretchBltMode 设置（GdiCache::new 中），
+            // StretchBlt 使用目标 DC 的拉伸模式
+            if scaling_mode == ScalingMode::Tile {
+                // 平铺模式：按 img_w×img_h 网格把图片重复绘制铺满客户区（不缩放、原点对齐）
+                let img_w_i32 = img_w as i32;
+                let img_h_i32 = img_h as i32;
+                let mut ty = 0i32;
+                while ty < client_h {
+                    let mut tx = 0i32;
+                    while tx < client_w {
+                        if !StretchBlt(
+                            cache.mem_dc(),
+                            tx,
+                            ty,
+                            img_w_i32,
+                            img_h_i32,
+                            src_dc,
+                            0,
+                            0,
+                            img_w_i32,
+                            img_h_i32,
+                            SRCCOPY,
+                        )
+                        .as_bool()
+                        {
+                            tracing::error!("StretchBlt 失败：图片绘制到内存 DC 失败（可能黑屏）");
                         }
-                        ty += img_h_i32;
+                        tx += img_w_i32;
                     }
-                } else if !StretchBlt(
-                    cache.mem_dc(),
-                    draw_x,
-                    draw_y,
-                    draw_w,
-                    draw_h,
-                    src_dc,
-                    0,
-                    0,
-                    img_w as i32,
-                    img_h as i32,
-                    SRCCOPY,
-                )
-                .as_bool()
-                {
-                    tracing::error!("StretchBlt 失败：图片绘制到内存 DC 失败（可能黑屏）");
+                    ty += img_h_i32;
                 }
-                SelectObject(src_dc, old_obj);
-                let _ = DeleteDC(src_dc);
+            } else if !StretchBlt(
+                cache.mem_dc(),
+                draw_x,
+                draw_y,
+                draw_w,
+                draw_h,
+                src_dc,
+                0,
+                0,
+                img_w as i32,
+                img_h as i32,
+                SRCCOPY,
+            )
+            .as_bool()
+            {
+                tracing::error!("StretchBlt 失败：图片绘制到内存 DC 失败（可能黑屏）");
             }
+            SelectObject(src_dc, old_obj);
+            let _ = DeleteDC(src_dc);
         }
+    }
 
-        // 一次性 BitBlt 到屏幕 DC，消除闪烁
-        if BitBlt(hdc, 0, 0, client_w, client_h, cache.mem_dc(), 0, 0, SRCCOPY).is_err() {
-            tracing::error!("BitBlt 失败：内存 DC 合成到屏幕失败（可能黑屏）");
-        }
+    // 一次性 BitBlt 到屏幕 DC，消除闪烁
+    if BitBlt(hdc, 0, 0, client_w, client_h, cache.mem_dc(), 0, 0, SRCCOPY).is_err() {
+        tracing::error!("BitBlt 失败：内存 DC 合成到屏幕失败（可能黑屏）");
     }
 }
 

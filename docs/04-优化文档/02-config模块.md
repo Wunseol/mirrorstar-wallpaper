@@ -323,10 +323,10 @@ config 模块采用**便携数据根**设计：所有用户数据都被集中收
 | # | 位置 | 问题 | 证据 | 级别 | 处置 |
 |---|---|---|---|---|---|
 | D-1 | playback.rs:110-114 | `impl Default for PlaybackStore` 无任何调用方 | 全仓无 `PlaybackStore::default()`；调度器用 `PlaybackStore::new()`（scheduler.rs:118） | Low | ✅ 已清理（删除） |
-| D-2 | manager.rs:170-178 | `resolve_pool`（pub）零生产调用方 | 仅 manager.rs 测试(1727) + mod.rs:46 重导出；生产走 `get_pool` | Medium | ⏳ 待确认（公开 API） |
+| D-2 | manager.rs::resolve_pool | `resolve_pool`（pub）零生产调用方 | 清理前仅 manager.rs 单测 + mod.rs 重导出，生产走 `get_pool` | Medium | ✅ 已清理（删除，见 audit-over-abstraction-and-redundancy Task 1.2） |
 | D-3 | manager.rs:117 | `WallpaperEntry.groups` 生产恒写 `Vec::new()`，仅测试读取 | 构造全空（commands/wallpaper.rs:601、scheduler.rs:1564）；池成员实际由 `Pool.member_ids` 承载 | Medium | ⏳ 待确认（serde schema） |
 | D-4 | settings.rs:137/140 | `GeneralConfig.auto_start` / `minimize_to_tray` 持久化却从未被读取 | 全仓仅测试/文档命中；自启真实来源为 OS 插件（commands/system.rs:170,190） | Medium | ⏳ 待确认（schema 变更） |
-| D-5 | mod.rs:46-49 | 4 个零外部引用重导出：`resolve_pool`/`WallpaperLibrary`/`WallpaperMetadata`/`PLAYBACK_SCHEMA_VERSION` | 全仓无 `config::<符号>` 引用 | Low | ⏳ 待确认（公开 API） |
+| D-5 | mod.rs:46-49 | 4 个零外部引用重导出：`resolve_pool`/`WallpaperLibrary`/`WallpaperMetadata`/`PLAYBACK_SCHEMA_VERSION` | 全仓无 `config::<符号>` 引用 | Low | 🟡 部分清理（resolve_pool 重导出已删除；其余 3 项仍无外部引用，保留待确认） |
 | D-6 | manager.rs:849 | 注释残留「ffmpeg 抽帧失败」，实现已是 mpv | 全仓 `ffmpeg` 仅命中 docs 与本注释 | Low | ✅ 已清理（改注释为 mpv） |
 | D-7 | docs/04-优化文档 | 文档仍引用已不存在的 `is_ffmpeg_available`/`TmpFrameGuard`/`escape_ffmpeg_input` | 代码零命中，仅 docs 命中 | Low | 归入本轮文档同步 |
 
@@ -338,14 +338,14 @@ config 模块采用**便携数据根**设计：所有用户数据都被集中收
 |---|---|---|---|---|---|
 | R-1 | manager.rs:995-1019 vs 1024-1068 | `flush` 与 `maybe_save_config` 除防抖判断外函数体近乎逐行相同 | 两函数体对照（取锁→clone→`save_config_to_file`→更新 `last_save_time`） | Medium | ⏳ 待确认（保存路径重构） |
 | R-2 | manager.rs:681-712 vs 776-807 | `reorder_pools` 与 `reorder_wallpapers` 逻辑逐行相同（仅字段名/文案不同） | 两函数体对照 | Medium | ⏳ 待确认 |
-| R-3 | manager.rs:589-712 | 池写路径 4 处 `mark_library_dirty()+save_library()` 尾部样板重复 | 各写路径末尾 | Low | ⏳ 待确认 |
+| R-3 | manager.rs:589-712 | 池写路径 4 处 `mark_library_dirty()+save_library()` 尾部样板重复 | 各写路径末尾 | Low | ✅ 已清理（写路径统一 mark+flush，含 update_thumbnail） |
 | R-4 | manager.rs:1094-1109 | `save_library_locked` 单调用，且 hot_reload.rs:271-287 另存内联副本 | 两处同构未复用 | Low | ✅ 已清理（内联） |
 | R-5 | manager.rs:1436-1461 | `read_bounded_utf8_file` 的 `max_size` 两处调用均传同一常量 | 调用点 1146/1218 均传 `MAX_CONFIG_FILE_SIZE` | Low | ✅ 已清理（去参） |
 | R-6 | settings.rs:188-222 | `volume` 与 `preview_volume` 的 clamp 分支结构相同，但 `tracing::warn!` 结构化字段名（`volume=`/`preview_volume=`）与默认值不同 | clamp 逻辑同构；日志字段名受 tracing 宏静态标识符约束 | Low | ⏳ 待确认（合并会改日志语义） |
 | R-7 | settings.rs:143-149/173-182/400-407 | `Default` impl 字面量与 `default_*()` 重复 | 如 `0.8`/`0.5`/`1.0` 各写两遍 | Low | ✅ 已清理（Default 委托 default_*()） |
 | R-8 | thumbnail.rs:317-350 vs manager.rs:1495-1517 | 临时文件+`sync_all`+rename 原子落盘逻辑重复 | 两处同构（签名不同：`&str` vs JPEG writer） | Medium | ⏳ 待确认 |
 | R-9 | thumbnail.rs:186-195 vs manager.rs:858-867 | 缩略图目录推导重复且口径不一 | `data_root()/thumbnails` vs `config_path.parent()/thumbnails` | Medium | ⏳ 待确认（跨模块） |
-| R-10 | detect.rs:10-18 | 扩展名常量 4 处重复定义且已漂移 | src-tauri/commands/system.rs:139、ui/dnd.rs:14、desktop/native_wallpaper.rs:4 | Medium | ⏳ 待确认（跨 crate） |
+| R-10 | detect.rs:10-18 | 扩展名常量 4 处重复定义且已漂移 | `ui/dnd.rs` 已改为调用 core `detect_wallpaper_type`（本轮）；剩余 `src-tauri/commands/system.rs` 的文件对话框过滤器与 `desktop/native_wallpaper.rs` 的 Windows 原生能力清单语义不同 | Medium | 🟡 部分收敛（UI 拖入已单源；其余语义不同，保留） |
 | R-11 | thumbnail.rs:113,463,557 | `create_dir_all` 重复调用（video 路径连续两次） | 幂等，可去一层 | Low | ✅ 已清理 |
 | R-12 | hot_reload.rs | `.lock().unwrap_or_else(...)` 毒锁样板重复 15+ 处 | 43,63,76,155… 等 | Low | ⏳ 待确认（纯重构） |
 
@@ -374,6 +374,8 @@ config 模块采用**便携数据根**设计：所有用户数据都被集中收
 
 ### 7.5 待确认项（涉及公开 API / 序列化 schema / 跨模块契约，本轮不实施）
 
-D-2、D-3、D-4、D-5、R-1、R-2、R-3、R-8、R-9、R-10、R-12、O-4、O-5、O-6。
+D-3、D-4、D-5、R-1、R-2、R-8、R-9、R-10、R-12、O-4、O-5、O-6。
 
-> 其中 **R-2/R-3（reorder 与池写样板）** 属「降低重复但会新增一层泛型/闭包抽象」，与本次「清理过度抽象」目标存在张力，收益有限，建议保持现状；**D-3/D-4** 涉及持久化 schema 与前端消费契约，需跨端确认后再动；**D-2/D-5/O-5/O-6** 为公开 API 面收敛，需外部消费者确认后统一处理。
+> 其中 **R-2（reorder 样板）** 属「降低重复但会新增一层泛型/闭包抽象」，与本次「清理过度抽象」目标存在张力，收益有限，建议保持现状；**D-3/D-4** 涉及持久化 schema 与前端消费契约，需跨端确认后再动；**D-5/O-5/O-6** 为公开 API 面收敛，需外部消费者确认后统一处理。
+>
+> `audit-over-abstraction-round2` 已收敛 R-10 的 UI 拖入部分。

@@ -61,7 +61,7 @@ impl AppConfig {
     ///
     /// 对各子 config 的数值字段执行范围校验，越界值 clamp 到合法范围：
     /// - `AudioConfig.volume`：clamp 到 `[0.0, 1.0]`
-    /// - `VideoConfig.speed`：clamp 到 `(0.0, MAX_VIDEO_SPEED]`（≤0 或 NaN 时回退到默认 1.0；C-017：超过上限 `MAX_VIDEO_SPEED`（10.0）回退到默认 1.0）
+    /// - `VideoConfig.speed`：clamp 到 `[SPEED_MIN, SPEED_MAX]`（即 `[0.25, 4.0]`）；越界、≤0 或 NaN/Inf 时回退到默认 1.0
     /// - `GifConfig.balanced_keep_frames`：clamp 到 `[1, MAX_BALANCED_KEEP_FRAMES]`（越界回退到默认值）
     ///
     /// 该方法不返回错误，越界值就地修正后保证配置处于可用状态。供
@@ -409,35 +409,21 @@ impl Default for VideoConfig {
 impl VideoConfig {
     /// C02 / C-017 修复：speed 范围校验
     ///
-    /// speed 必须 `> 0.0`（≤0 或 NaN 视为无效），无效时回退到默认 1.0。
-    /// C-017：同时校验上限 `MAX_VIDEO_SPEED`（默认 10.0，与 ST-007 `validate_speed`
-    /// 对齐），超过时回退到默认值，避免用户写入过大值导致播放器异常（音视频不同步、
-    /// 解码跟不上等）。
+    /// 复用 [`crate::config::validation::validate_speed`]（范围
+    /// [`crate::ipc::mpv_protocol::SPEED_MIN`]..=[`crate::ipc::mpv_protocol::SPEED_MAX`]），
+    /// 非法值（≤0、NaN/Inf 或越界）时回退到默认 1.0，避免用户写入非法值导致播放器异常
+    ///（音视频不同步、解码跟不上等）。
     pub fn validate(&mut self) {
-        if self.speed.is_nan() || self.speed <= 0.0 {
+        if let Err(e) = super::validation::validate_speed(self.speed) {
             tracing::warn!(
                 speed = self.speed,
-                "VideoConfig.speed 非法（应 > 0），回退到默认 1.0"
-            );
-            self.speed = default_speed();
-        } else if self.speed > MAX_VIDEO_SPEED {
-            tracing::warn!(
-                speed = self.speed,
-                max = MAX_VIDEO_SPEED,
-                "VideoConfig.speed 超过上限，回退到默认 1.0"
+                error = %e,
+                "VideoConfig.speed 非法或超出允许范围，回退到默认 1.0"
             );
             self.speed = default_speed();
         }
     }
 }
-
-/// C-017 修复：VideoConfig.speed 上限常量
-///
-/// 防止用户通过手动编辑 `config.toml` 设置过大的 `speed`（如 999999），
-/// 过高的播放速度可能导致播放器异常（音视频不同步、解码跟不上）。
-/// 超过该上限时在 `validate()` 中回退到默认值 `1.0`（与 ST-007 `validate_speed`
-/// 风格对齐，同样使用 `10.0` 作为上限）。
-const MAX_VIDEO_SPEED: f32 = 10.0;
 
 fn default_speed() -> f32 {
     1.0
@@ -596,7 +582,7 @@ impl RotationConfig {
                 value = self.interval_minutes,
                 min = MIN_INTERVAL_MINUTES,
                 default = DEFAULT_INTERVAL_MINUTES,
-                "RotationConfig.interval_minutes < 下限（1 分钟，DR-16），回退到默认值"
+                "RotationConfig.interval_minutes < 下限（1 分钟，DR-16），回退到下限"
             );
             self.interval_minutes = MIN_INTERVAL_MINUTES;
         }
@@ -983,6 +969,40 @@ arrangement = "span"
             (config.video.speed - 1.5).abs() < f32::EPSILON,
             "合法 speed 1.5 不应被修改"
         );
+        // 边界：SPEED_MAX 本身合法
+        let mut config = AppConfig {
+            video: VideoConfig {
+                hwdec: true,
+                speed: crate::ipc::mpv_protocol::SPEED_MAX,
+            },
+            ..AppConfig::default()
+        };
+        config.validate();
+        assert!(
+            (config.video.speed - crate::ipc::mpv_protocol::SPEED_MAX).abs() < f32::EPSILON,
+            "边界 speed 4.0 不应被修改"
+        );
+    }
+
+    #[test]
+    fn validate_resets_video_speed_above_max() {
+        // 超过 SPEED_MAX 应回退到默认 1.0
+        for &s in &[4.1_f32, 5.0] {
+            let mut config = AppConfig {
+                video: VideoConfig {
+                    hwdec: true,
+                    speed: s,
+                },
+                ..AppConfig::default()
+            };
+            config.validate();
+            assert!(
+                (config.video.speed - default_speed()).abs() < f32::EPSILON,
+                "speed {} 超过上限应回退到默认 1.0，实际 {}",
+                s,
+                config.video.speed
+            );
+        }
     }
 
     #[test]

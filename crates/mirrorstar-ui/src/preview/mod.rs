@@ -41,6 +41,7 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
 use mirrorstar_core::config::WallpaperType;
 
 use crate::protocol::log;
+use crate::settings::file_name;
 use crate::MainWindow;
 
 /// 预览类型（与 `main.slint` 的 `preview-kind` 一一对应）。
@@ -56,11 +57,6 @@ fn kind_of(wallpaper_type: WallpaperType) -> i32 {
         WallpaperType::Gif => KIND_GIF,
         WallpaperType::Web => KIND_WEB,
     }
-}
-
-/// 取路径末段作为预览标题（兼容 `/` 与 `\`）。
-fn display_name(path: &str) -> String {
-    path.rsplit(['\\', '/']).next().unwrap_or(path).to_string()
 }
 
 /// 预览期间的本地运行态（仅 UI 线程）。
@@ -533,7 +529,7 @@ impl PreviewController {
         self.kind = kind;
 
         ui.set_preview_kind(kind);
-        ui.set_preview_title(SharedString::from(display_name(file_path)));
+        ui.set_preview_title(SharedString::from(file_name(file_path)));
         ui.set_preview_image(Image::default());
         ui.set_preview_frame(Image::default());
         ui.set_preview_pending(false);
@@ -737,13 +733,8 @@ impl PreviewController {
 
     /// 释放全部原生资源并清空 UI 侧图像 / 定时器开关。
     fn teardown(&mut self, ui: &MainWindow) {
-        // 先隐藏再销毁（Drop 内部 destroy_host）：关闭/切换预览时杜绝残留可见子窗口。
-        if let Some(mpv) = self.mpv.as_ref() {
-            host_child::hide_host(mpv.host());
-        }
-        if let Some(web) = self.web.as_ref() {
-            host_child::hide_host(web.host());
-        }
+        // 先隐藏再销毁：各原生预览持有的 `PreviewHost` 在 Drop 中先 `hide` 再 `destroy`，
+        // 关闭/切换预览时杜绝残留可见子窗口。
         // 视频预览的就绪态（`ready`/`opened_at`/`shown`）随 `self.mpv = None` 一并 Drop，
         // 无需额外重置；下次打开会创建全新的 `MpvPreview`（就绪态从头开始）。
         self.mpv = None;

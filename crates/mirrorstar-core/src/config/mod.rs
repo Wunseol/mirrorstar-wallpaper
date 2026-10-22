@@ -23,8 +23,8 @@
 //! `crate::config::settings::AppConfig`。本模块不再额外 `pub use settings::AppConfig;`，
 //! 以避免与 crate 根重导出产生冗余访问路径。
 //!
-//! `pub mod` 暴露的子模块（[`detect`] / [`hot_reload`] / [`manager`] / [`settings`] /
-//! [`thumbnail`]）用于跨模块内部协作（如 `hot_reload` 为 `ConfigManager` 的 `impl`
+//! `pub mod` 暴露的子模块（[`detect`] / [`hot_reload`] / [`manager`] / [`playback`] /
+//! [`settings`] / [`thumbnail`] / [`validation`]）用于跨模块内部协作（如 `hot_reload` 为 `ConfigManager` 的 `impl`
 //! 扩展），外部调用方应优先使用顶层重导出；如确需访问子模块内部类型（如
 //! `ConfigChangedCallback` 类型别名），可通过 `config::manager::ConfigChangedCallback`
 //! 显式引用，但这属于内部 API，未来可能调整。
@@ -43,7 +43,7 @@ pub use crate::wallpaper::WallpaperType;
 // Re-export public API to preserve backward compatibility
 pub use detect::detect_wallpaper_type;
 pub use manager::{
-    data_root, init_data_root, resolve_data_root, resolve_pool, ConfigKind, ConfigLoadError,
+    data_root, init_data_root, normalize_path_key, resolve_data_root, ConfigKind, ConfigLoadError,
     ConfigManager, DisplayInfo, Pool, WallpaperEntry, WallpaperLibrary, WallpaperMetadata,
 };
 pub use playback::{PlaybackState, PlaybackStore, Unit, PLAYBACK_SCHEMA_VERSION};

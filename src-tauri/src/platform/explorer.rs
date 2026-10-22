@@ -23,10 +23,35 @@ const EXPLORER_CLASS_NAME: windows::core::PCWSTR = windows::core::w!("MirrorStar
 
 /// Explorer 重启监控窗口过程
 ///
+/// 用 `catch_unwind` 包裹消息处理体，避免窗口过程内部 panic 在 unwind 构建中
+/// 向外展开并越过 `extern "system"` 边界（Win32 回调）。注意：release 构建启用
+/// `panic = "abort"`，panic 会直接终止进程，本保护仅在 dev/test 构建生效。
+unsafe extern "system" fn explorer_monitor_wndproc(
+    hwnd: windows::Win32::Foundation::HWND,
+    msg: u32,
+    wparam: windows::Win32::Foundation::WPARAM,
+    lparam: windows::Win32::Foundation::LPARAM,
+) -> windows::Win32::Foundation::LRESULT {
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        handle_explorer_message(hwnd, msg, wparam, lparam)
+    }));
+
+    match result {
+        Ok(lresult) => lresult,
+        Err(_) => {
+            // panic 已被捕获，仅记录，防止穿越 FFI 硬崩溃
+            tracing::error!("Explorer 监控窗口过程 panic 已被捕获，防止穿越 FFI 硬崩溃");
+            windows::Win32::Foundation::LRESULT(0)
+        }
+    }
+}
+
+/// Explorer 重启监控窗口过程的消息处理体
+///
 /// 处理 TaskbarCreated 消息：当 Explorer 重启时系统会向所有顶层窗口广播该消息，
 /// 收到后立即重新初始化 WorkerW 并重新嵌入壁纸，实现事件驱动的即时检测。
 /// 同时处理 WM_POWERBROADCAST 消息，在电源状态变化时暂停/恢复壁纸。
-unsafe extern "system" fn explorer_monitor_wndproc(
+fn handle_explorer_message(
     hwnd: windows::Win32::Foundation::HWND,
     msg: u32,
     wparam: windows::Win32::Foundation::WPARAM,
@@ -74,11 +99,11 @@ unsafe extern "system" fn explorer_monitor_wndproc(
         // ST-018: 防御性处理——若外部代码（如系统或另一线程）通过 DestroyWindow 销毁本窗口，
         // WM_DESTROY 会在消息循环内被 dispatch。此处 PostQuitMessage 使下一次 GetMessageW
         // 返回 0 退出循环，确保监控线程能正常退出而不是无限等待已销毁窗口的消息。
-        PostQuitMessage(0);
+        unsafe { PostQuitMessage(0) };
         return windows::Win32::Foundation::LRESULT(0);
     }
 
-    DefWindowProcW(hwnd, msg, wparam, lparam)
+    unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
 }
 
 /// 启动 Explorer 重启监控线程（事件驱动，监听 TaskbarCreated 消息）
@@ -93,33 +118,9 @@ pub(crate) fn start_explorer_restart_monitor(desktop: Arc<std::sync::Mutex<Deskt
     if EXPLORER_MONITOR_RUNNING.swap(true, Ordering::SeqCst) {
         tracing::info!("Explorer 监控已在运行，先停止旧监控再重启");
         // 1. take 旧 thread_id 并 PostThreadMessage WM_QUIT 唤醒
-        if let Some(old_tid) = EXPLORER_MONITOR_THREAD_ID
-            .lock()
-            .ok()
-            .and_then(|mut t| t.take())
-        {
-            unsafe {
-                if windows::Win32::UI::WindowsAndMessaging::PostThreadMessageW(
-                    old_tid,
-                    windows::Win32::UI::WindowsAndMessaging::WM_QUIT,
-                    windows::Win32::Foundation::WPARAM(0),
-                    windows::Win32::Foundation::LPARAM(0),
-                )
-                .is_err()
-                {
-                    tracing::warn!("PostThreadMessageW 失败：WM_QUIT 未送达（线程可能已退出）");
-                }
-            }
-        }
+        crate::state::signal_thread_exit(&EXPLORER_MONITOR_THREAD_ID);
         // 2. take 旧 JoinHandle 并 join 等待旧线程退出
-        if let Some(old_handle) = EXPLORER_MONITOR_THREAD
-            .lock()
-            .ok()
-            .and_then(|mut h| h.take())
-        {
-            // 重启清理路径：join 失败（线程 panic）仅记录，无法传播
-            let _ = old_handle.join();
-        }
+        crate::state::join_monitor_thread(&EXPLORER_MONITOR_THREAD);
     }
 
     // 存储到全局静态变量，供窗口过程函数访问（窗口过程是函数指针，无法捕获闭包）

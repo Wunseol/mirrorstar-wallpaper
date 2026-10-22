@@ -549,7 +549,8 @@ pub(crate) fn try_terminate_all_fast(reason: PauseReason) -> Option<Vec<String>>
 /// ST-005：抽取自 `perform_shutdown_blocking` 中 FULLSCREEN/EXPLORER 重复 2 次的逻辑。
 /// `GetMessageW` 阻塞需 WM_QUIT 唤醒；`take()` 清空避免二次 shutdown 重复唤醒。
 /// Mutex 中毒（线程 panic）时不操作，线程会随进程退出。
-fn signal_thread_exit(thread_id: &Mutex<Option<u32>>) {
+/// 同时供 platform 监控线程的二次启动清理复用。
+pub(crate) fn signal_thread_exit(thread_id: &Mutex<Option<u32>>) {
     let tid = match thread_id.lock().ok().and_then(|mut t| t.take()) {
         Some(tid) => tid,
         None => return,
@@ -573,7 +574,8 @@ fn signal_thread_exit(thread_id: &Mutex<Option<u32>>) {
 /// ST-005：抽取自 `perform_shutdown_blocking` 中 FULLSCREEN/EXPLORER 重复 2 次的逻辑。
 /// ST-002：复用于 `WORKERW_INIT_THREAD` 的 join。
 /// join 失败（线程 panic）仅记录 warn，无法传播；Mutex 中毒时不操作。
-fn join_monitor_thread(handle: &Mutex<Option<std::thread::JoinHandle<()>>>) {
+/// 同时供 platform 监控线程的二次启动清理复用。
+pub(crate) fn join_monitor_thread(handle: &Mutex<Option<std::thread::JoinHandle<()>>>) {
     let handle = match handle.lock().ok().and_then(|mut h| h.take()) {
         Some(h) => h,
         None => return,
@@ -1160,6 +1162,48 @@ mod tests {
         assert!(
             source.contains(&needle),
             "perform_shutdown_blocking 应调用 {needle}() 卸载输入钩子线程"
+        );
+    }
+
+    // ── 线程清理辅助（signal_thread_exit / join_monitor_thread）──────────────
+
+    /// 空槽调用：两辅助 take 不到值应直接返回，不 panic 且可重复调用（幂等）。
+    #[test]
+    fn thread_exit_helpers_noop_on_empty_slot() {
+        let thread_id: Mutex<Option<u32>> = Mutex::new(None);
+        let handle: Mutex<Option<std::thread::JoinHandle<()>>> = Mutex::new(None);
+
+        // 连续两次调用验证幂等（不 panic、不死锁）
+        signal_thread_exit(&thread_id);
+        signal_thread_exit(&thread_id);
+        join_monitor_thread(&handle);
+        join_monitor_thread(&handle);
+
+        assert!(
+            thread_id.lock().unwrap().is_none(),
+            "空槽调用后 thread_id 应仍为 None"
+        );
+        assert!(
+            handle.lock().unwrap().is_none(),
+            "空槽调用后 JoinHandle 槽应仍为 None"
+        );
+    }
+
+    /// 线程 panic：join_monitor_thread 仅记录 warn 并正常返回，槽位被 take 为 None。
+    #[test]
+    fn join_monitor_thread_clears_slot_when_thread_panicked() {
+        let handle: Mutex<Option<std::thread::JoinHandle<()>>> = Mutex::new(None);
+        let panicked: std::thread::JoinHandle<()> = std::thread::spawn(|| {
+            panic!("测试用线程 panic");
+        });
+        *handle.lock().unwrap() = Some(panicked);
+
+        // join 失败（线程 panic）不应传播 panic，仅记录 warn
+        join_monitor_thread(&handle);
+
+        assert!(
+            handle.lock().unwrap().is_none(),
+            "join 后 JoinHandle 槽应为 None"
         );
     }
 }

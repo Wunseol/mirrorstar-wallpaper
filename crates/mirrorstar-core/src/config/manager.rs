@@ -162,21 +162,6 @@ impl Pool {
     }
 }
 
-/// 隐式"全部"池解析（DR-35）
-///
-/// `active_pool = Some(id)` 且该显式池在库中存在 → 返回该池；
-/// 否则（None，或指向已删除/不存在的池）→ 返回 `None`，调用方据此走"全部"池
-/// 语义（全集）。调用方不要手工构造"全部"池对象。
-pub fn resolve_pool<'a>(
-    library: &'a WallpaperLibrary,
-    active_pool: Option<&str>,
-) -> Option<&'a Pool> {
-    match active_pool {
-        Some(id) => library.pools.iter().find(|p| p.id == id),
-        None => None,
-    }
-}
-
 /// 壁纸库
 ///
 /// 持久化到 `wallpapers.toml`，由 `ConfigManager` 的 `RwLock` 保护并发访问。
@@ -337,7 +322,7 @@ pub fn data_root() -> std::path::PathBuf {
 impl ConfigManager {
     /// 创建配置管理器
     ///
-    /// 在 `data_dir()`（`%APPDATA%/mirrorstar/`）下加载或创建 `config.toml` 和
+    /// 在 `data_dir()`（默认 exe 所在目录，无法取得时回退 `dirs::data_dir()/mirrorstar`）下加载或创建 `config.toml` 和
     /// `wallpapers.toml`。文件不存在时使用默认配置；解析失败时记录警告并回退到默认
     /// （避免单次配置损坏导致应用无法启动）。
     ///
@@ -612,7 +597,7 @@ impl ConfigManager {
             lib.pools.push(pool.clone());
         }
         self.mark_library_dirty();
-        self.save_library()?;
+        self.flush_library()?;
         Ok(pool)
     }
 
@@ -646,7 +631,7 @@ impl ConfigManager {
         };
         if updated.is_some() {
             self.mark_library_dirty();
-            self.save_library()?;
+            self.flush_library()?;
         }
         Ok(updated)
     }
@@ -667,7 +652,7 @@ impl ConfigManager {
         };
         if removed.is_some() {
             self.mark_library_dirty();
-            self.save_library()?;
+            self.flush_library()?;
         }
         Ok(removed)
     }
@@ -676,7 +661,7 @@ impl ConfigManager {
     ///（集合相等校验），否则返回错误且不落盘。
     ///
     /// 校验通过后持写锁按 `ids` 顺序重建 `pools`（保留元素本体，仅重排），
-    /// 再 `mark_library_dirty` + 立即落盘（与 `update_pool` 写路径一致）。
+    /// 再 `mark_library_dirty` + `flush_library` 立即落盘（与 `update_pool` 写路径一致）。
     /// 当前池集合为空时，空 `ids` 视为合法（直接成功），非空 `ids` 报错。
     pub fn reorder_pools(&self, ids: Vec<String>) -> Result<(), MirrorStarError> {
         {
@@ -707,7 +692,7 @@ impl ConfigManager {
             lib.pools = reordered;
         }
         self.mark_library_dirty();
-        self.save_library()?;
+        self.flush_library()?;
         Ok(())
     }
 
@@ -721,7 +706,7 @@ impl ConfigManager {
     /// 供 `update_thumbnail` 快速查找。
     pub fn add_wallpaper(&self, mut entry: WallpaperEntry) -> Result<(), MirrorStarError> {
         // v5.0 C-PERF-003: 计算规范化路径派生字段，供 update_thumbnail 等快速查找
-        entry.normalized_path = normalize_path(&entry.file_path);
+        entry.normalized_path = normalize_path_key(&entry.file_path);
         {
             let mut lib = self
                 .wallpaper_library
@@ -771,7 +756,7 @@ impl ConfigManager {
     ///（集合相等校验），否则返回错误且不落盘。
     ///
     /// 校验通过后持写锁按 `ids` 顺序重建 `wallpapers`（保留元素本体，仅重排），
-    /// 再 `mark_library_dirty` + 立即落盘（与 `reorder_pools` 一致）。
+    /// 再 `mark_library_dirty` + `flush_library` 立即落盘（与 `reorder_pools` 一致）。
     /// 当前壁纸集合为空时，空 `ids` 视为合法（直接成功），非空 `ids` 报错。
     pub fn reorder_wallpapers(&self, ids: Vec<String>) -> Result<(), MirrorStarError> {
         {
@@ -802,7 +787,7 @@ impl ConfigManager {
             lib.wallpapers = reordered;
         }
         self.mark_library_dirty();
-        self.save_library()?;
+        self.flush_library()?;
         Ok(())
     }
 
@@ -810,7 +795,7 @@ impl ConfigManager {
     ///
     /// 由 `add_wallpaper` 命令在后台生成缩略图后调用。未找到匹配条目时为 no-op。
     ///
-    /// C09 修复：路径匹配前统一规范化（lowercase + 替换分隔符 `\` → `/`），
+    /// C09 修复：路径匹配前统一规范化（lowercase + 替换分隔符 `/` → `\`），
     /// 避免因大小写或路径分隔符差异（Windows 下 `\` vs `/`）导致匹配失败。
     pub fn update_thumbnail(
         &self,
@@ -822,9 +807,9 @@ impl ConfigManager {
                 .wallpaper_library
                 .write()
                 .unwrap_or_else(|e| e.into_inner());
-            let normalized = normalize_path(file_path);
+            let normalized = normalize_path_key(file_path);
             // v5.0 C-PERF-003: 直接比较 normalized_path 派生字段，
-            // 消除迭代内每次 normalize_path 的堆分配（100 条目 batch 省 ~10000 次分配）
+            // 消除迭代内每次路径规范化的堆分配（100 条目 batch 省 ~10000 次分配）
             let found = lib
                 .wallpapers
                 .iter_mut()
@@ -838,7 +823,8 @@ impl ConfigManager {
             }
         };
         if changed {
-            self.save_library()?;
+            self.mark_library_dirty();
+            self.flush_library()?;
         }
         Ok(())
     }
@@ -1214,7 +1200,7 @@ impl ConfigManager {
                 // 供 update_thumbnail 快速查找。
                 // #[serde(skip)] 反序列化时用 Default::default() 填充为空字符串，此处覆盖。
                 for entry in lib.wallpapers.iter_mut() {
-                    entry.normalized_path = normalize_path(&entry.file_path);
+                    entry.normalized_path = normalize_path_key(&entry.file_path);
                 }
                 Ok((lib, None))
             }
@@ -1283,9 +1269,9 @@ fn is_complete_permutation(ids: &[String], current: &[String]) -> bool {
 
 /// 规范化文件路径以便比较（字符串级别，不接触文件系统）
 ///
-/// 行为：统一转换为 lowercase；Windows（`cfg!(windows)`）上额外将 `/` 替换为 `\`，
-/// 避免 `C:\Users\img.jpg` 与 `c:/users/img.jpg` 因大小写或分隔符差异被判为不同路径。
-/// 非 Windows 平台 `\` 是合法文件名字符而非分隔符，仅做 lowercase 规范化。
+/// 行为：统一转换为 lowercase 并将 `/` 替换为 `\`，避免 `C:\Users\img.jpg` 与
+/// `c:/users/img.jpg` 因大小写或分隔符差异被判为不同路径。本函数是库内路径去重、
+/// 壁纸路径匹配与拖放去重的唯一实现（config / wallpaper / UI 共用）。
 ///
 /// # 安全策略
 ///
@@ -1293,15 +1279,8 @@ fn is_complete_permutation(ids: &[String], current: &[String]) -> bool {
 /// 不存在 "canonicalize 失败回退到原始路径" 的不安全分支。路径安全校验（绝对路径 /
 /// 路径遍历拒绝 / 符号链接解析）由调用方在更高层负责；本函数仅用于内部
 /// `WallpaperEntry::file_path` 字段的去重匹配，输入来源是已通过上层校验的库内条目。
-fn normalize_path(p: &str) -> String {
-    #[cfg(windows)]
-    {
-        p.to_lowercase().replace('/', "\\")
-    }
-    #[cfg(not(windows))]
-    {
-        p.to_lowercase()
-    }
+pub fn normalize_path_key(p: &str) -> String {
+    p.to_lowercase().replace('/', "\\")
 }
 
 /// 包裹回调调用以隔离 panic（C-003 / T12）
@@ -1698,28 +1677,6 @@ added_at = "1"
         assert!(lib.pools.is_empty(), "无 pools 段应回退为空池列表");
         assert_eq!(lib.wallpapers.len(), 1);
         assert!(lib.wallpapers[0].groups.is_empty(), "groups 默认应为空");
-    }
-
-    #[test]
-    fn resolve_pool_returns_none_for_missing_or_any_deleted_pool() {
-        // DR-35：None / 指向不存在（已删）池 → 回退"全部"池语义（返回 None）
-        let lib = WallpaperLibrary {
-            wallpapers: Vec::new(),
-            pools: vec![Pool {
-                id: "p1".to_string(),
-                name: "池 1".to_string(),
-                member_ids: vec!["a".to_string()],
-            }],
-        };
-        // None → "全部"
-        assert!(resolve_pool(&lib, None).is_none());
-        // 显式存在的池 → Some
-        assert_eq!(
-            resolve_pool(&lib, Some("p1")).map(|p| p.id.as_str()),
-            Some("p1")
-        );
-        // 指向已删/不存在的池 → None（回退"全部"）
-        assert!(resolve_pool(&lib, Some("deleted")).is_none());
     }
 
     #[test]
@@ -3481,34 +3438,34 @@ period_seconds=1.0
     }
 
     #[test]
-    fn normalize_path_direction_matches_w13() {
-        // C09 一致性测试：normalize_path 应与 W13 的 normalize_path_for_compare
-        // 产生相同的规范化结果（lowercase + `/` → `\`），确保跨模块路径匹配一致。
+    fn normalize_path_key_direction_matches_w13() {
+        // C09 一致性测试：normalize_path_key 应与 W13 的路径规范化方向相同
+        //（lowercase + `/` → `\`），确保跨模块路径匹配一致。
         // 直接测试纯辅助函数，验证规范化方向与具体输出。
         assert_eq!(
-            normalize_path("C:/Users/Test/File.mp4"),
+            normalize_path_key("C:/Users/Test/File.mp4"),
             "c:\\users\\test\\file.mp4"
         );
         assert_eq!(
-            normalize_path("C:\\Users\\Test\\File.mp4"),
+            normalize_path_key("C:\\Users\\Test\\File.mp4"),
             "c:\\users\\test\\file.mp4"
         );
         assert_eq!(
-            normalize_path("c:/users\\test/file.mp4"),
+            normalize_path_key("c:/users\\test/file.mp4"),
             "c:\\users\\test\\file.mp4"
         );
         assert_eq!(
-            normalize_path("c:\\users/test\\file.mp4"),
+            normalize_path_key("c:\\users/test\\file.mp4"),
             "c:\\users\\test\\file.mp4"
         );
         // 对称性：正斜杠与反斜杠输入应产生相同输出
         assert_eq!(
-            normalize_path("A/B/C.PNG"),
-            normalize_path("A\\B\\C.PNG"),
+            normalize_path_key("A/B/C.PNG"),
+            normalize_path_key("A\\B\\C.PNG"),
             "正斜杠与反斜杠应规范化为相同结果"
         );
         // 空字符串边界
-        assert_eq!(normalize_path(""), "");
+        assert_eq!(normalize_path_key(""), "");
     }
 
     // ── C11 修复：原子 reload config 与 library ──────────────────────────────

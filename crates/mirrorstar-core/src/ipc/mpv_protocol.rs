@@ -116,7 +116,7 @@ impl MpvIpcClient {
     /// 发送命令到 mpv，不等待响应（fire-and-forget）
     ///
     /// 仅构造 JSON（含 request_id）写入管道即返回，不读取 mpv 的 ack 响应。
-    /// 适用于 set_property / pause / resume / set_volume / set_speed / quit
+    /// 适用于 set_property / pause / resume / set_speed / quit
     /// 等无需返回数据的命令，避免 mpv 端处理延迟时同步等待 5s 超时导致 UI 卡顿（Bug #7）。
     ///
     /// 注意：调用方无法感知 mpv 是否成功执行命令。若命令失败，mpv 仍会异步返回 error 响应，
@@ -176,22 +176,6 @@ impl MpvIpcClient {
     /// 恢复播放（fire-and-forget）
     pub fn resume(&mut self) -> Result<(), crate::MirrorStarError> {
         self.set_property("pause", "no")
-    }
-
-    /// 设置音量 (0-100)（fire-and-forget）
-    ///
-    /// I-005：在发送给 mpv 前校验输入。`volume` 必须为有限值（非 NaN/inf）且在
-    /// `[0.0, 100.0]` 范围内，越界返回 `MirrorStarError::InvalidArgument`，不发送命令。
-    pub fn set_volume(&mut self, volume: f32) -> Result<(), crate::MirrorStarError> {
-        if !volume.is_finite() || !(0.0..=100.0).contains(&volume) {
-            return Err(crate::MirrorStarError::InvalidArgument {
-                reason: format!(
-                    "volume 必须在 [0.0, 100.0] 范围内且为有限值，实际: {}",
-                    volume
-                ),
-            });
-        }
-        self.set_property("volume", &volume.to_string())
     }
 
     /// 加载视频文件（fire-and-forget）
@@ -309,29 +293,7 @@ mod tests {
         assert_eq!(resp.request_id, Some(4));
     }
 
-    // --- I-005: set_volume / set_speed 输入校验测试 ---
-
-    #[test]
-    fn set_volume_rejects_nan() {
-        let mut client = MpvIpcClient::new("test-pipe");
-        let result = client.set_volume(f32::NAN);
-        assert!(
-            matches!(result, Err(crate::MirrorStarError::InvalidArgument { .. })),
-            "I-005: set_volume(NaN) 应返回 InvalidArgument，实际: {:?}",
-            result
-        );
-    }
-
-    #[test]
-    fn set_volume_rejects_out_of_range() {
-        let mut client = MpvIpcClient::new("test-pipe");
-        let result = client.set_volume(150.0);
-        assert!(
-            matches!(result, Err(crate::MirrorStarError::InvalidArgument { .. })),
-            "I-005: set_volume(150.0) 应返回 InvalidArgument，实际: {:?}",
-            result
-        );
-    }
+    // --- I-005: set_speed 输入校验测试 ---
 
     #[test]
     fn set_speed_rejects_nan() {

@@ -17,7 +17,7 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 
 use mirrorstar_core::config::settings::{
-    AppConfig, Arrangement, FullscreenAction, Order, RotationConfig,
+    AppConfig, Arrangement, FullscreenAction, RotationConfig,
 };
 use mirrorstar_core::config::{DisplayInfo, Pool, WallpaperEntry, WallpaperType};
 use mirrorstar_core::ui_proto::{Hello, UiEvent, UnitStateDto};
@@ -1140,7 +1140,7 @@ impl AppStore {
         };
         format!(
             "排列={} · 音量={:.0}%{} · 硬解={} · 速度={:.2}x · 自启={}",
-            arrangement_label(config.arrangement),
+            settings::arrangement_label(config.arrangement),
             config.audio.volume * 100.0,
             if config.audio.muted {
                 "（静音）"
@@ -1165,7 +1165,7 @@ impl AppStore {
                 "已停用"
             },
             rotation.interval_minutes,
-            order_label(rotation.order),
+            settings::order_label(rotation.order),
             if rotation.on_boot { "开" } else { "关" },
             self.units.len(),
         )
@@ -1261,22 +1261,6 @@ fn parse_removed_id(data: &Value) -> Option<String> {
     }
 }
 
-fn arrangement_label(arrangement: Arrangement) -> &'static str {
-    match arrangement {
-        Arrangement::PerMonitor => "每屏独立",
-        Arrangement::AllSame => "每屏同图",
-        Arrangement::Span => "跨屏单图",
-    }
-}
-
-fn order_label(order: Order) -> &'static str {
-    match order {
-        Order::Sequential => "顺序",
-        Order::ShuffleBag => "不重复随机",
-        Order::PseudoRandom => "完全随机",
-    }
-}
-
 fn wallpaper_state_label(state: WallpaperState) -> &'static str {
     match state {
         WallpaperState::Initializing => "初始化中",
@@ -1344,7 +1328,7 @@ mod tests {
         assert_eq!(view.item_count, 1);
         assert!(!view.loading, "已应用快照后不应仍处于 loading");
         assert_eq!(store.wallpapers()[0].file_path, "C:/x/one.mp4");
-        assert!(view.config_summary.contains("跨屏单图"));
+        assert!(view.config_summary.contains("跨屏合并"));
         assert!(view.config_summary.contains("静音"));
         assert!(view.config_summary.contains("自启=开"));
     }

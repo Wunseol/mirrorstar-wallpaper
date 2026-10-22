@@ -9,6 +9,7 @@ use mirrorstar_core::{
     init_logging, ConfigKind, ConfigLoadError, ConfigManager, DesktopIntegrator, PauseReason,
     VolumeControl, WallpaperEngine,
 };
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use tauri::{Emitter, Manager};
@@ -278,18 +279,91 @@ impl Drop for HandleGuard {
     }
 }
 
+/// 判断候选进程映像路径是否位于应用目录（含子目录）内。
+///
+/// 用于启动清理时区分「本应用遗留的子进程」与「用户自行从其它目录启动的同名进程」。
+/// 判定按路径分隔符边界进行，因此 `C:\app` 不会匹配 `C:\app2\mpv.exe`；
+/// Windows 路径大小写不敏感，比较时统一转小写；`\\?\` 前缀会被归一化。
+/// 仅做词法比较，不访问文件系统（候选路径由 `QueryFullProcessImageNameW` 返回，
+/// 已是绝对路径）。
+fn should_terminate_path(exe_dir: &Path, candidate: &Path) -> bool {
+    let dir = normalized_path_components(exe_dir);
+    if dir.is_empty() {
+        return false;
+    }
+    normalized_path_components(candidate).starts_with(&dir)
+}
+
+/// 将路径拆成小写归一化组件，供大小写不敏感的前缀比较使用。
+fn normalized_path_components(path: &Path) -> Vec<String> {
+    use std::path::Component;
+
+    path.components()
+        .filter_map(|component| match component {
+            // `\\?\C:` 与 `C:` 归一化为同一组件，避免 verbatim 前缀影响比较
+            Component::Prefix(prefix) => {
+                let raw = prefix.as_os_str().to_string_lossy().into_owned();
+                let trimmed = raw.strip_prefix(r"\\?\").unwrap_or(&raw);
+                Some(trimmed.to_lowercase())
+            }
+            Component::RootDir => Some("\\".to_string()),
+            Component::Normal(part) => Some(part.to_string_lossy().to_lowercase()),
+            Component::CurDir => None,
+            Component::ParentDir => Some("..".to_string()),
+        })
+        .collect()
+}
+
+/// 查询指定进程的完整映像路径（失败时返回 `None`）。
+///
+/// 使用 `PROCESS_QUERY_LIMITED_INFORMATION` 权限打开进程，再由
+/// `QueryFullProcessImageNameW` 取 Win32 格式路径；进程已退出或权限不足
+/// （如以管理员身份运行的同名进程）时返回 `None`，调用方应保守跳过。
+fn query_process_image_path(pid: u32) -> Option<PathBuf> {
+    use windows::Win32::System::Threading::{
+        OpenProcess, QueryFullProcessImageNameW, PROCESS_NAME_WIN32,
+        PROCESS_QUERY_LIMITED_INFORMATION,
+    };
+
+    let handle = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid) }.ok()?;
+    let _handle_guard = HandleGuard(handle);
+
+    // 32768 宽字符足以容纳 Windows 最大路径（含长路径）
+    let mut buffer = vec![0u16; 32_768];
+    let mut len = buffer.len() as u32;
+    unsafe {
+        QueryFullProcessImageNameW(
+            handle,
+            PROCESS_NAME_WIN32,
+            windows::core::PWSTR(buffer.as_mut_ptr()),
+            &mut len,
+        )
+    }
+    .ok()?;
+
+    if len == 0 {
+        return None;
+    }
+    Some(PathBuf::from(String::from_utf16_lossy(
+        &buffer[..len as usize],
+    )))
+}
+
 /// 启动清理：终止上次崩溃遗留的孤儿 mpv / wp-proc / UI 子进程
 ///
-/// 当前进程刚启动尚未 spawn 任何子进程，此时任何名称匹配
-/// mpv.exe / mirrorstar-wp-proc.exe / mirrorstar-ui.exe 的存活进程均为上次遗留。
-/// 通过 ToolHelp 快照（CreateToolhelp32Snapshot + Process32FirstW/NextW）
-/// 枚举系统进程并逐个终止（不含当前进程）。失败仅记录日志，不致命。
+/// 当前进程刚启动尚未 spawn 任何子进程，但系统中可能存在用户自行启动的同名进程
+/// （如用户自己的 `mpv.exe`）。因此不能仅凭进程名判定遗留：通过 ToolHelp 快照
+/// （CreateToolhelp32Snapshot + Process32FirstW/NextW）枚举系统进程，对名称命中
+/// `TARGET_NAMES` 的候选进程再用 `QueryFullProcessImageNameW` 取得完整映像路径，
+/// **仅当路径位于当前 exe 所在目录（含子目录）时才终止**；目录外同名进程记录日志后跳过。
+/// 无法取得路径（进程已退出、权限不足等）时保守跳过，绝不盲目终止。
 ///
 /// **`mirrorstar-wp-proc.exe` 用于回收旧版本升级后残留的独立 wp-proc 孤儿进程**：
-/// 运行中的 exe 无法被安装器删除，可能跨版本存活，故按名清理。采用「同一 exe、双入口」
-/// 后，本版本 spawn 的网页壁纸子进程与壳**同名**（`mirrorstar-wallpaper.exe`），
-/// 因此不会被本条按名匹配误杀；本版本同名子进程的孤儿由 `ProcessManager` 施加的
-/// Job Object `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE` 兜底（主进程退出即内核回收子进程）。
+/// 运行中的 exe 无法被安装器删除，可能跨版本存活，故按名 + 应用目录清理。采用
+/// 「同一 exe、双入口」后，本版本 spawn 的网页壁纸子进程与壳**同名**
+/// （`mirrorstar-wallpaper.exe`），因此不会被本条按名匹配误杀；本版本同名子进程的
+/// 孤儿由 `ProcessManager` 施加的 Job Object `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`
+/// 兜底（主进程退出即内核回收子进程）。失败仅记录日志，不致命。
 fn cleanup_stale_child_processes() {
     use windows::Win32::System::Diagnostics::ToolHelp::{
         CreateToolhelp32Snapshot, Process32FirstW, Process32NextW, PROCESSENTRY32W,
@@ -299,13 +373,26 @@ fn cleanup_stale_child_processes() {
         GetCurrentProcessId, OpenProcess, TerminateProcess, PROCESS_TERMINATE,
     };
 
-    // 目标残留进程名（统一小写比较）。
+    // 目标进程名（统一小写比较）。名称命中只是候选条件，还需校验映像路径
+    // 位于当前 exe 所在目录（含子目录）才终止，避免误杀用户自行启动的同名进程。
     // 含 mirrorstar-ui.exe：壳模式下 UI 子进程异常残留时，下次启动统一清理。
-    // 含 mirrorstar-wp-proc.exe：用于回收旧版本升级后残留的独立 wp-proc 孤儿进程
-    // （运行中的 exe 无法被安装器删除，可能跨版本存活）；本版本无同名产物，
+    // 含 mirrorstar-wp-proc.exe：回收旧版本升级后残留在应用目录内的独立 wp-proc
+    // 孤儿进程（运行中的 exe 无法被安装器删除，可能跨版本存活）；本版本无同名产物，
     // 本版本 spawn 的网页壁纸子进程与壳同名（mirrorstar-wallpaper.exe），不会被误杀
     // （详见函数文档）；其孤儿由 Job Object KILL_ON_JOB_CLOSE 兜底。
     const TARGET_NAMES: &[&str] = &["mpv.exe", "mirrorstar-wp-proc.exe", "mirrorstar-ui.exe"];
+
+    // 当前 exe 所在目录是所有清理操作的信任边界；取不到时保守跳过全部清理。
+    let exe_dir = match std::env::current_exe()
+        .ok()
+        .and_then(|exe| exe.parent().map(Path::to_path_buf))
+    {
+        Some(dir) => dir,
+        None => {
+            tracing::warn!("启动清理：无法确定当前 exe 所在目录，跳过残留进程清理");
+            return;
+        }
+    };
 
     let current_pid = unsafe { GetCurrentProcessId() };
 
@@ -342,32 +429,53 @@ fn cleanup_stale_child_processes() {
             let name = String::from_utf16_lossy(&entry.szExeFile[..name_len]);
 
             if TARGET_NAMES.contains(&name.to_lowercase().as_str()) {
-                unsafe {
-                    // 打开进程并终止（OpenProcess 失败说明进程已消失/无权限，忽略并记录）
-                    match OpenProcess(PROCESS_TERMINATE, false, entry.th32ProcessID) {
-                        Ok(handle) => {
-                            let _handle_guard = HandleGuard(handle);
-                            match TerminateProcess(handle, 1) {
-                                Ok(()) => tracing::info!(
-                                    pid = entry.th32ProcessID,
-                                    name = %name,
-                                    "启动清理：已终止崩溃遗留的孤儿进程"
-                                ),
+                let pid = entry.th32ProcessID;
+                // 名称只是候选：必须确认映像位于应用目录内才终止，
+                // 避免误杀用户从其它目录启动的同名进程。
+                match query_process_image_path(pid) {
+                    Some(image_path) if should_terminate_path(&exe_dir, &image_path) => {
+                        unsafe {
+                            // 打开进程并终止（OpenProcess 失败说明进程已消失/无权限，忽略并记录）
+                            match OpenProcess(PROCESS_TERMINATE, false, pid) {
+                                Ok(handle) => {
+                                    let _handle_guard = HandleGuard(handle);
+                                    match TerminateProcess(handle, 1) {
+                                        Ok(()) => tracing::info!(
+                                            pid,
+                                            name = %name,
+                                            path = %image_path.display(),
+                                            "启动清理：已终止崩溃遗留的孤儿进程"
+                                        ),
+                                        Err(e) => tracing::warn!(
+                                            pid,
+                                            name = %name,
+                                            path = %image_path.display(),
+                                            error = ?e,
+                                            "启动清理：终止残留进程失败"
+                                        ),
+                                    }
+                                }
                                 Err(e) => tracing::warn!(
-                                    pid = entry.th32ProcessID,
+                                    pid,
                                     name = %name,
+                                    path = %image_path.display(),
                                     error = ?e,
-                                    "启动清理：终止残留进程失败"
+                                    "启动清理：打开残留进程失败"
                                 ),
                             }
                         }
-                        Err(e) => tracing::warn!(
-                            pid = entry.th32ProcessID,
-                            name = %name,
-                            error = ?e,
-                            "启动清理：打开残留进程失败"
-                        ),
                     }
+                    Some(image_path) => tracing::info!(
+                        pid,
+                        name = %name,
+                        path = %image_path.display(),
+                        "启动清理：同名进程不在应用目录内，跳过（非本应用遗留）"
+                    ),
+                    None => tracing::debug!(
+                        pid,
+                        name = %name,
+                        "启动清理：无法获取进程映像路径，保守跳过（不终止）"
+                    ),
                 }
             }
         }
@@ -627,8 +735,8 @@ pub fn run() {
     // 同时处理 WM_POWERBROADCAST 消息，实现电源状态变化的即时检测
     start_explorer_restart_monitor(desktop.clone());
 
-    // 启动清理：终止上次崩溃遗留的孤儿 mpv / wp-proc 进程
-    // 当前进程刚启动尚未 spawn 任何子进程，任何同名存活进程均为崩溃残留。
+    // 启动清理：终止上次崩溃遗留的孤儿 mpv / wp-proc / UI 子进程
+    // （仅限当前 exe 所在目录及其子目录内的同名进程，目录外同名进程不会被误杀）。
     cleanup_stale_child_processes();
 
     // 注：WebView2 缓存清理已移至上方 "mirrorstar-boot-cleanup" 后台线程。
@@ -1244,6 +1352,42 @@ pub fn run() {
 #[cfg(test)]
 mod tests {
     use super::panic_hook_timestamp;
+    use super::should_terminate_path;
+    use std::path::Path;
+
+    #[test]
+    fn stale_cleanup_path_scope_rules() {
+        // 应用目录内的同名进程才允许终止；目录外（含相似前缀目录）必须保留，
+        // 防止启动清理误杀用户自行从其它目录启动的 mpv。
+        let exe_dir = Path::new(r"C:\app");
+
+        // 目录内（直接子文件）
+        assert!(should_terminate_path(exe_dir, Path::new(r"C:\app\mpv.exe")));
+        // 子目录内（如随包分发的 mpv\mpv.exe）
+        assert!(should_terminate_path(
+            exe_dir,
+            Path::new(r"C:\app\mpv\mpv.exe")
+        ));
+        // 目录外
+        assert!(!should_terminate_path(
+            exe_dir,
+            Path::new(r"C:\other\mpv.exe")
+        ));
+        // 相似前缀目录不能按字符串前缀误判
+        assert!(!should_terminate_path(
+            exe_dir,
+            Path::new(r"C:\app2\mpv.exe")
+        ));
+        assert!(!should_terminate_path(
+            exe_dir,
+            Path::new(r"C:\application\mpv.exe")
+        ));
+        // Windows 路径大小写不敏感
+        assert!(should_terminate_path(
+            exe_dir,
+            Path::new(r"c:\APP\Mpv\MPV.EXE")
+        ));
+    }
 
     #[test]
     fn panic_hook_timestamp_matches_format() {

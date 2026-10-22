@@ -34,7 +34,7 @@ use windows::core::{HSTRING, PCWSTR};
 use windows::Win32::Foundation::{HWND, RECT};
 use windows::Win32::System::Com::{CoInitializeEx, COINIT_APARTMENTTHREADED};
 
-use super::host_child::{self, PhysRect};
+use super::host_child::{PhysRect, PreviewHost};
 
 /// 目标为空 / 无法解析时展示的内置提示页。
 const FALLBACK_HTML: &str = r#"<!doctype html><html><head><meta charset="utf-8"><style>
@@ -97,13 +97,11 @@ struct Shared {
 /// WebView2 创建的异步状态机（自持专用宿主子窗口，就绪后移交 [`WebPreview`]）。
 pub struct WebPending {
     /// 专用宿主子窗口；就绪移交 [`WebPreview`] 后置为 `None`，避免被重复销毁。
-    host: Option<HWND>,
+    host: Option<PreviewHost>,
     target: Target,
     width: i32,
     height: i32,
     shared: Rc<RefCell<Shared>>,
-    /// 宿主子窗口是否已显式显示（隐藏创建 → 就绪后显示，避免打开时残影）。
-    shown: bool,
 }
 
 /// [`WebPending::poll`] 的结果。
@@ -123,7 +121,7 @@ impl WebPending {
         // 与视频预览同构：WebView2 必须承载在**专用 `WS_CHILD` 子窗口**内，否则
         // `SetBounds` 会以顶层窗口客户区为基准、把画面铺到整个窗口左上角（遮住
         // 关闭遮罩），且 `move_host` 会误搬动主窗口本身。
-        let host = host_child::create_host_child(parent, rect)?;
+        let host = PreviewHost::create(parent, rect)?;
         let (width, height) = (rect.2, rect.3);
 
         ensure_com();
@@ -153,7 +151,7 @@ impl WebPending {
             if let Err(e) =
                 CreateCoreWebView2EnvironmentWithOptions(PCWSTR::null(), &udf, &options, &callback)
             {
-                host_child::destroy_host(host);
+                // `host` 随作用域 Drop 先隐藏再销毁。
                 return Err(format!(
                     "CreateCoreWebView2EnvironmentWithOptions 失败: {e}"
                 ));
@@ -166,27 +164,22 @@ impl WebPending {
             width,
             height,
             shared,
-            shown: false,
         })
     }
 
     /// 显式显示宿主子窗口（幂等）。就绪后调用，隐藏创建 → 就绪显示，避免残影。
     pub fn show(&mut self) {
-        if self.shown {
-            return;
+        if let Some(host) = self.host.as_mut() {
+            host.show();
         }
-        if let Some(host) = self.host {
-            host_child::show_host(host);
-        }
-        self.shown = true;
     }
 
     /// 预览区尺寸变化时同步宿主子窗口位置，并刷新待用边界（供后续 `configure` 使用）。
     pub fn resize(&mut self, rect: PhysRect) {
         self.width = rect.2;
         self.height = rect.3;
-        if let Some(host) = self.host {
-            host_child::move_host(host, rect);
+        if let Some(host) = self.host.as_ref() {
+            host.move_to(rect);
         }
     }
 
@@ -214,13 +207,17 @@ impl WebPending {
             return match configure(&controller, self.width, self.height, &self.target) {
                 Ok(webview) => {
                     // 就绪即显示宿主子窗口（隐藏创建 → 几何/首帧就绪后显示，避免左上角残影）；
-                    // WebPreview 承接 shown=true，上层再调 show() 为 no-op。
+                    // PreviewHost 承接 shown=true，上层再调 show() 为 no-op。
                     self.show();
                     // 宿主子窗口移交 WebPreview 接管，置 None 避免本状态机 Drop 时误销毁。
-                    let host = self.host.take().unwrap_or_default();
+                    let Some(host) = self.host.take() else {
+                        unsafe {
+                            let _ = controller.Close();
+                        }
+                        return WebPoll::Failed("宿主子窗口缺失".to_string());
+                    };
                     WebPoll::Ready(WebPreview {
                         host,
-                        shown: true,
                         controller,
                         _environment: env,
                         _webview: webview,
@@ -272,7 +269,7 @@ impl WebPending {
                 },
             ));
             unsafe {
-                let host = self.host.unwrap_or_default();
+                let host = self.host.as_ref().map(PreviewHost::hwnd).unwrap_or_default();
                 if let Err(e) = env.CreateCoreWebView2Controller(host, &callback) {
                     return WebPoll::Failed(format!("CreateCoreWebView2Controller 调用失败: {e}"));
                 }
@@ -297,38 +294,28 @@ impl Drop for WebPending {
                 let _ = controller.Close();
             }
         }
-        if let Some(host) = self.host.take() {
-            // 先隐藏再销毁，避免关闭/切换预览瞬间残留可见子窗口。
-            host_child::hide_host(host);
-            host_child::destroy_host(host);
-        }
+        // 宿主子窗口（若尚未移交）由 `host` 字段 Drop 先隐藏再销毁，避免空白子窗口残留。
     }
 }
 
 /// 已就绪的网页预览。
 pub struct WebPreview {
-    host: HWND,
+    host: PreviewHost,
     controller: ICoreWebView2Controller,
     /// 保持环境与 WebView 接口存活，直到控制器关闭。
     _environment: ICoreWebView2Environment,
     _webview: ICoreWebView2,
-    /// 宿主子窗口是否已显式显示（就绪时置 true，供 show() 幂等）。
-    shown: bool,
 }
 
 impl WebPreview {
     /// 承载子窗口句柄。
     pub fn host(&self) -> HWND {
-        self.host
+        self.host.hwnd()
     }
 
     /// 显式显示宿主子窗口（幂等）。
     pub fn show(&mut self) {
-        if self.shown {
-            return;
-        }
-        host_child::show_host(self.host);
-        self.shown = true;
+        self.host.show();
     }
 
     /// 预览区尺寸变化时同步 WebView 边界。
@@ -348,12 +335,10 @@ impl WebPreview {
 impl Drop for WebPreview {
     fn drop(&mut self) {
         // 显式 Close() 释放 WebView2 资源（浏览器进程、渲染管线），随后字段依次 Drop
-        // 递减 COM 引用计数；宿主子窗口先隐藏再销毁，避免残留可见窗口。
+        // 递减 COM 引用计数；宿主子窗口由 `host` 字段 Drop 先隐藏再销毁，避免残留可见窗口。
         unsafe {
             let _ = self.controller.Close();
         }
-        host_child::hide_host(self.host);
-        host_child::destroy_host(self.host);
     }
 }
 
