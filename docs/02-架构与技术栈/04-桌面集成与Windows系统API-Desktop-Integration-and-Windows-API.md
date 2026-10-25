@@ -40,12 +40,15 @@ sequenceDiagram
             Desktop->>User32: FindWindowW("Progman", None)
             User32-->>Desktop: progman_hwnd
 
-            Desktop->>User32: SendMessageTimeoutW(progman, 0x052C, 0, 0, SMTO_NORMAL, 200)
-            Note over User32,Progman: 0x052C 消息触发 Progman<br/>创建新的 WorkerW<br/>超时从 500ms 降至 200ms
+            Desktop->>User32: FindWindowExW(Progman, NULL, "WorkerW", NULL)
+            Note over User32,WorkerW: raised desktop（Progman 带 WS_EX_NOREDIRECTIONBITMAP）下只探测 Progman 的直接子 WorkerW：<br/>发送 0x052C 之前一次、之后一次；<br/>不执行顶层 EnumWindows/兄弟 WorkerW 路径
+
+            Desktop->>User32: SendMessageTimeoutW(progman, 0x052C, 0xD, 0x1, SMTO_NORMAL | SMTO_ABORTIFHUNG, 1000)
+            Note over User32,Progman: 0x052C 消息（wParam=0xD / lParam=0x1）触发 Progman<br/>创建新的 WorkerW<br/>超时 1000ms（raised desktop 下创建较慢）
             Progman->>WorkerW: 创建 WorkerW 窗口
 
             Desktop->>User32: EnumWindows(callback, 0)
-            Note over User32: 遍历顶层窗口：<br/>1. 查找包含 SHELLDLL_DefView 的窗口<br/>2. 找到 SHELLDLL_DefView 的父窗口后，<br/>通过 GetWindow(GW_HWNDNEXT) 获取下一个<br/>兄弟 WorkerW 窗口作为嵌入目标
+            Note over User32: 非 raised desktop 下旧层级遍历顶层窗口：<br/>1. 查找包含 SHELLDLL_DefView 的窗口<br/>2. 找到 SHELLDLL_DefView 的父窗口后，<br/>通过 GetWindow(GW_HWNDNEXT) 获取下一个<br/>兄弟 WorkerW 窗口作为嵌入目标
             User32-->>Desktop: workerw_hwnd
 
             Desktop->>Desktop: 缓存 progman_hwnd, workerw_hwnd
@@ -57,30 +60,49 @@ sequenceDiagram
 
     rect rgb(255, 245, 230)
         Note over Engine,Wp: 阶段2: 嵌入壁纸窗口
-        Engine->>Desktop: embed_wallpaper(wp_hwnd, display_id)
+        Engine->>Desktop: embed_wallpaper(wp_hwnd, display_id, arrangement)
+        Desktop->>Desktop: ensure_initialized() → 读取缓存的 progman_hwnd / workerw_hwnd<br/>并取显示器缓存列表（5s TTL）
 
-        Desktop->>Desktop: 查找 display_id 对应的 MonitorInfoEx
-        Desktop->>User32: SetWindowPos(wp_hwnd, HWND_BOTTOM, x, y, w, h, SWP_NOACTIVATE) // 此处 HWND_BOTTOM 仅用于初始定位，真正的 z-order 在 SetParent 后设置
-        Note over User32,Wp: 步骤1: 将壁纸窗口定位到<br/>目标显示器的绝对坐标
+        Desktop->>User32: make_borderless(wp_hwnd) + remove_from_taskbar(wp_hwnd)
+        Note over User32,Wp: 步骤1: 去边框并移出任务栏<br/>读-改-写 GWL_STYLE / GWL_EXSTYLE
 
-        Desktop->>User32: MapWindowPoints(wp_hwnd → workerw_hwnd, &mut rect, 2)
-        Note over User32: 步骤2: 将绝对坐标转换为<br/>相对于 WorkerW 的坐标
+        Desktop->>User32: GetWindowRect(workerw_hwnd, &mut workerw_rect)
+        User32-->>Desktop: workerw_rect
+        Note over User32,WorkerW: 步骤2: 读取 WorkerW 的屏幕矩形<br/>（各分支共用一次调用）
+
+        Desktop->>Desktop: 计算子窗口坐标
+        Note over Desktop: 步骤3: PerMonitor / AllSame 用<br/>display.x - workerw_rect.left、display.y - workerw_rect.top<br/>（calculate_per_monitor_child_coords）；<br/>Span 用 (0, 0, WorkerW 宽, WorkerW 高)；<br/>找不到显示器时回退 WorkerW 全尺寸并 warn
 
         Desktop->>User32: SetParent(wp_hwnd, workerw_hwnd)
-        Note over User32,Wp: 步骤3: 将壁纸窗口设为<br/>WorkerW 的子窗口
+        Note over User32,Wp: 步骤4: 将壁纸窗口设为 WorkerW 的子窗口
 
-        Desktop->>User32: SetWindowPos(wp_hwnd, HWND_BOTTOM, rel_x, rel_y, w, h, SWP_NOACTIVATE)
-        Note over User32,Wp: 步骤4: 设置相对于父窗口的坐标
+        Desktop->>User32: SetWindowPos(wp_hwnd, HWND_BOTTOM, x, y, w, h,<br/>SWP_NOACTIVATE | SWP_FRAMECHANGED)
+        Note over User32,Wp: 步骤5: 按子窗口坐标定位并置于 z-order 底部
 
-        Desktop->>User32: SetForegroundWindow(progman_hwnd)
-        Note over User32: 步骤5: 将焦点还给桌面
+        Desktop->>User32: ShowWindow(wp_hwnd, SW_SHOW)
+        Note over User32,Wp: 步骤6: 显示窗口<br/>（创建时不带 WS_VISIBLE，避免闪屏）
 
-        Desktop->>User32: SystemParametersInfoW(SPI_SETDESKWALLPAPER, 0, NULL, SPIF_UPDATEINIFILE)
-        Note over User32: 步骤6: 刷新桌面（清除残留画面）
+        Desktop->>Desktop: worker_w::ensure_workerw_zorder(progman_hwnd, workerw_hwnd)
+        Note over Desktop,WorkerW: 步骤7: z-order 保障（仅 raised desktop 生效，旧层级直接返回）<br/>用 GetWindow(Progman, GW_CHILD) 取首个（最上层）直接子窗口，<br/>再用 GetWindow(首个直接子窗口, GW_HWNDLAST) 取最底层直接子窗口，<br/>与 WorkerW 比对；已是底层则返回，否则 SetWindowPos(WorkerW, HWND_BOTTOM,<br/>0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE)<br/>best-effort，失败仅 warn
 
         Desktop-->>Engine: 嵌入完成
     end
 ```
+
+#### 1.1.1 raised desktop 兼容分支（Windows 11 24H2/25H2）
+
+Windows 11 24H2/25H2 启用 raised desktop 后，桌面层级发生变化：`Progman` 带 `WS_EX_NOREDIRECTIONBITMAP` 扩展样式，承载壁纸的 `WorkerW` 变为 `Progman` 的**直接子窗口**，不再存在旧层级的顶层兄弟 `WorkerW`。若沿用旧查找逻辑会找不到 WorkerW 或嵌错层，因此实现中增加了以下兼容分支：
+
+- **特性检测（不判断系统版本号）**：`progman_is_raised_desktop(progman)` 读取 `GetWindowLongPtrW(Progman, GWL_EXSTYLE) & WS_EX_NOREDIRECTIONBITMAP`；`is_raised_desktop()` 在内部查找 Progman 后调用前者。以此识别层级形态，避免因系统 build 号差异误判。
+- **查找顺序（按层级分流）**：
+  - **非 raised desktop**：保持旧层级顺序不变——`SHELLDLL_DefView` 父窗口为 WorkerW → `Progman` 顶层兄弟 WorkerW → `EnumWindows` → 发送 `0x052C` → 再次 `EnumWindows` → fallback。
+  - **raised desktop**：只探测 `FindWindowExW(Progman, NULL, "WorkerW", NULL)` 得到的 Progman 直接子 WorkerW，由 `find_progman_child_workerw` 用 `is_workerw_class` 校验类名；发送 `0x052C` **之前**探测一次、**之后**探测一次，未命中即返回 `WorkerWNotFound`；**不执行**顶层兄弟 WorkerW 查找与任何顶层 `EnumWindows`（含 Step 2/4/5），避免误选第三方应用的顶层 WorkerW。
+- **嵌入方式不变**：仍通过 `SetParent` 将壁纸窗口挂到 WorkerW（raised desktop 下即 Progman 的直接子 WorkerW），不引入 `WS_EX_LAYERED`。
+- **z-order 保障**：raised desktop 下桌面图标层 `SHELLDLL_DefView` 与 WorkerW 同为 `Progman` 的子窗口，WorkerW 必须是 Progman 的最后一个（最底层）子窗口，否则壁纸窗口会遮挡桌面图标。`DesktopIntegrator::embed_wallpaper` 在 `worker_w::embed_wallpaper` 成功后调用 `ensure_workerw_zorder(progman_hwnd, workerw_hwnd)`：判定只考察 `Progman` 的直接子窗口——用 `GetWindow(Progman, GW_CHILD)` 取首个（最上层）直接子窗口、再以 `GetWindow(首个直接子窗口, GW_HWNDLAST)` 取最底层直接子窗口（不递归枚举子孙窗口），仅当该窗口不是 WorkerW 时才执行 `SetWindowPos(WorkerW, HWND_BOTTOM, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE)` 置底。该函数仅对 raised desktop 生效（旧层级直接返回），best-effort，失败仅 `warn`。
+- **SPI 早退**：raised desktop 下 `SPI_SETDESKWALLPAPER` 会销毁承载动态壁纸的 WorkerW（参考 Lively Wallpaper 的 `RefreshDesktop` 早退实现），因此 `refresh_desktop()` 在 raised desktop 下直接返回并记 debug 日志；`clear_native_wallpaper()` 同样记 debug 后返回 `Ok(())`（保持调用方既有语义，注册表原值保留不影响后续静态壁纸覆盖）。
+- **失效自愈不变**：`is_workerw_valid` / `check_and_reinitialize` / `ensure_workerw_ready` 的失效检测与重试逻辑保持不变；raised desktop 下句柄失效后重新查找会经上述子窗口探测得到新的 Progman 子 WorkerW，再按既有流程重新嵌入（每次嵌入同样经过 z-order 保障）。
+
+> 该分支只影响 WorkerW 嵌入路径的查找与层级保持；Native 静态图片路径（`SystemParametersInfoW` + 注册表）与旧层级桌面行为不变。
 
 ### 1.2 窗口样式修改
 
@@ -510,7 +532,7 @@ impl DesktopIntegrator {
 |------|--------|--------|
 | `new()` 行为 | 同步调用 `find_workerw()` | 仅初始化字段，后台线程预初始化 |
 | 初始化时机 | 构造时阻塞 | 后台线程异步，`ensure_initialized()` 懒等待 |
-| `SendMessageTimeoutW` 超时 | 500ms | 200ms |
+| `SendMessageTimeoutW` 超时 | 500ms | 1000ms（`WM_SPAWN_WORK_TIMEOUT_MS`，raised desktop 下创建较慢） |
 | 壳进程启动影响 | 阻塞直到 WorkerW 查找完成 | 不阻塞，启动更快 |
 
 ***
@@ -573,7 +595,7 @@ windows = { version = "0.58", features = [
 
 - `FindWindowW` — 定位桌面窗口（Progman）
 - `SendMessageTimeoutW` — 触发 WorkerW 创建
-- `EnumWindows` / `FindWindowExW` — 查找 Shell DefView / WorkerW
+- `EnumWindows` / `FindWindowExW` — 查找 Shell DefView / WorkerW（raised desktop 下用 `FindWindowExW(Progman, …)` 探测 Progman 的直接子 WorkerW）
 - 支持多显示器、DPI 感知，桌面/Explorer 重启后重新嵌入（Explorer 重启监控）
 
 #### 原生壁纸 API
@@ -625,17 +647,16 @@ windows = { version = "0.58", features = [
 | API                                           | 用途              | 模块   |
 | --------------------------------------------- | --------------- | ---- |
 | `FindWindowW("Progman", None)`                | 查找桌面管理器窗口       | 桌面集成 |
-| `SendMessageTimeoutW(0x052C)`                 | 触发创建 WorkerW    | 桌面集成 |
+| `SendMessageTimeoutW(0x052C)`                 | 触发创建 WorkerW（wParam=0xD / lParam=0x1，超时 1000ms） | 桌面集成 |
 | `EnumWindows`                                 | 遍历查找 WorkerW    | 桌面集成 |
 | `SetParent`                                   | 嵌入壁纸窗口到 WorkerW | 桌面集成 |
-| `MapWindowPoints`                             | 坐标系转换           | 桌面集成 |
 | `SetWinEventHook(EVENT_SYSTEM_FOREGROUND)`    | 监听前台窗口切换        | 进程监控 |
 | `IsZoomed`                                    | 检查窗口是否最大化       | 进程监控 |
 | `MonitorFromWindow`                           | 获取窗口所在显示器       | 全屏检测 |
 | `GetSystemPowerStatus`                        | 获取电源状态（ACLineStatus） | 电池监测 |
 | `IMMDeviceEnumerator`                         | 获取音频设备          | 音频控制 |
 | `ISimpleAudioVolume::SetMute`                 | 设置进程静音          | 音频控制 |
-| `SystemParametersInfoW(SPI_SETDESKWALLPAPER)` | 刷新桌面            | 桌面集成 |
+| `SystemParametersInfoW(SPI_SETDESKWALLPAPER)` | 设置静态壁纸 / 刷新桌面；`refresh_desktop` 与 `clear_native_wallpaper` 在 raised desktop 下跳过（避免销毁 WorkerW），`set_wallpaper_image` 设置静态图仍使用 | 桌面集成 |
 
 ***
 

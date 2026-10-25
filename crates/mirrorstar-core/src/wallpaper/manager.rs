@@ -824,6 +824,7 @@ impl WallpaperEngine {
         // 补清除：新 WorkerW 窗已嵌入（覆盖全屏），此刻清除旧系统壁纸不会产生
         // 可见间隙。清除失败仅记录日志（系统壁纸残留被新窗完全覆盖，用户不可见）。
         if defer_clear_native {
+            // raised desktop 下 clear_native_wallpaper 内部会跳过 SPI 调用，避免销毁刚嵌入壁纸的 WorkerW。
             if let Err(e) = native_wallpaper::clear_native_wallpaper() {
                 tracing::warn!(
                     error = %e,
@@ -1494,6 +1495,7 @@ impl WallpaperEngine {
         if let Some(WallpaperMode::Native) = mode {
             if clear_native {
                 // 原生壁纸：清除系统壁纸设置
+                // raised desktop 下 clear_native_wallpaper 内部会跳过 SPI 调用，避免销毁其他显示器正在使用的 WorkerW。
                 native_wallpaper::clear_native_wallpaper()?;
                 tracing::info!(display_id, "关闭原生壁纸");
             } else {

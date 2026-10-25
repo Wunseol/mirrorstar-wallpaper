@@ -55,9 +55,9 @@
 //! - `unsafe impl Send for DesktopIntegrator`（HWND 跨线程传递安全），
 //!   详见类型上方 SAFETY 注释与 v41-D-009 阻塞上界分析
 //! - 锁持有期间最坏阻塞分两种场景（口径不同，勿混用）：
-//!   1. `ensure_workerw_ready` 查找路径 ≈ 220ms（`WM_SPAWN_WORK_TIMEOUT_MS`
-//!      200ms + 两次 EnumWindows 遍历，典型 < 10ms）；
-//!   2. WorkerW 失效后重新嵌入活跃壁纸的循环路径上界 = N×200ms
+//!   1. `ensure_workerw_ready` 查找路径 ≈ 1020ms（`WM_SPAWN_WORK_TIMEOUT_MS`
+//!      1000ms + 两次 EnumWindows 遍历，典型 < 10ms）；
+//!   2. WorkerW 失效后重新嵌入活跃壁纸的循环路径上界 = N×1000ms
 //!      （N = 活跃壁纸数，即 D-004 所述 `embed_wallpaper` 的 SetParent/
 //!      SetWindowPos 同步消息最坏超时之和，通常 N ≤ 2）
 //! - 重试 sleep 由调用方在释放锁后执行，避免持锁 sleep
@@ -180,11 +180,11 @@ pub struct DesktopIntegrator {
 // 3. 重试 sleep 已由调用方在释放 desktop 锁后执行（见 ensure_workerw_ready 注释）
 //
 // v41-D-009: 锁持有期间最坏阻塞上界：
-// - `SendMessageTimeoutW(WM_SPAWN_WORK)` 最坏 200ms（`WM_SPAWN_WORK_TIMEOUT_MS`，
+// - `SendMessageTimeoutW(WM_SPAWN_WORK)` 最坏 1000ms（`WM_SPAWN_WORK_TIMEOUT_MS`，
 //   含 `SMTO_ABORTIFHUNG` flag，Progman 挂起时立即返回）
 // - 之后两次 `EnumWindows` 遍历所有顶层窗口，单次约 N×10ms（N = 顶层窗口数，
 //   典型 100-300 个，即 1-3ms；最坏 1000 个约 10ms）
-// - 总阻塞上界 ≈ 200ms + 2×10ms = 220ms（典型 < 10ms）
+// - 总阻塞上界 ≈ 1000ms + 2×10ms = 1020ms（典型 < 10ms）
 // 此上界适用于 `ensure_workerw_ready` 持锁查找路径；`embed_wallpaper` 的
 // `SetParent`/`SetWindowPos` 同步消息典型 5ms，不计入此上界。
 unsafe impl Send for DesktopIntegrator {}
@@ -245,7 +245,7 @@ impl DesktopIntegrator {
     ///
     /// 缓解措施：`SendMessageTimeoutW` 已设置 `SMTO_ABORTIFHUNG` flag（v41-D-003），
     /// 若 Progman 消息处理线程挂起则立即返回，超时上界为 `WM_SPAWN_WORK_TIMEOUT_MS`
-    ///（200ms）。极端 Explorer 阻塞场景（如 Progman 处理消息但未挂起）仍可能影响
+    ///（1000ms）。极端 Explorer 阻塞场景（如 Progman 处理消息但未挂起）仍可能影响
     /// 并发（锁外执行查找 / 异步初始化可进一步缓解，当前未实施）。
     fn ensure_workerw_ready(&mut self) -> Result<bool, MirrorStarError> {
         // 已初始化且有效，无需操作
@@ -280,8 +280,8 @@ impl DesktopIntegrator {
             // 阻塞规模上界：
             // - 循环次数 = active_wallpapers.len()（典型 1-2 个显示器）
             // - 每次 embed_wallpaper 典型耗时 5ms（SetParent/SetWindowPos 同步消息）
-            // - 最坏情况 200ms（SendMessageTimeoutW 超时，见 worker_w.rs）
-            // - 总阻塞上界 = N × 200ms（N = 活跃壁纸数）
+            // - 最坏情况 1000ms（SendMessageTimeoutW 超时，见 worker_w.rs）
+            // - 总阻塞上界 = N × 1000ms（N = 活跃壁纸数）
             //
             // 不重构为"锁外逐个 embed"的理由：
             // - embed_wallpaper 需要访问 self.active_wallpapers 与 self.workerw_hwnd
@@ -312,6 +312,7 @@ impl DesktopIntegrator {
                     }
                 }
             }
+            worker_w::ensure_workerw_zorder(progman_hwnd, workerw_hwnd);
             tracing::info!("WorkerW 重新初始化完成，壁纸已重新嵌入");
         } else {
             tracing::info!(
@@ -347,13 +348,15 @@ impl DesktopIntegrator {
     ) -> Result<(), MirrorStarError> {
         self.ensure_initialized()?;
         let workerw_hwnd = self.workerw_hwnd.ok_or(MirrorStarError::WorkerWNotFound)?;
-        // 校验桌面已初始化（progman_hwnd 存在）；嵌入过程不再使用该句柄
-        //（不再抢占前台恢复焦点，见 worker_w::embed_wallpaper）。
-        let _ = self.progman_hwnd.ok_or(MirrorStarError::WorkerWNotFound)?;
+        // 校验桌面已初始化（progman_hwnd 存在）；progman 句柄仅用于 raised desktop
+        // 的 z-order 保障（确保 WorkerW 位于 Progman 子窗口最底层）。
+        let progman_hwnd = self.progman_hwnd.ok_or(MirrorStarError::WorkerWNotFound)?;
         // D-013: 从缓存获取显示器列表（5s TTL），避免每次调用 enumerate_displays()。
         // clone 一份 Vec 以释放 &mut self 借用，使后续 self.active_wallpapers.insert 可用。
         let displays: Vec<DisplayInfo> = self.get_cached_displays().to_vec();
         worker_w::embed_wallpaper(hwnd, workerw_hwnd, display_id, arrangement, &displays)?;
+        // raised desktop 下保证 WorkerW 位于 Progman 子窗口最底层（否则壁纸会盖住桌面图标）。
+        worker_w::ensure_workerw_zorder(progman_hwnd, workerw_hwnd);
         self.active_wallpapers
             .insert(display_id.to_string(), (hwnd, arrangement));
         tracing::info!(display_id, hwnd = hwnd.0 as isize, "壁纸窗口已嵌入桌面");

@@ -31,8 +31,21 @@ const UNICODE_STRING_MAX_CHARS: usize = 32767;
 /// 发送此消息给 Progman 窗口会触发其创建 WorkerW 层，用于嵌入壁纸窗口。
 const WM_SPAWN_WORK: u32 = 0x052C;
 
+/// WM_SPAWN_WORK 的 WPARAM 参数
+///
+/// 对齐 Lively Wallpaper / electron-as-wallpaper 的实现：使用 0xD 而非 0，
+/// 以在 Windows 11 24H2/25H2 的 raised desktop 下正确触发 WorkerW 创建。
+const WM_SPAWN_WORK_WPARAM: usize = 0xD;
+
+/// WM_SPAWN_WORK 的 LPARAM 参数
+///
+/// 对齐 Lively Wallpaper / electron-as-wallpaper 的实现：使用 0x1 而非 0。
+const WM_SPAWN_WORK_LPARAM: isize = 0x1;
+
 /// WM_SPAWN_WORK 消息超时（ms），用于 SendMessageTimeoutW 调用（D-012）
-const WM_SPAWN_WORK_TIMEOUT_MS: u32 = 200;
+///
+/// 1000ms：给 Progman 足够时间创建子 WorkerW（raised desktop 下创建较慢）。
+const WM_SPAWN_WORK_TIMEOUT_MS: u32 = 1000;
 
 /// find_child_by_class 递归查找子窗口的最大深度
 ///
@@ -71,10 +84,71 @@ fn is_workerw_class(hwnd: HWND) -> bool {
     len > 0 && eq_wide(&class_buf, len as usize, WORKERW_CLASS_WIDE)
 }
 
+/// 判断扩展窗口样式中是否含 `WS_EX_NOREDIRECTIONBITMAP`。
+///
+/// Windows 11 raised desktop 下 Progman 带此扩展样式（无重定向位图），
+/// 可据此区分新旧桌面层级结构。
+fn has_noredirection_bitmap(ex_style: u32) -> bool {
+    ex_style & WS_EX_NOREDIRECTIONBITMAP.0 != 0
+}
+
+/// 判断指定 Progman 窗口是否处于 Windows 11 raised desktop 模式。
+///
+/// raised desktop 的标志：Progman 带 `WS_EX_NOREDIRECTIONBITMAP` 扩展样式，
+/// 此时 `SHELLDLL_DefView` 是其 `WS_EX_LAYERED` 子窗口，承载壁纸的 WorkerW
+/// 变成 Progman 的直接子窗口（不再有顶层兄弟 WorkerW）。
+pub fn progman_is_raised_desktop(progman: HWND) -> bool {
+    // SAFETY: GetWindowLongPtrW 仅读取指定窗口的扩展样式，不修改窗口状态。
+    unsafe { has_noredirection_bitmap(GetWindowLongPtrW(progman, GWL_EXSTYLE) as u32) }
+}
+
+/// 判断当前桌面是否处于 Windows 11 raised desktop 模式。
+///
+/// 内部查找 Progman 窗口；找不到或句柄无效时返回 `false`（不 panic、不记 error）。
+pub fn is_raised_desktop() -> bool {
+    // SAFETY: FindWindowW 仅查找窗口，不修改任何窗口状态。
+    match unsafe { FindWindowW(windows::core::w!("Progman"), None) } {
+        Ok(progman) if !progman.is_invalid() => progman_is_raised_desktop(progman),
+        _ => false,
+    }
+}
+
+/// 查找 Progman 的直接子 WorkerW（raised desktop 下的壁纸承载层）。
+///
+/// 旧层级中 WorkerW 是 Progman 的顶层兄弟窗口；raised desktop 下 WorkerW
+/// 改为 Progman 的直接子窗口，需用 `FindWindowExW(progman, ...)` 查找。
+/// 句柄有效且类名确为 WorkerW 时返回 `Some`，否则返回 `None`。
+fn find_progman_child_workerw(progman: HWND) -> Option<HWND> {
+    // SAFETY: FindWindowExW 仅查找子窗口，不修改窗口状态。
+    let Ok(workerw) = (unsafe {
+        FindWindowExW(
+            progman,
+            HWND::default(),
+            windows::core::w!("WorkerW"),
+            None,
+        )
+    }) else {
+        return None;
+    };
+    if !workerw.is_invalid() && is_workerw_class(workerw) {
+        Some(workerw)
+    } else {
+        None
+    }
+}
+
 /// 单次尝试查找 Progman 和 WorkerW 窗口句柄（无重试、无 sleep）
 ///
-/// 执行完整的查找流程：FindWindowW(Progman) → EnumWindows → SendMessageTimeoutW(WM_SPAWN_WORK) → EnumWindows → fallback。
-/// 适用于在持有 desktop 锁时调用，单次执行时间约 5ms（典型）至 200ms（SendMessageTimeoutW 超时）。
+/// 按桌面层级分流两条查找路径：
+///
+/// - 旧层级（`raised == false`）：FindWindowW(Progman) → Progman 直查（SHELLDLL_DefView 父窗口为
+///   WorkerW / 顶层兄弟 WorkerW）→ 顶层 EnumWindows → SendMessageTimeoutW(WM_SPAWN_WORK) →
+///   再次 EnumWindows → fallback。
+/// - raised desktop（Progman 带 `WS_EX_NOREDIRECTIONBITMAP`）：只探测 Progman 的直接子 WorkerW
+///   （发送 `0x052C` 前后各一次），跳过顶层兄弟 WorkerW 与全部顶层 `EnumWindows`，
+///   避免误选第三方壁纸工具创建的顶层 WorkerW。
+///
+/// 适用于在持有 desktop 锁时调用，单次执行时间约 5ms（典型）至 1000ms（SendMessageTimeoutW 超时）。
 /// 重试逻辑（含 sleep）由调用方在释放锁后执行，以避免持锁 sleep 阻塞其他 desktop 访问者。
 ///
 /// D-007: EnumWindows 失败时记录 warn 日志（错误码），避免静默吞错。
@@ -94,60 +168,81 @@ pub fn find_workerw_no_retry() -> Result<(HWND, HWND), MirrorStarError> {
             ));
         }
 
+        // Windows 11 24H2/25H2 raised desktop 下，WorkerW 是 Progman 的直接子窗口，
+        // 旧层级的“顶层兄弟 WorkerW / 顶层 EnumWindows”路径不适用，且可能误命中
+        // 第三方壁纸工具创建的顶层 WorkerW，因此 raised 下只走子窗口探测。
+        let raised = progman_is_raised_desktop(progman_hwnd);
+
         // v5.0 D-PERF-002: Progman 直查快速路径
         // SHELLDLL_DefView 通常直接挂在 Progman 下，先直查 Progman 子窗口，
         // 命中则取其父窗口（WorkerW）或 Progman 的兄弟 WorkerW，将 EnumWindows
         // 退化为极少触发的 fallback。直查失败时静默退回 EnumWindows 全量扫描，不报错。
-        if let Ok(shelldll) = FindWindowExW(
-            progman_hwnd,
-            HWND::default(),
-            windows::core::w!("SHELLDLL_DefView"),
-            None,
-        ) {
-            if !shelldll.is_invalid() {
-                // SHELLDLL_DefView 的父窗口可能是 WorkerW（WM_SPAWN_WORK 后）或 Progman（之前）
-                // GetAncestor 返回 HWND（无效时为 default），非 Result。
-                let parent = GetAncestor(shelldll, GA_PARENT);
-                if !parent.is_invalid() && parent != progman_hwnd && is_workerw_class(parent) {
-                    tracing::debug!(
-                        progman = progman_hwnd.0 as isize,
-                        workerw = parent.0 as isize,
-                        "D-PERF-002: Progman 直查命中（SHELLDLL_DefView 父窗口为 WorkerW）"
-                    );
-                    return Ok((progman_hwnd, parent));
-                }
-                // 父窗口是 Progman 或验证失败，尝试找 Progman 的兄弟 WorkerW
-                if let Ok(workerw_hwnd) = FindWindowExW(
-                    HWND::default(),
-                    progman_hwnd,
-                    windows::core::w!("WorkerW"),
-                    None,
-                ) {
-                    if !workerw_hwnd.is_invalid() && is_workerw_class(workerw_hwnd) {
+        if !raised {
+            if let Ok(shelldll) = FindWindowExW(
+                progman_hwnd,
+                HWND::default(),
+                windows::core::w!("SHELLDLL_DefView"),
+                None,
+            ) {
+                if !shelldll.is_invalid() {
+                    // SHELLDLL_DefView 的父窗口可能是 WorkerW（WM_SPAWN_WORK 后）或 Progman（之前）
+                    // GetAncestor 返回 HWND（无效时为 default），非 Result。
+                    let parent = GetAncestor(shelldll, GA_PARENT);
+                    if !parent.is_invalid() && parent != progman_hwnd && is_workerw_class(parent) {
                         tracing::debug!(
                             progman = progman_hwnd.0 as isize,
-                            workerw = workerw_hwnd.0 as isize,
-                            "D-PERF-002: Progman 直查命中（FindWindowExW 找到兄弟 WorkerW）"
+                            workerw = parent.0 as isize,
+                            "D-PERF-002: Progman 直查命中（SHELLDLL_DefView 父窗口为 WorkerW）"
                         );
-                        return Ok((progman_hwnd, workerw_hwnd));
+                        return Ok((progman_hwnd, parent));
+                    }
+                    // 父窗口是 Progman 或验证失败，尝试找 Progman 的兄弟 WorkerW
+                    if let Ok(workerw_hwnd) = FindWindowExW(
+                        HWND::default(),
+                        progman_hwnd,
+                        windows::core::w!("WorkerW"),
+                        None,
+                    ) {
+                        if !workerw_hwnd.is_invalid() && is_workerw_class(workerw_hwnd) {
+                            tracing::debug!(
+                                progman = progman_hwnd.0 as isize,
+                                workerw = workerw_hwnd.0 as isize,
+                                "D-PERF-002: Progman 直查命中（FindWindowExW 找到兄弟 WorkerW）"
+                            );
+                            return Ok((progman_hwnd, workerw_hwnd));
+                        }
                     }
                 }
             }
         }
-        // Progman 直查失败，退回 EnumWindows 全量扫描（原有逻辑）
+        // 非 raised desktop 下 Progman 直查失败时退回 EnumWindows 全量扫描（原有逻辑）；raised 下不执行顶层枚举
+
+        // Progman 直查未命中时（与 SHELLDLL_DefView 是否存在无关），探测 Progman 的
+        // 直接子 WorkerW：raised desktop 下这是唯一有效承载层；旧层级下该探测通常不命中，
+        // 不影响后续 Step 2/4/5 的原有顺序。
+        if let Some(w) = find_progman_child_workerw(progman_hwnd) {
+            tracing::debug!(
+                progman = progman_hwnd.0 as isize,
+                workerw = w.0 as isize,
+                "raised desktop: 找到 Progman 直接子 WorkerW"
+            );
+            return Ok((progman_hwnd, w));
+        }
 
         // Step 2: Try to find WorkerW without sending message (it may already exist)
-        let mut workerw_hwnd: Option<HWND> = None;
-        let workerw_hwnd_ptr = LPARAM(&mut workerw_hwnd as *mut Option<HWND> as isize);
-        let workerw_hwnd = try_enum_windows(
-            Some(find_workerw_callback),
-            workerw_hwnd_ptr,
-            "Step 2: 直接查找 WorkerW",
-        )?;
+        if !raised {
+            let mut workerw_hwnd: Option<HWND> = None;
+            let workerw_hwnd_ptr = LPARAM(&mut workerw_hwnd as *mut Option<HWND> as isize);
+            let workerw_hwnd = try_enum_windows(
+                Some(find_workerw_callback),
+                workerw_hwnd_ptr,
+                "Step 2: 直接查找 WorkerW",
+            )?;
 
-        if let Some(w) = workerw_hwnd {
-            tracing::debug!(workerw = w.0 as isize, "直接找到 WorkerW 窗口");
-            return Ok((progman_hwnd, w));
+            if let Some(w) = workerw_hwnd {
+                tracing::debug!(workerw = w.0 as isize, "直接找到 WorkerW 窗口");
+                return Ok((progman_hwnd, w));
+            }
         }
 
         // Step 3: SendMessageTimeoutW(progman_hwnd, WM_SPAWN_WORK, ...) to trigger WorkerW creation
@@ -160,46 +255,62 @@ pub fn find_workerw_no_retry() -> Result<(HWND, HWND), MirrorStarError> {
         let _ = SendMessageTimeoutW(
             progman_hwnd,
             WM_SPAWN_WORK,
-            WPARAM(0),
-            LPARAM(0),
+            WPARAM(WM_SPAWN_WORK_WPARAM),
+            LPARAM(WM_SPAWN_WORK_LPARAM),
             SMTO_NORMAL | SMTO_ABORTIFHUNG,
             WM_SPAWN_WORK_TIMEOUT_MS,
             None,
         );
 
-        // Step 4: Try EnumWindows again (WorkerW may have been created)
-        let mut workerw_hwnd: Option<HWND> = None;
-        let workerw_hwnd_ptr = LPARAM(&mut workerw_hwnd as *mut Option<HWND> as isize);
-        let workerw_hwnd = try_enum_windows(
-            Some(find_workerw_callback),
-            workerw_hwnd_ptr,
-            "Step 4: 发送 WM_SPAWN_WORK 后查找 WorkerW",
-        )?;
+        // Step 4: 再次查找 WorkerW（raised desktop 下仅做 Progman 子窗口探测，非 raised 额外做 EnumWindows）
 
-        if let Some(workerw_hwnd) = workerw_hwnd {
+        // 先探测一次 Progman 的直接子 WorkerW：raised desktop 下 WM_SPAWN_WORK 创建的就是该子窗口（唯一候选），
+        // 旧层级下通常不命中，不影响后续 EnumWindows。
+        if let Some(w) = find_progman_child_workerw(progman_hwnd) {
             tracing::debug!(
-                workerw = workerw_hwnd.0 as isize,
-                "发送 WM_SPAWN_WORK 后找到 WorkerW 窗口"
+                progman = progman_hwnd.0 as isize,
+                workerw = w.0 as isize,
+                "raised desktop: 发送 WM_SPAWN_WORK 后找到 Progman 直接子 WorkerW"
             );
-            return Ok((progman_hwnd, workerw_hwnd));
+            return Ok((progman_hwnd, w));
+        }
+
+        if !raised {
+            let mut workerw_hwnd: Option<HWND> = None;
+            let workerw_hwnd_ptr = LPARAM(&mut workerw_hwnd as *mut Option<HWND> as isize);
+            let workerw_hwnd = try_enum_windows(
+                Some(find_workerw_callback),
+                workerw_hwnd_ptr,
+                "Step 4: 发送 WM_SPAWN_WORK 后查找 WorkerW",
+            )?;
+
+            if let Some(workerw_hwnd) = workerw_hwnd {
+                tracing::debug!(
+                    workerw = workerw_hwnd.0 as isize,
+                    "发送 WM_SPAWN_WORK 后找到 WorkerW 窗口"
+                );
+                return Ok((progman_hwnd, workerw_hwnd));
+            }
         }
 
         // Step 5: Fallback - 查找所有 WorkerW 窗口
-        let mut fallback_workerw_hwnd: Option<HWND> = None;
-        let fallback_workerw_hwnd_ptr =
-            LPARAM(&mut fallback_workerw_hwnd as *mut Option<HWND> as isize);
-        let fallback_workerw_hwnd = try_enum_windows(
-            Some(find_workerw_fallback_callback),
-            fallback_workerw_hwnd_ptr,
-            "Step 5: 备用方法查找 WorkerW",
-        )?;
+        if !raised {
+            let mut fallback_workerw_hwnd: Option<HWND> = None;
+            let fallback_workerw_hwnd_ptr =
+                LPARAM(&mut fallback_workerw_hwnd as *mut Option<HWND> as isize);
+            let fallback_workerw_hwnd = try_enum_windows(
+                Some(find_workerw_fallback_callback),
+                fallback_workerw_hwnd_ptr,
+                "Step 5: 备用方法查找 WorkerW",
+            )?;
 
-        if let Some(workerw_hwnd) = fallback_workerw_hwnd {
-            tracing::debug!(
-                workerw = workerw_hwnd.0 as isize,
-                "备用方法找到 WorkerW 窗口"
-            );
-            return Ok((progman_hwnd, workerw_hwnd));
+            if let Some(workerw_hwnd) = fallback_workerw_hwnd {
+                tracing::debug!(
+                    workerw = workerw_hwnd.0 as isize,
+                    "备用方法找到 WorkerW 窗口"
+                );
+                return Ok((progman_hwnd, workerw_hwnd));
+            }
         }
 
         Err(MirrorStarError::WorkerWNotFound)
@@ -421,6 +532,60 @@ fn calculate_per_monitor_child_coords(
     )
 }
 
+/// 保证 raised desktop 下 WorkerW 位于 Progman 子窗口 z-order 的最底层。
+///
+/// Windows 11 24H2/25H2 的 raised desktop 下，壁纸承载 WorkerW 是 Progman 的
+/// 直接子窗口，而桌面图标层 `SHELLDLL_DefView` 也挂在 Progman 下。WorkerW 必须
+/// 是 Progman 的最后一个（最底）子窗口，否则壁纸窗口会盖住桌面图标。
+///
+/// 仅对 raised desktop 生效：旧层级（WorkerW 为顶层兄弟窗口）直接返回，
+/// 零行为变更。本函数为 best-effort：`SetWindowPos` 失败仅记录 warn，不返回 Err。
+pub fn ensure_workerw_zorder(progman: HWND, workerw: HWND) {
+    if !progman_is_raised_desktop(progman) {
+        return;
+    }
+
+    // EnumChildWindows 会递归枚举子孙窗口（壁纸宿主已挂到 WorkerW 时 last_child 永远不是 WorkerW），
+    // 因此这里改用 GetWindow 只遍历 Progman 的直接子窗口：
+    // GW_CHILD 取首个（最上层）直接子窗口，GW_HWNDLAST 在同一层级内取最底层兄弟。
+    // SAFETY: GetWindow 仅查询窗口关系，不修改窗口状态。
+    if let Ok(first_child) = unsafe { GetWindow(progman, GW_CHILD) } {
+        if !first_child.is_invalid() {
+            // SAFETY: first_child 是 Progman 的直接子窗口，GW_HWNDLAST 返回同层级最底层兄弟。
+            if let Ok(last_child) = unsafe { GetWindow(first_child, GW_HWNDLAST) } {
+                if last_child == workerw {
+                    return;
+                }
+            }
+        }
+    }
+
+    // SAFETY: SetWindowPos 仅调整 z-order，不移动、不改变大小、不激活窗口。
+    match unsafe {
+        SetWindowPos(
+            workerw,
+            HWND_BOTTOM,
+            0,
+            0,
+            0,
+            0,
+            SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
+        )
+    } {
+        Ok(()) => tracing::debug!(
+            progman = progman.0 as isize,
+            workerw = workerw.0 as isize,
+            "raised desktop: 已将 WorkerW 置为 Progman 最底层子窗口"
+        ),
+        Err(e) => tracing::warn!(
+            progman = progman.0 as isize,
+            workerw = workerw.0 as isize,
+            error = %e,
+            "raised desktop: 调整 WorkerW z-order 失败（壁纸可能遮挡桌面图标）"
+        ),
+    }
+}
+
 /// 将壁纸窗口嵌入到 WorkerW 层
 ///
 /// `displays` 参数由调用方传入（D-013：在 `DesktopIntegrator` 层缓存显示器列表
@@ -576,7 +741,14 @@ pub fn restore_system_wallpaper(path: &str) -> Result<(), MirrorStarError> {
 ///
 /// best-effort 操作：内部调用 `restore_system_wallpaper`，失败时仅记录 warn 日志，
 /// 不向上传播错误（用于 `restore_original_wallpaper` 的 None 分支降级兜底）。
+///
+/// raised desktop 下 `SPI_SETDESKWALLPAPER` 会销毁当前承载动态壁纸的 WorkerW
+/// （参考 Lively Wallpaper 的 RefreshDesktop 早退实现），因此直接返回。
 pub fn refresh_desktop() {
+    if is_raised_desktop() {
+        tracing::debug!("raised desktop 下跳过 refresh_desktop：SPI_SETDESKWALLPAPER 会销毁当前 WorkerW");
+        return;
+    }
     if let Some(current) = get_system_wallpaper() {
         if let Err(e) = restore_system_wallpaper(&current) {
             tracing::warn!(error = %e, "refresh_desktop 恢复壁纸失败（best-effort，已忽略）");
@@ -601,6 +773,27 @@ pub(crate) fn compute_retry_wait_ms(i: u32) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── has_noredirection_bitmap 纯函数测试 ─────────────────────────────
+    //
+    // raised desktop 判定依赖 WS_EX_NOREDIRECTIONBITMAP 扩展样式位，
+    // 此处仅覆盖纯位运算逻辑，不依赖交互式桌面环境。
+
+    #[test]
+    fn has_noredirection_bitmap_zero_style_returns_false() {
+        assert!(!has_noredirection_bitmap(0));
+    }
+
+    #[test]
+    fn has_noredirection_bitmap_flag_returns_true() {
+        assert!(has_noredirection_bitmap(WS_EX_NOREDIRECTIONBITMAP.0));
+    }
+
+    #[test]
+    fn has_noredirection_bitmap_with_other_flags_returns_true() {
+        let ex_style = WS_EX_NOREDIRECTIONBITMAP.0 | WS_EX_TRANSPARENT.0;
+        assert!(has_noredirection_bitmap(ex_style));
+    }
 
     // ── compute_retry_wait_ms 纯函数测试 ────────────────────────────────
     //

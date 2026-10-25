@@ -12,8 +12,8 @@ desktop 模块负责将壁纸窗口嵌入 Windows 桌面的 WorkerW 层（位于
 
 核心功能与设计模式：
 
-- WorkerW 发现：`find_workerw_no_retry` 通过 `FindWindowW(Progman)` + Progman 直查快速路径（D-PERF-002）+ `EnumWindows`（`try_enum_windows` 封装）+ `SendMessageTimeoutW(0x052C)` 多策略查找
-- 窗口嵌入：`SetParent` 将壁纸窗口挂到 WorkerW 下；PerMonitor 分支使用 `calculate_per_monitor_child_coords` 处理负坐标偏移（D-002）
+- WorkerW 发现：`find_workerw_no_retry` 通过 `FindWindowW(Progman)` + Progman 直查快速路径（D-PERF-002）+ `EnumWindows`（`try_enum_windows` 封装）+ `SendMessageTimeoutW(0x052C)` 多策略查找；Windows 11 raised desktop（24H2/25H2）下额外以 `FindWindowExW(Progman, …)` 探测 Progman 的直接子 WorkerW（见 1.4）
+- 窗口嵌入：`SetParent` 将壁纸窗口挂到 WorkerW 下；PerMonitor 分支使用 `calculate_per_monitor_child_coords` 处理负坐标偏移（D-002）；raised desktop 下嵌入成功后调用 `ensure_workerw_zorder` 将 WorkerW 置为 Progman 最底层子窗口（防遮挡桌面图标）
 - 原生壁纸 API：`SystemParametersInfoW` + 注册表读写（`RegistryGuard` 事务回滚守卫，D01）
 - 多显示器枚举：`EnumDisplayMonitors` 回调收集所有显示器，带 5s TTL 缓存（D-013）
 - Explorer 重启检测：`TaskbarCreated` 消息 + 5 分钟兜底轮询；`is_workerw_valid` 同时校验 progman/workerw（D-006）
@@ -34,6 +34,18 @@ desktop 模块负责将壁纸窗口嵌入 Windows 桌面的 WorkerW 层（位于
 ### 1.3 测试覆盖
 
 测试分布存在明显倾斜：mod.rs（~440 行测试，含大量 `include_str!` 文档化断言）、worker_w.rs（~330 行测试，含纯函数测试与 Progman 烟雾测试）、native_wallpaper.rs（~290 行测试，含注册表 round-trip 与事务回滚集成测试）、window.rs（~95 行测试，全为 `#[ignore]` Progman 烟雾测试）。涉及 Win32 API 的失败分支普遍通过 `include_str!` 模式断言源码标记验证，无法在 CI 中可靠触发真实失败分支。
+
+### 1.4 Windows 11 raised desktop 兼容（2026-10）
+
+Windows 11 24H2/25H2 的 raised desktop 改变了桌面层级：`Progman` 带 `WS_EX_NOREDIRECTIONBITMAP` 扩展样式，承载壁纸的 `WorkerW` 变为 `Progman` 的直接子窗口，旧层级中的顶层兄弟 `WorkerW` 不存在。模块据此新增以下兼容行为（旧层级逻辑与行为保持不变）：
+
+- **特性检测（不判断系统版本号）**：`progman_is_raised_desktop(progman)` 通过 `GetWindowLongPtrW(Progman, GWL_EXSTYLE) & WS_EX_NOREDIRECTIONBITMAP` 判定；`is_raised_desktop()` 内部 `FindWindowW("Progman")` 后调用前者，找不到 Progman 时返回 `false`。以窗口样式位识别层级形态，避免依据系统 build 号误判。
+- **查找顺序（按层级分流）**：`find_workerw_no_retry` 在非 raised desktop 时旧层级路径逐行不变（`SHELLDLL_DefView` 父窗口为 WorkerW → Progman 兄弟 WorkerW → `EnumWindows` → `0x052C` → 再次 `EnumWindows` → fallback）；raised desktop 下只走 `find_progman_child_workerw`（`FindWindowExW(Progman, NULL, "WorkerW", NULL)` 探测 + `is_workerw_class` 校验类名），在发送 `0x052C` **之前**探测一次、**之后**探测一次，未命中返回 `WorkerWNotFound`，并跳过 `SHELLDLL_DefView` 直查块、顶层兄弟 WorkerW 及 Step 2/4/5 的顶层 `EnumWindows`。该探测与 `SHELLDLL_DefView` 是否存在无关。
+- **`0x052C` 发送参数**：`SendMessageTimeoutW(Progman, 0x052C, WPARAM(0xD), LPARAM(0x1), SMTO_NORMAL | SMTO_ABORTIFHUNG, 1000)`；参数提为 `WM_SPAWN_WORK_WPARAM` / `WM_SPAWN_WORK_LPARAM` 常量，超时提为 `WM_SPAWN_WORK_TIMEOUT_MS = 1000`（raised desktop 下 Progman 创建子 WorkerW 较慢，原 200ms 不足）。
+- **嵌入与 z-order 保障**：嵌入方式不变，仍 `SetParent` 到 WorkerW（raised desktop 下即 Progman 的直接子 WorkerW），不引入 `WS_EX_LAYERED`。raised desktop 下 `SHELLDLL_DefView` 与 WorkerW 同为 Progman 子窗口，WorkerW 必须是最后一个（最底层）子窗口，否则壁纸会遮挡桌面图标；`DesktopIntegrator::embed_wallpaper` 在嵌入成功后调用 `ensure_workerw_zorder(progman, workerw)`：用 `GetWindow(Progman, GW_CHILD)` 取首个（最上层）直接子窗口、再以 `GetWindow(首个直接子窗口, GW_HWNDLAST)` 取最底层直接子窗口（只考察直接子窗口，不递归枚举子孙窗口），若 WorkerW 不是它则 `SetWindowPos(WorkerW, HWND_BOTTOM, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE)` 置底。该函数仅对 raised desktop 生效，best-effort，失败仅 `warn`。
+- **SPI 早退**：raised desktop 下 `SPI_SETDESKWALLPAPER` 会销毁承载动态壁纸的 WorkerW（参考 Lively Wallpaper 的 `RefreshDesktop` 早退实现）。因此 `refresh_desktop()` 在 raised desktop 下记 debug 日志后直接返回；`clear_native_wallpaper()` 同样记 debug 后返回 `Ok(())`，保持调用方既有成功语义（注册表原值保留不影响后续静态壁纸覆盖）。
+- **失效自愈不变**：`is_workerw_valid`（同时校验 progman/workerw，D-006）与 `check_and_reinitialize` / `ensure_workerw_ready` 的重试、重嵌入循环逻辑不变；raised desktop 下重新查找会经上述 Progman 子窗口探测得到新 WorkerW，再走既有 `embed_wallpaper` 流程重新嵌入，并在每次嵌入后重新应用 z-order 保障。
+- **影响边界**：仅涉及 WorkerW 嵌入路径的查找、Z 序与桌面刷新；Native 静态图片路径（`SystemParametersInfoW` + 注册表）与旧层级桌面不受影响。
 
 ## 2. v4.0 审查发现与修复状态（15 项）
 
@@ -120,7 +132,7 @@ desktop 模块经过 v3.0→v3.5 共 5 轮修复（D01-D12），事务回滚契�
 
 **描述**：`SendMessageTimeoutW` 超时参数 `200`（ms）为内联魔法数。
 
-**修复状态**：✅ 已修复于 v4.0 Wave 3B。现提取为命名常量 `WM_SPAWN_WORK_TIMEOUT_MS: u32 = 200`（worker_w.rs:35），并有消除歧义注释。
+**修复状态**：✅ 已修复于 v4.0 Wave 3B。现提取为命名常量 `WM_SPAWN_WORK_TIMEOUT_MS`（worker_w.rs:35），并有消除歧义注释。该常量值已在 2026-10 raised desktop 兼容修复中由 `200` 调整为 `1000`（见 1.4）。
 
 ### [D-013] [Low] [性能] worker_w.rs — `embed_wallpaper` PerMonitor 分支每次调用都全量枚举显示器
 
