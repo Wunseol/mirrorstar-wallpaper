@@ -28,8 +28,12 @@
 //!
 //! # 窗口显隐与前台策略（SubTask 2.6）
 //!
-//! 壳侧**只发送控制消息**，不做任何抢前台调用（全程无 `SetForegroundWindow` /
-//! `SetActiveWindow`）。UI 进程收到 `Show` 后必须以 `SWP_NOACTIVATE` 显示窗口。
+//! 壳侧**只发送控制消息**，不直接操作窗口。UI 收到 `Show` / `Toggle` 后按可见性状态
+//! 显示/还原/隐藏；**用户主动唤起（托盘 / 菜单 / 二次启动）会置前并聚焦**，使任务栏按钮
+//! 恢复「一次点击最小化」的原生语义。跨进程聚焦由壳侧
+//! `AllowSetForegroundWindow(ui_pid)`（仅 UI 已运行时，在托盘事件线程上调用）+ UI 侧 `SetForegroundWindow` 协作完成；受 Windows
+//! 前台锁限制时仅记录日志、不阻断显示。壳侧不感知窗口最终可见性，只依据 UI 上报的
+//! `WindowShown` / `WindowHidden` 维护空闲计时。
 //!
 //! ## 纯净模式 / 全屏检测是否依赖主窗口（结论）
 //!
@@ -41,8 +45,8 @@
 //! - 原"全屏时最小化主窗口 / 退出全屏恢复主窗口"逻辑已随 Task 10 移除——不再有 Tauri
 //!   主窗口需要最小化或恢复。
 //!
-//! 因此不破坏现有前台策略。原生 UI 窗口标题保持"镜星壁纸"并遵守 `SWP_NOACTIVATE`，
-//! 避免其成为前台窗口时被全屏检测误判为全屏应用。
+//! 因此不破坏现有前台策略。原生 UI 窗口标题保持"镜星壁纸"，被全屏检测按标题精确排除，
+//! 因此用户主动唤起时置前聚焦也不会被误判为全屏应用而暂停壁纸。
 //!
 //! # 应用清单（SubTask 2.7）
 //!
@@ -72,6 +76,7 @@ use windows::Win32::System::JobObjects::{
     SetInformationJobObject, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
     JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
 };
+use windows::Win32::UI::WindowsAndMessaging::AllowSetForegroundWindow;
 
 use mirrorstar_core::ui_proto::framing::{write_message, MessageReceiver};
 use mirrorstar_core::ui_proto::{
@@ -95,6 +100,8 @@ pub const IDLE_TICK_SECS: u64 = 30;
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 /// 协议泵轮询间隔：用于在无消息时周期性检查退出/停止条件，避免无限阻塞。
 const PUMP_POLL: Duration = Duration::from_millis(1000);
+/// 托盘左键切换的最小间隔：吞掉双击/系统级重复点击，避免窗口来回闪动。
+const TRAY_TOGGLE_DEBOUNCE: Duration = Duration::from_millis(300);
 
 /// 解析空闲阈值；非法/缺失时回退默认值。
 pub fn idle_timeout_from(value: Option<&str>, default: Duration) -> Duration {
@@ -112,6 +119,19 @@ pub fn idle_timeout_from(value: Option<&str>, default: Duration) -> Duration {
 pub fn should_exit_idle(running: bool, hidden_for: Option<Duration>, timeout: Duration) -> bool {
     running && hidden_for.is_some_and(|d| d >= timeout)
 }
+
+/// 托盘左键切换的防抖判定（纯函数，便于单测）。
+///
+/// 首次点击（`last` 为 `None`）或距上次已满 `min_gap` 时放行。
+fn should_accept_tray_toggle(last: Option<Instant>, now: Instant, min_gap: Duration) -> bool {
+    match last {
+        None => true,
+        Some(last) => now.saturating_duration_since(last) >= min_gap,
+    }
+}
+
+/// 上次托盘左键切换被受理的时刻。
+static LAST_TRAY_TOGGLE: Mutex<Option<Instant>> = Mutex::new(None);
 
 /// 全局单例：在 `run()` 中初始化一次，之后由托盘/事件桥/空闲任务共享。
 static MANAGER: OnceLock<Arc<UiProcessManager>> = OnceLock::new();
@@ -158,8 +178,60 @@ pub fn spawn_idle_tick(manager: Arc<UiProcessManager>) {
 /// 管理器未初始化时仅记录警告（不影响壁纸与托盘）。
 pub fn open_main_window(app: &AppHandle) {
     match manager() {
-        Some(manager) => manager.request_show(app),
+        Some(manager) => {
+            // 仅对已在运行的 UI 进程精确授权；冷启动时 pid 未知，由 UI 侧的
+            // AttachThreadInput 兜底（见 `mirrorstar_ui::focus::activate`）。
+            if let Some(pid) = manager.running_pid() {
+                allow_foreground(pid);
+            }
+            manager.request_show(app);
+        }
         None => tracing::warn!("请求打开主窗口，但 UI 进程管理器未初始化"),
+    }
+}
+
+/// 托盘左键"切换主窗口"的统一入口（显示/还原/置前/隐藏由 UI 判定）。
+///
+/// 含 300ms 防抖：双击或系统级重复点击只受理首次。管理器未初始化时仅记录警告
+/// （不影响壁纸与托盘）。
+pub fn toggle_main_window(app: &AppHandle) {
+    let now = Instant::now();
+    let accepted = {
+        let mut last = LAST_TRAY_TOGGLE
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if should_accept_tray_toggle(*last, now, TRAY_TOGGLE_DEBOUNCE) {
+            *last = Some(now);
+            true
+        } else {
+            false
+        }
+    };
+    if !accepted {
+        tracing::debug!("托盘左键切换在防抖窗口内被忽略");
+        return;
+    }
+    match manager() {
+        Some(manager) => {
+            if let Some(pid) = manager.running_pid() {
+                allow_foreground(pid);
+            }
+            manager.request_toggle(app);
+        }
+        None => tracing::warn!("请求切换主窗口，但 UI 进程管理器未初始化"),
+    }
+}
+
+/// 允许 UI 子进程把主窗口置为前台（按 pid 精确授权，best-effort）。
+///
+/// 必须在**处理用户点击的线程**上调用（托盘事件由 Tauri 主线程派发）：此时进程通常具备
+/// 前台切换权限；若拖到子线程再授权，跨进程置前会被 Windows 前台锁拒绝。
+/// 仅对**已在运行**的 UI 进程授权（冷启动 pid 未知，由 UI 侧 AttachThreadInput 兜底），
+/// 避免使用 `ASFW_ANY` 扩大授权范围。授权失败仅记 DEBUG——窗口仍会正常显示/置前。
+fn allow_foreground(pid: u32) {
+    // SAFETY: 仅向目标进程授予置前权限，不修改任何窗口状态；下一次前台切换后权限自然失效。
+    if let Err(error) = unsafe { AllowSetForegroundWindow(pid) } {
+        tracing::debug!(pid, error = %error, "授权 UI 进程置前失败（窗口仍会显示）");
     }
 }
 
@@ -264,6 +336,18 @@ impl UiProcessManager {
             .is_some()
     }
 
+    /// 当前运行实例的 pid；未运行时 `None`。
+    ///
+    /// 用于托盘路径的**精确前台授权**（`AllowSetForegroundWindow(pid)`）：
+    /// 冷启动时拿不到 pid，交由 UI 侧的 `AttachThreadInput` 兜底。
+    pub fn running_pid(&self) -> Option<u32> {
+        self.inner
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .as_ref()
+            .map(|running| running.pid)
+    }
+
     /// 请求显示主窗口：确保进程已拉起，然后发送 `Show` 控制消息。
     ///
     /// **非阻塞**：拉进程 + 握手在独立线程执行，避免阻塞托盘事件所在的主线程。
@@ -290,6 +374,35 @@ impl UiProcessManager {
             });
         if let Err(e) = spawn {
             tracing::warn!(error = %e, "创建 UI 进程拉起线程失败");
+        }
+    }
+
+    /// 请求切换主窗口：确保进程已拉起，然后发送 `Toggle` 控制消息。
+    ///
+    /// 与 [`Self::request_show`] 的区别：**不调用 `mark_shown`**——窗口最终可见性由 UI
+    /// 侧上报的 `WindowShown` / `WindowHidden` 决定（一次 Toggle 可能隐藏窗口）。
+    /// **非阻塞**：拉进程 + 握手在独立线程执行，避免阻塞托盘事件所在的主线程。
+    pub fn request_toggle(self: &Arc<Self>, app: &AppHandle) {
+        let manager = Arc::clone(self);
+        let app = app.clone();
+        let spawn = std::thread::Builder::new()
+            .name("mirrorstar-ui-toggle".to_string())
+            .spawn(move || match manager.ensure_running(&app) {
+                Ok(pid) => {
+                    tracing::info!(pid, "UI 进程已就绪，发送切换指令");
+                    let toggle = UiMessage::Control(UiControl {
+                        action: ControlAction::Toggle,
+                    });
+                    if let Err(e) = manager.send(&toggle) {
+                        tracing::warn!(error = %e, "发送切换指令失败");
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!(error = %e, exe = %manager.exe.display(), "拉起 UI 进程失败（不影响壁纸与托盘）");
+                }
+            });
+        if let Err(e) = spawn {
+            tracing::warn!(error = %e, "创建 UI 进程切换线程失败");
         }
     }
 
@@ -562,8 +675,11 @@ fn pump_loop(
                     match control.action {
                         ControlAction::WindowHidden => manager.mark_hidden(),
                         ControlAction::WindowShown => manager.mark_shown(),
-                        // Show/Hide/Exit 由壳侧发出，不应从 UI 侧收到；忽略。
-                        ControlAction::Show | ControlAction::Hide | ControlAction::Exit => {}
+                        // Show/Hide/Toggle/Exit 由壳侧发出，不应从 UI 侧收到；忽略。
+                        ControlAction::Show
+                        | ControlAction::Hide
+                        | ControlAction::Toggle
+                        | ControlAction::Exit => {}
                     }
                 }
             }
@@ -611,6 +727,26 @@ mod tests {
         let guard = UiJobGuard::new();
         assert!(guard.is_some(), "Job Object（KILL_ON_JOB_CLOSE）应能创建");
         drop(guard);
+    }
+
+    #[test]
+    fn tray_toggle_debounce_accepts_first_and_after_gap() {
+        let t0 = Instant::now();
+        let gap = Duration::from_millis(300);
+        // 首次（无历史）放行
+        assert!(should_accept_tray_toggle(None, t0, gap));
+        // 299ms 内拒绝
+        assert!(!should_accept_tray_toggle(
+            Some(t0),
+            t0 + Duration::from_millis(299),
+            gap
+        ));
+        // 恰好 300ms 放行
+        assert!(should_accept_tray_toggle(
+            Some(t0),
+            t0 + Duration::from_millis(300),
+            gap
+        ));
     }
 
     #[test]

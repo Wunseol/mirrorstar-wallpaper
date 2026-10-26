@@ -174,6 +174,9 @@ mod tests {
             UiMessage::Control(super::super::message::UiControl {
                 action: super::super::message::ControlAction::Show,
             }),
+            UiMessage::Control(super::super::message::UiControl {
+                action: super::super::message::ControlAction::Toggle,
+            }),
         ]
     }
 

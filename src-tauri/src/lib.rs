@@ -1,5 +1,6 @@
 mod commands;
 mod platform;
+pub mod single_instance;
 mod scheduler;
 mod state;
 // UI 子进程管理器与协议桥（壳模式下托管原生主窗口 UI 子进程）。
@@ -837,6 +838,10 @@ pub fn run() {
                 ui_process::spawn_idle_tick(manager);
             }
 
+            // 二次启动唤起：重复启动程序时通知本实例显示主窗口（主流单实例行为），
+            // 不再只弹「已在运行」对话框；等待线程随进程结束。
+            single_instance::install_listener(app.handle().clone());
+
             // v16-C-008：VolumeControl 降级时 emit `audio-disabled` 通知前端
             // SHARED_APP_HANDLE 刚 set 完，前端监听器在 init() 中注册，
             // emit 时机晚于前端 listenWithCleanup 注册（setup 在 DOMContentLoaded 后），
@@ -988,10 +993,12 @@ pub fn run() {
 
             // Create tray icon
             let mut tray_builder = tauri::tray::TrayIconBuilder::new()
+                .tooltip("镜星壁纸")
                 .menu(&menu)
                 // 关闭左键点击弹菜单（tray-icon 默认 menu_on_left_click=true，会在
-                // WM_LBUTTONUP 时弹出菜单）。左键仅通过 on_tray_icon_event 打开主窗口，
-                // 右键保留系统原生菜单。
+                // WM_LBUTTONUP 时弹出菜单）。左键通过 on_tray_icon_event 纯按窗口可见性
+                // 切换主窗口（可见则隐藏/最小化则还原/已隐藏则显示，不判断前台），
+                // 并有 300ms 防抖；右键保留系统原生菜单。
                 .show_menu_on_left_click(false)
                 .on_menu_event(move |app, event| {
                     match event.id.as_ref() {
@@ -1094,7 +1101,7 @@ pub fn run() {
                     } = event
                     {
                         let app = tray.app_handle();
-                        ui_process::open_main_window(app);
+                        ui_process::toggle_main_window(app);
                     }
                 });
 

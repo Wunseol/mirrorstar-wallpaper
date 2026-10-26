@@ -26,7 +26,7 @@
 //! 3. 同步握手：主线程独占 stdin 读一条 Hello（此刻读取线程尚未接管 stdin）。
 //! 4. 拉起读取线程：**把同一个 `BufReader` 交出去**——握手用的 `BufReader` 可能已预读了
 //!    后续字节，另建 reader 会丢缓冲。
-//! 5. 拉取全量快照：响应经事件循环投递，在 `run_event_loop()` 启动后逐个落地。
+//! 5. 拉取全量快照：响应经事件循环投递，在 `run_event_loop_until_quit()` 启动后逐个落地。
 //! 6. 进入事件循环。
 
 // release 使用 GUI 子系统，避免壳（GUI 进程）拉起本进程时弹出多余的控制台窗口。
@@ -233,6 +233,20 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     apply_static_options(&ui);
 
     install_handlers(&client, &store, &gstate, &add_job, &ui_weak);
+    // 关闭按钮 / Alt+F4：保持"隐藏而非销毁"，上报 `WindowHidden` 以启动壳侧空闲回收，
+    // 并关闭预览释放 mpv / WebView2（与托盘隐藏路径一致）。
+    {
+        let ui_weak_for_close = ui_weak.clone();
+        let client_for_close = Arc::clone(&client);
+        ui.window().on_close_requested(move || {
+            if let Some(ui) = ui_weak_for_close.upgrade() {
+                #[cfg(windows)]
+                preview::close(&ui);
+            }
+            client_for_close.report_visibility(false);
+            slint::CloseRequestResponse::HideWindow
+        });
+    }
     // 网格交互（Task 5）：搜索 / 选中 / 卡片操作 / 拖拽 / 添加按钮。
     install_interaction_handlers(&ui, &client, &store, &gstate, &add_job);
     // 桌面状态轮询补救（Task 9.7.1）：`desktop-status-changed (ok:false)` 后的 2s 轮询。
@@ -358,7 +372,12 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     );
 
     // 窗口初始保持隐藏：由壳侧 `Show` 控制指令驱动显示（窗口显隐权归壳，Task 2.6）。
-    let result = slint::run_event_loop();
+    //
+    // 必须用 `run_event_loop_until_quit()` 而非 `run_event_loop()`：Slint 1.18 的
+    // `Window::hide()` 会 `release_keepalive()`，隐藏最后一个窗口时 `run_event_loop()`
+    // 会直接返回并结束进程——托盘收起主窗口后 UI 进程立即退出，下次点击只能冷启动
+    // 新进程且丢失窗口状态。进程回收统一交给壳侧空闲计时（默认 300s）或 `Exit` 指令。
+    let result = slint::run_event_loop_until_quit();
     log("事件循环已退出，UI 进程正常结束");
     result.map_err(|e| e.into())
 }
@@ -428,7 +447,9 @@ fn install_handlers(
         }));
     }
 
-    // 控制指令：壳侧驱动窗口显隐（Show/Hide 后回报可见性供空闲退出计时），Exit 请求退出。
+    // 控制指令：壳侧驱动窗口显隐（Show / Toggle / Hide 后回报可见性供空闲退出计时），
+    // Exit 请求退出。Show / Toggle 均按窗口**真实状态**（可见 / 最小化 / 前台）分派：
+    // 对已可见窗口重复 `ui.show()` 是空操作，对最小化窗口更不会还原，故必须显式区分。
     {
         let store = Arc::clone(store);
         let gstate = Arc::clone(gstate);
@@ -439,39 +460,75 @@ fn install_handlers(
         let client_for_drop = Arc::clone(client);
         client.set_control_handler(Arc::new(move |action: ControlAction| match action {
             ControlAction::Show => {
+                #[cfg(windows)]
                 if let Some(ui) = ui_weak.upgrade() {
-                    // Task 9.10.2：真正不激活显示——仅在 `ui.show()` 这一瞬间给窗口置
-                    // `WS_EX_NOACTIVATE`（`SW_SHOW` 对带此位的窗口不激活），显示后立刻移除，
-                    // 因此用户此后点击窗口仍能正常输入焦点；全程不调用任何抢前台 API。
-                    #[cfg(windows)]
-                    {
-                        let _no_activate = focus::NoActivateGuard::install(ui.window());
-                        // 显示前把窗口居中到鼠标所在显示器的工作区（best-effort，不抢前台）。
-                        #[cfg(windows)]
-                        window_pos::center_on_cursor_monitor(ui.window());
-                        if let Err(e) = ui.show() {
-                            log(format!("显示窗口失败：{e}"));
-                        }
-                        // 窗口显示后才可能拿到惰性 HWND；显式设置应用图标（幂等，best-effort）。
-                        window_icon::apply(ui.window());
-                    }
-                    #[cfg(not(windows))]
+                    let (visible, minimized) = window_state(&ui);
+                    apply_window_action(
+                        &ui,
+                        focus::decide_show_action(visible, minimized),
+                        &client_for_drop,
+                        &store,
+                        &gstate,
+                        &add_job,
+                    );
+                }
+                #[cfg(not(windows))]
+                if let Some(ui) = ui_weak.upgrade() {
                     if let Err(e) = ui.show() {
                         log(format!("显示窗口失败：{e}"));
                     }
-                    // 窗口显示后才可能拿到原生 HWND，此处挂载文件拖入接收器（幂等）。
                     install_native_drop_target(&ui, &client_for_drop, &store, &gstate, &add_job);
-                    // 显示后布局才给出真实视口高度；此处主动重建一次，`viewport-changed`
-                    // 回调会再以真实高度刷新，二者幂等（窗口无变化时会被跳过）。
                     after_store_change(&ui, &store, &gstate);
                 }
                 client_for_control.report_visibility(true);
+            }
+            ControlAction::Toggle => {
+                // 托盘左键：纯可见性切换（最小化→还原；隐藏→显示；可见→隐藏）。
+                // 不查询系统前台：点击托盘会改变前台，且显示路径不抢焦点，跨进程前台
+                // 判定必然失真，曾导致"可见窗口点托盘只置前、要点两次才收起"。
+                #[cfg(windows)]
+                if let Some(ui) = ui_weak.upgrade() {
+                    let (visible, minimized) = window_state(&ui);
+                    let next = focus::decide_toggle_action(visible, minimized);
+                    log(format!(
+                        "托盘切换窗口：visible={visible} minimized={minimized} action={next:?}"
+                    ));
+                    apply_window_action(&ui, next, &client_for_drop, &store, &gstate, &add_job);
+                    client_for_control.report_visibility(next != focus::WindowAction::Hide);
+                }
+                #[cfg(not(windows))]
+                if let Some(ui) = ui_weak.upgrade() {
+                    let visible = ui.window().is_visible();
+                    let result = if visible { ui.hide() } else { ui.show() };
+                    if let Err(e) = result {
+                        log(format!("切换窗口失败：{e}"));
+                    }
+                    if !visible {
+                        install_native_drop_target(
+                            &ui,
+                            &client_for_drop,
+                            &store,
+                            &gstate,
+                            &add_job,
+                        );
+                        after_store_change(&ui, &store, &gstate);
+                    }
+                    client_for_control.report_visibility(!visible);
+                }
             }
             ControlAction::Hide => {
                 if let Some(ui) = ui_weak.upgrade() {
                     // 隐藏前先关闭预览：释放 mpv / WebView2 与宿主子窗口，杜绝后台残留。
                     #[cfg(windows)]
-                    preview::close(&ui);
+                    apply_window_action(
+                        &ui,
+                        focus::WindowAction::Hide,
+                        &client_for_drop,
+                        &store,
+                        &gstate,
+                        &add_job,
+                    );
+                    #[cfg(not(windows))]
                     let _ = ui.hide();
                 }
                 client_for_control.report_visibility(false);
@@ -505,6 +562,82 @@ fn install_handlers(
             }
             let _ = slint::quit_event_loop();
         }));
+    }
+}
+
+/// 读取主窗口的真实窗口状态：可见性来自 Slint，最小化优先走原生 HWND。
+///
+/// HWND 缺失（窗口尚未创建）时：最小化回退 Slint 自身的 `is_minimized`。
+/// 有意不返回前台状态——托盘切换只按进程内可见性/最小化判定。
+#[cfg(windows)]
+fn window_state(ui: &MainWindow) -> (bool, bool) {
+    let visible = ui.window().is_visible();
+    let minimized = match drop_target::hwnd_of(ui.window()) {
+        Some(hwnd) => focus::is_iconic(hwnd),
+        None => ui.window().is_minimized(),
+    };
+    (visible, minimized)
+}
+
+/// 执行一次窗口动作（Show / Restore / Raise / Hide），Windows 专用。
+///
+/// Show / Restore / Raise 由用户主动唤起触发，会置前并聚焦（任务栏按钮因此可一次点击
+/// 最小化）；Hide 不改变前台。置前聚焦受 Windows 前台锁限制，失败仅记录日志。
+/// 可见性上报由控制回调统一负责。
+#[cfg(windows)]
+fn apply_window_action(
+    ui: &MainWindow,
+    action: focus::WindowAction,
+    client: &Arc<UiClient>,
+    store: &Arc<Mutex<AppStore>>,
+    gstate: &Arc<Mutex<GridUiState>>,
+    add_job: &Arc<Mutex<AddJob>>,
+) {
+    match action {
+        focus::WindowAction::Show => {
+            // 显示前把窗口居中到鼠标所在显示器的工作区（best-effort）。
+            window_pos::center_on_cursor_monitor(ui.window());
+            if let Err(e) = ui.show() {
+                log(format!("显示窗口失败：{e}"));
+            }
+            // 用户主动唤起：显示后置前并聚焦，使任务栏按钮恢复「一次点击最小化」语义。
+            if let Some(hwnd) = drop_target::hwnd_of(ui.window()) {
+                focus::activate(hwnd);
+            }
+            // 窗口显示后才可能拿到惰性 HWND；显式设置应用图标（幂等，best-effort）。
+            window_icon::apply(ui.window());
+            install_native_drop_target(ui, client, store, gstate, add_job);
+            after_store_change(ui, store, gstate);
+        }
+        focus::WindowAction::Restore => {
+            // `SW_RESTORE` 还原到最小化前的尺寸/位置并激活；**禁止居中**。
+            if let Some(hwnd) = drop_target::hwnd_of(ui.window()) {
+                focus::restore_window(hwnd);
+            }
+            if let Err(e) = ui.show() {
+                log(format!("还原窗口失败：{e}"));
+            }
+            // 还原后置前聚焦：与 Show 一致，满足用户主动唤起的意图。
+            if let Some(hwnd) = drop_target::hwnd_of(ui.window()) {
+                focus::activate(hwnd);
+            }
+            window_icon::apply(ui.window());
+            install_native_drop_target(ui, client, store, gstate, add_job);
+            after_store_change(ui, store, gstate);
+        }
+        focus::WindowAction::Raise => {
+            // 不居中、不改尺寸/位置，也不重建内容（几何未变，重建无意义）。
+            // 先无激活置顶兜底，再置前聚焦；聚焦被前台锁拒绝时窗口仍可见且在最上层。
+            if let Some(hwnd) = drop_target::hwnd_of(ui.window()) {
+                focus::raise_no_activate(hwnd);
+                focus::activate(hwnd);
+            }
+        }
+        focus::WindowAction::Hide => {
+            // 与既有隐藏路径一致：先关闭预览（释放 mpv / WebView2 与宿主子窗口）。
+            preview::close(ui);
+            let _ = ui.hide();
+        }
     }
 }
 

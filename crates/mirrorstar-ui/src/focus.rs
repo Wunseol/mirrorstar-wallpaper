@@ -1,115 +1,179 @@
-//! Task 9.10.2：原生 UI 主窗口的**真正不激活显示**。
+//! 主窗口的显示 / 还原 / 置前聚焦策略。
 //!
-//! ## 根因
+//! ## 为什么用户主动唤起时要置前聚焦
 //!
-//! Slint 的 winit 后端在创建窗口时按 `WindowAttributes::default().active = true` 置位
-//! winit 的 `MARKER_ACTIVATE`（winit 0.30 `platform_impl/windows/window.rs`：
-//! `window_flags.set(WindowFlags::MARKER_ACTIVATE, attributes.active)`）。于是首次
-//! `Window::show()`（即 `set_visible(true)`）在 `window_state.rs::apply_diff` 里走
-//! `ShowWindow(SW_SHOW)` 而非 `SW_SHOWNOACTIVATE`，UI 窗口因此被激活、抢为前台窗口。
+//! Windows 任务栏按钮的语义是「窗口在前台 → 一次点击最小化；窗口在后台 → 第一次点击只
+//! 激活，第二次才最小化」。若主窗口显示时不抢焦点，窗口会停留在后台，任务栏按钮就需要
+//! 两次点击才能收起。主流实现（Tauri 官方托盘示例的 `show + set_focus`、Lively Wallpaper
+//! 的 `WM SHOW`）都会在用户主动唤起时把主窗口置为前台。
 //!
-//! 这违反规格 2.6（显示必须 `SWP_NOACTIVATE`），且会让 Tauri 壳的全屏检测把自身前台
-//! 窗口当作"全屏应用"，存在暂停壁纸的风险（`src-tauri/src/platform/fullscreen.rs`）。
+//! 因此本模块的策略是：**用户主动唤起（托盘 / 菜单 / 二次启动）⇒ 置前并聚焦**。
+//! 纯净壁纸模式等非用户主动场景仍禁止任何抢前台 API（见 `mirrorstar-core::pure_mode`）。
 //!
-//! ## 方案：`WS_EX_NOACTIVATE` 瞬时覆盖
+//! ## 跨进程注意点
 //!
-//! winit 未暴露关闭 `active` 的入口，故在应用层补救：显示前给窗口加上
-//! `WS_EX_NOACTIVATE`（`ShowWindow(SW_SHOW)` 对带此位的窗口不会激活它），显示完成后
-//! **立刻移除**该位。该位只覆盖"显示"这一瞬间，因此用户此后点击窗口仍能正常获得输入
-//! 焦点，不会退化成"永远不能聚焦"。
+//! 壳进程持有托盘图标，主窗口属于 `mirrorstar-ui.exe` 子进程。壳侧在 UI 进程已运行时
+//! 按 pid 精确调用 `AllowSetForegroundWindow(ui_pid)`（冷启动时 pid 未知，不授权），
+//! 本进程随后调用 `SetForegroundWindow`；若仍被前台锁拒绝，则用 `AttachThreadInput`
+//! 临时把本线程输入队列附加到当前前台线程后再置前（附加成功即解除），这是跨进程置前的
+//! 标准兜底。二次启动路径由新实例以 `AllowSetForegroundWindow(ASFW_ANY)` 授权（启动者
+//! 持有用户输入）。
 //!
-//! 全程**不调用任何抢前台 API**（无 `SetForegroundWindow` / `SetActiveWindow`）：
-//! 窗口此前的显示路径之所以会抢占前台，仅因 winit 的 `SW_SHOW` 语义；屏蔽该语义后
-//! 前台保持原样。若原窗口是别的应用，显示本窗口不会把前台夺走。
+//! 全屏检测按窗口标题精确排除「镜星壁纸」（`src-tauri/src/platform/fullscreen.rs`），
+//! 因此聚焦主窗口不会被误判为全屏应用而暂停壁纸。
 
 use windows::Win32::Foundation::HWND;
+use windows::Win32::System::Threading::{AttachThreadInput, GetCurrentThreadId};
 use windows::Win32::UI::WindowsAndMessaging::{
-    GetWindowLongPtrW, SetWindowLongPtrW, GWL_EXSTYLE, WS_EX_NOACTIVATE,
+    GetForegroundWindow, GetWindowThreadProcessId, IsHungAppWindow, IsIconic, SetForegroundWindow,
+    SetWindowPos, ShowWindow, HWND_TOP, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SW_RESTORE,
 };
 
-/// `WS_EX_NOACTIVATE` 在 `isize` 扩展样式位中的掩码。
-const NOACTIVATE_MASK: isize = WS_EX_NOACTIVATE.0 as isize;
+// ── 按真实窗口状态分派（托盘左键 Toggle） ───────────────────────────────────
 
-/// 扩展样式是否已置 `WS_EX_NOACTIVATE`。
-fn has_noactivate(ex_style: isize) -> bool {
-    ex_style & NOACTIVATE_MASK != 0
-}
-
-/// 置位 `WS_EX_NOACTIVATE` 后的扩展样式。
-fn with_noactivate(ex_style: isize) -> isize {
-    ex_style | NOACTIVATE_MASK
-}
-
-/// 清除 `WS_EX_NOACTIVATE` 后的扩展样式。
-fn without_noactivate(ex_style: isize) -> isize {
-    ex_style & !NOACTIVATE_MASK
-}
-
-/// 显示期间的"禁止激活"RAII 守卫。
+/// 一次窗口动作：由下面的纯决策函数给出，再由 Win32 辅助执行。
 ///
-/// 构造时给窗口置 `WS_EX_NOACTIVATE`，`Drop` 时清除——从而把该位严格限制在
-/// `ui.show()` 这一瞬间。若窗口原本就已置该位（例如外部环境、兼容模式），则不做改动
-/// 也不在 `Drop` 中清除，避免破坏调用方的既有状态。
-pub struct NoActivateGuard {
-    hwnd: HWND,
-    /// 是否由本守卫置位了 `WS_EX_NOACTIVATE`。
-    added: bool,
+/// `Show` / `Restore` 需要显示路径（居中 / 图标 / 内容重建）并置前聚焦，`Raise` 置前聚焦、
+/// `Hide` 走既有隐藏路径。`Hide` 不改变前台。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WindowAction {
+    /// 已隐藏 → 显示（居中到鼠标所在显示器）并置前聚焦。
+    Show,
+    /// 已最小化 → 还原到最小化前的尺寸/位置并置前聚焦。
+    Restore,
+    /// 已可见 → 置前聚焦，不改几何。
+    Raise,
+    /// 已可见且未最小化 → 隐藏。
+    Hide,
 }
 
-impl NoActivateGuard {
-    /// 对给定窗口句柄安装守卫；句柄无效时返回空守卫（不做任何事）。
-    pub fn new(hwnd: Option<HWND>) -> Self {
-        let Some(hwnd) = hwnd else {
-            return Self {
-                hwnd: HWND::default(),
-                added: false,
-            };
-        };
-        // SAFETY: 句柄来自 Slint 窗口的 raw-window-handle，且本函数在 UI 线程上调用。
-        unsafe {
-            let ex_style = GetWindowLongPtrW(hwnd, GWL_EXSTYLE);
-            if has_noactivate(ex_style) {
-                return Self { hwnd, added: false };
-            }
-            SetWindowLongPtrW(hwnd, GWL_EXSTYLE, with_noactivate(ex_style));
-        }
-        Self { hwnd, added: true }
-    }
-
-    /// 从 Slint 窗口安装守卫（幂等：句柄缺失时退化为空守卫并记日志）。
-    pub fn install(window: &slint::Window) -> Self {
-        let Some(hwnd) = crate::drop_target::hwnd_of(window) else {
-            // 关键前提缺失：无 HWND 就无法屏蔽 `SW_SHOW` 的激活语义，此处显式记录而非静默降级。
-            crate::protocol::log(
-                "显示前未获取到主窗口 HWND：无法置 WS_EX_NOACTIVATE，窗口可能抢占前台",
-            );
-            return Self {
-                hwnd: HWND::default(),
-                added: false,
-            };
-        };
-        let guard = Self::new(Some(hwnd));
-        if guard.added {
-            crate::protocol::log(format!(
-                "不激活显示：已置 WS_EX_NOACTIVATE（HWND=0x{:x}），显示后立即移除",
-                hwnd.0 as usize
-            ));
-        }
-        guard
+/// Show 语义：确保窗口可见（最小化优先还原，已可见仅置前聚焦）。
+pub fn decide_show_action(visible: bool, minimized: bool) -> WindowAction {
+    if minimized {
+        WindowAction::Restore
+    } else if !visible {
+        WindowAction::Show
+    } else {
+        WindowAction::Raise
     }
 }
 
-impl Drop for NoActivateGuard {
-    fn drop(&mut self) {
-        if !self.added {
-            return;
-        }
-        // SAFETY: 同 `new`；`hwnd` 在守卫存活期间由 Slint 窗口持有，不至失效。
-        unsafe {
-            let ex_style = GetWindowLongPtrW(self.hwnd, GWL_EXSTYLE);
-            SetWindowLongPtrW(self.hwnd, GWL_EXSTYLE, without_noactivate(ex_style));
-        }
+/// 托盘切换语义：只按**进程内窗口状态**切换，不查询系统前台。
+///
+/// 判定有意不使用 `GetForegroundWindow()`：本项目的显示路径由用户主动触发，点击托盘
+/// 本身会改变系统前台，等 `Toggle` 经 IPC 抵达 UI 时再查前台必然读到 `false`，
+/// 导致可见窗口永远落到 `Raise`、一次点击收不回窗口（Win10/Win11 均复现）。
+pub fn decide_toggle_action(visible: bool, minimized: bool) -> WindowAction {
+    if minimized {
+        WindowAction::Restore
+    } else if !visible {
+        WindowAction::Show
+    } else {
+        WindowAction::Hide
     }
+}
+
+/// 窗口是否处于最小化状态（只读查询）。
+pub fn is_iconic(hwnd: HWND) -> bool {
+    // SAFETY: 只读查询，不改变任何窗口状态；`IsIconic` 仅读取 `WS_MINIMIZE` 状态。
+    unsafe { IsIconic(hwnd).as_bool() }
+}
+
+/// 还原最小化窗口到最小化前的尺寸/位置并激活（`SW_RESTORE`）。
+///
+/// 仅由用户主动唤起路径调用；纯净模式等禁止抢前台的路径不使用。
+pub fn restore_window(hwnd: HWND) {
+    // SAFETY: `SW_RESTORE` 还原窗口并按用户主动唤起的预期激活它。
+    unsafe {
+        let _ = ShowWindow(hwnd, SW_RESTORE);
+    }
+    crate::protocol::log(format!(
+        "还原窗口：HWND=0x{:x} 已用 SW_RESTORE 还原并激活",
+        hwnd.0 as usize
+    ));
+}
+
+/// 不激活地把窗口置到 Z 序顶部（`SWP_NOACTIVATE`，best-effort）。
+///
+/// 用于聚焦失败时的兜底，保证窗口至少不被其它窗口遮挡。
+pub fn raise_no_activate(hwnd: HWND) {
+    // SAFETY: 仅调整 Z 序；`SWP_NOMOVE | SWP_NOSIZE` 不改几何，`SWP_NOACTIVATE` 不夺前台。
+    let result = unsafe {
+        SetWindowPos(
+            hwnd,
+            HWND_TOP,
+            0,
+            0,
+            0,
+            0,
+            SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
+        )
+    };
+    match result {
+        Ok(()) => crate::protocol::log(format!(
+            "置前窗口：HWND=0x{:x} 已用 SWP_NOACTIVATE 置顶（不激活）",
+            hwnd.0 as usize
+        )),
+        Err(error) => crate::protocol::log(format!("置前窗口：SetWindowPos 失败，跳过：{error}")),
+    }
+}
+
+/// 把窗口置为前台并聚焦；返回是否成功。
+///
+/// 先直接 `SetForegroundWindow`；被 Windows 前台锁拒绝（跨进程唤起时常见且间歇出现）时，
+/// 用 [`attach_and_activate`] 兜底。仍失败时窗口保持可见/置前（由 Show / Restore / Raise
+/// 保证），仅缺键盘焦点，不阻断功能。
+pub fn activate(hwnd: HWND) -> bool {
+    // SAFETY: 只读查询当前前台窗口；随后只改变前台窗口，不修改窗口样式/几何。
+    let foreground = unsafe { GetForegroundWindow() };
+    let direct = unsafe { SetForegroundWindow(hwnd).as_bool() };
+    if direct {
+        crate::protocol::log(format!(
+            "置前聚焦：HWND=0x{:x} 已置为前台（直接）",
+            hwnd.0 as usize
+        ));
+        return true;
+    }
+
+    // SAFETY: 兜底路径内部已处理前台句柄无效 / 前台线程 hung 的情况。
+    let activated = unsafe { attach_and_activate(hwnd, foreground) };
+    if activated {
+        crate::protocol::log(format!(
+            "置前聚焦：HWND=0x{:x} 直接调用被拒（前台 HWND=0x{:x}），AttachThreadInput 兜底成功",
+            hwnd.0 as usize, foreground.0 as usize
+        ));
+    } else {
+        crate::protocol::log(format!(
+            "置前聚焦：HWND=0x{:x} 被前台锁拒绝（前台 HWND=0x{:x}），窗口仍已显示/置前",
+            hwnd.0 as usize, foreground.0 as usize
+        ));
+    }
+    activated
+}
+
+/// 前台锁兜底：临时把本线程输入队列附加到当前前台线程，再尝试置前。
+///
+/// 附加成功后 `SetForegroundWindow` 不再受前台锁限制；无论结果如何都立即解除附加，
+/// 避免长期共享输入队列。前台线程挂起（hung）时直接放弃，防止 `AttachThreadInput` 阻塞。
+///
+/// # Safety
+///
+/// 调用方需保证 `hwnd` 来自本进程窗口；`foreground` 为 `GetForegroundWindow` 的返回值。
+unsafe fn attach_and_activate(hwnd: HWND, foreground: HWND) -> bool {
+    if foreground.0.is_null() || IsHungAppWindow(foreground).as_bool() {
+        return false;
+    }
+    let foreground_thread = GetWindowThreadProcessId(foreground, None);
+    let current_thread = GetCurrentThreadId();
+    if foreground_thread == 0 || foreground_thread == current_thread {
+        return false;
+    }
+    if !AttachThreadInput(current_thread, foreground_thread, true).as_bool() {
+        return false;
+    }
+    let activated = SetForegroundWindow(hwnd).as_bool();
+    let _ = AttachThreadInput(current_thread, foreground_thread, false);
+    activated
 }
 
 #[cfg(test)]
@@ -117,29 +181,37 @@ mod tests {
     use super::*;
 
     #[test]
-    fn noactivate_bit_set_and_clear_roundtrip() {
-        // 起始无该位 → 置位后命中 → 清除后复原。
-        let start: isize = 0;
-        assert!(!has_noactivate(start));
-        let set = with_noactivate(start);
-        assert!(has_noactivate(set));
-        let cleared = without_noactivate(set);
-        assert!(!has_noactivate(cleared));
-        assert_eq!(cleared, start);
+    fn show_action_restores_minimized_window_first() {
+        // 最小化优先：即便 Slint 侧认为可见，也要先还原。
+        assert_eq!(decide_show_action(false, true), WindowAction::Restore);
+        assert_eq!(decide_show_action(true, true), WindowAction::Restore);
     }
 
     #[test]
-    fn noactivate_bit_preserves_other_exstyle_bits() {
-        // 其它扩展样式位（如 WS_EX_TOOLWINDOW=0x80、WS_EX_APPWINDOW=0x40000）不受影响。
-        let other: isize = 0x0004_0080;
-        let set = with_noactivate(other);
-        assert_eq!(set & !NOACTIVATE_MASK, other);
-        assert!(has_noactivate(set));
-        assert_eq!(without_noactivate(set), other);
+    fn show_action_shows_hidden_window() {
+        assert_eq!(decide_show_action(false, false), WindowAction::Show);
     }
 
     #[test]
-    fn already_set_style_is_detected() {
-        assert!(has_noactivate(with_noactivate(0)));
+    fn show_action_raises_visible_window() {
+        assert_eq!(decide_show_action(true, false), WindowAction::Raise);
+    }
+
+    #[test]
+    fn toggle_action_restores_minimized_window_regardless_of_visibility() {
+        // 最小化优先：即便 Slint 侧认为可见，也要先还原而不是隐藏。
+        assert_eq!(decide_toggle_action(true, true), WindowAction::Restore);
+        assert_eq!(decide_toggle_action(false, true), WindowAction::Restore);
+    }
+
+    #[test]
+    fn toggle_action_shows_hidden_window() {
+        assert_eq!(decide_toggle_action(false, false), WindowAction::Show);
+    }
+
+    #[test]
+    fn toggle_action_hides_visible_window() {
+        // 纯可见性切换：只要可见且未最小化就隐藏，不再区分前台/后台。
+        assert_eq!(decide_toggle_action(true, false), WindowAction::Hide);
     }
 }

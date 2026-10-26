@@ -44,7 +44,7 @@ pub type Dispatcher = Arc<dyn Fn(Box<dyn FnOnce() + Send>) -> bool + Send + Sync
 
 /// 生产用投递器：经 Slint 事件循环执行闭包。
 ///
-/// 只要 `MainWindow` 已创建，事件循环 provider 即存在；即使在 `run_event_loop()` 之前调用，
+/// 只要 `MainWindow` 已创建，事件循环 provider 即存在；即使在 `run_event_loop_until_quit()` 之前调用，
 /// 闭包也会被排队，并在事件循环启动后执行——这正是启动期快照响应能正确落地的前提。
 pub fn slint_dispatch() -> Dispatcher {
     Arc::new(|task| slint::invoke_from_event_loop(task).is_ok())

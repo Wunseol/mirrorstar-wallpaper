@@ -15,7 +15,12 @@ fn ensure_single_instance() -> bool {
                 // CreateMutexW returns Ok even if mutex already exists,
                 // need to check GetLastError
                 if GetLastError() == ERROR_ALREADY_EXISTS {
-                    // Already running, show message and exit
+                    // 主流行为：再次启动时唤起已运行实例的主窗口（隐藏→显示、最小化→还原、
+                    // 已可见→置前），不再只弹「已在运行」提示。
+                    if mirrorstar_wallpaper_lib::single_instance::signal_primary_instance() {
+                        return false;
+                    }
+                    // 信号无法送达（主实例尚未创建事件或异常）：回退提示对话框。
                     MessageBoxW(
                         None,
                         windows::core::w!("镜星壁纸已在运行中。"),

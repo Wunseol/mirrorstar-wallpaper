@@ -142,7 +142,7 @@ pub struct UiEvent {
 
 /// 控制动作。本类型**双向**使用（Task 2.5 / 2.6 的窗口生命周期约定）：
 ///
-/// - 服务端（Tauri 壳）→ 客户端：`Show` / `Hide` / `Exit`，驱动 UI 进程显隐与退出；
+/// - 服务端（Tauri 壳）→ 客户端：`Show` / `Hide` / `Toggle` / `Exit`，驱动 UI 进程显隐与退出；
 /// - 客户端（UI 进程）→ 服务端：`WindowHidden` / `WindowShown`，告知壳侧主窗口当前可见性，
 ///   供壳侧空闲退出计时（据此判定"窗口隐藏后超过阈值"）。
 ///
@@ -152,10 +152,15 @@ pub struct UiEvent {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ControlAction {
-    /// 服务端 → 客户端：显示主窗口（**必须不激活**，见 Task 2.6；禁止 `SetForegroundWindow`）。
+    /// 服务端 → 客户端：显示主窗口并置前聚焦（用户主动唤起路径；跨进程聚焦受 Windows
+    /// 前台锁限制，失败仅记日志、不阻断显示）。
     Show,
-    /// 服务端 → 客户端：隐藏主窗口。
+    /// 服务端 → 客户端：隐藏主窗口（不改变前台）。
     Hide,
+    /// 服务端 → 客户端：按主窗口**可见性**切换——可见且未最小化则隐藏；最小化则还原并
+    /// 置前聚焦；已隐藏则显示并置前聚焦。判定不查询 `GetForegroundWindow`（点击托盘会改变
+    /// 系统前台，跨进程前台判定必然失真）。
+    Toggle,
     /// 服务端 → 客户端：请求 UI 进程正常退出（空闲退出 / 应用退出）。
     Exit,
     /// 客户端 → 服务端：主窗口已隐藏（开始空闲计时）。

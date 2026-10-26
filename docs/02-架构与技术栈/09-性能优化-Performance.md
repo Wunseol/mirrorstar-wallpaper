@@ -384,7 +384,7 @@ GIF 内存预算从 200MB 降至 40MB（`MAX_GIF_MEMORY_MB`）。暂停时释放
 | 按需启动 + 空闲退出 | 窗口隐藏超时（默认 300s，`MIRRORSTAR_UI_IDLE_TIMEOUT_SECS`）后整体退出 UI 子进程回收内存，再次请求重新拉起；同一时刻至多一个实例 |
 | 虚拟化网格 | 仅实例化可见区间 ±2 行缓冲，避免全量卡片实例化 |
 | 缩略图直读 | 按本地文件路径直读，不经 IPC 传字节 |
-| 显隐不激活 | `WS_EX_NOACTIVATE` 瞬时覆盖 + `SWP_NOACTIVATE`，不抢前台，避免误触发全屏检测/纯净模式 |
+| 用户主动唤起时置前聚焦 | 托盘 / 菜单 / 二次启动触发时 `SetForegroundWindow`（壳侧先 `AllowSetForegroundWindow`），使任务栏按钮一次点击最小化；纯净模式等非用户主动场景仍禁止抢前台 |
 
 **验收实测结论（对比改造前基线）：**
 
@@ -676,16 +676,16 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass `
 
 | 项目 | 字节 | MiB | 证据 | 压缩后占安装包比例 |
 | ---- | ---- | --- | ---- | ------------------ |
-| NSIS 安装包 | 43,035,835 B | 41.04 MiB | `target/release/bundle/nsis/MirrorStar Wallpaper_0.1.1_x64-setup.exe` | 100% |
+| NSIS 安装包 | 43,048,937 B | 41.05 MiB | `target/release/bundle/nsis/MirrorStar Wallpaper_0.1.2_x64-setup.exe` | 100% |
 | 随包 `mpv/mpv.exe` | 123,164,160 B | 117.46 MiB | bundle resources | 压缩后 ≈ 34.1 MiB，≈ **83%** |
-| 随包 `mirrorstar-ui.exe` | 11,672,576 B | 11.13 MiB | bundle resources | 压缩后 ≈ 4.16 MiB，≈ **10%** |
-| 随包 `mirrorstar-wallpaper.exe` | 9,632,256 B | 9.19 MiB | bundle 主程序 | 压缩后 ≈ 2.79 MiB，≈ **7%** |
+| 随包 `mirrorstar-ui.exe` | 11,689,984 B | 11.15 MiB | bundle resources | 压缩后 ≈ 4.16 MiB，≈ **10%** |
+| 随包 `mirrorstar-wallpaper.exe` | 9,648,128 B | 9.20 MiB | bundle 主程序 | 压缩后 ≈ 2.79 MiB，≈ **7%** |
 | 随包 `mpv/license` | 19,873 B | — | bundle resources | 可忽略 |
-| **未压缩载荷合计** | **144,488,865 B** | **137.8 MiB** | 上列随包载荷求和 | — |
+| **未压缩载荷合计** | **144,522,145 B** | **137.83 MiB** | 上列随包载荷求和 | — |
 
-**压缩证据**：内存内 Deflate(Optimal) 实测压缩率——`mpv.exe` 39.5%、`mirrorstar-ui.exe` 51.0%、主 `mirrorstar-wallpaper.exe` 41.4%；NSIS 采用 LZMA，实压缩比 Deflate 再优约 **26.5%**（安装包 43,035,835 / Deflate 合计 58,528,630 ≈ 0.735）。
+**压缩证据**：内存内 Deflate(Optimal) 实测压缩率——`mpv.exe` 39.5%、`mirrorstar-ui.exe` 51.0%、主 `mirrorstar-wallpaper.exe` 41.4%（v0.1.1 同构载荷基线）；NSIS 采用 LZMA，实压缩比 Deflate 再优约 **26.5%**（v0.1.2 安装包 43,048,937 / Deflate 合计 58,528,630 ≈ 0.736）。
 
-> **版本复核（v0.1.1，2026-10-19）**：上表的安装包与随包 exe 字节数已按 `MirrorStar Wallpaper_0.1.1_x64-setup.exe` 重新打包后复核更新；`mpv.exe` 与 `mpv/license` 未变（未纳入版本控制，体积不可由 git 追溯）。
+> **版本复核（v0.1.2，2026-10-26）**：上表的安装包与随包 exe 字节数已按 `MirrorStar Wallpaper_0.1.2_x64-setup.exe` 重新打包后复核更新（本次实测：安装包 43,048,937 B / 41.05 MiB，`mirrorstar-ui.exe` 11,689,984 B，`mirrorstar-wallpaper.exe` 9,648,128 B）；`mpv.exe` 与 `mpv/license` 未变（未纳入版本控制，体积不可由 git 追溯）。
 
 **主因排序**：
 

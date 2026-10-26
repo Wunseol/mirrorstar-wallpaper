@@ -109,7 +109,7 @@ graph LR
 - 新增 crate `crates/mirrorstar-ui/`（Slint 1.18，编译期绑定软件渲染：`default-features = false` + `renderer-software`）。
 - 壳（`src-tauri/`）不再创建任何 WebView2 主窗口（`app.windows: []`），仅保留托盘、壁纸引擎、轮换调度、命令桥与 UI 子进程管理。
 - 壳 ↔ UI 通过 `mirrorstar-core::ui_proto` 的 NDJSON 行协议 over stdio（`Hello` / `Request` / `Response` / `Event` / `Control`）；业务逻辑仅在壳侧。
-- UI 生命周期：按需启动 + 握手 + 窗口隐藏超时退出 + 单实例；窗口显隐不激活（`WS_EX_NOACTIVATE` / `SWP_NOACTIVATE`）。
+- UI 生命周期：按需启动 + 握手 + 窗口隐藏超时退出 + 单实例；用户主动唤起时置前聚焦（`AllowSetForegroundWindow` + `SetForegroundWindow`），纯净模式等非用户主动场景仍禁止抢前台。
 - 原生虚拟化壁纸网格；四类预览（图片自绘 / 视频进程内 mpv 子窗口 / GIF 逐帧 / 网页按需临时 WebView2 子窗口）。
 - 验收实测：主窗口打开并静置时壳 + UI 合计 private ≈ 16.8MB（门槛 ≤40MB）；关闭后回落 ≈7.6MB；idle CPU ≈0.4%。测试细节见 [测试报告](./05-测试报告-Test-Reports.md)。
 

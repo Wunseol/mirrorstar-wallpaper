@@ -82,7 +82,11 @@ fn ensure_single_instance() -> bool {
             Ok(_mutex) => {
                 // CreateMutexW 返回 Ok 即使 mutex 已存在，需通过 GetLastError 判断
                 if GetLastError() == ERROR_ALREADY_EXISTS {
-                    // 已有实例运行，提示用户并退出
+                    // 主流行为：通知已运行实例显示主窗口（隐藏→显示/最小化→还原/已可见→置前）
+                    if mirrorstar_wallpaper_lib::single_instance::signal_primary_instance() {
+                        return false;
+                    }
+                    // 信号无法送达（主实例仍在早期启动或事件创建失败）：回退提示
                     MessageBoxW(
                         None,
                         windows::core::w!("镜星壁纸已在运行中。"),
@@ -91,8 +95,8 @@ fn ensure_single_instance() -> bool {
                     );
                     return false;
                 }
-                // 互斥体句柄在进程生命周期内保持，进程退出时自动释放
-                let _ = Box::leak(Box::new(_mutex));
+                // windows-rs 0.58 的 HANDLE 无 Drop 行为，进程退出时由系统回收
+                let _ = _mutex;
                 true
             }
             Err(e) => {
@@ -107,8 +111,8 @@ fn ensure_single_instance() -> bool {
 **要点：**
 - 互斥体名称：`MirrorStarWallpaper_SingleInstance`
 - `CreateMutexW` 即使 mutex 已存在也会返回 `Ok`，必须通过 `GetLastError() == ERROR_ALREADY_EXISTS` 判断是否已有实例运行
-- 互斥体句柄通过 `Box::leak` 在进程生命周期内保持，进程退出时系统自动释放
-- 检测到已有实例时弹出 `MessageBoxW` 提示用户并退出
+- 互斥体句柄无 `Drop` 行为，进程退出时由系统自动释放
+- 检测到已有实例时，优先通过命名事件 `MirrorStarWallpaper_ShowMainWindow` 通知主实例显示主窗口（`single_instance::signal_primary_instance`，25ms 间隔重试至 1s），主实例由等待线程 `single_instance::install_listener` 接收后走 `open_main_window`；事件不可用时回退 `MessageBoxW` 提示并退出
 
 ### 1.3 子进程架构
 
@@ -151,7 +155,7 @@ fn ensure_single_instance() -> bool {
 - **通信方式**：与壳进程通过 `mirrorstar-core::ui_proto` 的 **NDJSON 行协议 over stdio** 通信，消息类型 `Hello` / `Request` / `Response` / `Event` / `Control`
 - **职责边界**：仅负责界面呈现与用户交互（壁纸库展示、设置面板、拖放、搜索、虚拟化网格、四类预览）；**不复制业务逻辑、不直接读写配置文件**，所有业务经 `Request` 转发至壳侧处理
 - **生命周期**：按需启动 → 握手（`Hello`）→ 窗口隐藏后按空闲超时（默认 300s，环境变量 `MIRRORSTAR_UI_IDLE_TIMEOUT_SECS`）退出回收内存 → 再次请求可重新拉起；**同一时刻至多一个实例**
-- **窗口显隐不激活**：显示时以 `WS_EX_NOACTIVATE` 瞬时覆盖 + `SWP_NOACTIVATE`，不调用 `SetForegroundWindow` / `SetActiveWindow` 等抢前台 API，避免误触发全屏检测 / 纯净模式；窗口标题保持"镜星壁纸"
+- **用户主动唤起时置前聚焦**：托盘 / 菜单 / 二次启动触发的显示、还原、置前会调用 `SetForegroundWindow`（壳侧先 `AllowSetForegroundWindow(ui_pid)`），使任务栏按钮恢复「一次点击最小化、再一次还原」；受 Windows 前台锁限制时仅记日志。纯净模式等非用户主动场景仍禁止抢前台；窗口标题保持"镜星壁纸"，被全屏检测按标题精确排除
 - **网格与预览**：原生 Slint 虚拟化壁纸网格（固定卡尺寸 + 固定列数，仅实例化可见区间 ±2 行缓冲）；缩略图按本地文件路径直读（不经 IPC 传字节）；图片/GIF 自绘，视频在 UI 进程内 spawn mpv 子窗口，网页按需创建临时 WebView2 子窗口（关闭后 `msedgewebview2.exe` 计数回落 0）
 
 ### 1.4 COM 初始化策略
@@ -270,7 +274,7 @@ MirrorStar 在壳进程与子进程之间使用**三套独立**的通信协议�
   - `Request`：壳 → UI 或 UI → 壳的业务请求（携带 request_id 匹配 `Response`）
   - `Response`：对 `Request` 的应答
   - `Event`：壳 → UI 的异步状态推送（壁纸列表、播放状态、进度等）
-  - `Control`：生命周期控制（如显示 / 隐藏 / 退出）
+  - `Control`：生命周期控制（`Show` / `Hide` / `Toggle` / `Exit`）。`Toggle`（壳 → UI）按主窗口**可见性**分派：可见且未最小化 → 隐藏；最小化 → 还原并置前聚焦；已隐藏或 UI 子进程未运行 → 拉起并显示（居中到鼠标所在显示器）并置前聚焦。判定不查询 `GetForegroundWindow`（点击托盘会改变系统前台，跨进程前台判定必然失真）。置前聚焦由壳侧在托盘事件线程上、仅对已运行的 UI 进程按 pid 精确调用 `AllowSetForegroundWindow(ui_pid)` + UI 侧 `SetForegroundWindow` 协作完成（二次启动由新实例以 `ASFW_ANY` 授权）；仍被前台锁拒绝时用 `AttachThreadInput` 临时附加到前台线程后重试（成功即解除），仍失败仅记日志；`Hide` 不改变前台
 
 **关键澄清：** 这是**三套独立的协议**，不是一个统一协议。mpv 使用 mpv 原生 JSON 协议，wp-proc 使用自定义 `WpProcCommand` 协议（二者走命名管道），壳与 UI 子进程使用 `ui_proto` NDJSON 行协议（走 stdio）。前两者复用了相同的连接重试 + request_id 响应匹配设计模式。
 
@@ -309,10 +313,10 @@ MirrorStar 在壳进程与子进程之间使用**三套独立**的通信协议�
 
 MirrorStar 的主窗口不在应用启动时创建，也不由壳创建任何 WebView2 窗口（`tauri.conf.json` 的 `app.windows` 为 `[]`）：
 
-- **按需启动**：用户点击托盘"打开主窗口"时，壳侧 UI 子进程管理模块 spawn `mirrorstar-ui.exe`，先握手（`Hello`）再显示
+- **按需启动**：用户左键单击托盘图标或选择"打开主窗口"时，壳侧 UI 子进程管理模块 spawn `mirrorstar-ui.exe`，先握手（`Hello`）再显示
 - **空闲退出**：窗口隐藏后按空闲超时（默认 300s，环境变量 `MIRRORSTAR_UI_IDLE_TIMEOUT_SECS`）退出 UI 子进程回收内存（回落至壳内存量级 ≈7.6MB），再次请求可重新拉起
 - **单实例**：同一时刻至多一个 UI 子进程实例
-- **显隐不激活**：窗口显示时以 `WS_EX_NOACTIVATE` 瞬时覆盖 + `SWP_NOACTIVATE`，不调用任何抢前台 API，避免误触发全屏检测 / 纯净模式；窗口标题保持"镜星壁纸"
+- **用户主动唤起时置前聚焦**：显示 / 还原 / 置前路径调用 `SetForegroundWindow`（壳侧先 `AllowSetForegroundWindow(ui_pid)`），使任务栏按钮恢复「一次点击最小化、再一次还原」；受前台锁限制时仅记日志。纯净模式等非用户主动场景仍禁止抢前台；窗口标题保持"镜星壁纸"，被全屏检测按标题精确排除
 
 此策略的优势：
 
@@ -376,7 +380,7 @@ MirrorStar 的主窗口不在应用启动时创建，也不由壳创建任何 We
 | 定义位置 | `mirrorstar-core::ui_proto`（壳与 `mirrorstar-ui` 共享） |
 | 传输方式 | UI 子进程标准输入 / 标准输出（**非**命名管道；同步 stdio 行读写） |
 | 协议格式 | 一行一条 JSON（NDJSON 行协议） |
-| 消息类型 | `Hello`（握手）/ `Request`（业务请求 + request_id）/ `Response`（应答）/ `Event`（壳→UI 异步推送）/ `Control`（生命周期控制） |
+| 消息类型 | `Hello`（握手）/ `Request`（业务请求 + request_id）/ `Response`（应答）/ `Event`（壳→UI 异步推送）/ `Control`（生命周期控制：`Show` / `Hide` / `Toggle` / `Exit`） |
 
 ### 4.3 连接重试（实测自 subprocess_base.rs）
 

@@ -318,13 +318,13 @@ MirrorStar 由 **11 个 `mirrorstar-core` 模块**（真实代码中的 `pub mod
 **已实现：**
 - **24 个 Tauri 命令全部完整实现**（无空操作），均为 `#[tauri::command]` 注解命令；托盘菜单的"暂停/恢复壁纸"复用 `pause_wallpaper`/`resume_wallpaper` 命令：
   `get_wallpapers`, `add_wallpaper`, `generate_thumbnail`, `regenerate_thumbnails`, `remove_wallpaper`, `set_wallpaper`, `pause_wallpaper`, `resume_wallpaper`, `get_config`, `update_config`, `set_volume`, `toggle_mute`, `set_interaction_mode`, `toggle_interaction`, `get_displays`, `get_wallpaper_state`, `open_file_dialog`, `toggle_auto_start`, `get_auto_start_status`, `set_scaling_mode`, `set_speed`, `update_positions`, `check_desktop_status`, `quit_app`
-- 系统托盘（**在 lib.rs setup 中构建（state.rs 管理状态），菜单仅 3 项：打开主窗口 / 暂停-恢复壁纸 / 退出；无音量子菜单、无显示器子菜单**）+ 点击图标显示窗口
-- 单实例保护（Win32 CreateMutexW）
+- 系统托盘（**在 lib.rs setup 中构建（state.rs 管理状态），菜单仅 3 项：打开主窗口 / 暂停-恢复壁纸 / 退出；无音量子菜单、无显示器子菜单**）+ 左键单击图标按主窗口**可见性**切换：可见且未最小化则隐藏、最小化则还原、已隐藏则显示（300ms 防抖；用户主动唤起时置前聚焦，使任务栏按钮恢复一次点击最小化；不判断系统前台）；壳 → UI 控制动作新增 `Toggle`；`Show` 语义为"确保窗口可见并置前聚焦"（隐藏→显示、最小化→还原、已可见→置前聚焦）
+- 单实例保护（Win32 `CreateMutexW`）+ 二次启动唤起（命名事件 `MirrorStarWallpaper_ShowMainWindow`，主实例等待线程收到信号后走 `open_main_window` 并置前聚焦；事件不可用时回退提示对话框）
 - Explorer 重启后台检测（TaskbarCreated 事件驱动 + WorkerW 5 分钟轮询兜底，**无 30 秒轮询**）
 - 全屏应用检测（**纯 SetWinEventHook(EVENT_SYSTEM_FOREGROUND) 事件驱动** + 状态去抖 + 自身窗口排除；**无 2 秒轮询回退**）— **全局暂停/恢复**（`pause_all_fast`），**非按显示器粒度**
 - 退出时壁纸恢复（`perform_shutdown`）
 - 配置热重载已启用
-- 主窗口按需启动原生 UI 子进程（`mirrorstar-ui.exe`），空闲超时退出
+- 主窗口按需启动原生 UI 子进程（`mirrorstar-ui.exe`），事件循环用 `run_event_loop_until_quit()` 保证窗口隐藏后进程存活（`run_event_loop()` 会在隐藏最后一个窗口时返回并结束进程），空闲超时（默认 300s）后由壳侧回收；关闭按钮/Alt+F4 走 `close_requested` 隐藏并上报 `WindowHidden`
 - PerMonitorV2 DPI 感知
 - **COM STA 初始化**：主进程显式调用 `CoInitializeEx(None, COINIT_APARTMENTTHREADED)`（STA），wp-proc 子进程同样使用 STA
 - PauseSender 快速路径（绕过引擎互斥锁）
