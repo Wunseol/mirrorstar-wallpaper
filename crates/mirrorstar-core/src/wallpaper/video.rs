@@ -1,8 +1,16 @@
-use std::sync::{Arc, Mutex};
-use std::time::Instant;
-use windows::Win32::Foundation::HWND;
+use std::sync::{Arc, Mutex, OnceLock};
+use std::time::{Duration, Instant};
+use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, RECT, WPARAM};
 use windows::Win32::System::Com::{CoInitializeEx, CoUninitialize, COINIT_MULTITHREADED};
-use windows::Win32::UI::WindowsAndMessaging::SetWindowPos;
+use windows::Win32::System::LibraryLoader::GetModuleHandleW;
+use windows::Win32::System::Threading::GetCurrentThreadId;
+use windows::Win32::UI::WindowsAndMessaging::{
+    CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, FindWindowExW, GetClientRect,
+    GetMessageW, GetWindow, GetWindowThreadProcessId, PostQuitMessage, PostThreadMessageW,
+    SetWindowPos, TranslateMessage, GW_CHILD, MSG, SWP_ASYNCWINDOWPOS, SWP_NOACTIVATE,
+    SWP_NOSENDCHANGING, SWP_NOZORDER, WM_APP, WM_DESTROY, WM_ERASEBKGND, WM_SHOWWINDOW, WM_SIZE,
+    WS_CLIPCHILDREN, WS_CLIPSIBLINGS, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_POPUP,
+};
 
 use crate::audio::volume::VolumeControl;
 use crate::ipc::mpv_protocol::MpvIpcClient;
@@ -269,6 +277,8 @@ pub struct VideoRenderer {
     muted: bool,
     /// 音量控制器（缓存 COM 接口），测试中可为 None
     volume_control: Option<Arc<Mutex<VolumeControl>>>,
+    /// 视频宿主窗口（mpv 通过 --wid 渲染到它的子窗口；桌面嵌入操作的是宿主）
+    host: Option<VideoHost>,
 }
 
 // SAFETY: VideoRenderer 的 HWND 仅作为值存储，用于 Win32 API 调用。
@@ -276,6 +286,244 @@ pub struct VideoRenderer {
 // MpvIpcClient 使用标准文件 I/O，ProcessManager 的 HANDLE 也是线程安全的。
 // VolumeControl 内部的 COM 接口在 MTA 中可跨线程访问。
 unsafe impl Send for VideoRenderer {}
+
+/// 视频宿主窗口关闭消息（仅宿主线程处理）。
+const WM_VIDEO_HOST_SHUTDOWN: u32 = WM_APP + 1;
+
+/// 等待 mpv 在宿主内创建子窗口的重试次数/间隔（20 × 100ms = 2s，与旧顶层窗口查找预算一致）。
+const VIDEO_HOST_CHILD_FIND_RETRIES: u32 = 20;
+const VIDEO_HOST_CHILD_FIND_INTERVAL_MS: u64 = 100;
+
+static VIDEO_HOST_CLASS_ONCE: OnceLock<()> = OnceLock::new();
+
+/// 视频宿主窗口：由本进程创建并拥有消息循环，mpv 通过 `--wid` 把子窗口挂到它内部。
+///
+/// 为什么需要宿主：
+/// - mpv 以顶层窗口启动时会在嵌入前 ~200ms 出现在任务栏；随包 mpv 0.41 的
+///   `--show-in-taskbar=no` 只在窗口样式刷新时生效，创建期不设置 `WS_EX_TOOLWINDOW`
+///   （实测 exstyle 与未设置该参数时一致），无法阻止该闪现；
+/// - 直接把 mpv 顶层窗口 `SetParent` 到桌面壁纸层还会遇到 `SetParent` 返回 NULL
+///   的二义性，以及把 `WS_EX_LAYERED` 写到 mpv D3D11 输出窗口上的呈现风险。
+///
+/// 宿主是普通 Win32 窗口：创建即隐藏且带 `WS_EX_TOOLWINDOW`，mpv 只创建子窗口，
+/// 因此任务栏/Alt+Tab 永远不会出现 mpv；`embed_wallpaper` 只需操作宿主窗口。
+struct VideoHost {
+    hwnd: HWND,
+    /// 宿主线程 ID：关闭时用 `PostThreadMessageW` 唤醒该线程，避免向可能被
+    /// 系统回收/复用的 HWND 投递消息（Explorer 重启销毁宿主后 HWND 可能复用）。
+    thread_id: u32,
+    thread: Option<std::thread::JoinHandle<()>>,
+}
+
+impl VideoHost {
+    fn spawn() -> Result<Self, crate::MirrorStarError> {
+        let (tx, rx) = std::sync::mpsc::channel::<Result<(isize, u32), String>>();
+        let handle = std::thread::Builder::new()
+            .name("mirrorstar-video-host".to_string())
+            .spawn(move || {
+                let hwnd = match create_video_host_window() {
+                    Ok(h) => h,
+                    Err(e) => {
+                        let _ = tx.send(Err(e.to_string()));
+                        return;
+                    }
+                };
+                let thread_id = unsafe { GetCurrentThreadId() };
+                // 接收端超时/丢弃时销毁窗口，避免宿主线程残留隐藏窗口。
+                if tx.send(Ok((hwnd.0 as isize, thread_id))).is_err() {
+                    unsafe {
+                        let _ = DestroyWindow(hwnd);
+                    }
+                    return;
+                }
+                let mut msg = MSG::default();
+                loop {
+                    let ret = unsafe { GetMessageW(&mut msg, None, 0, 0) };
+                    // 0 = WM_QUIT；-1 = 错误。两者都退出，避免宿主线程悬挂。
+                    if ret.0 <= 0 {
+                        break;
+                    }
+                    // 线程消息（hwnd 为空）：`WM_VIDEO_HOST_SHUTDOWN` 是关闭请求，
+                    // 由创建线程销毁窗口后退出；其它线程消息忽略。
+                    if msg.hwnd.is_invalid() {
+                        if msg.message == WM_VIDEO_HOST_SHUTDOWN {
+                            if let Err(e) = unsafe { DestroyWindow(hwnd) } {
+                                tracing::warn!(error = %e, "视频宿主窗口销毁失败，宿主线程仍退出");
+                            }
+                            // 无论 DestroyWindow 是否成功都退出循环，保证 Drop 的 join 不悬挂；
+                            // 正常销毁时 WM_DESTROY 已 PostQuitMessage，这里直接 break 兼容失败路径。
+                            break;
+                        }
+                        continue;
+                    }
+                    unsafe {
+                        let _ = TranslateMessage(&msg);
+                        DispatchMessageW(&msg);
+                    }
+                }
+            })
+            .map_err(|e| {
+                crate::MirrorStarError::DesktopIntegration(format!("创建视频宿主线程失败: {}", e))
+            })?;
+
+        match rx.recv_timeout(Duration::from_secs(5)) {
+            Ok(Ok((raw, thread_id))) => Ok(Self {
+                hwnd: HWND(raw as *mut _),
+                thread_id,
+                thread: Some(handle),
+            }),
+            Ok(Err(e)) => {
+                let _ = handle.join();
+                Err(crate::MirrorStarError::DesktopIntegration(e))
+            }
+            Err(e) => {
+                // 超时：线程会在 send 失败后自行销毁窗口并退出；此处不 join，
+                // 避免创建卡死时把调用线程一起阻塞。
+                tracing::error!(error = %e, "视频宿主窗口创建超时");
+                Err(crate::MirrorStarError::DesktopIntegration(
+                    "视频宿主窗口创建超时".to_string(),
+                ))
+            }
+        }
+    }
+}
+
+impl Drop for VideoHost {
+    fn drop(&mut self) {
+        if let Some(handle) = self.thread.take() {
+            // 线程已退出（如 Explorer 重启销毁宿主后 WM_DESTROY → 消息循环退出）时
+            // 不再投递关闭消息，避免 HWND/线程 ID 复用导致误发。
+            if !handle.is_finished() {
+                unsafe {
+                    let _ = PostThreadMessageW(
+                        self.thread_id,
+                        WM_VIDEO_HOST_SHUTDOWN,
+                        WPARAM(0),
+                        LPARAM(0),
+                    );
+                }
+            }
+            let _ = handle.join();
+        }
+    }
+}
+
+/// 宿主窗口过程：把 mpv 子窗口拉伸到宿主客户区、避免背景擦除闪烁、响应关闭。
+unsafe extern "system" fn video_host_wnd_proc(
+    hwnd: HWND,
+    msg: u32,
+    wparam: WPARAM,
+    lparam: LPARAM,
+) -> LRESULT {
+    match msg {
+        WM_VIDEO_HOST_SHUTDOWN => {
+            let _ = DestroyWindow(hwnd);
+            // DestroyWindow 已同步触发 WM_DESTROY（其中 PostQuitMessage）；
+            // 这里再补一次，确保 DestroyWindow 失败时消息循环也能退出。
+            PostQuitMessage(0);
+            LRESULT(0)
+        }
+        WM_DESTROY => {
+            PostQuitMessage(0);
+            LRESULT(0)
+        }
+        WM_ERASEBKGND => LRESULT(1),
+        WM_SIZE => {
+            resize_host_child(hwnd);
+            LRESULT(0)
+        }
+        WM_SHOWWINDOW if wparam.0 != 0 => {
+            resize_host_child(hwnd);
+            DefWindowProcW(hwnd, msg, wparam, lparam)
+        }
+        _ => DefWindowProcW(hwnd, msg, wparam, lparam),
+    }
+}
+
+/// 把宿主的第一个子窗口（mpv 的 vo 窗口）拉伸到宿主客户区。
+///
+/// mpv 跨进程监听父窗口的 `EVENT_OBJECT_LOCATIONCHANGE` 自行 resize，但事件投递有延迟；
+/// 宿主线程内的同步 `WM_SIZE` 处理可保证嵌入/SetWindowPos 后子窗口立即铺满。
+unsafe fn resize_host_child(host: HWND) {
+    let Ok(child) = GetWindow(host, GW_CHILD) else {
+        return;
+    };
+    if child.is_invalid() {
+        return;
+    }
+    let mut rect = RECT::default();
+    if GetClientRect(host, &mut rect).is_err() || rect.right <= 0 || rect.bottom <= 0 {
+        return;
+    }
+    let _ = SetWindowPos(
+        child,
+        HWND::default(),
+        0,
+        0,
+        rect.right,
+        rect.bottom,
+        SWP_NOZORDER | SWP_NOACTIVATE | SWP_ASYNCWINDOWPOS | SWP_NOSENDCHANGING,
+    );
+}
+
+fn create_video_host_window() -> Result<HWND, crate::MirrorStarError> {
+    let class = crate::wallpaper::gdi_base::register_window_class_once(
+        &VIDEO_HOST_CLASS_ONCE,
+        windows::core::w!("MirrorStarVideoHost"),
+        video_host_wnd_proc,
+    );
+    let hwnd = unsafe {
+        CreateWindowExW(
+            WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE,
+            class,
+            windows::core::w!("MirrorStarVideoHost"),
+            WS_POPUP | WS_CLIPCHILDREN | WS_CLIPSIBLINGS,
+            0,
+            0,
+            1280,
+            720,
+            HWND::default(),
+            None,
+            GetModuleHandleW(None).unwrap_or_default(),
+            None,
+        )
+    }
+    .map_err(|e| {
+        crate::MirrorStarError::DesktopIntegration(format!("创建视频宿主窗口失败: {}", e))
+    })?;
+    if hwnd.is_invalid() {
+        return Err(crate::MirrorStarError::DesktopIntegration(
+            "创建视频宿主窗口失败: 无效句柄".to_string(),
+        ));
+    }
+    Ok(hwnd)
+}
+
+/// 构造 mpv `--wid` 参数（HWND 十进制整数）。
+fn wid_arg(host: HWND) -> String {
+    format!("--wid={}", host.0 as isize)
+}
+
+/// 等待 mpv 在宿主内创建类名 "mpv" 的子窗口（PID 校验）。
+fn find_mpv_child(host: HWND, pid: u32) -> Option<HWND> {
+    for _ in 0..VIDEO_HOST_CHILD_FIND_RETRIES {
+        if let Ok(child) =
+            unsafe { FindWindowExW(host, HWND::default(), windows::core::w!("mpv"), None) }
+        {
+            if !child.is_invalid() {
+                let mut child_pid = 0u32;
+                unsafe {
+                    let _ = GetWindowThreadProcessId(child, Some(&mut child_pid));
+                }
+                if child_pid == pid {
+                    return Some(child);
+                }
+            }
+        }
+        std::thread::sleep(Duration::from_millis(VIDEO_HOST_CHILD_FIND_INTERVAL_MS));
+    }
+    None
+}
 
 impl VideoRenderer {
     pub fn new(
@@ -293,6 +541,7 @@ impl VideoRenderer {
             volume: 1.0,
             muted: false,
             volume_control,
+            host: None,
         }
     }
 
@@ -325,20 +574,20 @@ impl VideoRenderer {
     pub(crate) fn build_mpv_args(&self) -> Vec<String> {
         let ipc_path = format!(r"\\.\pipe\{}", self.base.pipe_name);
 
-        // 根因 E：mpv 以 --idle=yes 启动（不加载任何文件），窗口嵌入 WorkerW
-        // 壁纸层后再通过 IPC `loadfile` 加载视频文件。
+        // 根因 E + 视频宿主架构：mpv 以 --idle=yes 启动（不加载任何文件），
+        // 通过 `--wid=<视频宿主 HWND>` 把 vo 子窗口挂到本进程创建的隐藏宿主内；
+        // 宿主被嵌入桌面壁纸层后再通过 IPC `loadfile` 加载视频文件。
         //
         // 原实现把视频文件作为命令行参数传给 mpv，mpv 启动即开始解码并创建 4K
         // 视频纹理（约 0.28s）；与此同时主程序调用 SetParent + SetWindowPos 将
-        // mpv 窗口嵌入 WorkerW 壁纸层。窗口在重父化过程中被缩放触发 mpv D3D11
+        // mpv 顶层窗口嵌入 WorkerW 壁纸层。窗口在重父化过程中被缩放触发 mpv D3D11
         // 视频输出重配置，此时创建纹理返回 E_OUTOFMEMORY(0x8007000e)（并非真实
         // 内存不足，而是 swapchain/窗口重父化竞争导致的设备状态异常）→ 桌面黑屏。
-        // 该缺陷与 flip/bitblt 呈现模式无关（已实测两者均复现），根因是纹理创建
-        // 与嵌入窗口 resize 的时序竞争。
+        // 宿主 + --wid 后，mpv 只创建 `WS_CHILD` vo 窗口，嵌入操作只作用于宿主；
+        // 视频纹理在宿主已稳定嵌入后 loadfile 时才创建，无重父化竞争。
         //
-        // 修复方案（mpv-idle-load-test.ps1 已验证）：先 `--idle=yes` 启动空窗口
-        // （无视频、无纹理创建），嵌入完成后通过 IPC loadfile 加载视频。此时纹理
-        // 在窗口已稳定嵌入后才创建，不再有重父化竞争 → 正常渲染、无黑屏。
+        // 修复方案（mpv-idle-load-test.ps1 已验证 idle-load；宿主 + --wid 已用
+        // 随包 mpv 0.41 实测：mpv 不创建任何顶层窗口，子窗口类名仍为 "mpv"）。
         //
         // v10-A 内存优化：禁用 mpv 缓存并限制解码队列上限。
         //
@@ -385,6 +634,15 @@ impl VideoRenderer {
             "--no-terminal".to_string(),
             "--keep-open=no".to_string(),
             "--force-window=yes".to_string(),
+            // Win11 24H2 + 新版 mpv 的边框对齐修复（Lively issue #2415 / commit 7cc4116）：
+            // border=no 让窗口矩形与客户区一致，避免嵌入后屏幕顶部/右侧不刷新。
+            // --wid 子窗口本身无边框，此参数同时用于任何非 --wid 回退路径。
+            "--border=no".to_string(),
+            // 降级防御：随包 mpv 0.41 的 --show-in-taskbar=no 只在窗口样式刷新时生效，
+            // 创建期不会设置 WS_EX_TOOLWINDOW（本机实测与未设置时 exstyle 相同），
+            // 无法单独阻止任务栏闪现。真正的防护是宿主窗口 + --wid：mpv 不再创建
+            // 顶层窗口。保留该参数以兼容未来在创建期应用该选项的 mpv 版本。
+            "--show-in-taskbar=no".to_string(),
             // 根因 F：mpv 窗口创建时不抢占前台焦点（mpv ≥0.40 支持，当前 0.41 满足）。
             // 轮换/全屏恢复冷启动 mpv 时，其满屏窗口（1920x1080）嵌入 WorkerW 前会作为
             // 顶层窗口短暂浮动；默认 focus-on 会让窗口抢占前台，触发
@@ -392,13 +650,9 @@ impl VideoRenderer {
             // 恢复 → 重建 mpv → 再误判 的死循环（主窗口闪屏）。设为 never 后浮动期不再
             // 抢占前台，从源头消除该事件触发。
             "--focus-on=never".to_string(),
-            // 根因 G（轮换闪屏）：--geometry=+32000+32000 离屏定位。mpv 窗口创建即顶层可见
-            // （--force-window=yes），默认居中 960x540 浮动（实证 rect 472:230:976:579，
-            // IsWindowVisible=True），嵌入 WorkerW 前用户可见"窗口闪现"（浮动 ~80-250ms
-            // 直至 find_window_by_class 找到并嵌入）。离屏创建后窗口位于可视屏幕外
-            // （实证 rect 31993,32000，正常渲染），嵌入时由 embed_wallpaper 的
-            // SetWindowPos(0,0,1920,1080) 移回目标显示器，从源头消除闪现。仅影响初始位置，
-            // 与缩放参数（panscan/keepaspect/video-unscaled）不冲突。勿删！
+            // --wid 模式下 mpv 的窗口位置由父窗口（视频宿主）决定，--geometry 被忽略；
+            // 宿主窗口创建即隐藏，不再需要离屏定位。保留该参数作为未来非 --wid
+            // 回退路径的防御，避免回退时出现顶层窗口闪现。
             "--geometry=+32000+32000".to_string(),
             format!("--input-ipc-server={}", ipc_path),
             // v10-A：缓存与解码队列限制（详见函数开头注释）
@@ -662,16 +916,46 @@ pub fn video_playback_stalled(prev: &LivenessProbe, curr: &LivenessProbe) -> boo
     !curr.paused && !curr.idle_active && (curr.time_pos - prev.time_pos).abs() < STALL_EPSILON_SECS
 }
 
+impl VideoRenderer {
+    /// 关闭视频宿主窗口（幂等）。
+    ///
+    /// `VideoHost::drop` 向宿主线程发送 `WM_VIDEO_HOST_SHUTDOWN` 并 join，窗口由
+    /// 创建它的宿主线程销毁（Win32 要求 DestroyWindow 与创建线程一致）。
+    fn shutdown_host(&mut self) {
+        self.host = None;
+        self.base.set_hwnd(None);
+    }
+}
+
 impl WallpaperRenderer for VideoRenderer {
     fn play(&mut self) -> Result<(), crate::MirrorStarError> {
-        // 1. 构建并启动 mpv 进程
-        let args = self.build_mpv_args();
-        tracing::info!(args = ?args, "mpv 启动参数");
-        let pid = self.base.start_process(args)?;
+        // 0. 清理旧宿主（revive 场景），确保不会复用已销毁的 HWND
+        self.shutdown_host();
+
+        // 1. 创建隐藏宿主窗口：mpv 通过 --wid 只创建子窗口，永不产生顶层窗口。
+        //    宿主创建即隐藏且带 WS_EX_TOOLWINDOW，任务栏/Alt+Tab 不会出现 mpv；
+        //    embed_wallpaper 操作的是宿主，SetParent / layered 不再作用于 mpv 的 D3D11 窗口。
+        let host = VideoHost::spawn()?;
+        let host_hwnd = host.hwnd;
+        self.base.set_hwnd(Some(host_hwnd));
+        self.host = Some(host);
+
+        // 2. 构建并启动 mpv 进程（追加 --wid=<宿主 HWND>）
+        let mut args = self.build_mpv_args();
+        args.push(wid_arg(host_hwnd));
+        tracing::info!(args = ?args, host = host_hwnd.0 as isize, "mpv 启动参数");
+        let pid = match self.base.start_process(args) {
+            Ok(pid) => pid,
+            Err(e) => {
+                // 宿主窗口随 VideoHost drop 关闭，避免残留隐藏窗口
+                self.shutdown_host();
+                return Err(e);
+            }
+        };
 
         tracing::info!(pid, "mpv 进程已启动");
 
-        // 2. 连接 IPC（重试 40 次，每次间隔 50ms = 2s 最大等待，Task 7.4 冷启动优化）
+        // 3. 连接 IPC（重试 40 次，每次间隔 50ms = 2s 最大等待，Task 7.4 冷启动优化）
         // Task 7.4：从 120 次（6s）缩减到 40 次（2s）。真全屏退出恢复走后台线程
         // 异步执行，2s 连接窗口不再阻塞 Win32 回调线程；极端冷启动（GPU 驱动初始化
         // + DLL 加载 + 杀毒扫描，3-5s）下 2s 内未连接成功即失败，由周期复查线程重试
@@ -704,29 +988,36 @@ impl WallpaperRenderer for VideoRenderer {
 
         tracing::info!("mpv IPC 已连接");
 
-        // 3. 查找 mpv 窗口（最大 2s，从 5s 缩减）
-        // Task 8.4：改用窗口类名 "mpv" 查找（mpv 编译时固定 MPV_WINDOW_CLASS_NAME = L"mpv"），
-        // 比基于标题 "MirrorStarVideo" 的查找更稳定（标题可被外部进程修改或冲突）。
-        let hwnd = match SubprocessRendererBase::find_window_by_class(pid, "mpv") {
-            Some(hwnd) => hwnd,
+        // 4. 等待 mpv 在宿主内创建子窗口（最多 2s）。
+        //    宿主才是桌面嵌入对象；子窗口仅用于确认 VO 已初始化并记录诊断 hwnd。
+        let child = match find_mpv_child(host_hwnd, pid) {
+            Some(child) => child,
             None => {
-                tracing::error!(pid, "未能在超时内找到 mpv 窗口");
-                // Task 7.3：窗口查找失败时清理已 spawn 的 mpv 进程，避免孤儿进程残留
-                // （mpv 窗口未创建可能意味着渲染初始化失败，进程无意义驻留）。
+                tracing::error!(
+                    pid,
+                    host = host_hwnd.0 as isize,
+                    "未能在超时内找到 mpv 宿主子窗口"
+                );
                 if let Err(cleanup_err) = self.terminate() {
-                    tracing::warn!(error = %cleanup_err, "窗口查找失败后清理 mpv 进程也失败");
+                    tracing::warn!(
+                        error = %cleanup_err,
+                        "宿主子窗口查找失败后清理 mpv 进程也失败"
+                    );
                 }
                 return Err(crate::MirrorStarError::DesktopIntegration(format!(
-                    "未能在超时内找到 mpv 窗口 (pid={})",
+                    "未能在超时内找到 mpv 宿主子窗口 (pid={})",
                     pid
                 )));
             }
         };
-        self.base.set_hwnd(Some(hwnd));
+        tracing::info!(
+            host = host_hwnd.0 as isize,
+            child = child.0 as isize,
+            pid,
+            "已找到 mpv 宿主子窗口"
+        );
 
-        tracing::info!(hwnd = ?hwnd, "已找到 mpv 窗口");
-
-        // 4. 通过 WASAPI 应用当前音量和静音设置（异步执行，不阻塞嵌入流程）
+        // 5. 通过 WASAPI 应用当前音量和静音设置（异步执行，不阻塞嵌入流程）
         //
         // v5.1 修复：原实现同步调用 set_process_volume，当 mpv 进程刚启动尚无音频会话时，
         // WASAPI 会重试枚举会话（典型 5+ 秒），期间 mpv 窗口（--force-window=yes 创建）
@@ -894,7 +1185,18 @@ impl WallpaperRenderer for VideoRenderer {
     ) -> Result<(), crate::MirrorStarError> {
         if let Some(hwnd) = self.base.hwnd() {
             unsafe {
-                SetWindowPos(hwnd, None, x, y, w, h, Default::default())?;
+                // 与 image/gif/web 渲染器一致：只改几何、不动 Z 序。
+                // raised desktop 下宿主是 Progman 的子窗口，若此处改变 Z 序可能
+                // 把壁纸抬到 SHELLDLL_DefView 之上、遮挡桌面图标。
+                SetWindowPos(
+                    hwnd,
+                    HWND::default(),
+                    x,
+                    y,
+                    w,
+                    h,
+                    SWP_NOZORDER | SWP_NOACTIVATE,
+                )?;
             }
         } else {
             tracing::warn!("窗口句柄未就绪，设置位置命令未实际下发");
@@ -923,7 +1225,10 @@ impl WallpaperRenderer for VideoRenderer {
         // 2. 停止进程（会等待退出，超时后强制终止）
         // 临时诊断埋点：停止 mpv 子进程耗时（优雅 3s + 强杀 5s 路径，最关键）
         let trace_stop = Instant::now();
-        let _ = self.base.stop_process_for_terminate()?;
+        let stop_result = self.base.stop_process_for_terminate();
+        // 无论进程停止是否成功都关闭宿主，避免 HWND/线程泄漏；宿主销毁会带走 mpv 子窗口。
+        self.shutdown_host();
+        let _ = stop_result?;
         tracing::info!(target: "mirrorstar::exit_trace", "EXIT-TRACE ph=video_stop_process ms={}", trace_stop.elapsed().as_millis());
 
         // 3. 断开 IPC
@@ -934,7 +1239,6 @@ impl WallpaperRenderer for VideoRenderer {
             }
             *ipc = None;
         }
-        self.base.set_hwnd(None);
 
         tracing::info!("视频壁纸已终止");
         Ok(())
@@ -1271,9 +1575,11 @@ impl Drop for VideoRenderer {
             if let Err(e) = self.base.process.stop_immediate() {
                 tracing::warn!(error = %e, "VideoRenderer drop 时 stop_immediate 失败");
             }
-            self.base.set_hwnd(None);
+            self.shutdown_host();
             self.base.set_state(WallpaperState::Terminated);
         }
+        // 即使状态已是 Terminated，也确保宿主窗口/线程被回收（VideoHost::drop 幂等）。
+        self.host = None;
         tracing::debug!("VideoRenderer 已清理");
     }
 }
@@ -1283,6 +1589,9 @@ mod tests {
     use super::*;
     use crate::wallpaper::OwnedProcHandle;
     use windows::Win32::Foundation::CloseHandle;
+    use windows::Win32::UI::WindowsAndMessaging::{
+        PeekMessageW, PM_REMOVE, SWP_SHOWWINDOW, WINDOW_EX_STYLE, WS_CHILD, WS_VISIBLE,
+    };
 
     fn create_renderer(mode: ScalingMode) -> VideoRenderer {
         // 测试中不需要 VolumeControl（不会实际调用 COM）
@@ -1534,6 +1843,10 @@ mod tests {
             "--no-osd-bar",
             "--title=MirrorStarVideo",
             "--force-window=yes",
+            // Win11 24H2 边框对齐修复（Lively #2415）
+            "--border=no",
+            // 降级防御；主防线是宿主 + --wid（mpv 不创建顶层窗口）
+            "--show-in-taskbar=no",
         ];
 
         for expected in &common_args {
@@ -1610,6 +1923,144 @@ mod tests {
             !args.contains(&"--".to_string()),
             "启动参数不再包含 `--` 分隔符（文件路径已不在命令行）"
         );
+    }
+
+    // ========== 视频宿主 + --wid（任务栏闪现/SetParent 风险修复） ==========
+
+    #[test]
+    fn wid_arg_formats_host_hwnd() {
+        let host = HWND(0x1234 as *mut core::ffi::c_void);
+        assert_eq!(wid_arg(host), "--wid=4660");
+    }
+
+    #[test]
+    fn video_host_window_is_toolwindow_and_resizes_child() {
+        let host = VideoHost::spawn().expect("创建视频宿主窗口应成功");
+        let host_hwnd = host.hwnd;
+
+        // 宿主创建即隐藏且带 WS_EX_TOOLWINDOW：即使误显示也不进入任务栏/Alt+Tab。
+        let ex_style = unsafe {
+            windows::Win32::UI::WindowsAndMessaging::GetWindowLongPtrW(
+                host_hwnd,
+                windows::Win32::UI::WindowsAndMessaging::GWL_EXSTYLE,
+            )
+        } as u32;
+        assert_ne!(
+            ex_style & WS_EX_TOOLWINDOW.0,
+            0,
+            "视频宿主必须带 WS_EX_TOOLWINDOW"
+        );
+        assert!(
+            !unsafe {
+                windows::Win32::UI::WindowsAndMessaging::IsWindowVisible(host_hwnd).as_bool()
+            },
+            "视频宿主创建时必须隐藏"
+        );
+
+        // 在宿主内创建伪装 mpv 子窗口，验证宿主 WM_SIZE 会把首个子窗口铺满客户区。
+        let child = unsafe {
+            CreateWindowExW(
+                WINDOW_EX_STYLE::default(),
+                windows::core::w!("STATIC"),
+                windows::core::w!("fake-mpv"),
+                WS_CHILD | WS_VISIBLE,
+                0,
+                0,
+                100,
+                100,
+                host_hwnd,
+                None,
+                GetModuleHandleW(None).unwrap_or_default(),
+                None,
+            )
+        }
+        .expect("创建测试子窗口应成功");
+        unsafe {
+            let _ = SetWindowPos(
+                host_hwnd,
+                HWND::default(),
+                -32000,
+                -32000,
+                400,
+                300,
+                SWP_NOZORDER | SWP_NOACTIVATE | SWP_SHOWWINDOW,
+            );
+        }
+        // 子窗口属于测试线程；宿主线程用 SWP_ASYNCWINDOWPOS 投递 resize，
+        // 测试线程需泵消息才能让异步请求落地。
+        let mut ok = false;
+        let mut actual = (0, 0);
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while Instant::now() < deadline {
+            let mut msg = MSG::default();
+            while unsafe { PeekMessageW(&mut msg, None, 0, 0, PM_REMOVE) }.as_bool() {
+                unsafe {
+                    let _ = TranslateMessage(&msg);
+                    DispatchMessageW(&msg);
+                }
+            }
+            let mut rect = RECT::default();
+            if unsafe { GetClientRect(child, &mut rect) }.is_ok() {
+                actual = (rect.right, rect.bottom);
+                if actual == (400, 300) {
+                    ok = true;
+                    break;
+                }
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+
+        // 先清理子窗口再断言，避免断言 panic 时宿主线程销毁“属于测试线程且未泵消息”
+        // 的子窗口造成跨线程销毁阻塞。
+        unsafe {
+            let _ = DestroyWindow(child);
+        }
+        drop(host);
+        assert!(
+            ok,
+            "宿主 WM_SIZE 应把 mpv 子窗口拉伸到客户区，实际 {:?}",
+            actual
+        );
+    }
+
+    /// 宿主 + `--wid` 端到端启动/终止冒烟测试（需随包 mpv 与交互式桌面，手动运行）：
+    /// `cargo test -p mirrorstar-core video_host_wid_play_terminate_smoke -- --ignored`
+    #[test]
+    #[ignore = "需要随包 mpv 与交互式桌面：验证宿主 + --wid 端到端"]
+    fn video_host_wid_play_terminate_smoke() {
+        let mut renderer =
+            VideoRenderer::new("test_video.mp4".to_string(), ScalingMode::Fill, None);
+        renderer.play().expect("宿主 + --wid 启动应成功");
+
+        let host = renderer.hwnd().expect("play 后应返回宿主 HWND");
+        assert!(unsafe { windows::Win32::UI::WindowsAndMessaging::IsWindow(host).as_bool() });
+        let ex_style = unsafe {
+            windows::Win32::UI::WindowsAndMessaging::GetWindowLongPtrW(
+                host,
+                windows::Win32::UI::WindowsAndMessaging::GWL_EXSTYLE,
+            )
+        } as u32;
+        assert_ne!(
+            ex_style & WS_EX_TOOLWINDOW.0,
+            0,
+            "宿主应带 WS_EX_TOOLWINDOW（不进任务栏/Alt+Tab）"
+        );
+        assert!(
+            !unsafe { windows::Win32::UI::WindowsAndMessaging::IsWindowVisible(host).as_bool() },
+            "宿主在嵌入前应保持隐藏"
+        );
+
+        let pid = renderer.process_pid().expect("mpv PID 应存在");
+        let child = find_mpv_child(host, pid).expect("mpv 宿主子窗口应存在");
+        assert!(!child.is_invalid());
+        assert!(
+            SubprocessRendererBase::find_window_by_class(pid, "mpv").is_none(),
+            "宿主 + --wid 下 mpv 不应创建任何顶层窗口"
+        );
+
+        renderer.terminate().expect("终止应成功");
+        assert_eq!(renderer.state(), WallpaperState::Terminated);
+        assert!(renderer.hwnd().is_none());
     }
 
     // ========== Scaling mode specific tests ==========
@@ -2193,6 +2644,7 @@ mod tests {
             volume: 1.0,
             muted: false,
             volume_control: None,
+            host: None,
         };
 
         // 启动长生命周期进程：ping -t 持续 ping，进程不会自行退出，必须由 stop_immediate 终止

@@ -1,8 +1,8 @@
 //! 视频壁纸全链路运行时诊断测试
 //!
 //! 真实复现应用的完整设置流程：
-//!   play()（mpv `--idle=yes` 启动 + IPC 连接 + 找窗口）
-//!   → `DesktopIntegrator.embed_wallpaper`（嵌入 WorkerW 壁纸层）
+//!   play()（创建隐藏视频宿主 + mpv `--idle=yes --wid=<宿主>` + IPC 连接 + 找宿主子窗口）
+//!   → `DesktopIntegrator.embed_wallpaper`（把宿主窗口嵌入壁纸层）
 //!   → `after_embed()`（IPC `loadfile` 加载视频）
 //!   → IPC 查询播放状态（`idle-active` / `time-pos` 前进 / `width`/`height`）
 //!   → 检查 mpv 进程存活 + mpv 日志无纹理错误
@@ -46,13 +46,13 @@ fn video_wallpaper_fullpath_diagnostic() {
 
     let mut renderer = VideoRenderer::new(video_path.to_string(), ScalingMode::Fit, volume_control);
 
-    // Step 1: play() —— mpv --idle=yes 启动 + IPC 连接 + 找窗口
+    // Step 1: play() —— 创建隐藏视频宿主 + mpv --wid 启动 + IPC 连接 + 找宿主子窗口
     println!("== Step 1: play() ==");
     let play_result = renderer.play();
     println!("play() 返回: {:?}", play_result);
     assert!(play_result.is_ok(), "play() 失败，终止诊断");
-    let hwnd = renderer.hwnd().expect("play() 后应已找到 mpv 窗口");
-    println!("mpv 窗口 hwnd = {:?}", hwnd);
+    let hwnd = renderer.hwnd().expect("play() 后应已返回视频宿主窗口");
+    println!("视频宿主窗口 hwnd = {:?}", hwnd);
 
     // Step 2: 初始化桌面集成器，查找 WorkerW 并嵌入
     println!("== Step 2: embed_wallpaper ==");

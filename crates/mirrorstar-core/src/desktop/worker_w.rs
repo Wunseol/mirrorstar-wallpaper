@@ -120,14 +120,9 @@ pub fn is_raised_desktop() -> bool {
 /// 句柄有效且类名确为 WorkerW 时返回 `Some`，否则返回 `None`。
 fn find_progman_child_workerw(progman: HWND) -> Option<HWND> {
     // SAFETY: FindWindowExW 仅查找子窗口，不修改窗口状态。
-    let Ok(workerw) = (unsafe {
-        FindWindowExW(
-            progman,
-            HWND::default(),
-            windows::core::w!("WorkerW"),
-            None,
-        )
-    }) else {
+    let Ok(workerw) =
+        (unsafe { FindWindowExW(progman, HWND::default(), windows::core::w!("WorkerW"), None) })
+    else {
         return None;
     };
     if !workerw.is_invalid() && is_workerw_class(workerw) {
@@ -135,6 +130,25 @@ fn find_progman_child_workerw(progman: HWND) -> Option<HWND> {
     } else {
         None
     }
+}
+
+/// 查找 Progman 的直接子窗口 `SHELLDLL_DefView`（桌面图标层）。
+///
+/// raised desktop 下壁纸窗口必须插入到 DefView 的正下方（z-order 锚点），
+/// 使桌面图标与文字保持可见、可点击。句柄无效时返回 `None`。
+fn find_defview(progman: HWND) -> Option<HWND> {
+    // SAFETY: FindWindowExW 仅查找子窗口，不修改窗口状态。
+    let Ok(defview) = (unsafe {
+        FindWindowExW(
+            progman,
+            HWND::default(),
+            windows::core::w!("SHELLDLL_DefView"),
+            None,
+        )
+    }) else {
+        return None;
+    };
+    (!defview.is_invalid()).then_some(defview)
 }
 
 /// 单次尝试查找 Progman 和 WorkerW 窗口句柄（无重试、无 sleep）
@@ -511,25 +525,64 @@ unsafe fn find_child_by_class(
     None
 }
 
-/// 计算 PerMonitor 布局下壁纸窗口在 WorkerW 子窗口坐标系中的位置（D-002 修复）
+/// 计算 PerMonitor 布局下壁纸窗口在宿主子窗口坐标系中的位置（D-002 修复）
 ///
-/// `SetParent` 将壁纸窗口重定为 WorkerW 的子窗口后，`SetWindowPos` 的坐标
-/// 是相对 WorkerW 客户区左上角的子窗口坐标，而非虚拟桌面屏幕坐标。
-/// 当 WorkerW 左上角不位于虚拟屏幕原点 (0,0) 时（存在位于主显示器
+/// `SetParent` 将壁纸窗口重定为宿主（WorkerW 或 raised desktop 的 Progman）的
+/// 子窗口后，`SetWindowPos` 的坐标是相对宿主客户区左上角的子窗口坐标，而非
+/// 虚拟桌面屏幕坐标。当宿主左上角不位于虚拟屏幕原点 (0,0) 时（存在位于主显示器
 /// 左侧/上方的副显示器，坐标为负），需从 display 的虚拟屏幕坐标中减去
-/// WorkerW 左上角坐标，得到正确的子窗口坐标。
+/// 宿主左上角坐标，得到正确的子窗口坐标。
 ///
 /// 提取为纯函数以便单元测试 PerMonitor 负坐标偏移的正确性。
 fn calculate_per_monitor_child_coords(
     display: &DisplayInfo,
-    workerw_rect: &RECT,
+    host_rect: &RECT,
 ) -> (i32, i32, i32, i32) {
     (
-        display.x - workerw_rect.left,
-        display.y - workerw_rect.top,
+        display.x - host_rect.left,
+        display.y - host_rect.top,
         display.width as i32,
         display.height as i32,
     )
+}
+
+/// 按布局方式计算壁纸窗口相对宿主窗口（WorkerW / Progman）的子窗口坐标。
+///
+/// - `Span`：铺满宿主窗口（虚拟桌面）全尺寸，原点 (0,0)
+/// - `PerMonitor` / `AllSame`：目标显示器虚拟屏幕坐标减去宿主原点；未找到显示器时
+///   回退到宿主全尺寸（与历史行为一致）
+///
+/// 宿主为 Progman（raised desktop）时与 WorkerW 的坐标语义相同：两者都覆盖虚拟桌面。
+fn calculate_embed_coords(
+    host_rect: &RECT,
+    display_id: &str,
+    arrangement: Arrangement,
+    displays: &[DisplayInfo],
+) -> (i32, i32, i32, i32) {
+    match arrangement {
+        Arrangement::Span => (
+            0,
+            0,
+            host_rect.right - host_rect.left,
+            host_rect.bottom - host_rect.top,
+        ),
+        Arrangement::PerMonitor | Arrangement::AllSame => {
+            // D-013: 使用调用方传入的 displays 缓存，避免每次调用 enumerate_displays()。
+            // AllSame 编排每个显示器各设一次独立渲染器，定位与 PerMonitor 一致。
+            if let Some(display) = displays.iter().find(|d| d.id == display_id) {
+                calculate_per_monitor_child_coords(display, host_rect)
+            } else {
+                // Fallback: use host dimensions
+                tracing::warn!(display_id, "未找到显示器，回退到宿主窗口全尺寸");
+                (
+                    0,
+                    0,
+                    host_rect.right - host_rect.left,
+                    host_rect.bottom - host_rect.top,
+                )
+            }
+        }
+    }
 }
 
 /// 保证 raised desktop 下 WorkerW 位于 Progman 子窗口 z-order 的最底层。
@@ -586,13 +639,22 @@ pub fn ensure_workerw_zorder(progman: HWND, workerw: HWND) {
     }
 }
 
-/// 将壁纸窗口嵌入到 WorkerW 层
+/// 将壁纸窗口嵌入桌面壁纸层。
+///
+/// 按桌面层级分两条路径（`progman_hwnd` 由 `DesktopIntegrator` 传入，避免重复
+/// `FindWindowW`）：
+///
+/// - **raised desktop**（Progman 带 `WS_EX_NOREDIRECTIONBITMAP`）：按 Lively/Microsoft
+///   模型把窗口设为 `WS_CHILD` + `WS_EX_LAYERED`（alpha=255）的 Progman 子窗口，
+///   z-order 插入 `SHELLDLL_DefView` 正下方（WorkerW 之上），不使用 `HWND_BOTTOM`。
+/// - **旧层级**：保持原行为——`SetParent(WorkerW)` + `HWND_BOTTOM`，不改子窗口/分层样式。
 ///
 /// `displays` 参数由调用方传入（D-013：在 `DesktopIntegrator` 层缓存显示器列表
 /// 与 5s TTL 失效，避免 PerMonitor 分支每次调用 `enumerate_displays()`）。
 /// Span 分支不使用此参数。
 pub fn embed_wallpaper(
     wp_hwnd: HWND,
+    progman_hwnd: HWND,
     workerw_hwnd: HWND,
     display_id: &str,
     arrangement: Arrangement,
@@ -603,6 +665,68 @@ pub fn embed_wallpaper(
         crate::desktop::window::make_borderless(wp_hwnd)?;
         crate::desktop::window::remove_from_taskbar(wp_hwnd);
 
+        let raised = progman_is_raised_desktop(progman_hwnd);
+
+        if raised {
+            // raised desktop：DefView 是 z-order 锚点，找不到时直接失败，
+            // 不静默回退到旧层级 WorkerW（layered 模型与旧层级不兼容）。
+            let Some(defview) = find_defview(progman_hwnd) else {
+                return Err(MirrorStarError::DesktopIntegration(format!(
+                    "raised desktop 下未找到 SHELLDLL_DefView（progman=0x{:X}, workerw=0x{:X}）",
+                    progman_hwnd.0 as isize, workerw_hwnd.0 as isize
+                )));
+            };
+
+            // 宿主为 Progman：其矩形覆盖整个虚拟桌面，坐标语义与 WorkerW 一致。
+            let mut progman_rect = RECT::default();
+            GetWindowRect(progman_hwnd, &mut progman_rect).map_err(|e| {
+                MirrorStarError::DesktopIntegration(format!("GetWindowRect(Progman) 失败: {}", e))
+            })?;
+            let (x, y, width, height) =
+                calculate_embed_coords(&progman_rect, display_id, arrangement, displays);
+
+            // WS_CHILD + WS_EX_LAYERED + alpha=255 必须在 SetParent 之前套用。
+            crate::desktop::window::apply_raised_desktop_style(wp_hwnd)?;
+            crate::desktop::window::set_parent_verified(wp_hwnd, Some(progman_hwnd))?;
+
+            // 插入到 DefView 正下方：壁纸位于桌面图标层之下、WorkerW 之上。
+            SetWindowPos(
+                wp_hwnd,
+                defview,
+                x,
+                y,
+                width,
+                height,
+                SWP_NOACTIVATE | SWP_FRAMECHANGED,
+            )
+            .map_err(|e| {
+                MirrorStarError::DesktopIntegration(format!("SetWindowPos(raised) 失败: {}", e))
+            })?;
+
+            // 嵌入时不主动抢占前台（不再为恢复焦点调用 SetForegroundWindow）：每次壁纸
+            // 嵌入（轮换/手动切换）都会触发 EVENT_SYSTEM_FOREGROUND，扰乱全屏检测状态机，
+            // 并在自动轮换时长按闪烁主控制窗口。需要恢复焦点时由调用方负责。
+            // ShowWindow 失败不影响已完成的嵌入流程，下一次刷新会重新显示
+            let _ = ShowWindow(wp_hwnd, SW_SHOW);
+
+            log_embed_success(
+                wp_hwnd,
+                raised,
+                progman_hwnd,
+                workerw_hwnd,
+                Some(defview),
+                "defview",
+                display_id,
+                arrangement,
+                x,
+                y,
+                width,
+                height,
+            );
+            return Ok(());
+        }
+
+        // ── 旧层级：行为与历史实现逐行一致（WorkerW 父窗口 + HWND_BOTTOM） ──
         // Step 2: Determine position based on display_id and arrangement
         // D-TD-008: 在 match 前统一获取一次 workerw_rect，供所有分支共用
         //（原 3 处重复 GetWindowRect 调用合并为 1 处）。
@@ -611,42 +735,11 @@ pub fn embed_wallpaper(
             MirrorStarError::DesktopIntegration(format!("GetWindowRect 失败: {}", e))
         })?;
 
-        let (x, y, width, height) = match arrangement {
-            Arrangement::Span => {
-                // Span mode: cover entire WorkerW (virtual screen)
-                (
-                    0,
-                    0,
-                    workerw_rect.right - workerw_rect.left,
-                    workerw_rect.bottom - workerw_rect.top,
-                )
-            }
-            Arrangement::PerMonitor | Arrangement::AllSame => {
-                // Per-monitor mode: find the specific monitor
-                // D-013: 使用调用方传入的 displays 缓存，避免每次调用 enumerate_displays()。
-                // AllSame 编排每个显示器各设一次独立渲染器，定位与 PerMonitor 一致。
-                if let Some(display) = displays.iter().find(|d| d.id == display_id) {
-                    // D-002: SetParent 后 SetWindowPos 的坐标是相对 WorkerW 客户区
-                    // 左上角的子窗口坐标，而非虚拟屏幕坐标。当 WorkerW 左上角
-                    // 不在虚拟屏幕原点 (0,0)（存在负坐标副显示器）时，需从
-                    // display 虚拟屏幕坐标减去 workerw_rect 原点得到正确子窗口坐标。
-                    calculate_per_monitor_child_coords(display, &workerw_rect)
-                } else {
-                    // Fallback: use WorkerW dimensions
-                    tracing::warn!(display_id, "未找到显示器，回退到 WorkerW 全尺寸");
-                    (
-                        0,
-                        0,
-                        workerw_rect.right - workerw_rect.left,
-                        workerw_rect.bottom - workerw_rect.top,
-                    )
-                }
-            }
-        };
+        let (x, y, width, height) =
+            calculate_embed_coords(&workerw_rect, display_id, arrangement, displays);
 
-        // Step 3: SetParent - reparent into WorkerW
-        SetParent(wp_hwnd, workerw_hwnd)
-            .map_err(|e| MirrorStarError::DesktopIntegration(format!("SetParent 失败: {}", e)))?;
+        // Step 3: SetParent - reparent into WorkerW（带父链校验，兼容 NULL 返回二义性）
+        crate::desktop::window::set_parent_verified(wp_hwnd, Some(workerw_hwnd))?;
 
         // Step 4: Position at the correct coordinates, at bottom Z-order
         SetWindowPos(
@@ -660,24 +753,74 @@ pub fn embed_wallpaper(
         )
         .map_err(|e| MirrorStarError::DesktopIntegration(format!("SetWindowPos 失败: {}", e)))?;
 
-        // 嵌入时不主动抢占前台（不再为恢复焦点调用 SetForegroundWindow）：每次壁纸
-        // 嵌入（轮换/手动切换）都会触发 EVENT_SYSTEM_FOREGROUND，扰乱全屏检测状态机，
-        // 并在自动轮换时长按闪烁主控制窗口。需要恢复焦点时由调用方负责。
         // Step 5: Show the wallpaper window (created without WS_VISIBLE to avoid flash)
-        // ShowWindow 失败不影响已完成的嵌入流程，下一次刷新会重新显示
         let _ = ShowWindow(wp_hwnd, SW_SHOW);
 
-        tracing::info!(
+        log_embed_success(
+            wp_hwnd,
+            raised,
+            progman_hwnd,
+            workerw_hwnd,
+            None,
+            "bottom",
             display_id,
-            ?arrangement,
+            arrangement,
             x,
             y,
             width,
             height,
-            "壁纸窗口嵌入完成"
         );
         Ok(())
     }
+}
+
+/// 记录嵌入成功后的可诊断信息（raised/父链/样式/z-order 锚点/几何）。
+///
+/// 字段用于真机复测直接判定走了哪条路径：`raised`、`progman`、`workerw`、
+/// `defview`（仅 raised）、`parent_after`、`style_has_child`、
+/// `exstyle_has_layered`、`z_order_anchor`、`display_id`、坐标尺寸。
+#[allow(clippy::too_many_arguments)] // 诊断字段天然较多，拆结构体得不偿失。
+fn log_embed_success(
+    hwnd: HWND,
+    raised: bool,
+    progman: HWND,
+    workerw: HWND,
+    defview: Option<HWND>,
+    z_order_anchor: &str,
+    display_id: &str,
+    arrangement: Arrangement,
+    x: i32,
+    y: i32,
+    width: i32,
+    height: i32,
+) {
+    // SAFETY: 仅查询窗口样式与父链，不修改窗口状态。
+    let (style_has_child, exstyle_has_layered, parent_after) = unsafe {
+        let style = GetWindowLongPtrW(hwnd, GWL_STYLE) as u32;
+        let ex_style = GetWindowLongPtrW(hwnd, GWL_EXSTYLE) as u32;
+        (
+            style & WS_CHILD.0 != 0,
+            ex_style & WS_EX_LAYERED.0 != 0,
+            GetAncestor(hwnd, GA_PARENT),
+        )
+    };
+    tracing::info!(
+        display_id,
+        ?arrangement,
+        raised,
+        progman = progman.0 as isize,
+        workerw = workerw.0 as isize,
+        defview = defview.map_or(0, |h| h.0 as isize),
+        parent_after = parent_after.0 as isize,
+        style_has_child,
+        exstyle_has_layered,
+        z_order_anchor,
+        x,
+        y,
+        width,
+        height,
+        "壁纸窗口嵌入完成"
+    );
 }
 
 /// 获取当前系统壁纸路径
@@ -746,7 +889,9 @@ pub fn restore_system_wallpaper(path: &str) -> Result<(), MirrorStarError> {
 /// （参考 Lively Wallpaper 的 RefreshDesktop 早退实现），因此直接返回。
 pub fn refresh_desktop() {
     if is_raised_desktop() {
-        tracing::debug!("raised desktop 下跳过 refresh_desktop：SPI_SETDESKWALLPAPER 会销毁当前 WorkerW");
+        tracing::debug!(
+            "raised desktop 下跳过 refresh_desktop：SPI_SETDESKWALLPAPER 会销毁当前 WorkerW"
+        );
         return;
     }
     if let Some(current) = get_system_wallpaper() {
@@ -920,6 +1065,76 @@ mod tests {
         };
         let (x, y, width, height) = calculate_per_monitor_child_coords(&display, &workerw_rect);
         assert_eq!((x, y, width, height), (1920, 0, 1920, 1080));
+    }
+
+    // ── raised desktop：以 Progman 矩形为宿主的坐标测试 ───────────────────
+    //
+    // raised desktop 下壁纸窗口的父窗口是 Progman，`SetWindowPos` 坐标相对
+    // Progman 客户区。Progman 通常覆盖整个虚拟桌面，故原点可能为 (0,0)，
+    // 也可能为负值（副显示器位于主显示器左侧/上方）。
+
+    #[test]
+    fn raised_permonitor_progman_at_origin_unchanged() {
+        // Progman 原点 (0,0)：子窗口坐标应等于 display 虚拟屏幕坐标。
+        let display = DisplayInfo {
+            id: "\\\\.\\DISPLAY1".to_string(),
+            name: "显示器 1".to_string(),
+            width: 2560,
+            height: 1440,
+            x: 0,
+            y: 0,
+            is_primary: true,
+            dpi: 96,
+        };
+        let progman_rect = RECT {
+            left: 0,
+            top: 0,
+            right: 2560,
+            bottom: 1440,
+        };
+        let (x, y, width, height) = calculate_per_monitor_child_coords(&display, &progman_rect);
+        assert_eq!((x, y, width, height), (0, 0, 2560, 1440));
+    }
+
+    #[test]
+    fn raised_permonitor_progman_negative_origin_offset() {
+        // Progman 原点 (-1920,0)：副显示器虚拟屏幕坐标减去 Progman 原点应为 (0,0)。
+        let display = DisplayInfo {
+            id: "\\\\.\\DISPLAY2".to_string(),
+            name: "显示器 2".to_string(),
+            width: 1920,
+            height: 1080,
+            x: -1920,
+            y: 0,
+            is_primary: false,
+            dpi: 96,
+        };
+        let progman_rect = RECT {
+            left: -1920,
+            top: 0,
+            right: 0,
+            bottom: 1080,
+        };
+        let (x, y, width, height) = calculate_per_monitor_child_coords(&display, &progman_rect);
+        assert_eq!(
+            (x, y, width, height),
+            (0, 0, 1920, 1080),
+            "Progman 负原点时子窗口坐标应正确归零"
+        );
+    }
+
+    #[test]
+    fn raised_span_uses_progman_full_size() {
+        // Span 以宿主矩形全尺寸铺满：Progman 原点为负也不影响 Span 的 (0,0) 原点。
+        let progman_rect = RECT {
+            left: -1920,
+            top: 0,
+            right: 1920,
+            bottom: 1080,
+        };
+        let (x, y, width, height) =
+            calculate_embed_coords(&progman_rect, "\\\\.\\DISPLAY1", Arrangement::Span, &[]);
+        assert_eq!((x, y, width, height), (0, 0, 3840, 1080));
     }
 
     // ── 系统壁纸 API 烟雾测试 ───────────────────────────────────────────

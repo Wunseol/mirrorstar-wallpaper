@@ -106,7 +106,9 @@ pub fn set_native_wallpaper(
 /// 桌面视觉由已嵌入的动态壁纸覆盖，注册表保留原值不影响后续静态壁纸覆盖。
 pub fn clear_native_wallpaper() -> Result<(), crate::MirrorStarError> {
     if crate::desktop::worker_w::is_raised_desktop() {
-        tracing::debug!("raised desktop 下跳过 clear_native_wallpaper：避免 SPI_SETDESKWALLPAPER 销毁 WorkerW");
+        tracing::debug!(
+            "raised desktop 下跳过 clear_native_wallpaper：避免 SPI_SETDESKWALLPAPER 销毁 WorkerW"
+        );
         return Ok(());
     }
     use windows::Win32::UI::WindowsAndMessaging::{

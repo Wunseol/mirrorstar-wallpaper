@@ -1406,16 +1406,16 @@ impl WallpaperEngine {
                 let desktop = self.desktop.lock().map_err(|e| {
                     MirrorStarError::DesktopIntegration(format!("获取桌面集成器锁失败: {}", e))
                 })?;
-                desktop.is_child_of_workerw(hwnd)
+                desktop.is_attached_to_wallpaper_layer(hwnd)
             };
             if !parent_ok {
                 tracing::warn!(
                     display_id,
-                    "原子交换：commit 前校验失败（新窗父窗口已非当前 WorkerW），弃置新窗"
+                    "原子交换：commit 前校验失败（新窗父窗口已非当前壁纸层），弃置新窗"
                 );
                 let _ = new_renderer.terminate();
                 return Err(MirrorStarError::DesktopIntegration(
-                    "原子交换 commit 前校验失败：新窗父窗口已非当前 WorkerW".to_string(),
+                    "原子交换 commit 前校验失败：新窗父窗口已非当前壁纸层".to_string(),
                 ));
             }
         }
@@ -1691,7 +1691,8 @@ impl WallpaperEngine {
                     continue;
                 };
                 // 与 embed_wallpaper Step 1 同源：去边框 + 去任务栏（NOACTIVATE/TOOLWINDOW）。
-                // 覆盖窗是新 mpv 顶层窗口，默认带标题栏；不做这两步会在纯净模式里露出窗口边框。
+                // 覆盖窗是视频宿主窗口（mpv 以 --wid 渲染其子窗口）；宿主创建即隐藏，
+                // 去边框/去任务栏保证 lift_window_to_rect 显示后不出现任务栏项或边框。
                 if let Err(e) = crate::desktop::window::make_borderless(hwnd) {
                     tracing::warn!(
                         display_id,

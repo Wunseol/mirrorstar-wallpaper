@@ -95,7 +95,7 @@ MirrorStar 由 **11 个 `mirrorstar-core` 模块**（真实代码中的 `pub mod
 - Video 渲染器通过 ProcessManager 直接 spawn `mpv.exe` 子进程（按需），通过 mpv 原生命名管道 IPC（`MpvIpcClient`，定义于 `ipc/mpv_protocol.rs`）控制，**不使用 libmpv2 FFI 库嵌入**
 - **Web 渲染器已重构为代理层**：通过 ProcessManager 以 `--wp-proc` 模式 spawn 壳进程自身（`mirrorstar-wallpaper.exe --wp-proc`，按需），通过 `WpProcIpcClient`（定义于 `ipc/wp_proc.rs`）命名管道通信
 - **UI 主窗口为独立进程** `mirrorstar-ui.exe`（crate `crates/mirrorstar-ui/`，Slint 1.18 软件渲染），经 `mirrorstar-core::ui_proto` NDJSON over stdio 通信
-- HWND 通过 FindWindowW 获取后，壳进程执行 WorkerW 嵌入（与 mpv 窗口嵌入逻辑一致）
+- HWND 通过 FindWindowW 获取后，壳进程执行桌面壁纸层嵌入（与视频宿主窗口嵌入逻辑一致）
 
 **内存优化：**
 - 无 Web 壁纸、无主窗口时：零子进程开销（仅壳进程 + 可选的 mpv）

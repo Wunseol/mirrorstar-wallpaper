@@ -76,8 +76,7 @@ use windows::Win32::Graphics::Gdi::{
 };
 use windows::Win32::UI::HiDpi::{GetDpiForMonitor, MDT_EFFECTIVE_DPI};
 use windows::Win32::UI::WindowsAndMessaging::{
-    GetAncestor, IsWindow, IsWindowVisible, SetParent, ShowWindow, GA_PARENT,
-    MONITORINFOF_PRIMARY, SW_HIDE,
+    GetAncestor, IsWindow, IsWindowVisible, ShowWindow, GA_PARENT, MONITORINFOF_PRIMARY, SW_HIDE,
 };
 
 use crate::config::settings::Arrangement;
@@ -302,6 +301,7 @@ impl DesktopIntegrator {
                 if let Some(&(hwnd, arrangement)) = self.active_wallpapers.get(&display_id) {
                     if let Err(e) = worker_w::embed_wallpaper(
                         hwnd,
+                        progman_hwnd,
                         workerw_hwnd,
                         &display_id,
                         arrangement,
@@ -354,7 +354,14 @@ impl DesktopIntegrator {
         // D-013: 从缓存获取显示器列表（5s TTL），避免每次调用 enumerate_displays()。
         // clone 一份 Vec 以释放 &mut self 借用，使后续 self.active_wallpapers.insert 可用。
         let displays: Vec<DisplayInfo> = self.get_cached_displays().to_vec();
-        worker_w::embed_wallpaper(hwnd, workerw_hwnd, display_id, arrangement, &displays)?;
+        worker_w::embed_wallpaper(
+            hwnd,
+            progman_hwnd,
+            workerw_hwnd,
+            display_id,
+            arrangement,
+            &displays,
+        )?;
         // raised desktop 下保证 WorkerW 位于 Progman 子窗口最底层（否则壁纸会盖住桌面图标）。
         worker_w::ensure_workerw_zorder(progman_hwnd, workerw_hwnd);
         self.active_wallpapers
@@ -414,10 +421,10 @@ impl DesktopIntegrator {
 
         // 检查窗口是否仍然有效
         if unsafe { IsWindow(hwnd).as_bool() } {
-            // 将窗口从 WorkerW 分离
-            // v41-D-002: SetParent 失败时保留 active_wallpapers 条目并返回 Err，
+            // 将窗口从壁纸层分离（raised 下父窗口为 Progman，旧层级为 WorkerW）。
+            // v41-D-002: 分离失败时保留 active_wallpapers 条目并返回 Err，
             // 调用方可重试或手动处理半分离状态。
-            match unsafe { SetParent(hwnd, None) } {
+            match window::set_parent_verified(hwnd, None) {
                 Err(e) => {
                     tracing::warn!(
                         display_id,
@@ -429,8 +436,17 @@ impl DesktopIntegrator {
                         e
                     )));
                 }
-                Ok(_) => {
-                    tracing::info!(display_id, "壁纸窗口已从 WorkerW 分离");
+                Ok(()) => {
+                    tracing::info!(display_id, "壁纸窗口已从壁纸层分离");
+                    // raised 下窗口带 WS_CHILD，分离后必须恢复顶层窗口语义；
+                    // 失败仅 warn，不阻塞移除（窗口即将被隐藏/销毁）。
+                    if let Err(e) = window::restore_top_level_style(hwnd) {
+                        tracing::warn!(
+                            display_id,
+                            error = %e,
+                            "分离后恢复顶层窗口样式失败（不阻塞移除）"
+                        );
+                    }
                     // D-005: 分离后立即隐藏窗口，避免调用方未及时清理时残留可见顶层窗口。
                     // ShowWindow 失败仅 warn（窗口已分离，隐藏失败非致命，调用方负责销毁）。
                     if !unsafe { ShowWindow(hwnd, SW_HIDE) }.as_bool() {
@@ -547,7 +563,8 @@ impl DesktopIntegrator {
     /// A5：`detach_for_pure_mode` 失败后的"半摘出"恢复（best-effort）
     ///
     /// `lift_wallpaper_window` 任一步失败时，窗口可能已被 `SetParent(None)` 摘出但未置顶
-    /// （半摘出状态）。本方法先检测窗口是否已脱离当前 WorkerW（[`Self::is_child_of_workerw`]）：
+    /// （半摘出状态）。本方法先检测窗口是否已脱离当前壁纸层
+    ///（[`Self::is_attached_to_wallpaper_layer`]）：
     /// 已脱离则用进入时的 `arrangement` 经 [`Self::embed_wallpaper`] 嵌回；嵌回仍失败则调用
     /// [`hide_window_on_reattach_failure`] 对有效句柄做 best-effort 隐藏，避免窗口漂浮于桌面层
     /// 遮挡图标。恢复为 best-effort：失败只记录日志（隐藏失败 `warn` / 嵌回失败 `error!`），
@@ -561,8 +578,8 @@ impl DesktopIntegrator {
         hwnd: HWND,
         arrangement: Arrangement,
     ) {
-        // 未脱离（失败发生在 GetWindowRect / SetParent 阶段）：窗口仍在 WorkerW 内，无需恢复
-        if self.is_child_of_workerw(hwnd) {
+        // 未脱离（失败发生在 GetWindowRect / SetParent 阶段）：窗口仍在壁纸层内，无需恢复
+        if self.is_attached_to_wallpaper_layer(hwnd) {
             return;
         }
         if let Err(e) = self.embed_wallpaper(hwnd, display_id, arrangement) {
@@ -595,20 +612,29 @@ impl DesktopIntegrator {
                 .is_some_and(|h| unsafe { IsWindow(h).as_bool() })
     }
 
-    /// 校验 `hwnd` 的父窗口是否为当前 WorkerW（DR-40 原子交换 commit 前校验）
+    /// 校验 `hwnd` 是否附着在当前桌面壁纸层（DR-40 原子交换 commit 前校验）
+    ///
+    /// 覆盖两种层级：
+    /// - 旧层级：父窗口为缓存的 WorkerW
+    /// - raised desktop：父窗口为缓存的 Progman（壁纸窗口是 Progman 的 layered 子窗口）
     ///
     /// 必须用 `GetAncestor(GA_PARENT)` 而非 `GetParent`：mpv 等壁纸子进程窗口
     /// 为弹出式窗口（无 `WS_CHILD` 样式），`SetParent` 重定父后内部父链已指向
-    /// WorkerW（`EnumChildWindows` 可枚举到），但 `GetParent` 对无 `WS_CHILD`
+    /// WorkerW/Progman（`EnumChildWindows` 可枚举到），但 `GetParent` 对无 `WS_CHILD`
     /// 的窗口返回的是**拥有者**（此处为 NULL），导致已正确嵌入的窗口误判为
     /// 校验失败，轮换永不提交（且旧壁纸被误杀）。
     ///
-    /// 若 WorkerW 已失效或 `hwnd` 已无效（父窗口被回收/桌面重建），返回 `false`，
+    /// 若缓存句柄已失效或 `hwnd` 已无效（父窗口被回收/桌面重建），返回 `false`，
     /// 调用方应放弃原子交换并 terminate 新窗。
-    pub fn is_child_of_workerw(&self, hwnd: HWND) -> bool {
-        self.workerw_hwnd
-            .map(|w| unsafe { GetAncestor(hwnd, GA_PARENT) == w && IsWindow(hwnd).as_bool() })
-            .unwrap_or(false)
+    pub fn is_attached_to_wallpaper_layer(&self, hwnd: HWND) -> bool {
+        if !unsafe { IsWindow(hwnd).as_bool() } {
+            return false;
+        }
+        let parent = unsafe { GetAncestor(hwnd, GA_PARENT) };
+        [self.workerw_hwnd, self.progman_hwnd]
+            .into_iter()
+            .flatten()
+            .any(|host| parent == host)
     }
 
     /// 检测 Explorer 重启并重新初始化
@@ -1258,14 +1284,14 @@ mod tests {
     }
 
     /// A5 契约：`detach_for_pure_mode` 失败后必须尝试恢复"半摘出"窗口
-    ///（`recover_half_detached_window`：先 `is_child_of_workerw` 检测，再 `embed_wallpaper` 嵌回）；
+    ///（`recover_half_detached_window`：先 `is_attached_to_wallpaper_layer` 检测，再 `embed_wallpaper` 嵌回）；
     /// 嵌回仍失败时经共享 helper `hide_window_on_reattach_failure` 隐藏兜底（R3）。
     #[test]
     fn pure_mode_half_detach_recovery_markers() {
         let source = include_str!("mod.rs");
         let call = ["self.recover_half_", "detached_window("].join("");
         let def = ["fn recover_half_", "detached_window("].join("");
-        let child_check = ["is_child_", "of_workerw(hwnd)"].join("");
+        let child_check = ["is_attached_to_", "wallpaper_layer(hwnd)"].join("");
         let reembed = ["embed_", "wallpaper(hwnd"].join("");
         let end_marker = ["pub fn ", "is_workerw_valid"].join("");
         assert!(

@@ -52,7 +52,7 @@
 - Video 渲染器通过 ProcessManager 直接 spawn `mpv.exe` 子进程（按需）
 - **Web 渲染器为代理层**：通过 ProcessManager 以 `--wp-proc` 模式 spawn 壳进程自身（`mirrorstar-wallpaper.exe --wp-proc`，按需），仍是独立进程（崩溃隔离不变），通过 WpProcIpcClient 命名管道通信
 - **UI 主窗口为独立进程** `mirrorstar-ui.exe`（crate `crates/mirrorstar-ui/`，Slint 1.18 软件渲染）：由壳侧 UI 子进程管理模块按需 spawn，通过 `ui_proto` NDJSON 行协议 over stdio 通信；业务逻辑仅在壳侧，UI 不复制业务、不直接读写配置文件
-- HWND 通过 FindWindowW 获取后，壳进程执行 WorkerW 嵌入（与 mpv 窗口嵌入逻辑一致）
+- HWND 通过 FindWindowW 获取后，壳进程执行桌面壁纸层嵌入（与视频宿主窗口嵌入逻辑一致）
 
 **内存优化：**
 - 无 Web 壁纸、无主窗口时：零子进程开销（仅壳进程 + 可选的 mpv）
@@ -292,7 +292,7 @@ MirrorStar 在壳进程与子进程之间使用**三套独立**的通信协议�
 - 重试：20 次 × 100ms = 2 秒（`WINDOW_FIND_RETRIES`）
 - PID 验证：`GetWindowThreadProcessId` 确认窗口属于 wp-proc 子进程
 
-**嵌入流程**：HWND 获取后，壳进程的 `DesktopIntegrator` 执行 WorkerW 嵌入（`SetParent` + `SetWindowPos(HWND_BOTTOM)` + `ShowWindow`），与 mpv 窗口嵌入逻辑一致。
+**嵌入流程**：HWND 获取后，壳进程的 `DesktopIntegrator` 执行桌面壁纸层嵌入（raised 下为 `WS_CHILD`/layered/Progman + DefView z-order；旧层级为 `SetParent` + `SetWindowPos(HWND_BOTTOM)`），与视频宿主窗口嵌入逻辑一致。
 
 ### 2.3 进程模型要点总结
 

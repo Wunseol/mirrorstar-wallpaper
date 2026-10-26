@@ -36,7 +36,7 @@ use std::sync::Mutex;
 use windows::Win32::Foundation::{HWND, RECT};
 use windows::Win32::Graphics::Gdi::InvalidateRect;
 use windows::Win32::UI::WindowsAndMessaging::{
-    GetSystemMetrics, GetWindowRect, SetParent, SetWindowPos, HWND_TOPMOST, SM_CXVIRTUALSCREEN,
+    GetSystemMetrics, GetWindowRect, SetWindowPos, HWND_TOPMOST, SM_CXVIRTUALSCREEN,
     SM_CYVIRTUALSCREEN, SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN, SWP_FRAMECHANGED, SWP_NOACTIVATE,
     SWP_NOMOVE, SWP_NOSIZE, SWP_SHOWWINDOW,
 };
@@ -116,10 +116,11 @@ pub fn assert_topmost_all() {
 ///
 /// 严格按以下顺序执行（D1）：
 /// 1. `GetWindowRect` 读取当前屏幕矩形（**必须在摘出之前**，摘出后坐标含义变化）
-/// 2. `SetParent(hwnd, None)` 从 WorkerW 层重定父级摘出
-/// 3. `SetWindowPos(hwnd, HWND_TOPMOST, x, y, w, h, SWP_NOACTIVATE | SWP_SHOWWINDOW |
+/// 2. 带父链校验的 `SetParent(hwnd, None)` 从壁纸层（WorkerW/Progman）重定父级摘出
+/// 3. `restore_top_level_style` 清除 `WS_CHILD`（保留 `WS_EX_LAYERED`/alpha=255）
+/// 4. `SetWindowPos(hwnd, HWND_TOPMOST, x, y, w, h, SWP_NOACTIVATE | SWP_SHOWWINDOW |
 ///    SWP_FRAMECHANGED)` 置顶，矩形与第 1 步读到的完全一致
-/// 4. `InvalidateRect(hwnd, None, false)` 触发 GDI 渲染器保险重绘
+/// 5. `InvalidateRect(hwnd, None, false)` 触发 GDI 渲染器保险重绘
 ///
 /// 调用方职责：调用前需已置位 [`set_active`]，并在失败时按需回滚（本函数不做回滚）；
 /// 退出时须用现有 `DesktopIntegrator::embed_wallpaper` 嵌回。
@@ -148,19 +149,29 @@ pub fn lift_wallpaper_window(hwnd: HWND) -> Result<(), MirrorStarError> {
         rect.bottom - rect.top,
     );
 
-    // Step 2: 从 WorkerW 层摘出（不隐藏，窗口必须保持可见以继续出画）
-    unsafe {
-        SetParent(hwnd, None).map_err(|e| {
-            tracing::error!(
-                error = %e,
-                hwnd = hwnd.0 as isize,
-                "SetParent 摘出壁纸窗口失败"
-            );
-            MirrorStarError::DesktopIntegration(format!("SetParent 摘出壁纸窗口失败: {}", e))
-        })?;
-    }
+    // Step 2: 从壁纸层摘出（不隐藏，窗口必须保持可见以继续出画）。
+    // 使用带父链校验的封装：raised desktop 下 SetParent 可能返回 NULL 但父链已正确。
+    crate::desktop::window::set_parent_verified(hwnd, None).map_err(|e| {
+        tracing::error!(
+            error = %e,
+            hwnd = hwnd.0 as isize,
+            "SetParent 摘出壁纸窗口失败"
+        );
+        e
+    })?;
 
-    // Step 3 + Step 4: 置顶全屏 + GDI 保险重绘（复用公共步骤；矩形与 Step 1 完全一致）
+    // Step 3: 恢复顶层窗口语义（清除 WS_CHILD；保留 WS_EX_LAYERED/alpha=255）。
+    // 失败返回 Err，调用方将按半摘出流程恢复窗口。
+    crate::desktop::window::restore_top_level_style(hwnd).map_err(|e| {
+        tracing::error!(
+            error = %e,
+            hwnd = hwnd.0 as isize,
+            "摘出壁纸窗口后恢复顶层样式失败"
+        );
+        e
+    })?;
+
+    // Step 4 + Step 5: 置顶全屏 + GDI 保险重绘（复用公共步骤；矩形与 Step 1 完全一致）
     set_topmost_to_rect(hwnd, x, y, w, h, "壁纸窗口")
 }
 
@@ -353,7 +364,7 @@ mod tests {
         );
     }
 
-    /// lift_wallpaper_window 中 GetWindowRect 必须出现在 SetParent 之前
+    /// lift_wallpaper_window 中 GetWindowRect 必须在摘出（SetParent）之前
     /// （保证"先取矩形再摘出"的 D1 契约）。
     #[test]
     fn get_window_rect_precedes_set_parent() {
@@ -364,11 +375,11 @@ mod tests {
             .find("GetWindowRect(hwnd, &mut rect).map_err")
             .expect("源码应包含 GetWindowRect(hwnd, &mut rect) 调用");
         let set_parent_at = source
-            .find("SetParent(hwnd, None).map_err")
-            .expect("源码应包含 SetParent(hwnd, None) 调用");
+            .find("set_parent_verified(hwnd, None).map_err")
+            .expect("源码应包含带父链校验的 set_parent_verified(hwnd, None) 调用");
         assert!(
             get_rect_at < set_parent_at,
-            "GetWindowRect 必须先于 SetParent 出现（先取矩形再摘出）"
+            "GetWindowRect 必须先于摘出（SetParent）出现（先取矩形再摘出）"
         );
     }
 

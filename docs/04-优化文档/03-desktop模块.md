@@ -8,12 +8,12 @@
 
 ### 1.1 模块职责
 
-desktop 模块负责将壁纸窗口嵌入 Windows 桌面的 WorkerW 层（位于桌面图标层之下），并管理显示器枚举、原生壁纸设置等与 Win32 桌面环境的交互。模块分为两层：`DesktopIntegrator`（状态层，持有 progman/workerw 句柄与活跃壁纸表，提供懒加载、嵌入、移除、失效检测等高级 API）与 `worker_w` 无状态操作层（提供纯函数式 Win32 操作），后者又包含 `window`（窗口样式操作）与 `native_wallpaper`（注册表 + SystemParametersInfoW 原生壁纸）两个子模块。
+desktop 模块负责将壁纸窗口嵌入 Windows 桌面的壁纸层（旧层级为 WorkerW，位于桌面图标层之下；raised desktop 下为 Progman 的 `WS_CHILD` + `WS_EX_LAYERED` 子窗口，位于 `SHELLDLL_DefView` 之下、WorkerW 之上），并管理显示器枚举、原生壁纸设置等与 Win32 桌面环境的交互。模块分为两层：`DesktopIntegrator`（状态层，持有 progman/workerw 句柄与活跃壁纸表，提供懒加载、嵌入、移除、失效检测等高级 API）与 `worker_w` 无状态操作层（提供纯函数式 Win32 操作），后者又包含 `window`（窗口样式操作）与 `native_wallpaper`（注册表 + SystemParametersInfoW 原生壁纸）两个子模块。
 
 核心功能与设计模式：
 
 - WorkerW 发现：`find_workerw_no_retry` 通过 `FindWindowW(Progman)` + Progman 直查快速路径（D-PERF-002）+ `EnumWindows`（`try_enum_windows` 封装）+ `SendMessageTimeoutW(0x052C)` 多策略查找；Windows 11 raised desktop（24H2/25H2）下额外以 `FindWindowExW(Progman, …)` 探测 Progman 的直接子 WorkerW（见 1.4）
-- 窗口嵌入：`SetParent` 将壁纸窗口挂到 WorkerW 下；PerMonitor 分支使用 `calculate_per_monitor_child_coords` 处理负坐标偏移（D-002）；raised desktop 下嵌入成功后调用 `ensure_workerw_zorder` 将 WorkerW 置为 Progman 最底层子窗口（防遮挡桌面图标）
+- 窗口嵌入：旧层级 `SetParent` 将壁纸窗口挂到 WorkerW 下并以 `HWND_BOTTOM` 定位；raised desktop 下改为 Progman 的 `WS_CHILD` + `WS_EX_LAYERED`（alpha=255）子窗口，`SetWindowPos` 锚定 `SHELLDLL_DefView`（位于 DefView 之下、WorkerW 之上），嵌入后调用 `ensure_workerw_zorder` 将 WorkerW 置为 Progman 最底层子窗口；PerMonitor 分支使用 `calculate_per_monitor_child_coords` 处理负坐标偏移（D-002）
 - 原生壁纸 API：`SystemParametersInfoW` + 注册表读写（`RegistryGuard` 事务回滚守卫，D01）
 - 多显示器枚举：`EnumDisplayMonitors` 回调收集所有显示器，带 5s TTL 缓存（D-013）
 - Explorer 重启检测：`TaskbarCreated` 消息 + 5 分钟兜底轮询；`is_workerw_valid` 同时校验 progman/workerw（D-006）
@@ -42,10 +42,27 @@ Windows 11 24H2/25H2 的 raised desktop 改变了桌面层级：`Progman` 带 `W
 - **特性检测（不判断系统版本号）**：`progman_is_raised_desktop(progman)` 通过 `GetWindowLongPtrW(Progman, GWL_EXSTYLE) & WS_EX_NOREDIRECTIONBITMAP` 判定；`is_raised_desktop()` 内部 `FindWindowW("Progman")` 后调用前者，找不到 Progman 时返回 `false`。以窗口样式位识别层级形态，避免依据系统 build 号误判。
 - **查找顺序（按层级分流）**：`find_workerw_no_retry` 在非 raised desktop 时旧层级路径逐行不变（`SHELLDLL_DefView` 父窗口为 WorkerW → Progman 兄弟 WorkerW → `EnumWindows` → `0x052C` → 再次 `EnumWindows` → fallback）；raised desktop 下只走 `find_progman_child_workerw`（`FindWindowExW(Progman, NULL, "WorkerW", NULL)` 探测 + `is_workerw_class` 校验类名），在发送 `0x052C` **之前**探测一次、**之后**探测一次，未命中返回 `WorkerWNotFound`，并跳过 `SHELLDLL_DefView` 直查块、顶层兄弟 WorkerW 及 Step 2/4/5 的顶层 `EnumWindows`。该探测与 `SHELLDLL_DefView` 是否存在无关。
 - **`0x052C` 发送参数**：`SendMessageTimeoutW(Progman, 0x052C, WPARAM(0xD), LPARAM(0x1), SMTO_NORMAL | SMTO_ABORTIFHUNG, 1000)`；参数提为 `WM_SPAWN_WORK_WPARAM` / `WM_SPAWN_WORK_LPARAM` 常量，超时提为 `WM_SPAWN_WORK_TIMEOUT_MS = 1000`（raised desktop 下 Progman 创建子 WorkerW 较慢，原 200ms 不足）。
-- **嵌入与 z-order 保障**：嵌入方式不变，仍 `SetParent` 到 WorkerW（raised desktop 下即 Progman 的直接子 WorkerW），不引入 `WS_EX_LAYERED`。raised desktop 下 `SHELLDLL_DefView` 与 WorkerW 同为 Progman 子窗口，WorkerW 必须是最后一个（最底层）子窗口，否则壁纸会遮挡桌面图标；`DesktopIntegrator::embed_wallpaper` 在嵌入成功后调用 `ensure_workerw_zorder(progman, workerw)`：用 `GetWindow(Progman, GW_CHILD)` 取首个（最上层）直接子窗口、再以 `GetWindow(首个直接子窗口, GW_HWNDLAST)` 取最底层直接子窗口（只考察直接子窗口，不递归枚举子孙窗口），若 WorkerW 不是它则 `SetWindowPos(WorkerW, HWND_BOTTOM, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE)` 置底。该函数仅对 raised desktop 生效，best-effort，失败仅 `warn`。
+- **嵌入模型（raised desktop，Lively/Microsoft 模型）**：壁纸窗口为 `Progman` 的 `WS_CHILD` + `WS_EX_LAYERED`（alpha=255）子窗口，`SetWindowPos` 以 `SHELLDLL_DefView` 为 `hWndInsertAfter`（插入 DefView 正下方、WorkerW 之上），**不使用 `HWND_BOTTOM`**，也不再 `SetParent` 到 Progman 的直接子 WorkerW。时序：`make_borderless` + `remove_from_taskbar` → `apply_raised_desktop_style`（`WS_CHILD` → `WS_EX_LAYERED` + `SetLayeredWindowAttributes(0, 255, LWA_ALPHA)`，**必须先于 `SetParent`**）→ `set_parent_verified(hwnd, Some(progman))` → `SetWindowPos(…, SHELLDLL_DefView, …)` → `ShowWindow(SW_SHOW)` → `ensure_workerw_zorder`。找不到 `SHELLDLL_DefView` 时直接返回 `DesktopIntegration`（含 Progman/WorkerW 句柄），不静默回退旧层级。旧层级行为不变：`SetParent(WorkerW)` + `HWND_BOTTOM`，不改 `WS_CHILD`/`WS_EX_LAYERED`。
+- **`SetParent` 二义性处理**：`SetParent` 成功时返回前一个父窗口，顶层窗口的前父可能为 `NULL`，故不能以 NULL 单独判失败。`window.rs::set_parent_verified` 调用前 `SetLastError(0)`，调用后以 `GetAncestor(GA_PARENT)` 与期望父窗口比对：父链正确即成功（NULL 返回记 `setparent_ambiguous_success` 并继续）；父链不符且 `GetLastError != 0` 返回含错误码的 `DesktopIntegration`，父链不符且错误码为 0 返回"未生效且无错误码"错误。嵌入、`remove_wallpaper` 分离、纯净模式摘出与半摘出恢复均使用该封装。
+- **z-order 保障**：raised desktop 下 `SHELLDLL_DefView`、壁纸窗口与 WorkerW 同为 Progman 子窗口；壁纸插在 DefView 之下，WorkerW 必须是最后一个（最底层）子窗口，否则 WorkerW 会盖住壁纸。`DesktopIntegrator::embed_wallpaper` 在嵌入成功后调用 `ensure_workerw_zorder(progman, workerw)`：用 `GetWindow(Progman, GW_CHILD)` 取首个（最上层）直接子窗口、再以 `GetWindow(首个直接子窗口, GW_HWNDLAST)` 取最底层直接子窗口（只考察直接子窗口，不递归枚举子孙窗口），若 WorkerW 不是它则 `SetWindowPos(WorkerW, HWND_BOTTOM, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE)` 置底。该函数仅对 raised desktop 生效，best-effort，失败仅 `warn`。
 - **SPI 早退**：raised desktop 下 `SPI_SETDESKWALLPAPER` 会销毁承载动态壁纸的 WorkerW（参考 Lively Wallpaper 的 `RefreshDesktop` 早退实现）。因此 `refresh_desktop()` 在 raised desktop 下记 debug 日志后直接返回；`clear_native_wallpaper()` 同样记 debug 后返回 `Ok(())`，保持调用方既有成功语义（注册表原值保留不影响后续静态壁纸覆盖）。
-- **失效自愈不变**：`is_workerw_valid`（同时校验 progman/workerw，D-006）与 `check_and_reinitialize` / `ensure_workerw_ready` 的重试、重嵌入循环逻辑不变；raised desktop 下重新查找会经上述 Progman 子窗口探测得到新 WorkerW，再走既有 `embed_wallpaper` 流程重新嵌入，并在每次嵌入后重新应用 z-order 保障。
-- **影响边界**：仅涉及 WorkerW 嵌入路径的查找、Z 序与桌面刷新；Native 静态图片路径（`SystemParametersInfoW` + 注册表）与旧层级桌面不受影响。
+- **失效自愈不变**：`is_workerw_valid`（同时校验 progman/workerw，D-006）与 `check_and_reinitialize` / `ensure_workerw_ready` 的重试、重嵌入循环逻辑不变；raised desktop 下重新查找会经上述 Progman 子窗口探测得到新 WorkerW，再走既有 `embed_wallpaper`（raised 下即 layered/Progman 路径）重新嵌入，并在每次嵌入后重新应用 z-order 保障。
+- **影响边界**：仅涉及 WorkerW 嵌入路径的查找、层级与桌面刷新；Native 静态图片路径（`SystemParametersInfoW` + 注册表）与旧层级桌面不受影响。
+
+**raised desktop 层级结构**：
+
+```text
+Progman（WS_EX_NOREDIRECTIONBITMAP，覆盖虚拟桌面）
+├─ SHELLDLL_DefView（WS_EX_LAYERED，桌面图标层）
+├─ 壁纸窗口（WS_CHILD + WS_EX_LAYERED，alpha=255；视频为 MirrorStarVideoHost 宿主） ← 插入 DefView 正下方
+└─ WorkerW（Progman 的最后一个/最底层子窗口）
+```
+
+- **桌面附着判定**：`is_attached_to_wallpaper_layer(hwnd)` 用 `GetAncestor(GA_PARENT)` 判定父窗口为缓存的 WorkerW（旧层级）或 Progman（raised）且 `IsWindow(hwnd)` 为真；用于原子交换 `commit_atomic_swap` 的 commit 前校验与 `recover_half_detached_window` 的脱离检测。缓存句柄或窗口失效时返回 `false`。
+- **摘出 / 移除 / 重嵌**：`remove_wallpaper` 与 `lift_wallpaper_window` 分离后调用 `restore_top_level_style` 清除 `WS_CHILD`（保留 `WS_EX_LAYERED` / alpha=255），重嵌由 `embed_wallpaper` 重新套用 raised 样式。
+- **鼠标穿透（raised）**：`set_mouse_passthrough(false)` 不清除 `WS_EX_LAYERED`，并重设 `SetLayeredWindowAttributes(alpha=255)`；旧层级仍幂等清除遗留的 `WS_EX_LAYERED`。
+- **视频壁纸：宿主窗口 + mpv `--wid`**：`VideoRenderer::play` 由宿主线程创建隐藏的 `MirrorStarVideoHost`（`WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE`、无 `WS_VISIBLE`），mpv 以 `--wid=<宿主>` 只创建 `WS_CHILD` vo 子窗口；`renderer.hwnd()` 返回宿主，桌面嵌入/摘出/重嵌均作用于宿主。宿主线程消息循环在 `WM_SIZE`/`WM_SHOWWINDOW` 时把 mpv 子窗口拉伸到客户区。mpv 无顶层窗口 → 任务栏/Alt+Tab 不会出现 mpv，也消除了 mpv 顶层窗口 `SetParent` 的二义性。
+- **mpv 参数**：`--border=no`（Lively #2415 / commit 7cc4116，修复 Win11 24H2 顶部/右侧不刷新）；`--show-in-taskbar=no` 仅作防御（随包 mpv 0.41 创建期不应用该选项），主防护是宿主 + `--wid`。
 
 ## 2. v4.0 审查发现与修复状态（15 项）
 
@@ -126,7 +143,7 @@ desktop 模块经过 v3.0→v3.5 共 5 轮修复（D01-D12），事务回滚契�
 
 **描述**：`set_mouse_passthrough` 曾对 `enabled=true` 分支 OR 上 `WS_EX_LAYERED | WS_EX_TRANSPARENT`，`enabled=false` 分支仅移除 `WS_EX_TRANSPARENT` 而保留 `WS_EX_LAYERED`。壁纸窗口（mpv 视频输出窗口、图片 GDI 窗口）从未调用 `SetLayeredWindowAttributes`，一旦被写入 `WS_EX_LAYERED` 即进入「分层但无分层属性」的非合成状态，画面停止更新——表现为开关「鼠标交互模式」时视频壁纸被"暂停"，且关闭后因 `WS_EX_LAYERED` 未清除而不恢复。真实呈现状态可在 mpv 日志中确认无 `pause="yes"`（即解码未真正暂停）。
 
-**修复状态**：✅ 已修复于 v41-D-013。此前 v4.0 Wave 3B 仅补齐 doc comment 声明"分层属性契约"，未消除非合成态风险。现 `set_mouse_passthrough` 绝不写入 `WS_EX_LAYERED`：`enabled=true` 仅 OR `WS_EX_TRANSPARENT`；`enabled=false` 幂等清除 `WS_EX_TRANSPARENT` 与遗留的 `WS_EX_LAYERED`（并输出 info 诊断日志）。样式计算抽取为纯函数 `passthrough_ex_style` 并补单测（window.rs）。
+**修复状态**：✅ 已修复于 v41-D-013。此前 v4.0 Wave 3B 仅补齐 doc comment 声明"分层属性契约"，未消除非合成态风险。现 `set_mouse_passthrough` 绝不写入 `WS_EX_LAYERED`：`enabled=true` 仅 OR `WS_EX_TRANSPARENT`；`enabled=false` 幂等清除 `WS_EX_TRANSPARENT` 与遗留的 `WS_EX_LAYERED`（并输出 info 诊断日志）。样式计算抽取为纯函数 `passthrough_ex_style` 并补单测（window.rs）。raised desktop 例外：关闭穿透时保留 `WS_EX_LAYERED` 并重设 `SetLayeredWindowAttributes(alpha=255)`，避免壁纸失去桌面合成（见 1.4）。
 
 ### [D-012] [Low] [可维护性] worker_w.rs — `SendMessageTimeoutW` 超时参数 200ms 为内联魔法数
 
@@ -226,20 +243,20 @@ desktop 模块经过 v3.0→v3.5 共 5 轮修复（D01-D12），事务回滚契�
 
 ### 5.1 两个新原语的契约
 
-纯净壁纸模式需要把"正在播放的壁纸窗口"从 WorkerW 层**临时摘出**并置顶全屏覆盖桌面（含图标与任务栏），退出后再嵌回。desktop 层为此新增两个方法，Win32 操作与几何全部复用既有原语 / 算法，零新增布局代码（**视频显示器例外**：架构 D1 后视频不再搬动原窗口，改由临时顶层覆盖渲染器呈现，见 [5.5](#55-退出回嵌的防呈现冻结契约架构-d1)）：
+纯净壁纸模式需要把"正在播放的壁纸窗口"从壁纸层（旧层级 WorkerW / raised desktop 的 Progman）**临时摘出**并置顶全屏覆盖桌面（含图标与任务栏），退出后再嵌回。desktop 层为此新增两个方法，Win32 操作与几何全部复用既有原语 / 算法，零新增布局代码（**视频显示器例外**：架构 D1 后视频不再搬动原窗口，改由临时顶层覆盖渲染器呈现，见 [5.5](#55-退出回嵌的防呈现冻结契约架构-d1)）：
 
 | 方法 | 行为 | 调用方 |
 |---|---|---|
-| `detach_for_pure_mode(display_id)` | 读当前矩形 → `lift_wallpaper_window`（`SetParent(hwnd, None)` 摘出 + `SetWindowPos(HWND_TOPMOST, 原矩形, SWP_NOACTIVATE \| SWP_SHOWWINDOW \| SWP_FRAMECHANGED)` + `InvalidateRect`）→ **移除 `active_wallpapers` 条目** → 返回摘出的 `HWND` | `WallpaperEngine::enter_pure_mode` |
-| `reattach_after_pure_mode(display_id, hwnd, arrangement)` | 委托现有 `embed_wallpaper`：重新查找 WorkerW 并重新写回 `active_wallpapers` 条目；**成功后再补一次 `InvalidateRect(hwnd, None, false)`** 保险重绘（失败仅 `warn`，见 5.4） | `WallpaperEngine::exit_pure_mode` / `rollback_pure_mode_enter` |
+| `detach_for_pure_mode(display_id)` | 读当前矩形 → `lift_wallpaper_window`（`set_parent_verified(hwnd, None)` 摘出 + `restore_top_level_style` 清 `WS_CHILD`（保留 `WS_EX_LAYERED` / alpha=255）+ `SetWindowPos(HWND_TOPMOST, 原矩形, SWP_NOACTIVATE \| SWP_SHOWWINDOW \| SWP_FRAMECHANGED)` + `InvalidateRect`）→ **移除 `active_wallpapers` 条目** → 返回摘出的 `HWND` | `WallpaperEngine::enter_pure_mode` |
+| `reattach_after_pure_mode(display_id, hwnd, arrangement)` | 委托现有 `embed_wallpaper`：重新查找 WorkerW 并重新写回 `active_wallpapers` 条目（raised desktop 下重新套用 `WS_CHILD` + `WS_EX_LAYERED` alpha=255、Progman 父级、DefView z-order）；**成功后再补一次 `InvalidateRect(hwnd, None, false)`** 保险重绘（失败仅 `warn`，见 5.4） | `WallpaperEngine::exit_pure_mode` / `rollback_pure_mode_enter` |
 
 契约细节：
 
 - **不隐藏窗口**：摘出后窗口必须保持可见以继续出画，故 `detach_for_pure_mode` **不**调用 `ShowWindow(SW_HIDE)`。
-- **保持当前屏幕矩形（零 resize）**：`lift_wallpaper_window` 先 `GetWindowRect` 读当前屏幕矩形，再 `SetParent(hwnd, None)`，随后原样复用该矩形置顶（宽高不做任何调整）——规避 mpv D3D11 输出在"重父化 + resize"时重配置。
+- **保持当前屏幕矩形（零 resize）**：`lift_wallpaper_window` 先 `GetWindowRect` 读当前屏幕矩形，再经 `set_parent_verified(hwnd, None)` 摘出、`restore_top_level_style` 清除 `WS_CHILD`（保留 `WS_EX_LAYERED` / alpha=255），随后原样复用该矩形置顶（宽高不做任何调整）——规避 mpv D3D11 输出在"重父化 + resize"时重配置。
 - **不抢前台**：只做"重定父级 + 设置 `HWND_TOPMOST`"，置顶带 `SWP_NOACTIVATE`；窗口在嵌入阶段已由 `remove_from_taskbar` 设置 `WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW`，因此置顶后不会成为前台窗口、不进 Alt+Tab。
 - **失败语义**：`active_wallpapers` 无该 `display_id` → 返回 `Err`；`IsWindow(hwnd)` 为假（窗口已消失）→ 移除条目并返回 `Err`；`lift_wallpaper_window` 失败 → **保留条目**并返回 `Err`（见下条"半摘出恢复"）。
-- **失败语义新增项：半摘出恢复（A5）**：`lift_wallpaper_window` 的失败可能发生在 `SetParent(None)` **之后**（如 `SetWindowPos` 失败）——此时窗口已脱离 WorkerW 成为普通顶层窗口，即**"半摘出"状态**（若不恢复会漂浮在桌面层遮挡图标，而引擎回滚只处理已计入 `lifted` 的窗口，覆盖不到本次失败窗口）。失败后 `detach_for_pure_mode` 先做 **best-effort 恢复**：若 `is_child_of_workerw` 为假（确认已脱离）→ 用进入时的 `arrangement` 经 `embed_wallpaper` 嵌回；嵌回仍失败 → 对有效句柄 `ShowWindow(SW_HIDE)` 隐藏兜底并记录 `error!`。恢复为 best-effort，**不改返回值**：随后仍**保留 `active_wallpapers` 条目并返回原 `Err`**（进入回滚语义不变）。未脱离（失败发生在 `GetWindowRect` / `SetParent` 阶段）则窗口仍在 WorkerW 内，无需恢复。
+- **失败语义新增项：半摘出恢复（A5）**：`lift_wallpaper_window` 的失败可能发生在 `SetParent(None)` **之后**（如 `SetWindowPos` / `restore_top_level_style` 失败）——此时窗口已脱离 WorkerW/Progman 成为普通顶层窗口，即**"半摘出"状态**（若不恢复会漂浮在桌面层遮挡图标，而引擎回滚只处理已计入 `lifted` 的窗口，覆盖不到本次失败窗口）。失败后 `detach_for_pure_mode` 先做 **best-effort 恢复**：若 `is_attached_to_wallpaper_layer` 为假（`GetAncestor(GA_PARENT)` 父窗口既非 WorkerW 也非 Progman，确认已脱离）→ 用进入时的 `arrangement` 经 `embed_wallpaper` 嵌回；嵌回仍失败 → 对有效句柄 `ShowWindow(SW_HIDE)` 隐藏兜底并记录 `error!`。恢复为 best-effort，**不改返回值**：随后仍**保留 `active_wallpapers` 条目并返回原 `Err`**（进入回滚语义不变）。未脱离（失败发生在 `GetWindowRect` / `SetParent` 阶段）则窗口仍在壁纸层内，无需恢复。
 - **回嵌失败不由本层兜底**：`reattach_after_pure_mode` 复用 `embed_wallpaper`，**失败时由调用方（引擎）按降级语义隐藏窗口**——即本方法自身**不隐藏、不销毁**窗口（隐藏兜底属于引擎侧的失败处理契约，见 `docs/04-优化文档/04-wallpaper模块.md` 的"嵌回失败的隐藏降级"）。
 
 ### 5.2 为什么必须移除 `active_wallpapers` 条目
@@ -249,18 +266,19 @@ desktop 模块经过 v3.0→v3.5 共 5 轮修复（D01-D12），事务回滚契�
 - 摘出成功即移除条目 → 重初始化循环不再触达该窗口 → 置顶状态保持（配套：收到 `TaskbarCreated` 广播时由输入钩子线程调用 `pure_mode::assert_topmost_all()` 重断言 Z 序，防任务栏抢 Z 序）。
 - 条目的回写只发生在退出（或进入失败回滚）时，由 `embed_wallpaper` 重新查找新 WorkerW 后写回（Explorer 重启后自动使用新句柄）。
 
-> 本节只适用于**走摘出路径**的显示器。**视频显示器例外**（架构 D1，见 [5.5](#55-退出回嵌的防呈现冻结契约架构-d1)）：原窗口从不摘出，其 `active_wallpapers` 条目**全程保留**，因此重初始化循环会照常维护它（这正是期望行为——它仍嵌在 WorkerW 中）。
+> 本节只适用于**走摘出路径**的显示器。**视频显示器例外**（架构 D1，见 [5.5](#55-退出回嵌的防呈现冻结契约架构-d1)）：原窗口从不摘出，其 `active_wallpapers` 条目**全程保留**，因此重初始化循环会照常维护它（这正是期望行为——它仍嵌在壁纸层中）。
 
 ### 5.3 与 `remove_wallpaper` 的语义差异
 
 | 维度 | `remove_wallpaper` | `detach_for_pure_mode` |
 |---|---|---|
 | 目的 | 彻底移除某显示器壁纸（销毁前的分离） | 纯净壁纸模式临时摘出，稍后回嵌 |
-| `SetParent(hwnd, None)` | 是 | 是（在 `lift_wallpaper_window` 内） |
+| `SetParent(hwnd, None)` | 是（经 `set_parent_verified` 校验父链） | 是（在 `lift_wallpaper_window` 内，经 `set_parent_verified`） |
+| 分离后样式 | `restore_top_level_style` 清 `WS_CHILD`（保留 `WS_EX_LAYERED` / alpha=255），失败仅 `warn` | `restore_top_level_style` 清 `WS_CHILD`（保留 `WS_EX_LAYERED` / alpha=255），失败返回 `Err` 并走半摘出恢复 |
 | 置顶 | 否（分离后为普通顶层窗口） | 是（`HWND_TOPMOST`，保持原矩形） |
 | `ShowWindow(SW_HIDE)` | **是**（D-005：分离后立即隐藏，防残留可见顶层窗口） | **否**（窗口须继续可见出画） |
 | `active_wallpapers` 条目 | 移除 | 移除（见 5.2） |
-| 窗口所有权 | 调用方负责 `DestroyWindow`，本方法只分离 + 隐藏 | 窗口**不销毁**，退出时由 `embed_wallpaper` 嵌回 |
+| 窗口所有权 | 调用方负责 `DestroyWindow`，本方法只分离 + 隐藏 | 窗口**不销毁**，退出时由 `embed_wallpaper` 嵌回（raised desktop 下重新套用 raised 样式） |
 | `SetParent` 失败时条目 | 保留条目并返回 `Err` | 保留条目并返回 `Err`：lift 失败（含半摘出）先做 best-effort 恢复（嵌回 / 隐藏兜底），随后仍保留条目并返回 `Err` |
 
 > **文档断言 → 代码位置**：A5 半摘出恢复函数 `recover_half_detached_window` 定义于 `crates/mirrorstar-core/src/desktop/mod.rs` 中 `detach_for_pure_mode` 与 `is_workerw_valid` 之间。
