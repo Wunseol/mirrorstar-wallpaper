@@ -88,6 +88,16 @@ pub fn clear_lifted() {
     guard.clear();
 }
 
+/// 返回置顶窗口注册表的快照（`HWND` 列表）。
+///
+/// 供上层在进入模式后复位覆盖窗光标：后台线程创建的顶层 `NOACTIVATE` 覆盖窗会被
+/// Windows 显示为系统 `IDC_WAIT`，需要按窗口定位其所属线程后临时挂接输入队列并
+/// `SetCursor`。返回空表示当前没有置顶窗口（未进入模式或已退出）。
+pub fn lifted_hwnds() -> Vec<HWND> {
+    let guard = LIFTED.lock().unwrap_or_else(|e| e.into_inner());
+    guard.iter().map(|raw| HWND(*raw as *mut _)).collect()
+}
+
 /// 对注册表内所有置顶窗口重断言一次 `HWND_TOPMOST`（不动几何）。
 ///
 /// 使用场景：收到 `TaskbarCreated` 广播（可能伴随任务栏重建并抢走 Z 序）时，由输入
@@ -337,15 +347,23 @@ mod tests {
             assert_eq!(guard[1], 0, "HWND::default() 的 isize 值为 0");
         }
 
+        // lifted_hwnds 快照必须与注册内容一致（与 register/clear 共用同一全局，
+        // 故并入本测试串行执行，避免并行测试互相覆盖注册表导致偶发失败）。
+        let snapshot = lifted_hwnds();
+        assert_eq!(snapshot.len(), 2, "lifted_hwnds 应返回 2 个句柄");
+        assert_eq!(snapshot[0].0, invalid[0].0, "首个快照句柄应与注册值一致");
+        assert_eq!(snapshot[1].0, invalid[1].0, "第二个快照句柄应与注册值一致");
+
         // 对无效句柄重断言：SetWindowPos 会失败，但函数应只 warn、不 panic
         assert_topmost_all();
 
-        // 清空后注册表应为空
+        // 清空后注册表与快照均应为空
         clear_lifted();
         {
             let guard = LIFTED.lock().unwrap_or_else(|e| e.into_inner());
             assert!(guard.is_empty(), "clear_lifted 后注册表应为空");
         }
+        assert!(lifted_hwnds().is_empty(), "清空后 lifted_hwnds 快照应为空");
     }
 
     // ── 文档标记测试（仓库惯例：include_str! 断言关键契约） ──────────────

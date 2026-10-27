@@ -386,6 +386,18 @@ desktop 模块经过 v3.0→v3.5 共 5 轮修复（D01-D12），事务回滚契�
 - **伪造浮出窗**（`NotifyIconOverflowWindow` 类名的可见顶层窗口）：进入编排完成后该窗口被销毁（枚举不到），日志含同一条命中记录。
 - **回归**：`MIRRORSTAR_TEST_PURE_MODE=3` 三轮往返全部完成（3/3），0 失败、0 自愈误报；退出后对 mpv 窗口 `PrintWindow` 连续 5 帧采样指纹**互异**（画面在动）、窗口为 1920×1080 全屏可见。
 
+### 5.7 覆盖窗光标复位（IDC_WAIT 蓝圈修复，2026-10-27）
+
+> 来源：本轮真机复现与修复。现象：进入纯净壁纸模式后鼠标变成纯蓝圈（Windows 系统 `IDC_WAIT`），移动不恢复，直到退出才恢复。
+
+**根因**：视频覆盖窗由 `mirrorstar-video-host` 后台线程创建，带 `WS_EX_NOACTIVATE` 且以 `SWP_NOACTIVATE` 置顶（D1 不抢前台）。Windows 会在这类"后台出现的全屏顶层窗口"上显示系统 `IDC_WAIT`（Win11 的纯蓝圈；系统侧表现为启动中/忙碌状态）；覆盖窗线程不属于前台输入队列，`WM_SETCURSOR` / `SetCursor` 无法改写光标形状，蓝圈持续到覆盖窗隐藏。实测排除了隐藏栏（不经浮出窗也复现）、渲染器无响应（`IsHungAppWindow=false`、视频持续播放）、鼠标 Capture（`GetCapture` 为空）与 mpv（其窗口类光标为箭头）。
+
+**修复**：`src-tauri/src/platform/pure_mode.rs::reset_pure_mode_cursor_when_waiting()` 在覆盖窗置顶后立即以 2ms 间隔轮询 `GetCursorInfo`，一旦检测到 `IDC_WAIT`，就把当前线程 `AttachThreadInput` 到鼠标下覆盖窗（`pure_mode::lifted_hwnds()` 注册表）所属线程，`SetCursor(IDC_ARROW)` 后立即解除挂接；最长轮询 250ms。不抢前台、不碰桌面 / 任务栏 / 其它应用。覆盖窗线程无响应或挂接失败仅记日志，不阻断进入。
+
+**实测（调试版 + 测试钩子）**：3 轮往返、5ms 探针（实际采样间隔约 16ms）下，3 轮合计仅 1 次 `IDC_WAIT` 采样，其余均为 `IDC_ARROW`；日志确认每轮都执行了“等待态 → 箭头”复位（`previous_cursor=0x10007`）。即蓝圈闪烁压缩到 ≤1 帧，退出后仍为箭头。`cargo test -p mirrorstar-core --lib pure_mode::` 与 `cargo test -p mirrorstar-wallpaper --lib` 全部通过（198 passed / 3 ignored）。
+
+**遗留**：`pure_mode_input` 的"空闲隐藏光标"使用后台线程 `ShowCursor(FALSE)`，实测不改变可见光标（显示计数为线程级），属独立的既有问题，本轮未改；如需要"模式内隐藏光标"，应另行走前台 / 挂接方案。
+
 ## 6. 优化机会与交集汇总
 
 ### 6.1 v4.0 仍可关注的渐进优化方向
