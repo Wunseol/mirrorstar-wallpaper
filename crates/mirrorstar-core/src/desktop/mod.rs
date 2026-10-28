@@ -614,9 +614,11 @@ impl DesktopIntegrator {
 
     /// 校验 `hwnd` 是否附着在当前桌面壁纸层（DR-40 原子交换 commit 前校验）
     ///
-    /// 覆盖两种层级：
+    /// 覆盖三种层级：
     /// - 旧层级：父窗口为缓存的 WorkerW
-    /// - raised desktop：父窗口为缓存的 Progman（壁纸窗口是 Progman 的 layered 子窗口）
+    /// - raised desktop：父窗口为缓存的 Progman（DefView 直接挂在 Progman 下）
+    /// - raised desktop：父窗口的父窗口为缓存的 Progman（宿主为 Progman 直接子 WorkerW，
+    ///   此时 DefView 挂在该 WorkerW 子树内）
     ///
     /// 必须用 `GetAncestor(GA_PARENT)` 而非 `GetParent`：mpv 等壁纸子进程窗口
     /// 为弹出式窗口（无 `WS_CHILD` 样式），`SetParent` 重定父后内部父链已指向
@@ -631,10 +633,22 @@ impl DesktopIntegrator {
             return false;
         }
         let parent = unsafe { GetAncestor(hwnd, GA_PARENT) };
-        [self.workerw_hwnd, self.progman_hwnd]
+        if [self.workerw_hwnd, self.progman_hwnd]
             .into_iter()
             .flatten()
             .any(|host| parent == host)
+        {
+            return true;
+        }
+        // raised desktop：宿主可能是 Progman 的直接子 WorkerW。若该 WorkerW 与缓存的
+        // workerw_hwnd 不同（DefView 挂在另一个子 WorkerW 子树内），只要父窗口的父窗口
+        // 是缓存的 Progman，仍视为附着在桌面壁纸层。
+        match self.progman_hwnd {
+            Some(progman) if !parent.is_invalid() => {
+                (unsafe { GetAncestor(parent, GA_PARENT) }) == progman
+            }
+            _ => false,
+        }
     }
 
     /// 检测 Explorer 重启并重新初始化

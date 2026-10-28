@@ -78,7 +78,9 @@ pub use commands::wallpaper::resolve_display_id;
 //     - 设置 `SHARED_ENGINE` / `SHARED_CONFIG` OnceLock
 //     - 失败：内部记录，线程会自动退出（无致命影响）
 //
-// 12. **Explorer 重启监控**：`start_explorer_restart_monitor(desktop)`
+// 12. **Explorer 监控**：`start_explorer_restart_monitor()`
+//     - 事件源：`TaskbarCreated` / WorkerW·Progman 销毁 / 会话解锁 / 睡眠恢复
+//       （统一经 `try_heal_desktop_layer` 自愈）
 //     - 失败：内部记录，线程会自动退出
 //
 // 13. **AppState 构造**：组装 config_manager / wallpaper_engine / desktop / tray_paused / tray_pause_resume_item / tray_pure_mode_item
@@ -732,9 +734,10 @@ pub fn run() {
     // 启动全屏应用检测
     start_fullscreen_monitor(wallpaper_engine.clone(), config_manager.clone());
 
-    // 启动 Explorer 重启监控（事件驱动，监听 TaskbarCreated 消息）
-    // 同时处理 WM_POWERBROADCAST 消息，实现电源状态变化的即时检测
-    start_explorer_restart_monitor(desktop.clone());
+    // 启动 Explorer 监控（事件驱动）：TaskbarCreated（Explorer 重启）、
+    // WorkerW/Progman 销毁、会话解锁、睡眠恢复，统一经 try_heal_desktop_layer 自愈；
+    // 同时处理 WM_POWERBROADCAST 的电源状态变化（暂停/恢复壁纸）。
+    start_explorer_restart_monitor();
 
     // 启动清理：终止上次崩溃遗留的孤儿 mpv / wp-proc / UI 子进程
     // （仅限当前 exe 所在目录及其子目录内的同名进程，目录外同名进程不会被误杀）。
@@ -1124,10 +1127,10 @@ pub fn run() {
                 ui_process::open_main_window(app.handle());
             }
 
-            // WorkerW 有效性兜底检查（5 分钟间隔）
-            // 主要监控由 TaskbarCreated 事件驱动，此检查仅作为事件遗漏的最终兜底
-            let desktop_clone = app.state::<AppState>().desktop.clone();
-            start_workerw_check(desktop_clone);
+            // 桌面层兜底检查（300s / 5 分钟间隔）
+            // 主要监控为事件驱动（WorkerW/Progman 销毁、TaskbarCreated、会话解锁、睡眠恢复），
+            // 此检查仅作为事件全部遗漏时的最终兜底；tick 内走 engine.heal_desktop_layer。
+            start_workerw_check(app.state::<AppState>().wallpaper_engine.clone());
 
             // 启动壁纸轮换调度器主循环（§16 启动时序：读 playback/config → 对账 DR-34 →
             // 对齐单元 → resolve_boot() 一次 apply → 进入主循环）。

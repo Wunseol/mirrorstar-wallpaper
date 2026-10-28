@@ -676,16 +676,16 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass `
 
 | 项目 | 字节 | MiB | 证据 | 压缩后占安装包比例 |
 | ---- | ---- | --- | ---- | ------------------ |
-| NSIS 安装包 | 43,048,937 B | 41.05 MiB | `target/release/bundle/nsis/MirrorStar Wallpaper_0.1.2_x64-setup.exe` | 100% |
+| NSIS 安装包 | 43,049,955 B | 41.06 MiB | `target/release/bundle/nsis/MirrorStar Wallpaper_0.1.3_x64-setup.exe` | 100% |
 | 随包 `mpv/mpv.exe` | 123,164,160 B | 117.46 MiB | bundle resources | 压缩后 ≈ 34.1 MiB，≈ **83%** |
 | 随包 `mirrorstar-ui.exe` | 11,689,984 B | 11.15 MiB | bundle resources | 压缩后 ≈ 4.16 MiB，≈ **10%** |
-| 随包 `mirrorstar-wallpaper.exe` | 9,648,128 B | 9.20 MiB | bundle 主程序 | 压缩后 ≈ 2.79 MiB，≈ **7%** |
+| 随包 `mirrorstar-wallpaper.exe` | 9,684,992 B | 9.24 MiB | bundle 主程序 | 压缩后 ≈ 2.80 MiB，≈ **7%** |
 | 随包 `mpv/license` | 19,873 B | — | bundle resources | 可忽略 |
-| **未压缩载荷合计** | **144,522,145 B** | **137.83 MiB** | 上列随包载荷求和 | — |
+| **未压缩载荷合计** | **144,559,009 B** | **137.86 MiB** | 上列随包载荷求和 | — |
 
-**压缩证据**：内存内 Deflate(Optimal) 实测压缩率——`mpv.exe` 39.5%、`mirrorstar-ui.exe` 51.0%、主 `mirrorstar-wallpaper.exe` 41.4%（v0.1.1 同构载荷基线）；NSIS 采用 LZMA，实压缩比 Deflate 再优约 **26.5%**（v0.1.2 安装包 43,048,937 / Deflate 合计 58,528,630 ≈ 0.736）。
+**压缩证据**：内存内 Deflate(Optimal) 实测压缩率——`mpv.exe` 39.5%、`mirrorstar-ui.exe` 51.0%、主 `mirrorstar-wallpaper.exe` 41.4%（v0.1.1 同构载荷基线）；NSIS 采用 LZMA，实压缩比 Deflate 再优约 **26.6%**（v0.1.3 安装包 43,049,955 / Deflate 合计 58,621,322 ≈ 0.734）。
 
-> **版本复核（v0.1.2，2026-10-26）**：上表的安装包与随包 exe 字节数已按 `MirrorStar Wallpaper_0.1.2_x64-setup.exe` 重新打包后复核更新（本次实测：安装包 43,048,937 B / 41.05 MiB，`mirrorstar-ui.exe` 11,689,984 B，`mirrorstar-wallpaper.exe` 9,648,128 B）；`mpv.exe` 与 `mpv/license` 未变（未纳入版本控制，体积不可由 git 追溯）。
+> **版本复核（v0.1.3，2026-10-27）**：上表的安装包与随包 exe 字节数已按 `MirrorStar Wallpaper_0.1.3_x64-setup.exe` 重新打包后复核更新（本次实测：安装包 43,049,955 B / 41.06 MiB @16:25:50，`mirrorstar-ui.exe` 11,689,984 B @16:19:13，`mirrorstar-wallpaper.exe` 9,684,992 B @16:25:51）；`mpv.exe` 与 `mpv/license` 未变（未纳入版本控制，体积不可由 git 追溯）。
 
 **主因排序**：
 

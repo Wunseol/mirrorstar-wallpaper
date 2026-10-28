@@ -41,7 +41,7 @@
 | 文件 | 行数 | 主要内容 |
 |---|---|---|
 | mod.rs | 11 | 平台模块导出（3 个 `pub(crate) use` + `pub(crate) mod liveness_watchdog / pure_mode / pure_mode_input`）|
-| explorer.rs | 289 | `start_explorer_restart_monitor`：`HWND_MESSAGE` 消息窗口 + `explorer_monitor_wndproc`（TaskbarCreated / WM_POWERBROADCAST / WM_DESTROY） |
+| explorer.rs | 约 490 | `start_explorer_restart_monitor`：隐藏顶层窗口（`WS_EX_TOOLWINDOW \| WS_POPUP`，刻意不用 `HWND_MESSAGE`）+ `explorer_monitor_wndproc`（TaskbarCreated / WorkerW·Progman 销毁 / WM_WTSSESSION_CHANGE / WM_POWERBROADCAST / WM_DESTROY），统一转 `try_heal_desktop_layer` |
 | fullscreen.rs | 1801 | `start_fullscreen_monitor`：`SetWinEventHook(EVENT_SYSTEM_FOREGROUND)` + `foreground_event_callback` + 纯函数 + 56 个纯函数单元测试 |
 | liveness_watchdog.rs | 490 | 视频卡帧常驻看护（`video_playback_stalled` / 采样确认 / 自愈），随 runtime 结束**（原文档缺失）** |
 | power.rs | 246 | `handle_power_status_change`：`GetSystemPowerStatus` + `interpret_ac_line_status` + 电池↔AC 切换暂停/恢复 |

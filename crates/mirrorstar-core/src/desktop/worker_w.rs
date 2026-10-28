@@ -151,6 +151,152 @@ fn find_defview(progman: HWND) -> Option<HWND> {
     (!defview.is_invalid()).then_some(defview)
 }
 
+/// 深度查找 `SHELLDLL_DefView`（桌面图标层）。
+///
+/// 先按历史行为查 Progman 的直接子窗口；未命中时（DefView 可能挂在 Progman
+/// 直接子 WorkerW 的子树里，H2 场景）再对 Progman 的每个直接子窗口递归查找
+///（深度 ≤ [`MAX_CHILD_DEPTH`]）。句柄无效时返回 `None`。
+fn find_defview_deep(progman: HWND) -> Option<HWND> {
+    if let Some(defview) = find_defview(progman) {
+        return Some(defview);
+    }
+
+    // SAFETY: FindWindowExW/GetWindow 仅查找、遍历窗口，不修改窗口状态。
+    unsafe {
+        let mut child = HWND::default();
+        loop {
+            let Ok(next_child) = FindWindowExW(progman, child, None, None) else {
+                break;
+            };
+            if next_child.is_invalid() {
+                break;
+            }
+            if let Some(found) = find_child_by_class(
+                next_child,
+                windows::core::w!("SHELLDLL_DefView"),
+                MAX_CHILD_DEPTH,
+            ) {
+                return Some(found);
+            }
+            child = next_child;
+        }
+    }
+    None
+}
+
+/// 壁纸窗口的嵌入路径选择结果。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EmbedPath {
+    /// raised desktop 且 DefView 可用：layered 子窗口 + 锚点插入
+    RaisedLayered(HWND),
+    /// 旧层级，或 raised 但 DefView 缺失时的降级
+    LegacyWorkerW,
+}
+
+/// 纯函数：按桌面层级与 DefView 可用性选择嵌入路径。
+///
+/// - `raised == true` 且 DefView 句柄有效 → `RaisedLayered(defview)`；
+/// - 其余情况（旧层级，或 raised 但 DefView 缺失的用户状态）→ `LegacyWorkerW`，
+///   即落回旧层级嵌入（`SetParent(WorkerW)` + `HWND_BOTTOM`）。
+///
+/// `Option<HWND>` 中的无效句柄（如 `HWND::default()`）按缺失归一化处理；
+/// 本函数不调用任何 Win32 API，便于单测四象限。
+fn choose_embed_path(raised: bool, defview: Option<HWND>) -> EmbedPath {
+    match defview.filter(|h| !h.is_invalid()) {
+        Some(defview) if raised => EmbedPath::RaisedLayered(defview),
+        _ => EmbedPath::LegacyWorkerW,
+    }
+}
+
+/// 判断 `hwnd` 的子树（深度 ≤ [`MAX_CHILD_DEPTH`]）是否包含指定类名的窗口。
+///
+/// 薄封装 [`find_child_by_class`]（该函数不检查 `hwnd` 自身，仅查其子孙），
+/// 用于 `SysListView32` / `SHELLDLL_DefView` 归属探测。
+fn subtree_has_class(hwnd: HWND, class_name: windows::core::PCWSTR) -> bool {
+    // SAFETY: find_child_by_class 仅查找子窗口，不修改窗口状态。
+    unsafe { find_child_by_class(hwnd, class_name, MAX_CHILD_DEPTH).is_some() }
+}
+
+/// 读取窗口类名；句柄无效或读取失败时返回 `"?"`（仅用于诊断日志）。
+fn class_name_of(hwnd: HWND) -> String {
+    if hwnd.is_invalid() {
+        return "?".to_string();
+    }
+    let mut buf = [0u16; 256];
+    // SAFETY: GetClassNameW 读取窗口类名到栈缓冲区，256 >= 任何窗口类名长度。
+    let len = unsafe { GetClassNameW(hwnd, &mut buf) };
+    if len > 0 {
+        String::from_utf16_lossy(&buf[..len as usize])
+    } else {
+        "?".to_string()
+    }
+}
+
+/// 纯判定：宿主是否属于 Progman 的窗口层级。
+///
+/// 成立条件：宿主有效，且宿主本身等于 Progman，或宿主的父窗口等于 Progman。
+/// 输入均为调用方已探测好的 HWND 值，本函数不调用任何 Win32 API（便于单测）。
+fn host_is_under_progman(host: HWND, progman: HWND, host_parent: HWND) -> bool {
+    !host.is_invalid() && !progman.is_invalid() && (host == progman || host_parent == progman)
+}
+
+/// 纯函数：选择壁纸窗口的宿主（即 DefView 的直接父窗口）。
+///
+/// 仅当 [`host_is_under_progman`] 成立时返回 `Some(宿主)`，否则返回 `None`。
+/// 不调用 Win32 API，便于单测判定矩阵。
+fn choose_wallpaper_host(defview_parent: HWND, host_parent: HWND, progman: HWND) -> Option<HWND> {
+    host_is_under_progman(defview_parent, progman, host_parent).then_some(defview_parent)
+}
+
+/// Win32 探针：解析 raised desktop 下壁纸窗口的宿主（DefView 的直接父窗口）。
+///
+/// 通过 `GetAncestor(GA_PARENT)` 取得 DefView 的父窗口及其自身的父窗口，
+/// 交给纯逻辑 [`choose_wallpaper_host`] 判定；不满足时返回 `None`。
+fn resolve_wallpaper_host(defview: HWND, progman: HWND) -> Option<HWND> {
+    // SAFETY: GetAncestor 仅查询窗口父链，不修改窗口状态。
+    unsafe {
+        let host = GetAncestor(defview, GA_PARENT);
+        if host.is_invalid() {
+            return None;
+        }
+        let host_parent = GetAncestor(host, GA_PARENT);
+        choose_wallpaper_host(host, host_parent, progman)
+    }
+}
+
+/// 汇总 Progman 直接子窗口链（`GW_CHILD` → `GW_HWNDNEXT`），供诊断日志使用。
+///
+/// 每项格式为 `"类名#vis=0/1#0x句柄"`；最多遍历 64 个兄弟窗口以防异常 z 序导致
+/// 死循环，任何 Win32 调用失败都静默结束（不 panic、不修改窗口状态）。
+fn progman_child_chain_summary(progman: HWND) -> Vec<String> {
+    /// 单层最多遍历的兄弟窗口数（防止死循环）。
+    const MAX_SIBLINGS: usize = 64;
+
+    let mut chain = Vec::new();
+    // SAFETY: GetWindow/GetClassNameW/IsWindowVisible 仅查询窗口关系与状态。
+    unsafe {
+        let Ok(mut child) = GetWindow(progman, GW_CHILD) else {
+            return chain;
+        };
+        while !child.is_invalid() && chain.len() < MAX_SIBLINGS {
+            let class = class_name_of(child);
+            let visible = u8::from(IsWindowVisible(child).as_bool());
+            chain.push(format!(
+                "{}#vis={}#0x{:X}",
+                class, visible, child.0 as isize
+            ));
+            let Ok(next) = GetWindow(child, GW_HWNDNEXT) else {
+                break;
+            };
+            if next.is_invalid() {
+                break;
+            }
+            child = next;
+        }
+    }
+    chain
+}
+
 /// 单次尝试查找 Progman 和 WorkerW 窗口句柄（无重试、无 sleep）
 ///
 /// 按桌面层级分流两条查找路径：
@@ -598,6 +744,12 @@ pub fn ensure_workerw_zorder(progman: HWND, workerw: HWND) {
         return;
     }
 
+    // 宿主复核：raised desktop 下壁纸宿主是 DefView 的直接父窗口（Progman 或
+    // Progman 直接子 WorkerW）。宿主恰为该 WorkerW 时，置底它只改变它与 Progman
+    // 其它直接子窗口的先后，不影响其内部 DefView 与壁纸窗口的相对 z 序；
+    // 宿主为 Progman 时，置底 WorkerW 也是把承载层移到 DefView 之下，同样满足
+    // "壁纸位于图标层之下"。两种情况均无需跳过置底。
+    //
     // EnumChildWindows 会递归枚举子孙窗口（壁纸宿主已挂到 WorkerW 时 last_child 永远不是 WorkerW），
     // 因此这里改用 GetWindow 只遍历 Progman 的直接子窗口：
     // GW_CHILD 取首个（最上层）直接子窗口，GW_HWNDLAST 在同一层级内取最底层兄弟。
@@ -639,15 +791,84 @@ pub fn ensure_workerw_zorder(progman: HWND, workerw: HWND) {
     }
 }
 
+/// 纯判定：窗口的上一个兄弟窗口（`GW_HWNDPREV`）是否正是 z 序锚点。
+///
+/// `prev_sibling == anchor` 表示窗口紧贴在锚点下方（z 序更低），即壁纸位于
+/// 桌面图标层之下。不调用 Win32 API，便于单测。
+fn is_below_anchor(prev_sibling: HWND, anchor: HWND) -> bool {
+    !anchor.is_invalid() && prev_sibling == anchor
+}
+
+/// 校验 raised desktop 下壁纸窗口是否紧贴 z 序锚点（DefView）下方（best-effort）。
+///
+/// 流程：
+/// 1. `GetWindow(hwnd, GW_HWNDPREV)` 与锚点比对，通过即返回 `true`；
+/// 2. 不通过则用 `SetWindowPos(hwnd, anchor, ...)` 重试一次并再次校验；
+/// 3. 仍不通过则回退到宿主内最底层（`HWND_BOTTOM`）并记录 `warn`，返回 `false`。
+///
+/// 不返回 `Err`：z 序校验失败不应让已完成的嵌入整体失败，兜底后由日志
+/// `z_anchor_ok=false` 暴露问题。
+fn ensure_below_anchor(hwnd: HWND, anchor: HWND, progman: HWND) -> bool {
+    // SAFETY: GetWindow/SetWindowPos 仅查询或调整 z 序，不移动、不改变大小、不激活窗口。
+    unsafe {
+        if GetWindow(hwnd, GW_HWNDPREV).is_ok_and(|prev| is_below_anchor(prev, anchor)) {
+            return true;
+        }
+
+        // 重试一次：锚点插入可能被后续同步消息打回兄弟 z 序顶部。
+        if SetWindowPos(
+            hwnd,
+            anchor,
+            0,
+            0,
+            0,
+            0,
+            SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
+        )
+        .is_ok()
+            && GetWindow(hwnd, GW_HWNDPREV).is_ok_and(|prev| is_below_anchor(prev, anchor))
+        {
+            return true;
+        }
+
+        // 兜底：放到宿主内最底层，保证壁纸不会停留在兄弟 z 序顶部遮挡图标。
+        let prev = GetWindow(hwnd, GW_HWNDPREV).unwrap_or_default();
+        let fallback_ok = SetWindowPos(
+            hwnd,
+            HWND_BOTTOM,
+            0,
+            0,
+            0,
+            0,
+            SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_FRAMECHANGED,
+        )
+        .is_ok();
+        tracing::warn!(
+            hwnd = hwnd.0 as isize,
+            anchor = anchor.0 as isize,
+            progman = progman.0 as isize,
+            prev = prev.0 as isize,
+            fallback_ok,
+            "raised desktop: z 序锚点校验失败，已回退到宿主最底层（壁纸可能覆盖桌面图标）"
+        );
+        false
+    }
+}
+
 /// 将壁纸窗口嵌入桌面壁纸层。
 ///
 /// 按桌面层级分两条路径（`progman_hwnd` 由 `DesktopIntegrator` 传入，避免重复
 /// `FindWindowW`）：
 ///
 /// - **raised desktop**（Progman 带 `WS_EX_NOREDIRECTIONBITMAP`）：按 Lively/Microsoft
-///   模型把窗口设为 `WS_CHILD` + `WS_EX_LAYERED`（alpha=255）的 Progman 子窗口，
-///   z-order 插入 `SHELLDLL_DefView` 正下方（WorkerW 之上），不使用 `HWND_BOTTOM`。
+///   模型把窗口设为 `WS_CHILD` + `WS_EX_LAYERED`（alpha=255）的子窗口，
+///   宿主 = `SHELLDLL_DefView` 的直接父窗口（Progman 或 Progman 直接子 WorkerW），
+///   z-order 插入 `SHELLDLL_DefView` 正下方，并在插入后校验/兜底。
+/// - **raised 但找不到 `SHELLDLL_DefView`**（如用户关闭"显示桌面图标"）：记录 warn 后
+///   降级为旧层级嵌入，壁纸仍挂在 WorkerW 上显示，不整体失败。
 /// - **旧层级**：保持原行为——`SetParent(WorkerW)` + `HWND_BOTTOM`，不改子窗口/分层样式。
+///
+/// 路径选择由纯函数 [`choose_embed_path`] 决定。
 ///
 /// `displays` 参数由调用方传入（D-013：在 `DesktopIntegrator` 层缓存显示器列表
 /// 与 5s TTL 失效，避免 PerMonitor 分支每次调用 `enumerate_displays()`）。
@@ -666,30 +887,44 @@ pub fn embed_wallpaper(
         crate::desktop::window::remove_from_taskbar(wp_hwnd);
 
         let raised = progman_is_raised_desktop(progman_hwnd);
+        // 深度查找覆盖"Progman 直接子"与"Progman → WorkerW → DefView"两种层级；
+        // 仅 raised 下需要 DefView 作为 z-order 锚点与宿主探测入口。
+        let probed_defview = if raised {
+            find_defview_deep(progman_hwnd)
+        } else {
+            None
+        };
 
-        if raised {
-            // raised desktop：DefView 是 z-order 锚点，找不到时直接失败，
-            // 不静默回退到旧层级 WorkerW（layered 模型与旧层级不兼容）。
-            let Some(defview) = find_defview(progman_hwnd) else {
+        // raised 且 DefView 可用 → layered 锚点插入；raised 但 DefView 缺失（或旧层级）
+        // → 落入下方唯一的旧层级实现（降级路径不复制粘贴第二份）。
+        if let EmbedPath::RaisedLayered(defview) = choose_embed_path(raised, probed_defview) {
+            // 宿主 = DefView 的直接父窗口（Progman 或 Progman 直接子 WorkerW），
+            // 要求父链上溯可到 Progman；否则不嵌入，交由既有重试/自愈处理。
+            let Some(host) = resolve_wallpaper_host(defview, progman_hwnd) else {
+                let host_probe = GetAncestor(defview, GA_PARENT);
                 return Err(MirrorStarError::DesktopIntegration(format!(
-                    "raised desktop 下未找到 SHELLDLL_DefView（progman=0x{:X}, workerw=0x{:X}）",
-                    progman_hwnd.0 as isize, workerw_hwnd.0 as isize
+                    "raised desktop 下壁纸宿主校验失败（progman=0x{:X}, workerw=0x{:X}, defview=0x{:X}, host=0x{:X}）",
+                    progman_hwnd.0 as isize,
+                    workerw_hwnd.0 as isize,
+                    defview.0 as isize,
+                    host_probe.0 as isize
                 )));
             };
 
-            // 宿主为 Progman：其矩形覆盖整个虚拟桌面，坐标语义与 WorkerW 一致。
-            let mut progman_rect = RECT::default();
-            GetWindowRect(progman_hwnd, &mut progman_rect).map_err(|e| {
-                MirrorStarError::DesktopIntegration(format!("GetWindowRect(Progman) 失败: {}", e))
+            // 坐标按宿主矩形计算：Progman 覆盖整个虚拟桌面；Progman 子 WorkerW
+            // 同样覆盖其桌面区域，两者坐标语义一致。
+            let mut host_rect = RECT::default();
+            GetWindowRect(host, &mut host_rect).map_err(|e| {
+                MirrorStarError::DesktopIntegration(format!("GetWindowRect(宿主) 失败: {}", e))
             })?;
             let (x, y, width, height) =
-                calculate_embed_coords(&progman_rect, display_id, arrangement, displays);
+                calculate_embed_coords(&host_rect, display_id, arrangement, displays);
 
             // WS_CHILD + WS_EX_LAYERED + alpha=255 必须在 SetParent 之前套用。
             crate::desktop::window::apply_raised_desktop_style(wp_hwnd)?;
-            crate::desktop::window::set_parent_verified(wp_hwnd, Some(progman_hwnd))?;
+            crate::desktop::window::set_parent_verified(wp_hwnd, Some(host))?;
 
-            // 插入到 DefView 正下方：壁纸位于桌面图标层之下、WorkerW 之上。
+            // 插入到 DefView 正下方：壁纸位于桌面图标层之下。
             SetWindowPos(
                 wp_hwnd,
                 defview,
@@ -702,6 +937,10 @@ pub fn embed_wallpaper(
             .map_err(|e| {
                 MirrorStarError::DesktopIntegration(format!("SetWindowPos(raised) 失败: {}", e))
             })?;
+
+            // SetParent 会把重定父窗口放到新兄弟 z 序顶部，必须校验并兜底，
+            // 否则壁纸停留在 DefView 之上会盖住桌面图标。
+            let z_anchor_ok = ensure_below_anchor(wp_hwnd, defview, progman_hwnd);
 
             // 嵌入时不主动抢占前台（不再为恢复焦点调用 SetForegroundWindow）：每次壁纸
             // 嵌入（轮换/手动切换）都会触发 EVENT_SYSTEM_FOREGROUND，扰乱全屏检测状态机，
@@ -716,6 +955,8 @@ pub fn embed_wallpaper(
                 workerw_hwnd,
                 Some(defview),
                 "defview",
+                host,
+                z_anchor_ok,
                 display_id,
                 arrangement,
                 x,
@@ -727,6 +968,17 @@ pub fn embed_wallpaper(
         }
 
         // ── 旧层级：行为与历史实现逐行一致（WorkerW 父窗口 + HWND_BOTTOM） ──
+        // raised 但无 DefView 时也落到此处（降级）：只有 warn 提示，嵌入流程与旧层级完全相同，
+        // 不写 WS_CHILD / WS_EX_LAYERED；日志中 defview=0 + z_order_anchor="bottom" + raised=true
+        // 即代表走了降级路径。
+        if raised {
+            tracing::warn!(
+                progman = progman_hwnd.0 as isize,
+                workerw = workerw_hwnd.0 as isize,
+                "raised desktop 下未找到 SHELLDLL_DefView，已降级为 WorkerW 嵌入；若桌面图标不可见，请确认：桌面右键 → 查看 → 显示桌面图标 已勾选"
+            );
+        }
+
         // Step 2: Determine position based on display_id and arrangement
         // D-TD-008: 在 match 前统一获取一次 workerw_rect，供所有分支共用
         //（原 3 处重复 GetWindowRect 调用合并为 1 处）。
@@ -763,6 +1015,8 @@ pub fn embed_wallpaper(
             workerw_hwnd,
             None,
             "bottom",
+            workerw_hwnd,
+            true,
             display_id,
             arrangement,
             x,
@@ -774,11 +1028,16 @@ pub fn embed_wallpaper(
     }
 }
 
-/// 记录嵌入成功后的可诊断信息（raised/父链/样式/z-order 锚点/几何）。
+/// 记录嵌入成功后的可诊断信息（raised/父链/宿主/样式/z-order 锚点/图标层归属/几何）。
 ///
 /// 字段用于真机复测直接判定走了哪条路径：`raised`、`progman`、`workerw`、
-/// `defview`（仅 raised）、`parent_after`、`style_has_child`、
-/// `exstyle_has_layered`、`z_order_anchor`、`display_id`、坐标尺寸。
+/// `defview`（raised 且找到 DefView 时为句柄；降级/旧层级时为 0）、`parent_after`、
+/// `host`、`host_class`、`style_has_child`、`exstyle_has_layered`、`z_order_anchor`、
+/// `z_anchor_ok`、`defview_has_icon_list`、`workerw_has_defview`、
+/// `workerw_has_icon_list`、`sibling_chain`、`display_id`、坐标尺寸。
+///
+/// 降级路径的判据：`raised=true` + `defview=0` + `z_order_anchor="bottom"` +
+/// `style_has_child=false` + `exstyle_has_layered=false`。
 #[allow(clippy::too_many_arguments)] // 诊断字段天然较多，拆结构体得不偿失。
 fn log_embed_success(
     hwnd: HWND,
@@ -787,6 +1046,8 @@ fn log_embed_success(
     workerw: HWND,
     defview: Option<HWND>,
     z_order_anchor: &str,
+    host: HWND,
+    z_anchor_ok: bool,
     display_id: &str,
     arrangement: Arrangement,
     x: i32,
@@ -804,6 +1065,22 @@ fn log_embed_success(
             GetAncestor(hwnd, GA_PARENT),
         )
     };
+    let host_class = class_name_of(host);
+
+    // 图标层归属探测与 Progman 子窗口链仅用于 raised 路径诊断（H1/H2 判定）；
+    // 旧层级没有 layered 子窗口模型，跳过这些额外 Win32 探测。
+    let (defview_has_icon_list, workerw_has_defview, workerw_has_icon_list, sibling_chain) =
+        if raised {
+            (
+                defview.is_some_and(|d| subtree_has_class(d, windows::core::w!("SysListView32"))),
+                subtree_has_class(workerw, windows::core::w!("SHELLDLL_DefView")),
+                subtree_has_class(workerw, windows::core::w!("SysListView32")),
+                progman_child_chain_summary(progman),
+            )
+        } else {
+            (false, false, false, Vec::new())
+        };
+
     tracing::info!(
         display_id,
         ?arrangement,
@@ -812,9 +1089,16 @@ fn log_embed_success(
         workerw = workerw.0 as isize,
         defview = defview.map_or(0, |h| h.0 as isize),
         parent_after = parent_after.0 as isize,
+        host = host.0 as isize,
+        host_class = %host_class,
         style_has_child,
         exstyle_has_layered,
         z_order_anchor,
+        z_anchor_ok,
+        defview_has_icon_list,
+        workerw_has_defview,
+        workerw_has_icon_list,
+        ?sibling_chain,
         x,
         y,
         width,
@@ -1135,6 +1419,159 @@ mod tests {
         let (x, y, width, height) =
             calculate_embed_coords(&progman_rect, "\\\\.\\DISPLAY1", Arrangement::Span, &[]);
         assert_eq!((x, y, width, height), (0, 0, 3840, 1080));
+    }
+
+    // ── raised desktop 宿主选择 / z 序纯函数测试 ─────────────────────────
+    //
+    // choose_wallpaper_host / host_is_under_progman / is_below_anchor 均为纯逻辑，
+    // 用伪造 HWND 值覆盖判定矩阵即可，不依赖真实桌面环境。
+
+    /// 构造伪造 HWND：仅用于纯函数判定，不解引用、不传给 Win32 API。
+    fn fake_hwnd(value: isize) -> HWND {
+        HWND(value as *mut std::ffi::c_void)
+    }
+
+    #[test]
+    fn host_is_under_progman_matrix() {
+        let progman = fake_hwnd(0x100);
+        let workerw = fake_hwnd(0x200);
+        let other = fake_hwnd(0x300);
+
+        // 宿主 == Progman：成立
+        assert!(host_is_under_progman(progman, progman, other));
+        // 宿主的父窗口 == Progman：成立
+        assert!(host_is_under_progman(workerw, progman, progman));
+        // 宿主的父窗口 != Progman：不成立
+        assert!(!host_is_under_progman(workerw, progman, other));
+        // 宿主无效：不成立
+        assert!(!host_is_under_progman(HWND::default(), progman, progman));
+        // Progman 无效（桌面重建/查找失败）：不成立
+        assert!(!host_is_under_progman(
+            workerw,
+            HWND::default(),
+            HWND::default()
+        ));
+    }
+
+    #[test]
+    fn choose_wallpaper_host_matrix() {
+        let progman = fake_hwnd(0x100);
+        let workerw = fake_hwnd(0x200);
+        let other = fake_hwnd(0x300);
+
+        // DefView 直接挂在 Progman 下：宿主 = Progman（宿主自身的父窗口不是 Progman）
+        assert_eq!(
+            choose_wallpaper_host(progman, other, progman),
+            Some(progman)
+        );
+        // DefView 挂在 Progman 直接子 WorkerW 下：宿主 = 该 WorkerW
+        assert_eq!(
+            choose_wallpaper_host(workerw, progman, progman),
+            Some(workerw)
+        );
+        // 宿主父窗口既不是 Progman、宿主也不是 Progman：拒绝
+        assert_eq!(choose_wallpaper_host(workerw, other, progman), None);
+        // DefView 父窗口无效：拒绝
+        assert_eq!(
+            choose_wallpaper_host(HWND::default(), progman, progman),
+            None
+        );
+    }
+
+    #[test]
+    fn is_below_anchor_matrix() {
+        let anchor = fake_hwnd(0x100);
+
+        // 上一个兄弟正是锚点：位于锚点之下
+        assert!(is_below_anchor(anchor, anchor));
+        // 上一个兄弟是别的窗口：不在锚点之下
+        assert!(!is_below_anchor(fake_hwnd(0x200), anchor));
+        // 没有上一个兄弟（z 序顶部）：不在锚点之下
+        assert!(!is_below_anchor(HWND::default(), anchor));
+        // 锚点无效：不成立
+        assert!(!is_below_anchor(anchor, HWND::default()));
+    }
+
+    #[test]
+    fn choose_embed_path_four_quadrants() {
+        let defview = fake_hwnd(0x400);
+
+        // raised + DefView 可用：layered 锚点插入
+        assert_eq!(
+            choose_embed_path(true, Some(defview)),
+            EmbedPath::RaisedLayered(defview)
+        );
+        // raised 但 DefView 缺失（用户关闭"显示桌面图标"）：降级到旧层级嵌入
+        assert_eq!(choose_embed_path(true, None), EmbedPath::LegacyWorkerW);
+        // 旧层级即使探测到 DefView 也不走 layered 模型
+        assert_eq!(
+            choose_embed_path(false, Some(defview)),
+            EmbedPath::LegacyWorkerW
+        );
+        // 旧层级 + 无 DefView：旧层级嵌入
+        assert_eq!(choose_embed_path(false, None), EmbedPath::LegacyWorkerW);
+        // 无效 HWND 归一化为缺失，不得误判为 raised layered
+        assert_eq!(
+            choose_embed_path(true, Some(HWND::default())),
+            EmbedPath::LegacyWorkerW
+        );
+    }
+
+    #[test]
+    fn raised_workerw_host_permonitor_negative_origin_offset() {
+        // 宿主为 Progman 直接子 WorkerW，原点位于负坐标 (-1920,0)：
+        // 子窗口坐标应为 display 虚拟屏幕坐标减去宿主原点。
+        let display = DisplayInfo {
+            id: "\\\\.\\DISPLAY2".to_string(),
+            name: "显示器 2".to_string(),
+            width: 1920,
+            height: 1080,
+            x: -1920,
+            y: 0,
+            is_primary: false,
+            dpi: 96,
+        };
+        let workerw_rect = RECT {
+            left: -1920,
+            top: 0,
+            right: 0,
+            bottom: 1080,
+        };
+        let (x, y, width, height) = calculate_embed_coords(
+            &workerw_rect,
+            &display.id,
+            Arrangement::PerMonitor,
+            std::slice::from_ref(&display),
+        );
+        assert_eq!((x, y, width, height), (0, 0, 1920, 1080));
+    }
+
+    #[test]
+    fn raised_workerw_host_span_uses_host_full_size() {
+        // 宿主为 Progman 子 WorkerW 时，Span 仍以宿主全尺寸铺满（与 Progman 一致）。
+        let workerw_rect = RECT {
+            left: -1920,
+            top: -200,
+            right: 1920,
+            bottom: 1080,
+        };
+        let (x, y, width, height) =
+            calculate_embed_coords(&workerw_rect, "\\\\.\\DISPLAY1", Arrangement::Span, &[]);
+        assert_eq!((x, y, width, height), (0, 0, 3840, 1280));
+    }
+
+    #[test]
+    fn progman_child_chain_summary_no_panic() {
+        // 真实桌面上遍历 Progman 直接子窗口链：不 panic，且长度受 64 上限约束。
+        let progman = unsafe { FindWindowW(windows::core::w!("Progman"), None) };
+        if let Ok(hwnd) = progman {
+            let chain = progman_child_chain_summary(hwnd);
+            assert!(chain.len() < 64, "子窗口链长度应受上限约束");
+            for item in &chain {
+                assert!(item.contains("#vis="), "每项应含可见性字段: {item}");
+            }
+        }
+        // Progman 找不到时（极端情况）跳过，不 panic 即通过
     }
 
     // ── 系统壁纸 API 烟雾测试 ───────────────────────────────────────────

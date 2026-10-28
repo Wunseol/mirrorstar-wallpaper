@@ -3,6 +3,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use windows::Win32::Foundation::HWND;
+use windows::Win32::UI::WindowsAndMessaging::IsWindow;
 
 use crate::audio::volume::VolumeControl;
 use crate::config::normalize_path_key;
@@ -370,6 +371,38 @@ pub(crate) fn resolve_display_id_from(
         }
     }
     String::new()
+}
+
+/// 桌面层自愈时单个渲染器窗口的健康判定结果。
+///
+/// 由纯函数 [`classify_renderer_health`] 产生，供
+/// [`WallpaperEngine::heal_desktop_layer`] 逐屏分流：
+/// - [`RendererHealth::Attached`]：窗口句柄存在且 `IsWindow` 为真，只需重新嵌入
+///   （恢复坐标与 DefView z 锚点）；
+/// - [`RendererHealth::Dead`]：句柄缺失或已被销毁（Explorer 重启 / Win+Tab 抬起
+///   桌面会连带销毁挂在桌面层下的子窗口），需要重建渲染器。
+///
+/// 之所以把判定抽成不触碰 Win32 的纯函数：`IsWindow` 的调用留在调用方（需要
+/// `unsafe`），判定结果可在单测里四象限覆盖，避免测试依赖真实桌面环境。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RendererHealth {
+    /// 窗口仍存活（句柄存在且 `IsWindow` 为真）
+    Attached,
+    /// 窗口已销毁或句柄缺失
+    Dead,
+}
+
+/// 判定渲染器窗口健康状态（纯函数，便于单测）。
+///
+/// `hwnd_present` 表示 `renderer.hwnd()` 是否返回了句柄；`is_window` 表示该句柄
+/// 的 `IsWindow` 结果。只有两者同时为真才视为存活，否则一律按已销毁处理
+/// （句柄缺失时渲染器必然不可用，保守走重建路径）。
+fn classify_renderer_health(hwnd_present: bool, is_window: bool) -> RendererHealth {
+    if hwnd_present && is_window {
+        RendererHealth::Attached
+    } else {
+        RendererHealth::Dead
+    }
 }
 
 impl WallpaperEngine {
@@ -1234,9 +1267,21 @@ impl WallpaperEngine {
             source,
             "检测到视频壁纸输出停滞，执行自愈（重建渲染器）"
         );
-        // 先终止：terminate 会置 Terminated 状态 + `ipc.quit` + `stop_process`（超时强杀）。
-        // 失败不阻断——即便进程未能优雅退出，随后 revive_terminated 的 play() 仍会尝试
-        // 重建；强杀兜底在 stop_process 内已尽力。终止失败仅 warn 保留证据。
+        self.rebuild_renderer(display_id)
+    }
+
+    /// 重建指定显示器的渲染器（`terminate` + `revive_terminated` 的最小抽取）。
+    ///
+    /// 抽取自 [`Self::heal_stalled_renderer`] 的"终止后重建"主体，供两处复用、
+    /// 避免出现两份渲染器重建逻辑：
+    /// - [`Self::heal_stalled_renderer`]：视频输出停滞自愈（先打出停滞上下文日志）；
+    /// - [`Self::heal_desktop_layer`]：桌面层自愈中渲染器窗口已被销毁的分支。
+    ///
+    /// 先终止：`terminate` 会置 Terminated 状态 + `ipc.quit` + `stop_process`
+    /// （超时强杀）。失败不阻断——即便进程未能优雅退出，随后 `revive_terminated`
+    /// 的 `play()` 仍会尝试重建；强杀兜底在 `stop_process` 内已尽力，终止失败
+    /// 仅 warn 保留证据。
+    fn rebuild_renderer(&mut self, display_id: &str) -> Result<(), MirrorStarError> {
         if let Some(renderer) = self.wallpapers.get_mut(display_id) {
             if let Err(e) = renderer.terminate() {
                 tracing::warn!(
@@ -1247,6 +1292,149 @@ impl WallpaperEngine {
             }
         }
         self.revive_terminated(display_id)
+    }
+
+    /// 引擎级桌面层统一自愈入口：重初始化桌面句柄 → 修复已脱离的存活窗口 → 重建已销毁渲染器。
+    ///
+    /// 背景：Explorer 重启、Win+Tab 抬起/放下桌面、锁屏-解锁、睡眠唤醒都会销毁
+    /// `Progman`/`WorkerW`；壁纸窗口是它们的子窗口，会一并被销毁。仅靠
+    /// `DesktopIntegrator::check_and_reinitialize` 只能重嵌**存活**窗口，无法让已销毁
+    /// 的渲染器复活，结果就是壁纸永久消失。本方法是唯一编排入口：先重初始化桌面
+    /// 句柄，再按窗口健康状态分流，必要时复用 `terminate` + `revive_terminated` 链路
+    /// 重建渲染器（与 `heal_stalled_renderer` 同一套原语，不新增渲染器逻辑）。
+    ///
+    /// 返回值 `bool` 表示桌面句柄是否被实际重初始化（透传 `check_and_reinitialize`）。
+    ///
+    /// # 不做无谓重嵌（避免周期性抖动）
+    ///
+    /// 存活窗口**只有已脱离桌面层**（`is_attached_to_wallpaper_layer` 为假）时才重嵌：
+    /// - 句柄失效触发的重初始化路径中，`check_and_reinitialize` 已把存活窗口重新嵌入，
+    ///   此处再嵌一次是重复的 `SetParent` + z 序重排（会短暂把窗口抬到兄弟顶部）；
+    /// - 300s 兜底轮询每次都会走到本方法，若无条件重嵌，会每 5 分钟制造一次
+    ///   重排/合成抖动（视频宿主还可能因 `SWP_FRAMECHANGED` 闪一帧）。
+    ///
+    /// # 锁顺序（重要）
+    ///
+    /// `check_and_reinitialize` 与逐屏重嵌都在 `self.desktop` 锁内执行，而重建路径
+    /// 会经 `revive_terminated` → `reembed_and_register_renderer` **再次获取同一把
+    /// `desktop` 锁**。故重初始化必须放进独立作用域、取到返回值后立即释放锁；
+    /// 若在锁内直接进入逐屏循环会自死锁（`std::sync::Mutex` 不可重入）。
+    /// 逐屏的重嵌/重建也各自"取锁 → 用 → 释放"，不在同一锁作用域内串联。
+    ///
+    /// # 暂停语义
+    ///
+    /// `pause_reasons` 非空时**不**重建已终止的渲染器：保持全屏 / 电池暂停语义，
+    /// 避免自愈把"本应保持暂停"的壁纸复活。读锁失败时按"暂停中"保守处理。
+    ///
+    /// # 失败处理
+    ///
+    /// 单屏失败仅记录 `error!` 并继续（best-effort），不中断其余显示器，也不修改
+    /// `wallpaper_mode` / `wallpaper_sources` / `pause_reasons` / `wallpaper_scaling_modes`。
+    pub fn heal_desktop_layer(&mut self) -> Result<bool, MirrorStarError> {
+        // 1. 纯净壁纸模式：临时覆盖窗是顶层窗口、不挂在桌面层下，重嵌反而会破坏模式。
+        if self.pure_mode.is_some() {
+            tracing::debug!("纯净壁纸模式运行中，跳过桌面层自愈");
+            return Ok(false);
+        }
+
+        // 2. 重初始化桌面句柄。独立作用域确保锁在逐屏循环前释放——
+        //    下面的重建路径会再次获取同一把 desktop 锁（见方法注释"锁顺序"）。
+        let did_reinit = {
+            let mut desktop = self.desktop.lock().map_err(|e| {
+                MirrorStarError::DesktopIntegration(format!("获取桌面集成器锁失败: {}", e))
+            })?;
+            desktop.check_and_reinitialize()?
+        };
+
+        // 3. 暂停判定：读失败按"暂停中"保守处理。
+        let paused = match self.pause_reasons.lock() {
+            Ok(reasons) => !reasons.is_empty(),
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    "读取暂停原因失败，按暂停中保守处理：仅修复脱离窗口，不重建渲染器"
+                );
+                true
+            }
+        };
+
+        // 4. 先克隆 display_id 列表，避免遍历时与 `&mut self` 的方法调用冲突。
+        let display_ids: Vec<String> = self.wallpapers.keys().cloned().collect();
+
+        let mut healed = 0usize;
+        let mut skipped = 0usize;
+        let mut failed = 0usize;
+        for display_id in display_ids {
+            let hwnd = self.wallpapers.get(&display_id).and_then(|r| r.hwnd());
+            let health = classify_renderer_health(
+                hwnd.is_some(),
+                hwnd.is_some_and(|h| unsafe { IsWindow(h).as_bool() }),
+            );
+            match health {
+                RendererHealth::Attached => {
+                    let Some(hwnd) = hwnd else {
+                        // classify_renderer_health 对 None 必判 Dead，此分支不可达；
+                        // 保留 continue 而非 unwrap，避免未来判定变化时 panic。
+                        continue;
+                    };
+                    // 仍正确挂在壁纸层下 → 无需重嵌（见方法注释"不做无谓重嵌"）。
+                    let attached = self
+                        .desktop
+                        .lock()
+                        .map(|desktop| desktop.is_attached_to_wallpaper_layer(hwnd))
+                        .unwrap_or(false);
+                    if attached {
+                        skipped += 1;
+                        continue;
+                    }
+                    // 半脱离（仍在但父级不对，如历史上半摘出残留）→ 重嵌恢复。
+                    let embed_result = self
+                        .desktop
+                        .lock()
+                        .map_err(|e| {
+                            MirrorStarError::DesktopIntegration(format!(
+                                "获取桌面集成器锁失败: {}",
+                                e
+                            ))
+                        })
+                        .and_then(|mut desktop| {
+                            desktop.embed_wallpaper(hwnd, &display_id, self.arrangement)
+                        });
+                    match embed_result {
+                        Ok(()) => healed += 1,
+                        Err(e) => {
+                            failed += 1;
+                            tracing::error!(
+                                display_id,
+                                error = %e,
+                                "桌面层自愈：重嵌脱离窗口失败，继续修复其余显示器"
+                            );
+                        }
+                    }
+                }
+                RendererHealth::Dead => {
+                    // 暂停中不重建：保持全屏 / 电池暂停语义。
+                    if paused {
+                        tracing::debug!(display_id, "暂停中，跳过重建");
+                        continue;
+                    }
+                    match self.rebuild_renderer(&display_id) {
+                        Ok(()) => healed += 1,
+                        Err(e) => {
+                            failed += 1;
+                            tracing::error!(
+                                display_id,
+                                error = %e,
+                                "桌面层自愈：重建渲染器失败，继续修复其余显示器"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+
+        tracing::info!(did_reinit, healed, skipped, failed, "桌面层自愈完成");
+        Ok(did_reinit)
     }
 
     /// 为 PauseSender spawn 状态变更转发任务并注册到 `pause_senders`。
@@ -2507,6 +2695,58 @@ mod tests {
         assert_eq!(
             renderer_id(&url, WallpaperType::Web),
             renderer_id(&url, WallpaperType::Web)
+        );
+    }
+
+    // ── 桌面层自愈：渲染器健康判定（纯函数） ─────────────────────────────
+
+    /// 句柄存在且 `IsWindow` 为真 → Attached（只需重嵌）。
+    #[test]
+    fn classify_renderer_health_attached_when_present_and_valid() {
+        assert_eq!(
+            classify_renderer_health(true, true),
+            RendererHealth::Attached
+        );
+    }
+
+    /// 句柄存在但窗口已销毁 → Dead（需要重建）。
+    #[test]
+    fn classify_renderer_health_dead_when_present_but_destroyed() {
+        assert_eq!(classify_renderer_health(true, false), RendererHealth::Dead);
+    }
+
+    /// 句柄缺失 → 无论 `is_window` 取值都按 Dead 处理（保守走重建）。
+    #[test]
+    fn classify_renderer_health_dead_when_absent() {
+        assert_eq!(classify_renderer_health(false, false), RendererHealth::Dead);
+        assert_eq!(classify_renderer_health(false, true), RendererHealth::Dead);
+    }
+
+    /// `heal_desktop_layer` 源码契约：纯净模式早退、重初始化、重建复用
+    /// `rebuild_renderer`，且 desktop 锁在逐屏循环前释放（重建路径会二次取锁）。
+    #[test]
+    fn heal_desktop_layer_source_contract_markers() {
+        let source = include_str!("manager.rs");
+        let body = source_segment(
+            source,
+            "pub fn heal_desktop_layer(&mut self)",
+            "/// 为 PauseSender spawn",
+        );
+        assert!(
+            body.contains("纯净壁纸模式运行中，跳过桌面层自愈"),
+            "纯净模式应早退并记录 debug"
+        );
+        assert!(
+            body.contains("check_and_reinitialize"),
+            "应先重初始化桌面句柄"
+        );
+        assert!(
+            body.contains("rebuild_renderer"),
+            "已销毁的渲染器应复用 rebuild_renderer 重建"
+        );
+        assert!(
+            body.contains("在逐屏循环前释放"),
+            "desktop 锁必须在逐屏循环前释放（重建路径会再次获取同一把锁，锁不可重入）"
         );
     }
 

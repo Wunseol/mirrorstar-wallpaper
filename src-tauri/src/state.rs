@@ -36,8 +36,10 @@ use tauri::AppHandle;
 ///
 /// - `get_displays`：仅获取 desktop 锁读取显示器列表
 /// - `check_desktop_status`：仅获取 desktop 锁检查/重初始化 WorkerW
-/// - WorkerW 兜底检查任务（`run()` 中 spawn 的 5 分钟间隔任务）
-/// - Explorer 重启监控窗口过程（通过 `EXPLORER_DESKTOP` 全局静态获取 desktop 锁）
+///
+/// WorkerW 兜底检查任务与 Explorer 重启监控窗口过程**不再**直接获取 `desktop` 锁：
+/// 两者统一通过 `SHARED_ENGINE.try_lock()` 调用 `heal_desktop_layer()`，由引擎内部
+/// 按 engine → desktop 顺序获取，因此同样不构成锁环。
 ///
 /// # 注意事项
 ///
@@ -113,7 +115,7 @@ use tauri::AppHandle;
 /// Win32 回调（`foreground_event_callback` / `handle_power_status_change` /
 /// `explorer_monitor_wndproc`）是 `extern "system" fn` 函数指针，无法接收
 /// `State` 或 `AppHandle` 参数，需通过 `SHARED_ENGINE` / `SHARED_CONFIG` /
-/// `EXPLORER_DESKTOP` 等全局静态量访问。这些静态量在 `lib.rs` setup 中通过
+/// `EXPLORER_MONITOR_HWND` 等全局静态量访问。这些静态量在 `lib.rs` setup 中通过
 /// `OnceLock::set` 一次性写入，与 AppState 内的 `Arc` 字段指向同一对象
 /// （setup 时 `AppState.wallpaper_engine` clone 后存入 `SHARED_ENGINE`）。
 /// 详见下方"Global Statics"注释的 A/B/C 分类。
@@ -136,7 +138,7 @@ pub struct AppState {
 //
 // 全局静态量收敛评估（保守策略：全部保留，仅文档化）
 //
-// 共 15 个全局静态量。评估结论：**全部保留，不做收敛**。理由如下：
+// 全局静态量清单（按可收敛性分类）。评估结论：**全部保留，不做收敛**。理由如下：
 //
 // 核心约束：Win32 回调（`foreground_event_callback`、`explorer_monitor_wndproc`）
 // 是 `extern "system" fn` 函数指针，**无法捕获闭包变量**，也无法访问 Tauri 的
@@ -145,11 +147,13 @@ pub struct AppState {
 //
 // 按可收敛性分类：
 //
-// A. 必须保留（Win32 回调直接访问，无法移入 AppState）—— 5 个：
+// A. 必须保留（Win32 回调直接访问，无法移入 AppState）—— 6 个：
 //   - `SHARED_ENGINE`         : foreground_event_callback / handle_power_status_change 访问
 //   - `SHARED_CONFIG`         : foreground_event_callback / handle_power_status_change 访问
 //   - `FULLSCREEN_WAS`        : foreground_event_callback 的全屏状态机
-//   - `EXPLORER_DESKTOP`      : explorer_monitor_wndproc 重新初始化 WorkerW
+//   - `EXPLORER_MONITOR_HWND` : desktop_layer_destroy_callback 向监控窗口 PostMessage
+//   - `DESKTOP_LAYER_HEAL_LAST_MS`（含 `DESKTOP_LAYER_HEAL_EPOCH`）
+//                             : explorer_monitor_wndproc 的桌面层自愈去抖时间戳
 //   - `TASKBAR_CREATED_MSG`   : explorer_monitor_wndproc 比对消息 ID
 //
 // B. 可移入 MonitorRegistry 但收益低、风险高 —— 8 个：
@@ -205,9 +209,24 @@ fn notify_scheduler_wake() {
 }
 pub(crate) static FULLSCREEN_WAS: AtomicBool = AtomicBool::new(false);
 
-/// 全局状态用于 Explorer 重启监控窗口过程（窗口过程是函数指针，无法使用闭包）
-pub(crate) static EXPLORER_DESKTOP: OnceLock<Arc<std::sync::Mutex<DesktopIntegrator>>> =
-    OnceLock::new();
+/// Explorer 监控消息窗口句柄（供 WinEvent 销毁回调 `PostMessageW` 投递事件）
+///
+/// 窗口过程 / WinEvent 回调是函数指针，无法捕获闭包变量，只能经全局静态量取句柄。
+/// 存 `usize`（句柄数值）而非 `HWND`：`HWND` 内部是裸指针（`!Send + !Sync`），
+/// 无法放入 `static OnceLock<HWND>`；句柄数值本身是进程级有效令牌，可安全共享。
+pub(crate) static EXPLORER_MONITOR_HWND: OnceLock<usize> = OnceLock::new();
+/// 桌面层自愈去抖基准时刻（进程启动即初始化）
+///
+/// `Instant::now()` 非 const fn，无法直接初始化 `static`，故用 `LazyLock`。
+pub(crate) static DESKTOP_LAYER_HEAL_EPOCH: std::sync::LazyLock<std::time::Instant> =
+    std::sync::LazyLock::new(std::time::Instant::now);
+/// 上一次触发桌面层自愈的毫秒时间戳（相对 `DESKTOP_LAYER_HEAL_EPOCH`；`0` 表示从未触发）
+///
+/// Win32 回调上下文不能加锁，去抖用无锁 `AtomicU64`：多个事件源（WinEvent 销毁 /
+/// TaskbarCreated / 会话解锁 / 睡眠恢复）在同一窗口过程内串行访问，`Relaxed` 语义
+/// 已足够；此处沿用文件内其他标志的 `SeqCst` 以保持风格一致。
+pub(crate) static DESKTOP_LAYER_HEAL_LAST_MS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
 /// 注册的 TaskbarCreated 消息 ID（系统范围内一致，由 RegisterWindowMessageW 返回）
 pub(crate) static TASKBAR_CREATED_MSG: OnceLock<u32> = OnceLock::new();
 
@@ -273,11 +292,11 @@ pub(crate) static EXPLORER_MONITOR_THREAD: Mutex<Option<std::thread::JoinHandle<
     Mutex::new(None);
 /// WorkerW 兜底检查任务退出标志
 pub(crate) static WORKERW_CHECK_RUNNING: AtomicBool = AtomicBool::new(true);
-/// WorkerW 兜底检查任务 JoinHandle（用于退出时 abort，避免任务长时间持 desktop 锁）
+/// WorkerW 兜底检查任务 JoinHandle（用于退出时 abort，避免任务长时间持 engine 锁）
 ///
 /// ST-003：原实现 fire-and-forget，shutdown 设置 RUNNING=false 后任务最多 300s 才
-/// 在下次 tick 检查到标志并退出。期间任务可能持 desktop 锁，导致 engine.shutdown()
-/// 阻塞。现保存 JoinHandle，shutdown 时配合 Notify 唤醒 + abort 立即终止。
+/// 在下次 tick 检查到标志并退出。期间任务可能持 engine 锁（桌面层自愈的锁），
+/// 导致 `engine.shutdown()` 阻塞。现保存 JoinHandle，shutdown 时配合 Notify 唤醒 + abort 立即终止。
 pub(crate) static WORKERW_CHECK_TASK: Mutex<Option<tauri::async_runtime::JoinHandle<()>>> =
     Mutex::new(None);
 /// WorkerW 兜底检查任务即时唤醒通知（ST-003）
@@ -430,6 +449,69 @@ pub(crate) fn try_pause_all_fast(reason: PauseReason) -> Option<Vec<String>> {
         }
     };
     Some(engine.pause_all_fast(reason).unwrap_or_default())
+}
+
+/// 尝试触发桌面层自愈（事件驱动入口与 300s 兜底轮询的唯一共享入口）
+///
+/// 与 [`try_pause_all_fast`] 同构：从 `SHARED_ENGINE` 取 engine Arc → `try_lock()`
+/// → 调用 `WallpaperEngine::heal_desktop_layer`（重初始化桌面句柄 + 重嵌存活窗口 +
+/// 重建已销毁渲染器）。
+///
+/// # 返回值
+///
+/// - `None`：`SHARED_ENGINE` 未设置 / 锁忙 / 守卫命中 / 自愈失败。调用方应跳过本次事件，
+///   不更新状态标志（下一次事件或 300s 轮询会兜底）。
+/// - `Some(did_reinit)`：自愈已执行，`did_reinit` 表示桌面句柄是否被实际重初始化。
+///
+/// # 设计要点
+///
+/// - `try_lock` 而非 `blocking_lock`：本函数运行于 Win32 回调上下文
+///   （`explorer_monitor_wndproc` / WinEvent 回调触发的窗口消息），blocking_lock 会
+///   阻塞消息循环，延迟后续 `TaskbarCreated` / `WM_WTSSESSION_CHANGE` /
+///   `WM_POWERBROADCAST` 的处理。
+/// - 纯净壁纸模式守卫：模式内的临时覆盖窗是顶层窗口、不挂在桌面层下，重嵌反而会
+///   破坏模式；返回 `None` 与其他"跳过"路径语义一致，调用方不更新状态。
+/// - 原子交换守卫：轮换原子交换 build 阶段（新渲染器构建/嵌入中）自愈会与换槽争用
+///   WorkerW，跳过本次触发不干扰交换；兜底轮询稍后仍会修复。
+pub(crate) fn try_heal_desktop_layer() -> Option<bool> {
+    if mirrorstar_core::pure_mode::is_active() {
+        tracing::warn!("纯净壁纸模式运行中，跳过桌面层自愈（模式退出后会补跑判定）");
+        return None;
+    }
+    if atomic_swap_in_progress() {
+        tracing::warn!("原子交换进行中，跳过桌面层自愈（后续事件/轮询会兜底）");
+        return None;
+    }
+    let engine = SHARED_ENGINE.get()?;
+    let mut engine = match engine.try_lock() {
+        Ok(e) => e,
+        Err(e) => {
+            tracing::debug!(
+                error = ?e,
+                "engine 锁忙，跳过桌面层自愈（后续事件/轮询会重试，可容忍偶发跳过）"
+            );
+            return None;
+        }
+    };
+    match engine.heal_desktop_layer() {
+        Ok(did_reinit) => Some(did_reinit),
+        Err(e) => {
+            tracing::error!(error = %e, "桌面层自愈失败");
+            None
+        }
+    }
+}
+
+/// 桌面层自愈去抖判定（纯函数，便于单测）
+///
+/// `last_ms == 0` 表示从未触发（首次直接放行）；否则要求距上次触发 ≥ 1000ms。
+/// 事件密集时（如 Explorer 重启连续销毁多个 WorkerW/Progman）只执行一次，
+/// 多余的丢弃——下一次事件或 300s 兜底轮询会兜底。
+///
+/// `now_ms < last_ms`（时钟回绕 / 时间戳异常）按"未满间隔"处理（`saturating_sub`
+/// 归零），即拒绝本次触发，避免异常时间戳造成去抖失效。
+pub(crate) fn heal_debounce_ok(last_ms: u64, now_ms: u64) -> bool {
+    last_ms == 0 || now_ms.saturating_sub(last_ms) >= 1000
 }
 
 /// 尝试恢复所有壁纸的快速路径（ST-004 抽取自 fullscreen.rs / power.rs 6 处重复逻辑）
@@ -654,7 +736,7 @@ fn try_lock_with_timeout<T>(
 ///   5. **join 监控线程**：FULLSCREEN / EXPLORER / WORKERW_INIT 三类监控线程
 ///      join 等待退出，避免线程泄漏与回调访问已释放资源
 ///   6. **abort workerw_check 任务**：`WORKERW_CHECK_TASK.take().abort()`
-///      兜底取消任务，避免任务持 desktop 锁阻塞 engine.shutdown()
+///      兜底取消任务，避免任务持 engine 锁阻塞 engine.shutdown()
 ///   7. **等待缩略图任务完成**：`THUMBNAIL_TASK` 中所有 JoinHandle 顺序 join
 ///      （共享 5s 截止时间），超时未完成的任务在后台继续执行至完成
 ///   8. **WallpaperEngine.shutdown()**：通过 `try_lock_with_timeout` 获取 engine 锁
@@ -740,14 +822,15 @@ pub(crate) fn perform_shutdown_blocking(
     join_monitor_thread(&WORKERW_INIT_THREAD);
 
     // ST-003：abort workerw_check 任务兜底取消（notify 已唤醒任务检查 RUNNING 退出，
-    // 但若任务正在 desktop.lock() 持锁中执行同步代码，abort 在下次 await 点生效；
-    // 此处 abort 确保任务不再持 desktop 锁阻塞 engine.shutdown）
+    // 但若任务正在 `engine.lock().await` 内执行同步的桌面层自愈代码，abort 在下次 await 点生效；
+    // 此处 abort 确保任务不再持 engine 锁阻塞 engine.shutdown）
     //
     // ST-012: 状态变更订阅任务的自引用关系与退出策略（已评估并接受，方案 ②）
     // - workerw_check 任务（及其他状态变更订阅任务）持有 `engine: Arc<WallpaperEngine>` 克隆，
     //   形成自引用：engine 内部状态被其订阅任务引用，shutdown 时无法通过 channel 关闭协作式退出
     // - 任务退出依赖 runtime 强制 abort（如本块 `handle.abort()`）而非通道关闭协作式退出，
-    //   简化实现但需注意 abort 时任务可能正在执行非异步代码段（如持 desktop 锁），abort 在下次 await 点生效
+    //   简化实现但需注意 abort 时任务可能正在执行非异步代码段（如持 engine 锁做桌面层自愈），
+    //   abort 在下次 await 点生效
     // - 此为已评估并接受的设计权衡：避免引入 CancellationToken 复杂度（方案 ①），
     //   当前 shutdown 流程已通过 try_lock_with_timeout + 任务 abort 兜底覆盖所有已知场景
     if let Some(handle) = WORKERW_CHECK_TASK.lock().ok().and_then(|mut t| t.take()) {
@@ -1162,6 +1245,37 @@ mod tests {
         assert!(
             source.contains(&needle),
             "perform_shutdown_blocking 应调用 {needle}() 卸载输入钩子线程"
+        );
+    }
+
+    // ── 桌面层自愈去抖（heal_debounce_ok）────────────────────────────────────
+
+    /// 去抖阈值：首次（last_ms == 0）直接放行；间隔 < 1000ms 拒绝；≥ 1000ms 放行。
+    #[test]
+    fn heal_debounce_thresholds() {
+        // 从未触发过：任何时刻都放行
+        assert!(heal_debounce_ok(0, 0), "last_ms=0 应放行（首次触发）");
+        assert!(heal_debounce_ok(0, 60_000), "last_ms=0 应放行（首次触发）");
+
+        // 间隔 0 / 999ms：不足 1s，丢弃
+        assert!(!heal_debounce_ok(1000, 1000), "间隔 0ms 应丢弃");
+        assert!(!heal_debounce_ok(1000, 1999), "间隔 999ms 应丢弃");
+
+        // 间隔 1000ms / 5000ms：达到阈值，放行
+        assert!(heal_debounce_ok(1000, 2000), "间隔 1000ms 应放行");
+        assert!(heal_debounce_ok(1000, 6000), "间隔 5000ms 应放行");
+    }
+
+    /// 时间戳回绕（now_ms < last_ms）：`saturating_sub` 归零后不足 1s，按丢弃处理。
+    #[test]
+    fn heal_debounce_rejects_when_now_before_last() {
+        assert!(
+            !heal_debounce_ok(6000, 1000),
+            "now_ms < last_ms（回绕/时钟异常）应丢弃本次触发"
+        );
+        assert!(
+            !heal_debounce_ok(u64::MAX, 0),
+            "last_ms 为极大值时 now_ms < last_ms 应丢弃"
         );
     }
 

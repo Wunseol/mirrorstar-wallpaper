@@ -25,20 +25,17 @@ use std::sync::atomic::Ordering;
 //
 // ## 未处理事件（已知限制）
 //
-// ### PBT_APMRESUMESUSPEND / PBT_APMRESUMEAUTOMATIC（从睡眠/休眠恢复）
+// ### PBT_APMRESUMESUSPEND / PBT_APMRESUMEAUTOMATIC（从睡眠/休眠恢复）与会话解锁
 //
-// - **当前状态**：未处理。系统从睡眠恢复时不会触发 `PBT_APMPOWERSTATUSCHANGE`
-//   （电源类型可能未变），仅触发 `PBT_APMRESUMESUSPEND` / `PBT_APMRESUMEAUTOMATIC`
-// - **潜在影响**：睡眠期间 mpv 子进程可能被系统挂起（SuspendThread），
-//   恢复后音频/视频可能不同步或卡顿；WorkerW 窗口可能因 DWM 重置失效
-// - **当前缓解**：
-//   - `workerw_check.rs` 5 分钟间隔兜底检查会检测到 WorkerW 失效并重新初始化
-//   - `TaskbarCreated` 事件（Explorer 重启时触发）也会触发 WorkerW 重初始化
-//   - 用户可通过 `check_desktop_status` 命令手动触发重初始化
-// - **未来改进方向**：在 `explorer_monitor_wndproc` 中追加
-//   `PBT_APMRESUMESUSPEND` / `PBT_APMRESUMEAUTOMATIC` 分支，
-//   调用 `engine.restart_all()` 或 emit `desktop-status-changed` 事件
-//   触发壁纸重新加载（需评估 mpv 子进程在睡眠后的状态）
+// - **当前状态**：**已由 Explorer 监控窗口统一转 `try_heal_desktop_layer`**
+//   （见 `explorer.rs` 的 `handle_explorer_message`）：`WM_POWERBROADCAST` 收到
+//   `PBT_APMRESUMESUSPEND` / `PBT_APMRESUMEAUTOMATIC`、`WM_WTSSESSION_CHANGE` 收到
+//   `WTS_SESSION_UNLOCK` 时，经 1s 去抖后调用 `state::try_heal_desktop_layer()`
+//   （重初始化桌面句柄 + 重嵌存活窗口 + 重建被销毁的渲染器），不再依赖 300s 兜底，
+//   本模块不再重复处理上述事件。
+// - **历史影响**（保留供追溯）：睡眠期间 mpv 子进程可能被系统挂起（SuspendThread），
+//   恢复后音频/视频可能不同步或卡顿；WorkerW 窗口可能因 DWM 重置失效。
+//   现由上述自愈入口覆盖句柄失效场景，mpv 进程本身的卡顿仍依赖用户重新设置壁纸。
 //
 // ### PBT_APMSUSPEND（系统即将进入睡眠/休眠）
 //

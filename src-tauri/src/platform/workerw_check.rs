@@ -1,7 +1,7 @@
 use crate::state::{
     SHARED_APP_HANDLE, WORKERW_CHECK_NOTIFY, WORKERW_CHECK_RUNNING, WORKERW_CHECK_TASK,
 };
-use mirrorstar_core::DesktopIntegrator;
+use mirrorstar_core::WallpaperEngine;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use tauri::Emitter;
@@ -19,17 +19,20 @@ struct DesktopStatusPayload {
     error: Option<String>,
 }
 
-/// 启动 WorkerW 有效性兜底检查任务（5 分钟间隔）
+/// 启动桌面层自愈兜底检查任务（300s / 5 分钟间隔）
 ///
-/// 主要监控由 TaskbarCreated 事件驱动，此检查仅作为事件遗漏的最终兜底。
+/// 主要监控由 Explorer 监控窗口事件驱动（WorkerW/Progman 销毁、TaskbarCreated、
+/// 会话解锁、睡眠恢复），此任务仅作为事件全部遗漏的最终兜底。
+/// tick 内调用 `WallpaperEngine::heal_desktop_layer()`：重初始化桌面句柄 → 重嵌存活
+/// 窗口 → 重建已销毁的渲染器（暂停中不重建），语义与事件路径完全一致。
 ///
 /// ST-003：保存 `JoinHandle` 到 `WORKERW_CHECK_TASK`，并在 `tokio::select!` 中
 /// 同时等待 interval tick 与 `WORKERW_CHECK_NOTIFY`。`perform_shutdown_blocking`
 /// 设置 `WORKERW_CHECK_RUNNING=false` + `notify_one()` 让任务立即跳出 300s tick
 /// 阻塞、检查标志并退出，再 `abort()` 兜底取消。原实现 fire-and-forget，shutdown
-/// 后任务最多 300s 才退出，期间可能持 desktop 锁阻塞 `engine.shutdown()`。
+/// 后任务最多 300s 才退出，期间可能持 engine 锁阻塞 `engine.shutdown()`。
 ///
-/// T07：检测到 WorkerW 失效并重新初始化后，通过 `SHARED_APP_HANDLE` emit
+/// T07：桌面层自愈实际重初始化桌面句柄后，通过 `SHARED_APP_HANDLE` emit
 /// `desktop-status-changed` 事件通知前端刷新桌面状态（壁纸可能已重新嵌入）。
 ///
 /// v16-C-007：成功与失败均 emit，payload `DesktopStatusPayload { ok, error }` 区分：
@@ -39,53 +42,36 @@ struct DesktopStatusPayload {
 ///
 /// async 锁使用场景文档化
 ///
-/// # 锁类型混用场景说明
+/// # 锁使用说明
 ///
-/// 本模块涉及两类 Mutex，调用方需小心区分：
+/// 本任务使用 engine 锁（`tokio::sync::Mutex<WallpaperEngine>`，即 `AppState.wallpaper_engine`
+/// 的克隆）：
 ///
-/// ## 1. `tokio::sync::Mutex`（async 锁）
+/// - `engine.lock().await` 获取守卫后调用同步方法 `heal_desktop_layer()`；
+/// - 引擎内部按 state.rs 文档化的 **engine → desktop** 顺序访问
+///   `desktop`（`std::sync::Mutex<DesktopIntegrator>`），desktop 锁仅在
+///   重初始化 / 重嵌 / 重建期间短暂持有，符合锁顺序约定，不会形成锁环；
+/// - 任务本身不再直接持有 `desktop` 锁，也不再使用 `std::sync::Mutex`。
 ///
-/// - **使用位置**：本任务外部的 `state.wallpaper_engine`（`Arc<tokio::sync::Mutex<WallpaperEngine>>`）
-/// - **使用场景**：需在持有锁期间执行 `.await`（如 `set_wallpaper` 三阶段流程的
-///   `engine.lock().await`），或需跨 `.await` 点持有锁的命令
-/// - **本任务不使用**：`start_workerw_check` 内部不获取 engine 锁，
-///   仅通过 `desktop` 锁（std::sync::Mutex）操作 WorkerW 状态
+/// ## 为什么用 tokio::sync::Mutex 而非 std::sync::Mutex
 ///
-/// ## 2. `std::sync::Mutex`（同步锁）
+/// - engine 锁全局统一为 `tokio::sync::Mutex`（命令层 / 托盘 / 后台任务共用同一
+///   `Arc`），本任务必须使用同类型锁才能与这些路径互斥；
+/// - 本任务运行于 tokio runtime，`lock().await` 是标准用法，且引擎调用结束后立即
+///   释放锁，不跨 `await` 持有。
 ///
-/// - **使用位置**：`desktop: Arc<std::sync::Mutex<DesktopIntegrator>>`（本任务参数）
-/// - **使用场景**：
-///   - `desktop.lock()` 获取守卫后调用同步方法 `is_workerw_valid()` /
-///     `check_and_reinitialize()`（内部含 `EnumWindows` / `FindWindowW` 等 Win32 同步调用）
-///   - 这些 Win32 调用本身阻塞，无法改为异步
-///   - 同步锁的获取/释放开销低于 tokio Mutex（无需 await 点状态机）
-/// - **阻塞窗口**：见函数体内"阻塞窗口评估"注释，单次检查通常 <50ms，
-///   5 分钟间隔下可接受
+/// ## 阻塞窗口评估
 ///
-/// ## 为什么不统一为 tokio::sync::Mutex？
-///
-/// - `DesktopIntegrator` 的所有方法都是同步的（Win32 API 调用），
-///   改用 async 锁无实际收益
-/// - 同步锁在 `spawn_blocking` 线程池中性能更优（无 future state machine 开销）
-/// - `workerw_check` 任务虽运行于 tokio runtime，但 `desktop.lock()` 持有期间
-///   无 `.await` 点（见函数体内"阻塞窗口评估"注释），不会阻塞 tokio 调度公平性
-///
-/// ## 为什么不统一为 std::sync::Mutex + spawn_blocking？
-///
-/// - `wallpaper_engine` 需在锁内执行 `.await`（如 `set_wallpaper` 三阶段），
-///   `std::sync::Mutex` 跨 `.await` 持有会触发 clippy::await_holding_lock 警告
-///   且可能导致死锁（如锁被持有期间 future 被取消，锁守卫泄漏）
-/// - 因此 `wallpaper_engine` 必须使用 `tokio::sync::Mutex`
+/// `heal_desktop_layer()` 为同步调用（内部含 `EnumWindows` / `SetParent` 等 Win32
+/// 调用，必要时还会重建渲染器），持有 engine 锁期间会阻塞 tokio worker 线程。
+/// 补偿措施：检查间隔 300s（低频）、`heal_desktop_layer` 仅在桌面层确实变化时
+/// 才执行重活（渲染器存活时只做重嵌），且锁在 emit 前释放。
 ///
 /// ## 调用方注意事项
 ///
-/// - **不可在持有 `desktop` 锁期间 `.await`**：会阻塞 tokio worker 线程
-///   （本任务内 `desktop.lock()` 后立即调用同步方法并释放，无 `.await`）
-/// - **不可在持有 `wallpaper_engine` 锁期间获取 `desktop` 锁**：
-///   会违反 state.rs 文档化的锁顺序（engine → desktop），可能形成锁环
-///   （`set_wallpaper` 通过 `engine.lock().await` 后调用 engine 内部方法，
-///   engine 内部方法才获取 desktop 锁，符合 engine → desktop 顺序）
-pub(crate) fn start_workerw_check(desktop: Arc<std::sync::Mutex<DesktopIntegrator>>) {
+/// - 不可在持有 engine 锁期间再获取 `desktop` 锁（违反 engine → desktop 顺序）；
+///   引擎内部方法自行按序获取，任务侧无需（也不应）直接碰 desktop。
+pub(crate) fn start_workerw_check(engine: Arc<tokio::sync::Mutex<WallpaperEngine>>) {
     // v8.0 内存优化说明：本任务为真正的 async 逻辑（tokio::select! + interval + Notify），
     // 运行于 tokio worker 线程池，无法通过 std::thread::Builder 设置独立栈大小。
     // 改用 spawn_blocking + 专用小栈线程需重写 ST-003 关闭协调（WORKERW_CHECK_TASK
@@ -106,43 +92,39 @@ pub(crate) fn start_workerw_check(desktop: Arc<std::sync::Mutex<DesktopIntegrato
             if !WORKERW_CHECK_RUNNING.load(Ordering::SeqCst) {
                 break;
             }
-            // ST-003: 此处使用 `std::sync::Mutex::lock()` 阻塞 tokio worker 线程。
+            // 原子交换守卫（与事件路径的 `try_heal_desktop_layer` 对齐）：换槽 build 阶段
+            // 新渲染器尚未注册，此刻重嵌旧窗口可能干扰 DefView 锚点/父链校验，跳过本 tick。
+            if crate::state::atomic_swap_in_progress() {
+                tracing::debug!("原子交换进行中，跳过本次桌面层兜底自愈");
+                continue;
+            }
+            // 桌面层自愈：重初始化桌面句柄 + 修复已脱离窗口 + 重建已销毁渲染器
+            // （暂停中不重建）。锁在 emit 前释放，避免 emit 期间持 engine 锁。
             //
             // 阻塞窗口评估：
-            // - 检查间隔 5 分钟（300s），频率极低
-            // - `check_and_reinitialize` 内含 `EnumWindows` 调用，通常 <50ms
-            //   （极端情况下可能阻塞数百毫秒）
-            //
-            // 可接受性理由：低频 + 短阻塞，不影响 tokio 调度公平性。
-            // 整个 lock 持有期间无 await 点，不会跨 await 持有 std 锁。
-            //
-            // 未来优化方向：使用 `tokio::task::spawn_blocking` 包装锁持有段，
-            // 彻底避免阻塞 tokio worker 线程。
-            let mut desktop = match desktop.lock() {
-                Ok(d) => d,
-                Err(e) => {
-                    tracing::error!(error = %e, "获取桌面锁失败");
-                    continue;
-                }
+            // - 检查间隔 300s，频率极低
+            // - `heal_desktop_layer` 内含 `EnumWindows` / `SetParent` 等同步 Win32 调用，
+            //   渲染器仍存活时通常 <100ms；仅在桌面层被销毁时才重建渲染器（耗时更长），
+            //   属事件遗漏的兜底路径，可接受。
+            let healed = {
+                let mut engine = engine.lock().await;
+                engine.heal_desktop_layer()
             };
-            if !desktop.is_workerw_valid() {
-                tracing::warn!("检测到 WorkerW 失效，尝试重新初始化...");
-                // T14：check_and_reinitialize 返回 `Result<bool, MirrorStarError>`，
-                // `Ok(true)` 表示实际执行了重新初始化，`Ok(false)` 表示 WorkerW 已有效无需重初始化
-                match desktop.check_and_reinitialize() {
-                    Ok(true) => {
-                        tracing::info!("WorkerW 重新初始化成功");
-                        // T07 / v16-C-007：通知前端桌面状态已变化（壁纸可能已重新嵌入）
-                        emit_desktop_status(true, None);
-                    }
-                    Ok(false) => {
-                        tracing::debug!("WorkerW 已恢复有效，无需重新初始化");
-                    }
-                    Err(e) => {
-                        tracing::error!(error = %e, "WorkerW 重新初始化失败");
-                        // v16-C-007：失败也 emit，前端据此启动轮询补救 + 超时提示
-                        emit_desktop_status(false, Some(e.to_string()));
-                    }
+            // T14 / v16-C-007：`Ok(true)` 表示桌面句柄被实际重初始化，emit 通知前端；
+            // `Ok(false)` 表示无变化（不 emit），`Err` 表示自愈失败（emit 让前端补救）。
+            match healed {
+                Ok(true) => {
+                    tracing::info!("桌面层自愈完成（桌面句柄已重初始化）");
+                    // T07 / v16-C-007：通知前端桌面状态已变化（壁纸可能已重新嵌入）
+                    emit_desktop_status(true, None);
+                }
+                Ok(false) => {
+                    tracing::debug!("桌面层无需重初始化（无变化，不 emit）");
+                }
+                Err(e) => {
+                    tracing::error!(error = %e, "桌面层自愈失败");
+                    // v16-C-007：失败也 emit，前端据此启动轮询补救 + 超时提示
+                    emit_desktop_status(false, Some(e.to_string()));
                 }
             }
         }
