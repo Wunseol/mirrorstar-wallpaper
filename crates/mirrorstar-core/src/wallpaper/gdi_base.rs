@@ -226,6 +226,8 @@ pub fn register_window_class_once(
             hInstance: HINSTANCE(h_instance.0),
             lpszClassName: class_name,
             lpfnWndProc: Some(wnd_proc),
+            // 类默认箭头光标，使 DefWindowProc 的 WM_SETCURSOR 能把停留在等待态的光标恢复为箭头
+            hCursor: LoadCursorW(None, IDC_ARROW).unwrap_or_default(),
             ..Default::default()
         };
         // W08: 检查 RegisterClassW 返回值，通过纯辅助函数区分"已注册"与真实失败
@@ -862,6 +864,43 @@ mod tests {
         assert_eq!(y, 0);
         assert!(w > 0, "屏幕宽度应 > 0（或回退到 1920）");
         assert!(h > 0, "屏幕高度应 > 0（或回退到 1080）");
+    }
+
+    // ========== 窗口类默认箭头光标（SubTask 10.3）==========
+
+    /// 窗口类必须设置默认箭头光标（`hCursor: IDC_ARROW`）。
+    ///
+    /// 继承窗口类光标为 NULL 时 `DefWindowProc` 的 `WM_SETCURSOR` 无法把停留在系统
+    /// 等待态的光标恢复为箭头，蓝圈会持续（见 desktop 模块的光标复位修复）。
+    ///
+    /// 本测试为文档测试（include_str! 模式），通过断言源码包含关键标记验证修复存在；
+    /// `RegisterClassW` 需要真实窗口环境，无法直接单测窗口类字段。
+    /// 截取 `register_window_class_once` 函数体片段，避免匹配到文件其它位置。
+    #[test]
+    fn register_window_class_sets_default_arrow_cursor() {
+        let source = include_str!("gdi_base.rs");
+        // 运行期拼接搜索串，避免 include_str! 把测试自身的字面量计入匹配
+        let fn_def = ["pub fn register_window_", "class_once("].join("");
+        let next_item = ["enum Register", "ClassOutcome"].join("");
+        let start = source
+            .find(&fn_def)
+            .expect("源码应包含 register_window_class_once 定义");
+        let end = start
+            + source[start..]
+                .find(&next_item)
+                .expect("register_window_class_once 之后应有 RegisterClassOutcome 定义");
+        let segment = &source[start..end];
+
+        let field = ["hCur", "sor"].join("");
+        let arrow = ["IDC_", "ARROW"].join("");
+        assert!(
+            segment.contains(&field),
+            "register_window_class_once 应设置窗口类 {field} 字段"
+        );
+        assert!(
+            segment.contains(&arrow),
+            "窗口类默认光标应使用 {arrow}（使 WM_SETCURSOR 能恢复等待态光标）"
+        );
     }
 
     // ========== W08 修复测试：register_window_class_once 区分逻辑 ==========

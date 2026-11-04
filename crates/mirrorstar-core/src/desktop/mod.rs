@@ -40,6 +40,9 @@
 //!    - `window::remove_from_taskbar`（移除任务栏条目）
 //!    - `SetParent`（重定为 WorkerW 子窗口）
 //!    - `SetWindowPos`（定位到目标显示器）
+//!    - raised desktop 下另有顺序约束：`SetParent` → `ShowWindow(SW_SHOW)`（首次显示会把
+//!      窗口提到兄弟 z 序顶部）→ 锚点 `SetWindowPos(hwnd, defview, …)`（最后一次 z 序写入）
+//!      → `ensure_below_anchor`（显示之后校验/重试/兜底）→ `reset_wait_cursor_after_show`
 //! 4. 写入 `active_wallpapers` 条目
 //!
 //! 移除流程（`DesktopIntegrator::remove_wallpaper`）：
@@ -649,6 +652,44 @@ impl DesktopIntegrator {
             }
             _ => false,
         }
+    }
+
+    /// 运行期 z 序体检：确认壁纸窗口仍在桌面图标层（`SHELLDLL_DefView`）之下。
+    ///
+    /// 用途是**运行期体检**而非重嵌：`heal_desktop_layer` 的附着判定只看父窗口
+    /// 是否正确（`is_attached_to_wallpaper_layer`），若壁纸窗口在运行期被外部因素
+    /// （DefView 重建、第三方置顶工具等）抬到 DefView 之上，父级仍是 Progman，
+    /// 单看附着会误判为"无需处理"。
+    ///
+    /// 零写入契约：已在锚点之下时不做任何写操作（返回
+    /// [`worker_w::ZOrderRepair::Ok`]），避免每 5 分钟制造一次 z 序重排抖动；
+    /// 仅在检测到 z 序错误时才由 `worker_w::reassert_below_defview` 重断言锚点。
+    ///
+    /// WorkerW 运行期复核：raised desktop 下 WorkerW 必须是 Progman 直接子窗口的
+    /// **最底层**，否则 WorkerW 渲染的静态壁纸会盖住图标与视频。24H2 下
+    /// `SPI_SETDESKWALLPAPER` 会销毁并重建 WorkerW，新窗口可能落在链顶；第三方
+    /// 改系统壁纸同理。因此在断言 DefView 相对位置前，先由
+    /// [`worker_w::ensure_workerw_zorder`] 复核 WorkerW 层级。该函数幂等：WorkerW
+    /// 已在最底层时不产生任何写操作，非 raised desktop 时内部直接返回。
+    ///
+    /// `hwnd` 无效或 `progman_hwnd` 尚未缓存（未初始化）时返回
+    /// [`worker_w::ZOrderRepair::NotApplicable`]，不做任何探测。
+    pub fn reassert_zorder(&self, hwnd: HWND) -> worker_w::ZOrderRepair {
+        if !unsafe { IsWindow(hwnd).as_bool() } {
+            return worker_w::ZOrderRepair::NotApplicable;
+        }
+        let Some(progman) = self.progman_hwnd else {
+            return worker_w::ZOrderRepair::NotApplicable;
+        };
+        // 先保证 WorkerW 位于最底层，再断言壁纸与 DefView 的相对位置：否则
+        // "WorkerW 盖住壁纸"这类 z 序问题会被误判为正常。
+        // SAFETY: IsWindow 仅查询句柄有效性，不修改窗口状态。
+        if let Some(workerw) = self.workerw_hwnd {
+            if unsafe { IsWindow(workerw).as_bool() } {
+                worker_w::ensure_workerw_zorder(progman, workerw);
+            }
+        }
+        worker_w::reassert_below_defview(hwnd, progman)
     }
 
     /// 检测 Explorer 重启并重新初始化
@@ -1401,6 +1442,40 @@ mod tests {
         assert!(
             embed_at < invalidate_at,
             "保险重绘必须在 embed_wallpaper 成功之后执行（D5）"
+        );
+    }
+
+    /// 运行期 z 序体检契约：`reassert_zorder` 必须先复核 WorkerW 是否位于
+    /// Progman 直接子窗口的最底层（`ensure_workerw_zorder`），再校验壁纸窗口与
+    /// `SHELLDLL_DefView` 的相对位置（`reassert_below_defview`）。
+    ///
+    /// 沿用仓库 `include_str!` 惯例：截取 `pub fn reassert_zorder` 到其后第一个
+    /// `fn ` 之间的源码片段。
+    #[test]
+    fn reassert_zorder_contract_markers() {
+        let source = include_str!("mod.rs");
+        // 运行期拼接搜索串，避免 include_str! 把测试自身的字面量计入匹配。
+        let start_marker = ["pub fn reassert_", "zorder("].join("");
+        let start = source
+            .find(&start_marker)
+            .expect("源码应包含 reassert_zorder 定义");
+        // 从定义签名之后开始找下一个 `fn `（避免匹配到定义自身的 "fn "）。
+        let after_sig = start + start_marker.len();
+        let end = after_sig
+            + source[after_sig..]
+                .find("fn ")
+                .expect("reassert_zorder 之后应有下一个函数定义");
+        let segment = &source[start..end];
+
+        let workerw_check = ["ensure_workerw", "_zorder("].join("");
+        let defview_check = ["reassert_below_", "defview("].join("");
+        assert!(
+            segment.contains(&workerw_check),
+            "reassert_zorder 应调用 {workerw_check} 复核 WorkerW 层级"
+        );
+        assert!(
+            segment.contains(&defview_check),
+            "reassert_zorder 应调用 {defview_check} 校验壁纸与图标层相对位置"
         );
     }
 }

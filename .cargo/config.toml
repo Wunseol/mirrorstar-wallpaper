@@ -23,7 +23,15 @@ git-fetch-with-cli = true
 #
 # 通过统一注入 /MANIFESTDEPENDENCY 修复：MSVC 链接器把该依赖合并进默认 manifest。
 # 仅对 windows 目标生效（linux/mac 目标不受影响）；MSVC 专属（本仓库仅在 MSVC 工具链构建）。
+#
+# 静态链接 CRT（`-C target-feature=+crt-static`）：MSVC 默认动态链接 CRT，exe 运行期
+# 向系统索取 VCRUNTIME140.dll / VCRUNTIME140_1.dll；未装 VC++ 运行库的纯净 Win10/Win11
+# 或新虚拟机上双击即弹窗报缺失 DLL。开启静态 CRT 后运行时代码随 exe 自带，免依赖。
+# 代价：每个 exe 增加约 130–160 KB（各带一份 CRT 代码）。**两个 flag 必须共存，且不可移除**：
+# 去掉 crt-static 会重新依赖系统运行库；去掉 MANIFESTDEPENDENCY 会让 cargo test 产物
+# 在 comctl32 5.82 上 `0xC0000139` 崩溃。
 [target.'cfg(windows)']
 rustflags = [
+  "-C", "target-feature=+crt-static",
   "-C", "link-arg=/MANIFESTDEPENDENCY:type='win32' name='Microsoft.Windows.Common-Controls' version='6.0.0.0' processorArchitecture='*' publicKeyToken='6595b64144ccf1df' language='*'",
 ]

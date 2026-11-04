@@ -33,12 +33,16 @@ use std::time::{Duration, Instant};
 
 use tauri::{AppHandle, Manager};
 
+use mirrorstar_core::desktop::window::{
+    force_arrow_cursor, should_attach_cursor_thread, CURSOR_WAIT_POLL_INTERVAL_MS,
+    CURSOR_WAIT_POLL_MAX_MS,
+};
 use mirrorstar_core::LivenessProbe;
 use windows::Win32::Foundation::POINT;
-use windows::Win32::System::Threading::{AttachThreadInput, GetCurrentThreadId};
+use windows::Win32::System::Threading::GetCurrentThreadId;
 use windows::Win32::UI::WindowsAndMessaging::{
-    GetCursorInfo, GetCursorPos, GetWindowThreadProcessId, IsHungAppWindow, LoadCursorW, SetCursor,
-    WindowFromPoint, CURSORINFO, IDC_ARROW, IDC_WAIT,
+    GetCursorInfo, GetCursorPos, GetWindowThreadProcessId, IsHungAppWindow, LoadCursorW,
+    WindowFromPoint, CURSORINFO, IDC_WAIT,
 };
 
 use crate::platform::liveness_watchdog::{confirmed_stalls, stalled_display_ids};
@@ -71,28 +75,7 @@ impl Drop for OrchestrationGuard {
     }
 }
 
-/// 检测系统等待态（`IDC_WAIT`）的轮询间隔（毫秒）。
-///
-/// 覆盖窗 `SetWindowPos(SWP_SHOWWINDOW)` 后 Windows 才把光标切到 `IDC_WAIT`；
-/// 固定延迟会留下可感知的等待指针窗口。改为短间隔轮询，检测到等待态立即复位，
-/// 把可见等待压缩到 1 帧以内。
-const CURSOR_WAIT_POLL_INTERVAL_MS: u64 = 2;
-
-/// 等待系统进入等待态的最长轮询时间（毫秒）。
-///
-/// 正常显示窗口后系统在一个输入周期内设置等待态；250ms 足够覆盖慢机/低帧率。
-/// 超时说明鼠标不在覆盖窗上（或系统未设置等待态），无需继续挂接。
-const CURSOR_WAIT_POLL_MAX_MS: u64 = 250;
-
-/// 是否应把当前线程挂接到目标线程以复位光标（纯函数，便于单测）。
-///
-/// 目标线程为 0（取不到线程）、与当前线程相同（当前线程已拥有该输入队列，直接
-/// `SetCursor` 即可、无需挂接）或目标窗口无响应（挂接可能一起挂死）时返回 false。
-fn should_attach_cursor_thread(target_tid: u32, current_tid: u32, target_hung: bool) -> bool {
-    target_tid != 0 && target_tid != current_tid && !target_hung
-}
-
-/// 复位纯净模式覆盖窗的光标；返回是否真正执行了挂接 + `SetCursor`。
+/// 复位纯净模式覆盖窗的光标；返回是否真正完成了箭头光标复位。
 ///
 /// # 根因
 ///
@@ -104,12 +87,13 @@ fn should_attach_cursor_thread(target_tid: u32, current_tid: u32, target_hung: b
 ///
 /// # 修复
 ///
-/// 把当前线程临时 `AttachThreadInput` 到覆盖窗所属线程（即鼠标下窗口的输入队列），
-/// `SetCursor(IDC_ARROW)` 后立即解除挂接。实测（真机）可在**不抢前台**的前提下把
-/// `IDC_WAIT` 复位为箭头，解除挂接后保持。
+/// 复用核心 [`force_arrow_cursor`]：把当前线程临时 `AttachThreadInput` 到覆盖窗所属线程
+/// （即鼠标下窗口的输入队列），`SetCursor(IDC_ARROW)` 后立即解除挂接。实测（真机）可在
+/// **不抢前台**的前提下把 `IDC_WAIT` 复位为箭头，解除挂接后保持；行为与此前真机验证一致。
 ///
 /// 只处理"鼠标下窗口本身是本次纯净模式置顶窗口"的情形；桌面 / 任务栏 / 用户前台
-/// 窗口 / mpv 子窗口一律不碰。失败或目标线程无响应只记录日志，不阻断进入。
+/// 窗口 / mpv 子窗口一律不碰。失败或目标线程无响应只记录日志（挂接序列的失败由核心
+/// 函数 warn），不阻断进入。
 fn reset_pure_mode_cursor() -> bool {
     // 并发退出时置顶注册表可能已清空，直接跳过。
     if !mirrorstar_core::pure_mode::is_active() {
@@ -150,30 +134,17 @@ fn reset_pure_mode_cursor() -> bool {
         return false;
     }
 
-    let arrow = match unsafe { LoadCursorW(None, IDC_ARROW) } {
-        Ok(cursor) => cursor,
-        Err(e) => {
-            tracing::warn!(error = %e, "纯净模式光标复位：加载箭头光标失败");
-            return false;
+    match force_arrow_cursor(target_tid) {
+        Some(previous) => {
+            tracing::info!(
+                target_tid,
+                previous_cursor = previous.0 as isize,
+                "纯净模式光标复位：覆盖窗光标已从系统等待态复位为箭头"
+            );
+            true
         }
-    };
-
-    // 挂接失败不重试：光标会停留在系统等待态，但不影响模式本身。
-    if !unsafe { AttachThreadInput(current_tid, target_tid, true) }.as_bool() {
-        tracing::warn!(target_tid, "纯净模式光标复位：AttachThreadInput 挂接失败");
-        return false;
+        None => false,
     }
-    let previous = unsafe { SetCursor(arrow) };
-    // 必须解除挂接，避免长期共享输入队列。
-    if !unsafe { AttachThreadInput(current_tid, target_tid, false) }.as_bool() {
-        tracing::warn!(target_tid, "纯净模式光标复位：AttachThreadInput 解除失败");
-    }
-    tracing::info!(
-        target_tid,
-        previous_cursor = previous.0 as isize,
-        "纯净模式光标复位：覆盖窗光标已从系统等待态复位为箭头"
-    );
-    true
 }
 
 /// 进入纯净模式后轮询系统光标：一旦出现 `IDC_WAIT` 且鼠标位于覆盖窗上，立即复位。
@@ -1077,13 +1048,12 @@ mod tests {
 
     /// 光标复位契约（根因：后台 NOACTIVATE 覆盖窗被 Windows 显示为 IDC_WAIT）：
     /// 进入编排必须在引擎置顶**之后**、同步置勾选**之前**调用 `reset_pure_mode_cursor`，
-    /// 且实现使用 `AttachThreadInput` + `SetCursor`，不得改成抢前台。
+    /// 且复位复用核心 `force_arrow_cursor`（挂接序列已收敛到核心），不得改成抢前台。
     #[test]
     fn source_contains_cursor_reset_markers() {
         let source = include_str!("pure_mode.rs");
         // 运行期拼接搜索串，避免 include_str! 把测试自身的字面量计入匹配
-        let attach = ["Attach", "ThreadInput"].join("");
-        let set_cursor = ["Set", "Cursor"].join("");
+        let force_arrow = ["force_arrow_", "cursor"].join("");
         let reset_fn = ["fn reset_pure_mode_", "cursor()"].join("");
         let reset_call = ["reset_pure_mode_", "cursor_when_waiting"].join("");
         let poll = ["GetCursor", "Info"].join("");
@@ -1092,8 +1062,10 @@ mod tests {
         let enter_engine = ["enter_", "pure_mode()"].join("");
         let checked_wait = ["set_checked_", "and_wait"].join("");
 
-        assert!(source.contains(&attach), "光标复位应使用 {attach}");
-        assert!(source.contains(&set_cursor), "光标复位应使用 {set_cursor}");
+        assert!(
+            source.contains(&force_arrow),
+            "挂接序列已收敛到核心 force_arrow_cursor：本文件应调用 {force_arrow}"
+        );
         assert!(source.contains(&reset_fn), "应定义 {reset_fn}");
         assert!(source.contains(&poll), "光标轮询应使用 {poll}");
         assert!(

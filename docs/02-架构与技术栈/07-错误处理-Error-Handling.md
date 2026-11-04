@@ -137,18 +137,18 @@ flowchart TD
 
 上图的判断要点：
 
-- `spawn_proc_exit_monitor`（wallpaper/mod.rs L155-186）是**唯一**的退出监听器，无 watchdogs、无重试循环。
+- `spawn_proc_exit_monitor`（wallpaper/mod.rs L155-186）是**唯一**的子进程退出监听器，无重试循环；**无独立看门狗进程**，但存在进程内 `liveness_watchdog`（5s 采样 / 1.3s 确认 / 60s 冷却）做视频停滞自愈。子进程异常退出**不自动 respawn**。
 - 当子进程**异常退出**（即以非 `Terminated` 状态退出）时，将渲染器状态更新为 `Terminated`，并通过 `PauseSender::notify_state_changed` 通知引擎。
 - 引擎据此触发 `wallpaper-state-changed` 事件，通知前端（web.rs / video.rs）刷新状态。
 
 ### 3.3 恢复策略现状
 
-> **重要说明**：自动重启（respawn）**未实现**，处于观察中。不存在"重新 spawn 子进程 3 次""重启 GIF 渲染线程 3 次""连续崩溃(3 次/分钟)放弃恢复并切换静态壁纸"等自动重启/重试流程。
+> **重要说明**：自动重启（respawn）**未实现**，处于观察中。不存在"重新 spawn 子进程 3 次""重启 GIF 渲染线程 3 次""连续崩溃(3 次/分钟)放弃恢复并切换静态壁纸"等自动重启/重试流程。全屏 `terminate` 后的子进程由 `resume_all_fast` / 后台复查线程重建，不属于异常崩溃 respawn。
 
 | 场景        | 现状                          | 后续方向      |
 | ---------- | --------------------------- | --------- |
-| 子进程异常退出  | 仅监听并更新状态为 Terminated，通知前端    | 自动重启（respawn）待评估，处于观察中 |
-| 主进程崩溃    | 操作系统自动回收子进程（父子进程关系），不需要独立看门狗进程；Web 子进程崩溃可通过 IPC 管道断开检测 | -         |
+| 子进程异常退出  | 仅监听并更新状态为 Terminated，通知前端；**不自动 respawn**    | 自动重启（respawn）待评估，处于观察中 |
+| 主进程崩溃    | 操作系统自动回收子进程（父子进程关系），**无独立看门狗进程**；进程内 `liveness_watchdog` 仅做视频停滞自愈（5s 采样 / 1.3s 确认 / 60s 冷却）；Web 子进程崩溃可通过 IPC 管道断开检测 | - |
 
 ***
 
@@ -156,15 +156,15 @@ flowchart TD
 
 | 故障场景               | 降级方案                              |
 | ------------------ | --------------------------------- |
-| WorkerW 未找到        | Native 模式下不影响静态图片壁纸；WorkerW 模式下回退到 SetWindowPos 底层窗口模式（高对比度模式未处理） |
-| WebView2 不可用       | 网页壁纸功能不可用，提示用户安装 WebView2 Runtime |
+| WorkerW 未找到        | Native 模式下不影响静态图片壁纸；WorkerW 模式下嵌入失败并返回 `DesktopIntegration`/`WorkerWNotFound` 错误（不自动降级为普通底层窗口） |
+| WebView2 不可用       | 网页壁纸/预览不可用，程序无内置引导安装，需用户自行安装 WebView2 Runtime |
 | mpv.exe 缺失/启动失败   | 视频壁纸不可用，提示用户检查 mpv.exe（随程序分发或 PATH 查找）         |
 | 配置文件损坏             | 使用默认配置启动，记录警告日志                   |
 | 音频控制失败             | 壁纸正常播放，仅音频控制不可用                   |
-| SetWinEventHook 失败 | 仅记录错误并退出全屏监控线程（**无 2 秒轮询回退**） |
-| Native 壁纸 API 失败  | 回退到 WorkerW 嵌入模式，记录警告日志           |
+| SetWinEventHook 失败 | 记录错误并退出全屏监控线程；已启动的 2s 周期复查线程仍可处理“已暂停状态”的退出恢复，但无法检测新的全屏进入 |
+| Native 壁纸 API 失败  | 返回错误，**不回退** WorkerW 嵌入模式，记录错误日志           |
 
-> **SetWinEventHook 降级说明**：全屏检测为纯事件驱动（`SetWinEventHook(EVENT_SYSTEM_FOREGROUND)`）。当钩子设置失败（返回 `nullptr`）时，实现仅在 fullscreen.rs 中记录错误并退出全屏监控线程，**不存在**"回退到低频轮询（2 秒间隔）"的兜底逻辑。
+> **SetWinEventHook 降级说明**：全屏**进入**检测依赖 `SetWinEventHook(EVENT_SYSTEM_FOREGROUND)` 事件；钩子设置失败（返回 `nullptr`）时，fullscreen.rs 记录错误并退出监控线程，不再检测新的全屏进入。另有独立的 2s 周期复查线程，仅用于兜底“已暂停但退出全屏时无前台切换事件”的恢复场景，不能替代进入检测。
 
 ***
 

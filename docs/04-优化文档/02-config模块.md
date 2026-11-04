@@ -6,21 +6,22 @@
 
 ### 1.1 模块职责
 
-config 模块是 mirrorstar-core 的配置与壁纸库管理中枢，聚合五类职责：① 应用配置 `AppConfig` 的结构定义与范围校验（`settings.rs`）；② 配置与壁纸库的加载、持久化、原子写入与增删改查（`manager.rs` 中的 `ConfigManager`）；③ 文件监视与热重载（`hot_reload.rs`，通过 `impl ConfigManager` 扩展）；④ 壁纸类型检测（`detect.rs`，扩展名 + 魔数双路径）；⑤ 缩略图生成（`thumbnail.rs`，image crate + ffmpeg CLI）。模块通过 `Arc<RwLock<...>>` + `AtomicBool` + `Mutex` 提供线程安全的并发访问，被 Tauri 命令层以 `Arc<ConfigManager>` 形式共享。该模块历经 v3.x→v4.0→v5.0→v6.0 多轮深度修复（C01-C11、C-001~C-018、v41-C-XXX、C-PERF-XXX、C-TD-001~C-TD-032 等数十个 spec），代码中保留了大量的修复痕迹注释。
+config 模块是 mirrorstar-core 的配置与壁纸库管理中枢，聚合六类职责：① 应用配置 `AppConfig` 的结构定义与范围校验（`settings.rs`）；② 配置与壁纸库的加载、持久化、原子写入与增删改查（`manager.rs` 中的 `ConfigManager`）；③ 文件监视与热重载（`hot_reload.rs`，通过 `impl ConfigManager` 扩展）；④ 壁纸类型检测（`detect.rs`，当前仅按扩展名检测，内容魔数/HTML 检测已移除）；⑤ 缩略图生成（`thumbnail.rs`，image crate + 随包 mpv `--vo=image` 抽帧）；⑥ 播放状态持久化（`playback.rs`，`PlaybackStore`）。模块通过 `Arc<RwLock<...>>` + `AtomicBool` + `Mutex` 提供线程安全的并发访问，被 Tauri 命令层以 `Arc<ConfigManager>` 形式共享。该模块历经 v3.x→v4.0→v5.0→v6.0 多轮深度修复（C01-C11、C-001~C-018、v41-C-XXX、C-PERF-XXX、C-TD-001~C-TD-032 等数十个 spec），代码中保留了大量的修复痕迹注释。
 
 ### 1.2 文件清单与行数
 
-> 行数为 2026-09-01 依据真实代码统计（v6.0 清理后状态；v6 审查文档报的行数为清理前版本，数字偏高，以本节为准）。
+> 行数为 **2026-11-04** 依据真实代码统计的当前快照（含 `#[cfg(test)]` 测试代码），会随重构继续变化；此前 v6 审查文档报的行数为清理前版本，已不再适用。
 
 | 文件 | 行数 | 主要内容 |
 |---|---|---|
-| mod.rs | 45 | 模块导出与 `pub use` 重导出 |
-| manager.rs | 2533 | `ConfigManager` 实现、`WallpaperEntry`/`WallpaperLibrary`/`DisplayInfo` 数据模型、`atomic_write`、`normalize_path`、`read_bounded_utf8_file`、`invoke_callback_safe`、`save_with_dirty_rollback`、配置加载错误类型、`#[cfg(test)] mod tests` |
-| settings.rs | 735 | `AppConfig` 及子配置（`AudioConfig`/`VideoConfig`/`GifConfig`/`WebConfig`/`PauseConfig`/`GeneralConfig`）与 `validate()` 范围校验 |
-| hot_reload.rs | 549 | `start_watching`/`reload_config_and_library`/`start_periodic_save`/`shutdown_periodic_save`/`stop_watching` |
-| detect.rs | 738 | `detect_wallpaper_type`（扩展名）、`detect_wallpaper_type_by_content`（魔数，保留无调用方）、`detect_html` |
-| thumbnail.rs | 1168 | `generate_thumbnail`/`generate_video_thumbnail`/`is_ffmpeg_available`/`TmpFrameGuard` RAII 守卫 |
-| validation.rs | 33 | 校验相关辅助（v6.0 后新增） |
+| mod.rs | 47 | 模块导出与 `pub use` 重导出 |
+| manager.rs | 3280 | `ConfigManager` 实现、`WallpaperEntry`/`WallpaperLibrary`/`DisplayInfo` 数据模型、`atomic_write`、`normalize_path_key`、`read_bounded_utf8_file`、`invoke_callback_safe`、`save_with_dirty_rollback`、配置加载错误类型、`#[cfg(test)] mod tests` |
+| settings.rs | 1406 | `AppConfig` 及子配置（`GeneralConfig`/`AudioConfig`/`PauseConfig`/`ScalingConfig`/`VideoConfig`/`GifConfig`/`RotationConfig`）与各 `validate()` 范围校验 |
+| hot_reload.rs | 551 | `start_watching`/`reload_config_and_library`/`start_periodic_save`/`shutdown_periodic_save`/`stop_watching` |
+| detect.rs | 173 | `detect_wallpaper_type`（扩展名检测；内容魔数检测与 `detect_html` 已移除） |
+| thumbnail.rs | 1245 | `generate_thumbnail`/`generate_video_thumbnail`/`thumbnail_cache_path`/`escape_cli_input`/`find_mpv_frame`，及 `TmpDirGuard`/`TmpFileGuard` RAII 守卫 |
+| validation.rs | 39 | `validate_volume`/`validate_speed` 共享范围校验（v6.0 后新增） |
+| playback.rs | 334 | `PlaybackStore`/`PlaybackState`/`Unit`/`PLAYBACK_SCHEMA_VERSION`（播放状态存储） |
 
 - **模块路径**：`crates/mirrorstar-core/src/config/`
 - **核心结构**：`WallpaperEntry`、`WallpaperMetadata`、`WallpaperLibrary`、`DisplayInfo`、`ConfigManager`
@@ -29,11 +30,14 @@ config 模块是 mirrorstar-core 的配置与壁纸库管理中枢，聚合五�
 
 ### 1.3 测试覆盖
 
-- `manager.rs` 含约 40 个 `#[test]`，覆盖序列化往返、`atomic_write`、`ConfigManager` 增删改查、`load_config`/`load_library` 损坏回退、dirty 标志竞态（C-001）、配置加载错误通知（C01）、validate clamp（C02/C-009）、cleanup 路径推导（C03）、TOCTOU（C08）、路径规范化（C09）、reload 原子性（C11）、sync_all 等。
-- `hot_reload.rs` 含 6 个 `#[test]`，覆盖 spawn 失败清理（C10）、reload 原子性对称测试（C11）、注释一致性（C-004）、watcher_alive 标志。
-- `detect.rs` 含约 30 个 `#[test]`，覆盖扩展名/魔数/HTML/BOM 检测、读取错误回退与 warn 日志（C-008）。
-- `thumbnail.rs` 含约 20 个 `#[test]`，覆盖缩略图生成、解压炸弹防护（C-002）、文件名稳定性（C-006）、临时文件名唯一性（C-007）、`TmpFrameGuard`。
-- `settings.rs` 含约 15 个 `#[test]`，覆盖默认值、TOML 往返、validate clamp（C-005/C-017 等）。
+> 以下测试数量为 **2026-11-04** 依据 `#[test]` 宏统计的当前快照（不含标 `#[ignore]` 或位于集成测试的用例）。
+
+- `manager.rs` 含 67 个 `#[test]`，覆盖序列化往返、`atomic_write`、`ConfigManager` 增删改查、`load_config`/`load_library` 损坏回退、dirty 标志竞态（C-001）、配置加载错误通知（C01）、validate clamp（C02/C-009）、cleanup 路径推导（C03）、TOCTOU（C08）、路径规范化（C09）、reload 原子性（C11）、sync_all 等。
+- `hot_reload.rs` 含 4 个 `#[test]`，覆盖 spawn 失败清理（C10）、reload 原子性对称测试（C11）、注释一致性（C-004）、watcher_alive 标志。
+- `detect.rs` 含 9 个 `#[test]`，覆盖扩展名匹配、大小写不敏感与路径处理（内容魔数/HTML/BOM 检测及其测试已移除）。
+- `thumbnail.rs` 含 35 个 `#[test]`，覆盖缩略图生成、解压炸弹防护（C-002）、文件名稳定性（C-006）、临时文件/目录唯一性与 RAII 守卫（C-007、`TmpDirGuard`/`TmpFileGuard`）。
+- `settings.rs` 含 38 个 `#[test]`，覆盖默认值、TOML 往返、validate clamp（C-005/C-017、速度范围 `[0.25, 4.0]` 等）。
+- `playback.rs` 含 10 个 `#[test]`，覆盖默认状态、单元创建/复用、持久化往返、旧版本/损坏文件回退与历史裁剪。
 
 测试盲区见第 5 节。
 
@@ -171,7 +175,7 @@ config 模块采用**便携数据根**设计：所有用户数据都被集中收
 
 **描述**：仅检查 `speed <= 0 || NaN`，无上限，过大的播放速度可能导致播放器异常。
 
-**修复状态**：✅ 已修复 — 新增 `MAX_VIDEO_SPEED: f32 = 10.0` 上限校验，越界回退 `1.0`（settings.rs:240,223）。
+**修复状态**：✅ 已修复 — `VideoConfig::validate()` 复用 `crate::config::validation::validate_speed`（范围 `crate::ipc::mpv_protocol::SPEED_MIN..=SPEED_MAX`，即 `[0.25, 4.0]`）；非法值（≤0、NaN/Inf 或越界）回退 `1.0` 并 `tracing::warn!`（`settings.rs` `VideoConfig::validate`，`validation.rs` `validate_speed`）。
 
 ### [C-018] [Low] [资源管理] manager.rs:810-816 — `atomic_write` 锁文件永不清理
 
@@ -182,6 +186,8 @@ config 模块采用**便携数据根**设计：所有用户数据都被集中收
 ## 3. v6.0 技术债清单（C-TD-001 ~ C-TD-032）
 
 > 来源：v6.0 技术债审查（2026-07-25）config 模块技术债清单（第 2 节全量）及清理状态（第 6 节），已并入本文档。
+>
+> **阅读说明（2026-11-04）**：下表为 v6.0 审查时的**债务快照**，其中 `detect_wallpaper_type_by_content`、`WebConfig`、`TmpFrameGuard`/`disarm`、`maybe_save_library` 等条目已在后续重构中整体移除；各条「清理建议」仅作历史记录，当前代码状态以第 1.2 节文件清单与真实代码为准。
 
 ### 3.1 死代码
 

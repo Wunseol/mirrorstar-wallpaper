@@ -29,6 +29,7 @@
 
 | 命令 | 用途 |
 |------|------|
+| `cargo check --workspace` | 编译检查（不含测试目标） |
 | `cargo test --workspace` | 运行全部单元/集成测试（默认跳过 `#[ignore]`） |
 | `cargo test --workspace -- --ignored` | 运行共享资源类串行测试 |
 | `cargo clippy --workspace --all-targets -- -D warnings` | Lint，零警告 |

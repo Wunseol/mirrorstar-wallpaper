@@ -15,37 +15,41 @@
   - `WallpaperEngine`：管理所有壁纸实例，提供 `set_wallpaper`/`pause_all_fast`/`resume_all_fast`/`shutdown` 等方法
   - `WallpaperRenderer` trait：统一渲染器接口
   - 4 种渲染器：`ImageRenderer`（原生 GDI + 双缓冲）、`GifRenderer`（image crate + GDI 双缓冲 + 40MB 内存预算）、`VideoRenderer`（mpv.exe 子进程 + 命名管道 IPC）、`WebRenderer`（wp-proc 子进程代理层）
-  - `PauseSender`：`tokio::sync::mpsc::UnboundedSender`，快速通道绕过 engine Mutex
+  - `PauseSender`：`tokio::sync::mpsc::UnboundedSender<PauseCommand>`，快速通道由命令层短暂获取 engine 锁定位各显示器 sender，随后 mpsc 直投渲染线程（不经过异步命令队列）
   - `WallpaperMode`：Native（`SystemParametersInfoW`）vs WorkerW（窗口嵌入）双路径
-  - `ScalingMode`：Fill / Fit / Stretch / Center / Original
+  - `ScalingMode`：Fill（默认）/ Fit / Stretch / Tile / Center
 - **设计模式**：
   - 专用线程消息循环（`WallpaperCommand` 枚举 + channel + `PostMessageW` 唤醒）
   - GDI 对象缓存（通过 `GdiCache` 统一管理，仅在 resize 时重建）
-  - 暂停时像素释放（Image/GIF 暂停时通过 `GdiCache.release_bitmap()` 释放，恢复时重新解码）
+  - 暂停时像素释放（Image 暂停时通过 `GdiCache.release_bitmap()` 释放缓冲并丢弃 pixels；GIF 经 `GifRenderData::handle_pause` 按内存策略释放帧；恢复时重新解码 / 重绘）
   - `PauseReason` 位图协调多暂停源
   - `GdiRendererBase`/`SubprocessRendererBase` 基类消除渲染器间重复逻辑
 
 ### 文件清单
 
+> 行数为 2026-11-04 实测的非空行数（与既有表口径一致；代码持续演进，非冻结值）。
+
 | 文件 | 行数 | 主要内容 |
 |---|---|---|
-| mod.rs | 1434 | 模块入口、WallpaperState/ScalingMode/GifMemoryStrategy/PauseCommand/PauseSender/WallpaperRenderer trait、calculate_scaling、PauseReason 位图、OwnedProcHandle、spawn_proc_exit_monitor、屏幕分辨率缓存 |
-| manager.rs | 4183 | WallpaperEngine 状态机、RendererConfig、三阶段 set_wallpaper 流程、construct_renderer、embed_and_register_renderer、close_wallpaper、纯净壁纸模式入口、原子交换、渲染器存活探针与自愈 |
-| gif.rs | 2032 | GifRenderer GIF 渲染器（WM_TIMER 驱动帧推进 + 后台解码线程 + 4 种内存管理策略） |
-| video.rs | 2080 | VideoRenderer 视频渲染器（mpv 子进程 + MpvIpcClient + WASAPI 音量控制 + pause 线程 COM MTA） |
+| mod.rs | 1460 | 模块入口、WallpaperState/ScalingMode/GifMemoryStrategy/PauseCommand/PauseSender/WallpaperRenderer trait、calculate_scaling、PauseReason 位图、OwnedProcHandle、spawn_proc_exit_monitor、屏幕分辨率缓存 |
+| manager.rs | 4459 | WallpaperEngine 状态机、RendererConfig、三阶段 set_wallpaper 流程、construct_renderer、embed_and_register_renderer、close_wallpaper、纯净壁纸模式入口、原子交换、渲染器存活探针与自愈 |
+| gif.rs | 2000 | GifRenderer GIF 渲染器（WM_TIMER 驱动帧推进 + 后台解码线程 + 4 种内存管理策略） |
+| video.rs | 2504 | VideoRenderer 视频渲染器（mpv 子进程 + MpvIpcClient + WASAPI 音量控制 + pause 线程 COM MTA） |
 | fast_path.rs | 1329 | WallpaperEngine 快速通道扩展（pause/resume/volume/mute 快速路径 + PauseReason 位图协调） |
-| image.rs | 1393 | ImageRenderer 图片渲染器（GdiRendererBase + 专用线程消息循环 + WM_WALLPAPER_COMMAND） |
-| gdi_base.rs | 866 | GdiRendererBase 共享基类（paint_with_double_buffer、spawn_pause_forwarder、register_window_class_once、create_wallpaper_window） |
+| image.rs | 1359 | ImageRenderer 图片渲染器（GdiRendererBase + 专用线程消息循环 + WM_WALLPAPER_COMMAND） |
+| gdi_base.rs | 923 | GdiRendererBase 共享基类（paint_with_double_buffer、spawn_pause_forwarder、register_window_class_once、create_wallpaper_window） |
 | gif_decode.rs | 1511 | decode_gif 全帧解码（40MB 内存预算 + 降采样）、decode_gif_first_frame 首帧快速解码 |
-| web.rs | 785 | WebRenderer 网页渲染器（wp-proc 子进程 + WpProcIpcClient） |
-| mode_dispatch.rs | 436 | determine_wallpaper_mode 集中决策、WallpaperEngine::set_wallpaper 同步路径 |
+| web.rs | 750 | WebRenderer 网页渲染器（wp-proc 子进程 + WpProcIpcClient） |
+| mode_dispatch.rs | 432 | determine_wallpaper_mode 集中决策、WallpaperEngine::set_wallpaper 同步路径 |
 | gif_memory.rs | 725 | GifRenderData（frames/current_frame/memory_strategy，handle_pause/handle_resume 4 策略） |
-| subprocess_base.rs | 479 | SubprocessRendererBase（ProcessManager/state/hwnd/pipe_name/pause_sender，find_window_by_title/find_window_by_class） |
+| subprocess_base.rs | 550 | SubprocessRendererBase（ProcessManager/state/hwnd/pipe_name/pause_sender，find_window_by_title/find_window_by_class） |
 | gdi_cache.rs | 183 | GdiCache 共享 GDI 双缓冲缓存（mem_dc/mem_bitmap/old_bitmap） |
 
 ### 测试覆盖
 
-测试分布广泛但存在倾斜：mod.rs（~547 行测试，覆盖 calculate_scaling、枚举 serde、PauseSender 状态/广播/版本号、spawn_proc_exit_monitor 集成测试）、manager.rs（~1724 行测试，含 MockRenderer 状态管理测试与 W-008 回退逻辑测试）、fast_path.rs（~871 行测试，覆盖快速路径与 PauseReason 位图协调）、gif_memory.rs（~322 行测试，4 种内存策略单元测试）、subprocess_base.rs（~44 行测试）、mode_dispatch.rs（~260 行测试，含模式判定与同步路径测试）、video.rs（~783 行测试，含 validate_renderer_speed 与 WASAPI 判断逻辑）、gif.rs（~616 行测试）、gif_decode.rs（~900 行测试）、image.rs（~521 行测试）、web.rs（~286 行测试）、gdi_base.rs（~75 行测试）。涉及 Win32 API 的失败分支普遍通过文档化注释标记验证，无法在 CI 中可靠触发真实失败分支。`paused_displays` 方法已被 v6.0 清理（见 W-TD-005）。
+> 以下测试数量为 2026-11-04 按 `#[test]` / `#[tokio::test]` 宏统计的当前快照。
+
+测试分布广泛但存在倾斜：mod.rs（43 个测试，覆盖 calculate_scaling、枚举 serde、PauseSender 状态/广播/版本号、spawn_proc_exit_monitor 集成测试）、manager.rs（77 个测试，含 MockRenderer 状态管理测试与 W-008 回退逻辑测试）、fast_path.rs（24 个测试，覆盖快速路径与 PauseReason 位图协调）、gif_memory.rs（20 个测试，4 种内存策略单元测试）、subprocess_base.rs（5 个测试）、mode_dispatch.rs（11 个测试，含模式判定与同步路径测试）、video.rs（37 个测试，含 validate_renderer_speed 与 WASAPI 判断逻辑）、gif.rs（37 个测试）、gif_decode.rs（32 个测试）、image.rs（22 个测试）、web.rs（9 个测试）、gdi_base.rs（10 个测试）。涉及 Win32 API 的失败分支普遍通过文档化注释标记验证，无法在 CI 中可靠触发真实失败分支。`paused_displays` 方法已被 v6.0 清理（见 W-TD-005）。
 
 ## 纯净壁纸模式（引擎侧入口）
 
@@ -398,7 +402,7 @@ wallpaper 模块是项目最大且最复杂的模块，整体架构清晰：`Wal
 - `cargo test -p mirrorstar-core wallpaper::`：全部通过
 - `cargo clippy --workspace --all-targets -- -D warnings`：零警告
 - `cargo check --workspace`：编译通过
-- `npx vitest run` + `npm run lint` + `npm run typecheck`：全部通过
+- `npx vitest run` + `npm run lint` + `npm run typecheck`：全部通过（历史记录，旧前端阶段）
 
 ## 优化机会与交集汇总
 

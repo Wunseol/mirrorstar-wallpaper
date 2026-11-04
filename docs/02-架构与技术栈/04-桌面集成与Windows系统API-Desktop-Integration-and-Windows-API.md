@@ -18,6 +18,8 @@
 桌面集成模块负责：WorkerW 窗口查找与嵌入、窗口样式修改、多显示器定位、DPI 感知、Explorer 重启检测与重建、纯净壁纸模式（窗口层级临时提升）以及鼠标输入处理。
 
 > **渲染路径说明**：静态图片（JPG/JPEG/PNG/BMP/TIF/TIFF/DIB）使用 Windows 原生壁纸 API（`SystemParametersInfoW` + 注册表）实现零资源占用，其余格式走 WorkerW 嵌入。两条路径的选择规则、对比表与原生 API 实现详见[壁纸渲染](./05-壁纸渲染-Wallpaper-Rendering.md)。
+>
+> **格式边界**：原生 API 支持 `.dib`，但文件名检测的添加识别列表（`crates/mirrorstar-core/src/config/detect.rs` 的 `IMAGE_EXTS`：`jpg` / `jpeg` / `png` / `bmp` / `webp` / `tiff` / `tif` / `ico`）不含 `dib`，因此 `.dib` 当前无法通过添加入口加入壁纸库；添加识别含 `ico`（走 WorkerW 渲染，原生列表不含 `ico`）。
 
 ### 1.1 WorkerW 嵌入完整流程
 
@@ -83,14 +85,19 @@ sequenceDiagram
             Desktop->>User32: set_parent_verified(wp_hwnd, Some(host))
             Note over User32,Progman: 步骤6: SetParent 到宿主（Progman 或 Progman 直接子 WorkerW）<br/>（父链校验，NULL 返回不单独判失败，见 1.2.3）
 
+            Desktop->>User32: ShowWindow(wp_hwnd, SW_SHOW)
+            Note over User32,Wp: 步骤7: 先显示再定位——首次 ShowWindow 会把刚显示的窗口<br/>提到宿主子窗口 z 序顶部，锚点插入必须晚于它
+
             Desktop->>User32: SetWindowPos(wp_hwnd, defview, x, y, w, h,<br/>SWP_NOACTIVATE | SWP_FRAMECHANGED)
-            Note over User32,Wp: 步骤7: 插入 DefView 正下方（z 序紧贴锚点之下）
+            Note over User32,Wp: 步骤8: 插入 DefView 正下方（z 序紧贴锚点之下），<br/>这是嵌入流程中最后一次 z 序写入
 
             Desktop->>User32: ensure_below_anchor(wp_hwnd, defview, progman)
-            Note over User32,Wp: 步骤8: 校验 GetWindow(hwnd, GW_HWNDPREV) == defview；<br/>失败则以 SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE 重试一次；<br/>仍失败则在宿主内回退 HWND_BOTTOM 并 warn（z_anchor_ok=false）
+            Note over User32,Wp: 步骤9: 显示之后测量 z 序——校验 GetWindow(hwnd, GW_HWNDPREV) == defview；<br/>失败则以 SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE 重试一次；<br/>仍失败则在宿主内回退 HWND_BOTTOM 并 warn（z_anchor_ok=false）
 
-            Desktop->>User32: ShowWindow(wp_hwnd, SW_SHOW)
-            Desktop->>Desktop: log_embed_success(raised=true, z_order_anchor="defview", z_anchor_ok, host, …)
+            Desktop->>Desktop: window::reset_wait_cursor_after_show(wp_hwnd)
+            Note over Desktop,Wp: 收尾: 壁纸窗口带 WS_EX_NOACTIVATE，后台首次整屏显示可能让系统切到 IDC_WAIT，<br/>且窗口类未注册 hCursor（DefWindowProc 不复位）；独立线程以 2ms 间隔、<br/>最长 250ms 轮询 GetCursorInfo，仅当鼠标下窗口属于该壁纸窗口时<br/>AttachThreadInput → SetCursor(IDC_ARROW) → 立即解挂；不抢前台、不持锁
+
+            Desktop->>Desktop: log_embed_success(raised=true, z_order_anchor="defview", z_anchor_ok, cursor_wait_reset, host, …)
         else 旧层级（WorkerW 为顶层兄弟窗口）
             Desktop->>User32: GetWindowRect(workerw_hwnd, &mut workerw_rect)
             User32-->>Desktop: workerw_rect
@@ -104,7 +111,7 @@ sequenceDiagram
             Note over User32,Wp: 步骤5: 按子窗口坐标定位并置于 z-order 底部
 
             Desktop->>User32: ShowWindow(wp_hwnd, SW_SHOW)
-            Desktop->>Desktop: log_embed_success(raised=false, z_order_anchor="bottom", …)
+            Desktop->>Desktop: log_embed_success(raised=false, z_order_anchor="bottom", cursor_wait_reset=false, …)
         end
 
         Desktop->>Desktop: worker_w::ensure_workerw_zorder(progman_hwnd, workerw_hwnd)
@@ -123,8 +130,8 @@ Windows 11 24H2/25H2 启用 raised desktop 后，桌面层级发生变化：`Pro
   - **非 raised desktop**：保持旧层级顺序不变——`SHELLDLL_DefView` 父窗口为 WorkerW → `Progman` 顶层兄弟 WorkerW → `EnumWindows` → 发送 `0x052C` → 再次 `EnumWindows` → fallback。
   - **raised desktop**：只探测 `FindWindowExW(Progman, NULL, "WorkerW", NULL)` 得到的 Progman 直接子 WorkerW，由 `find_progman_child_workerw` 用 `is_workerw_class` 校验类名；发送 `0x052C` **之前**探测一次、**之后**探测一次，未命中即返回 `WorkerWNotFound`；**不执行**顶层兄弟 WorkerW 查找与任何顶层 `EnumWindows`（含 Step 2/4/5），避免误选第三方应用的顶层 WorkerW。
 - **嵌入模型（Lively/Microsoft raised desktop 模型）**：raised desktop 下壁纸窗口为 **`SHELLDLL_DefView` 的直接父窗口**（下称宿主；可为 `Progman`，也可为 Progman 的直接子 `WorkerW`）的 `WS_CHILD` + `WS_EX_LAYERED`（alpha=255）子窗口，`SetWindowPos` 以 `SHELLDLL_DefView` 为 `hWndInsertAfter`（z 序插入 DefView 正下方，壁纸位于图标层之下）；宿主不再固定为 Progman，也不使用 `HWND_BOTTOM`（仅 z 序校验失败时的兜底分支例外）。旧层级（非 raised）行为不变：`SetParent(WorkerW)` + `HWND_BOTTOM`，不改 `WS_CHILD` / `WS_EX_LAYERED`。
-- **raised 嵌入时序**：`make_borderless` + `remove_from_taskbar` → `find_defview_deep`（Progman 直查，未命中则递归 Progman 直接子窗口子树，深度 ≤ 3）→ 宿主 = DefView 的直接父窗口 + 父链校验（`resolve_wallpaper_host` / `choose_wallpaper_host`：宿主 == Progman 或宿主的父窗口 == Progman）→ `apply_raised_desktop_style`（`WS_CHILD` → `WS_EX_LAYERED` + `SetLayeredWindowAttributes(0, 255, LWA_ALPHA)`，**必须先于 `SetParent`**）→ `set_parent_verified(wp_hwnd, Some(host))` → 按**宿主矩形**计算坐标并 `SetWindowPos(wp_hwnd, defview, x, y, w, h, SWP_NOACTIVATE | SWP_FRAMECHANGED)` → `ensure_below_anchor`（z 序校验 → 重试一次 → `HWND_BOTTOM` 兜底）→ `ShowWindow(SW_SHOW)` → `ensure_workerw_zorder`。路径选择由纯函数 `choose_embed_path(raised, defview)` 决定：`SHELLDLL_DefView` 找不到（如用户关闭"显示桌面图标"）或句柄无效时返回 `EmbedPath::LegacyWorkerW`，**降级为旧层级嵌入**（`SetParent(WorkerW)` + `HWND_BOTTOM`，不写 `WS_CHILD` / `WS_EX_LAYERED`），仅记 `warn`（提示检查"桌面右键 → 查看 → 显示桌面图标"），壁纸仍显示、不再整体失败；降级日志可用 `defview=0` + `z_order_anchor="bottom"` + `raised=true` 辨识。宿主父链校验失败（DefView 存在但 `resolve_wallpaper_host` 返回 `None`）时仍返回 `DesktopIntegration`（含 Progman/WorkerW/DefView/宿主句柄），不做降级。
-- **z-order 保障**：`DesktopIntegrator::embed_wallpaper` 在 `worker_w::embed_wallpaper` 成功后调用 `ensure_workerw_zorder(progman_hwnd, workerw_hwnd)`：判定只考察 `Progman` 的直接子窗口——用 `GetWindow(Progman, GW_CHILD)` 取首个（最上层）直接子窗口、再以 `GetWindow(首个直接子窗口, GW_HWNDLAST)` 取最底层直接子窗口（不递归枚举子孙窗口），仅当该窗口不是 WorkerW 时才执行 `SetWindowPos(WorkerW, HWND_BOTTOM, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE)` 置底。宿主为 Progman 时置底 WorkerW 使其位于 DefView 之下；宿主恰为该 WorkerW 时，置底只改变它与 Progman 其它直接子窗口的先后，不影响其内部 DefView 与壁纸窗口的相对 z 序——两种情况均无需跳过。该函数仅对 raised desktop 生效（旧层级直接返回），best-effort，失败仅 `warn`。
+- **raised 嵌入时序**：`make_borderless` + `remove_from_taskbar` → `find_defview_deep`（Progman 直查，未命中则递归 Progman 直接子窗口子树，深度 ≤ 3）→ 宿主 = DefView 的直接父窗口 + 父链校验（`resolve_wallpaper_host` / `choose_wallpaper_host`：宿主 == Progman 或宿主的父窗口 == Progman）→ `apply_raised_desktop_style`（`WS_CHILD` → `WS_EX_LAYERED` + `SetLayeredWindowAttributes(0, 255, LWA_ALPHA)`，**必须先于 `SetParent`**）→ `set_parent_verified(wp_hwnd, Some(host))` → `ShowWindow(SW_SHOW)`（**必须先于锚点插入**：首次显示会把窗口提到宿主子窗口 z 序顶部）→ 按**宿主矩形**计算坐标并 `SetWindowPos(wp_hwnd, defview, x, y, w, h, SWP_NOACTIVATE | SWP_FRAMECHANGED)`（锚点插入，流程中最后一次 z 序写入）→ `ensure_below_anchor`（显示之后测量 z 序 → 重试一次 → `HWND_BOTTOM` 兜底）→ `schedule_zorder_recheck(hwnd)`（独立线程 sleep 150ms（`ZORDER_RECHECK_DELAY_MS`）后延迟复核，覆盖系统 / Explorer 延迟提交的 z 序变更；已位于 DefView 下方时零写入）→ `reset_wait_cursor_after_show`（独立线程把 `IDC_WAIT` 复位为箭头）→ `ensure_workerw_zorder`。路径选择由纯函数 `choose_embed_path(raised, defview)` 决定：`SHELLDLL_DefView` 找不到（如用户关闭"显示桌面图标"）或句柄无效时返回 `EmbedPath::LegacyWorkerW`，**降级为旧层级嵌入**（`SetParent(WorkerW)` + `HWND_BOTTOM`，不写 `WS_CHILD` / `WS_EX_LAYERED`），仅记 `warn`（提示检查"桌面右键 → 查看 → 显示桌面图标"），壁纸仍显示、不再整体失败；降级日志可用 `defview=0` + `z_order_anchor="bottom"` + `raised=true` 辨识。宿主父链校验失败（DefView 存在但 `resolve_wallpaper_host` 返回 `None`）时仍返回 `DesktopIntegration`（含 Progman/WorkerW/DefView/宿主句柄），不做降级。
+- **z-order 保障**：`DesktopIntegrator::embed_wallpaper` 在 `worker_w::embed_wallpaper` 成功后调用 `ensure_workerw_zorder(progman_hwnd, workerw_hwnd)`：判定只考察 `Progman` 的直接子窗口——用 `GetWindow(Progman, GW_CHILD)` 取首个（最上层）直接子窗口、再以 `GetWindow(首个直接子窗口, GW_HWNDLAST)` 取最底层直接子窗口（不递归枚举子孙窗口），仅当该窗口不是 WorkerW 时才执行 `SetWindowPos(WorkerW, HWND_BOTTOM, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE)` 置底。宿主为 Progman 时置底 WorkerW 使其位于 DefView 之下；宿主恰为该 WorkerW 时，置底只改变它与 Progman 其它直接子窗口的先后，不影响其内部 DefView 与壁纸窗口的相对 z 序——两种情况均无需跳过。该函数仅对 raised desktop 生效（旧层级直接返回），best-effort，失败仅 `warn`。运行期由 300s 兜底轮询与桌面层事件触发的自愈在窗口仍附着时会先做**零写入**的 z 序体检（`reassert_zorder` → `reassert_below_defview`），仅在检测到壁纸窗口不在 `SHELLDLL_DefView` 之下时才重断言锚点；宿主父链变化时回到既有重嵌路径；重断言失败只记 `warn`、不重嵌。运行期体检还会在断言 DefView 相对位置前复核 WorkerW 是否仍在 `Progman` 直接子窗口最底层（`ensure_workerw_zorder` 幂等，已在最底层时零写入），覆盖 24H2 下系统壁纸变更（`SPI_SETDESKWALLPAPER`）导致 WorkerW 重建、新 WorkerW 落在子窗口链顶的场景。
 - **桌面附着判定**：`DesktopIntegrator::is_attached_to_wallpaper_layer(hwnd)` 用 `GetAncestor(GA_PARENT)` 接受三种情况：父窗口为缓存的 `workerw_hwnd`（旧层级）、父窗口为缓存的 `progman_hwnd`（raised desktop 下 DefView 直接挂 Progman）、或父窗口的父窗口为缓存的 `progman_hwnd`（宿主为 Progman 直接子 WorkerW）；且 `IsWindow(hwnd)` 为真。供原子交换 `commit_atomic_swap` 的 commit 前校验与纯净模式半摘出恢复使用。缓存句柄或窗口失效时返回 `false`，调用方放弃新窗并由自愈流程重新初始化、重嵌。
 - **SPI 早退**：raised desktop 下 `SPI_SETDESKWALLPAPER` 会销毁承载动态壁纸的 WorkerW（参考 Lively Wallpaper 的 `RefreshDesktop` 早退实现），因此 `refresh_desktop()` 在 raised desktop 下直接返回并记 debug 日志；`clear_native_wallpaper()` 同样记 debug 后返回 `Ok(())`（保持调用方既有语义，注册表原值保留不影响后续静态壁纸覆盖）。
 - **失效自愈**：`is_workerw_valid` / `check_and_reinitialize`（单行委托 `ensure_workerw_ready`）仍负责**桌面句柄层**的失效检测与重初始化——raised desktop 下句柄失效后重新查找会经上述子窗口探测得到新的 Progman 子 WorkerW，并重嵌其 `active_wallpapers` 登记的窗口，重嵌走本节的 layered/宿主路径，每次嵌入后重新调用 `ensure_workerw_zorder` 保证 WorkerW 仍在 Progman 子窗口最底层。但"仅重初始化"无法复活已销毁的渲染器窗口，故引擎层在其之上新增统一入口 `WallpaperEngine::heal_desktop_layer`：重初始化后再逐屏重嵌存活窗口、并对已销毁窗口重建渲染器（见 1.6.4）。
@@ -155,17 +162,20 @@ Progman（WS_EX_NOREDIRECTIONBITMAP，覆盖虚拟桌面）
 
 `SetParent` 会把重定父的窗口放到新兄弟 z 序顶部，因此 raised desktop 下 `SetWindowPos(hwnd, defview, …)` 的锚点插入必须显式校验，否则壁纸可能停留在 DefView 之上遮挡图标。
 
-- **校验与兜底（`worker_w.rs::ensure_below_anchor`）**：`GetWindow(hwnd, GW_HWNDPREV)` 必须等于 `defview`（纯判定 `is_below_anchor`）；不满足则用 `SetWindowPos(hwnd, defview, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE)` 重试一次；仍不满足则在宿主内改为 `HWND_BOTTOM`（附加 `SWP_FRAMECHANGED`）并记录 `warn`，保证壁纸不会停留在兄弟 z 序顶部。校验结果写入日志字段 `z_anchor_ok`，函数不返回 `Err`——兜底后嵌入流程照常完成，问题由日志暴露。
+首次 `ShowWindow(SW_SHOW)` 同样会重置兄弟 z 序：它把刚显示的窗口提到宿主子窗口的 z 序顶部，覆盖此前写入的锚点位置。因此 raised 嵌入顺序固定为 `SetParent` → `ShowWindow(SW_SHOW)` → 锚点插入（**流程中最后一次 z 序写入**）→ `ensure_below_anchor`（**显示之后**测量）。若在显示之前做锚点插入与校验，量到的只是显示前的瞬时状态：2026-11-01 真机日志即出现 `z_anchor_ok=true` 但 `sibling_chain` 中 `MirrorStarVideoHost` 排在 `SHELLDLL_DefView` 之前的自相矛盾记录——校验在 `ShowWindow` 之前、兄弟链采集在 `ShowWindow` 之后。
+
+- **校验与兜底（`worker_w.rs::ensure_below_anchor`）**：**紧邻 `SHELLDLL_DefView` 下方优先**——`GetWindow(hwnd, GW_HWNDPREV) == defview`（纯判定 `is_below_anchor`）；**否则允许兄弟链中位于 DefView 之后**（`is_after_in_chain`：在 `GetWindow(host, GW_CHILD)` → `GW_HWNDNEXT` 链中排在 `SHELLDLL_DefView` 之后即通过），避免中间夹了其它兄弟窗口时误报失败、走 `HWND_BOTTOM` 兜底把壁纸沉到 `WorkerW` 之下被静态壁纸遮住。不满足则用 `SetWindowPos(hwnd, defview, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE)` 重试一次；仍不满足则在宿主内改为 `HWND_BOTTOM`（附加 `SWP_FRAMECHANGED`）并记录 `warn`，保证壁纸不会停留在兄弟 z 序顶部。**锚点 `SetWindowPos` 失败时先 `ShowWindow(SW_HIDE)` 再返回错误**，避免已提前 `SW_SHOW` 的窗口停留在 DefView 之上遮挡桌面图标。校验结果写入日志字段 `z_anchor_ok`（`true` = 位于 DefView 之下，紧邻或链序在后），函数不返回 `Err`——兜底后嵌入流程照常完成，问题由日志暴露。z 序判定与插入分别只有 `is_already_below` / `insert_below` 一份实现，同步（`ensure_below_anchor`）、周期（`reassert_below_defview`）、延迟（`verify_and_fix_below_defview`）三条路径共用。
 
 - **图标层归属诊断**：日志 `壁纸窗口嵌入完成` 在 raised 路径新增以下字段（旧层级不做这些探测，固定为 `false` / 空列表）：
 
 | 字段 | 含义 | 判定用途 |
 |---|---|---|
 | `host` / `host_class` | 实际使用的宿主句柄与类名（`Progman` / `WorkerW`） | 确认走了哪种层级形态 |
-| `z_anchor_ok` | `GW_HWNDPREV == defview` 是否成立（含重试后） | `false` 表示锚点插入未生效、已回退宿主最底层，壁纸可能覆盖图标 |
+| `z_anchor_ok` | 壁纸窗口是否位于 DefView 之下（`GW_HWNDPREV == defview` 紧邻，或兄弟链中位于 DefView 之后；含重试后） | `false` 表示锚点插入未生效、已回退宿主最底层，壁纸可能覆盖图标 |
 | `defview_has_icon_list` | DefView 子树（深度 ≤ 3）是否含 `SysListView32` | `false` 表示该 DefView 不是图标承载层 |
 | `workerw_has_defview` / `workerw_has_icon_list` | 缓存的 `workerw_hwnd` 子树是否含 `SHELLDLL_DefView` / `SysListView32` | 判定图标层在 Progman 子级还是 WorkerW 子树 |
-| `sibling_chain` | Progman 直接子窗口链摘要（`类名#vis=0/1#0x句柄`，`GW_CHILD` → `GW_HWNDNEXT`，上限 64 项） | 核对兄弟顺序与实际 z 序 |
+| `sibling_chain` | 宿主（Progman 或 Progman 直接子 WorkerW）的直接子窗口链摘要（`类名#vis=0/1#0x句柄`，`GW_CHILD` → `GW_HWNDNEXT`，上限 64 项；命中本次嵌入的壁纸窗口时追加 `#self=1`，如 `MirrorStarVideoHost#vis=1#0x250C78#self=1`，用于多显示器区分是哪块屏） | 核对兄弟顺序与实际 z 序 |
+| `cursor_wait_reset` | 显示后 `IDC_WAIT` 光标复位流程是否已启动（`window::reset_wait_cursor_after_show`；光标挂接序列只有核心 `desktop::window::force_arrow_cursor` 一份实现，壁纸路径与纯净模式共用） | `false` 表示未启动复位，壁纸窗口可能持续显示蓝圈（见 1.1.1 收尾步骤） |
 
 真机日志据此可区分两类失效：`z_anchor_ok=false` 属锚点插入未生效；`defview_has_icon_list=false` 且 `workerw_has_icon_list=true` 属图标层归属判错（壁纸插在该 DefView 之下仍处于图标层之上）。
 
@@ -347,7 +357,7 @@ MirrorStar 声明为 Per-Monitor DPI Aware V2 应用，确保在不同 DPI 缩�
 
 #### 1.5.1 DPI 感知声明
 
-在应用程序 manifest 中声明 Per-Monitor DPI Aware V2：
+壳进程使用 `src-tauri/manifest.xml`，UI 子进程使用 `crates/mirrorstar-ui/app.manifest`，两者均声明 Per-Monitor DPI Aware V2：
 
 ```xml
 <application xmlns="urn:schemas-microsoft-com:asm.v3">
@@ -606,11 +616,11 @@ FR-034 定义了五种壁纸缩放模式，各模式渲染逻辑如下：
 
 | 模式 | 说明 | 视频实现 | GIF/图片实现 | 网页实现 | 原生壁纸实现 |
 |------|------|----------|-------------|----------|-------------|
-| Fill | 填满屏幕，保持比例，裁剪溢出 | mpv --panscan=1.0 | GDI 双缓冲缩放+裁剪 | CSS object-fit: cover | 注册表 WallPaperStyle=10, TileWallpaper=0 |
-| Fit | 适配屏幕，保持比例，留黑边 | mpv --keepaspect | GDI 双缓冲缩放+居中 | CSS object-fit: contain | 注册表 WallPaperStyle=6, TileWallpaper=0 |
-| Stretch | 拉伸填满，不保持比例 | mpv --no-keepaspect | GDI 双缓冲拉伸 | CSS object-fit: fill | 注册表 WallPaperStyle=2, TileWallpaper=0 |
-| Center | 原始大小居中，超出裁剪 | mpv --no-keepaspect --panscan=0 | GDI 双缓冲居中+裁剪 | CSS object-fit: none | 注册表 WallPaperStyle=0, TileWallpaper=0 |
-| Original | 原始大小，左上角对齐 | mpv 默认 | GDI 双缓冲原始大小 | CSS 无缩放 | 注册表 WallPaperStyle=0, TileWallpaper=0 |
+| Fill | 填满屏幕，保持比例，裁剪溢出 | mpv `--panscan=1.0` | GDI 双缓冲缩放+裁剪 | CSS object-fit: cover | 注册表 WallPaperStyle=10, TileWallpaper=0 |
+| Fit | 适配屏幕，保持比例，留黑边 | mpv `--panscan=0.0` | GDI 双缓冲缩放+居中 | CSS object-fit: contain | 注册表 WallPaperStyle=6, TileWallpaper=0 |
+| Stretch | 拉伸填满，不保持比例 | mpv `--keepaspect=no` | GDI 双缓冲拉伸 | CSS object-fit: fill | 注册表 WallPaperStyle=2, TileWallpaper=0 |
+| Center | 原始大小居中，超出裁剪 | mpv `--video-unscaled=yes` | GDI 双缓冲居中+裁剪 | CSS object-fit: none | 注册表 WallPaperStyle=0, TileWallpaper=0 |
+| Tile | 原始大小平铺重复填满 | mpv `--video-unscaled=yes`（mpv 无原生平铺，回退为居中） | GDI 按原尺寸网格重复绘制 | WebView2 自行渲染（不适用） | 注册表 WallPaperStyle=0, TileWallpaper=1 |
 
 缩放模式通过 IPC `set_scaling_mode` 命令传递给子进程，子进程的 WallpaperRenderer 实现类根据模式调整渲染参数。对于原生壁纸模式（jpg/jpeg/png/bmp/tif/tiff/dib），缩放模式通过注册表 `WallPaperStyle` 和 `TileWallpaper` 值控制。
 
@@ -652,11 +662,11 @@ fn set_mouse_passthrough(hwnd: HWND, enabled: bool) {
 
 #### 1.9.2 鼠标交互模式（FR-033）
 
-交互模式用于网页壁纸，允许用户直接与网页内容交互（如点击链接）：
-- 交互模式开启：壁纸窗口正常接收鼠标消息，WebView2 处理输入
-- 交互模式关闭：同鼠标穿透模式，使用 `WS_EX_TRANSPARENT`
+交互模式是全局鼠标输入开关，当前仅 Image / Video 渲染器实际改写窗口穿透样式；GIF / Web 渲染器沿用 trait 默认实现（no-op）：
+- 交互模式开启：关闭鼠标穿透（`set_mouse_passthrough(false)`），Image / Video 壁纸窗口可接收鼠标
+- 交互模式关闭：恢复鼠标穿透（`set_mouse_passthrough(true)`，`WS_EX_TRANSPARENT`）
 
-两种模式通过 IPC `set_mouse_passthrough` 和 `set_interaction_mode` 命令控制，互为补充。
+交互模式只经 Tauri 命令 `set_interaction_mode` 切换（内部映射为渲染器的 `set_interaction_mode` → `set_mouse_passthrough(!enabled)`）；`set_mouse_passthrough` 是内部 Win32 函数（`desktop::window::set_mouse_passthrough`），**不是** Tauri 命令。仅 Image / Video 渲染器实际改写窗口穿透样式，GIF / Web 渲染器沿用 trait 默认实现（no-op）。
 
 ***
 
@@ -779,11 +789,12 @@ windows = { version = "0.58", features = [
 - `SystemParametersInfoW(SPI_SETDESKWALLPAPER)` — 设置桌面壁纸（需要与 `SPIF_UPDATEINIFILE | SPIF_SENDCHANGE` 配合持久化）
 - `SystemParametersInfoW(SPI_GETDESKWALLPAPER)` — 读取当前壁纸路径
 - 用于静态图片壁纸的 Native 路径，零运行时资源占用（实现细节见[壁纸渲染](./05-壁纸渲染-Wallpaper-Rendering.md)）
+- **失败语义**：`set_native_wallpaper_internal` 在原生 API 失败时直接向上返回错误，**不回退 WorkerW 嵌入**；由调用方（命令层 / 引擎）按错误处理，不自动切换渲染路径
 
 #### 窗口管理与嵌入
 
 - `SetParent` / `SetWindowPos` — 将壁纸窗口设为 WorkerW（旧层级）或宿主（raised desktop：`SHELLDLL_DefView` 的直接父窗口，Progman 或 Progman 直接子 WorkerW）的子窗口并控制位置、层级；`SetParent` 统一经 `set_parent_verified` 以 `GetAncestor(GA_PARENT)` 校验父链，NULL 返回不单独判失败（见 1.2.3）
-- raised desktop 下 `SetWindowPos` 以 `SHELLDLL_DefView` 为 `hWndInsertAfter`（插入 DefView 正下方），随后经 `ensure_below_anchor` 校验 `GW_HWNDPREV == defview`、必要时重试或回退宿主 `HWND_BOTTOM`；旧层级仍直接用 `HWND_BOTTOM`
+- raised desktop 下 `SetWindowPos` 以 `SHELLDLL_DefView` 为 `hWndInsertAfter`（插入 DefView 正下方），随后经 `ensure_below_anchor` 校验是否位于 DefView 之下（紧邻 `GW_HWNDPREV == defview` 优先，否则允许兄弟链中位于 DefView 之后）、必要时重试或回退宿主 `HWND_BOTTOM`；锚点插入失败先 `ShowWindow(SW_HIDE)` 再返回错误。旧层级仍直接用 `HWND_BOTTOM`
 - `SetWindowPos` 驱动 mpv / WebView2 窗口尺寸与位置同步
 
 #### 事件驱动监控

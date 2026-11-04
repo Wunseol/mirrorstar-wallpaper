@@ -89,12 +89,12 @@ graph LR
 
 **Phase 4：体验优化 ✅**
 
-- 壁纸预览与「设为壁纸」、搜索、响应式布局、关于页面、加载动画、电池供电暂停、全屏处置选择（终止/暂停/持续）。
+- 壁纸预览与「设为壁纸」、搜索、关于页面、加载动画、电池供电暂停、全屏处置选择（终止/暂停/持续）。
 
 **Phase 2：架构优化与代码清理 ✅**
 
 - 移除未使用的 write-only `OnceLock`，收敛为 `SHARED_ENGINE` / `SHARED_CONFIG` / `SHARED_APP_HANDLE`。
-- Explorer 重启监控：`TaskbarCreated` 消息监听 + 轮询兜底。
+- Explorer 桌面自愈：事件驱动（`TaskbarCreated` / WorkerW·Progman 销毁 / 会话解锁 / 睡眠恢复，统一经 `try_heal_desktop_layer`，销毁类事件 1s 去抖）+ `workerw_check` 每 300s 兜底。
 - 托盘菜单增加「暂停/恢复壁纸」快捷项，文本随状态动态切换。
 - 配置校验、GIF 内存策略、进程/管道会话清理等多项重构。
 
@@ -111,7 +111,7 @@ graph LR
 - 壳 ↔ UI 通过 `mirrorstar-core::ui_proto` 的 NDJSON 行协议 over stdio（`Hello` / `Request` / `Response` / `Event` / `Control`）；业务逻辑仅在壳侧。
 - UI 生命周期：按需启动 + 握手 + 窗口隐藏超时退出 + 单实例；用户主动唤起时置前聚焦（`AllowSetForegroundWindow` + `SetForegroundWindow`），纯净模式等非用户主动场景仍禁止抢前台。
 - 原生虚拟化壁纸网格；四类预览（图片自绘 / 视频进程内 mpv 子窗口 / GIF 逐帧 / 网页按需临时 WebView2 子窗口）。
-- 验收实测：主窗口打开并静置时壳 + UI 合计 private ≈ 16.8MB（门槛 ≤40MB）；关闭后回落 ≈7.6MB；idle CPU ≈0.4%。测试细节见 [测试报告](./05-测试报告-Test-Reports.md)。
+- 历史验收基线（原生 UI 重构初期，待复测）：主窗口打开并静置时壳 + UI 合计私有工作集 ≈ 16.8MB（门槛 ≤40MB）；关闭后回落 ≈7.6MB；idle CPU ≈0.4%。测试细节见 [性能优化](../02-架构与技术栈/09-性能优化-Performance.md) §21。
 
 ***
 
@@ -125,11 +125,11 @@ graph LR
 |------|--------|------|
 | 四种壁纸类型端到端 | ✅ 100% | 图片 / GIF / 视频 / 网页（添加→设置→显示→退出恢复） |
 | 桌面集成 | ✅ 100% | WorkerW 三重查找嵌入、原生壁纸 API 双路径、Explorer 重启恢复、显示器枚举 |
-| 渲染优化 | ✅ 100% | HALFTONE、双缓冲、专用线程消息循环、GIF 内存策略、图片降采样、暂停释放资源 |
+| 渲染优化 | ✅ 100% | HALFTONE、双缓冲、专用线程消息循环、GIF 内存策略、图片降采样；GIF/图片暂停释放资源，视频暂停保留当前帧 |
 | 全屏检测 | ✅ 100% | `SetWinEventHook` 事件驱动 + 状态去抖、面积比判定、自身窗口排除 |
-| 音量控制 | ✅ 100% | WASAPI 进程级（mpv）+ 静音切换；无音频设备时降级 no-op |
-| IPC 通信 | ✅ 100% | mpv 原生 JSON 管道 + wp-proc 自定义管道（`MpvIpcClient` / `WpProcIpcClient`） |
-| 进程管理 | ✅ 100% | `ProcessManager` 子进程管理 + 崩溃检测 |
+| 音量控制 | ✅ 100% | 视频经 WASAPI 进程级（mpv）控制，网页经 wp-proc IPC 控制音量/静音；无音频设备时降级 no-op |
+| IPC 通信 | ✅ 100% | mpv 原生 JSON 管道 + wp-proc 自定义管道（`MpvIpcClient` / `WpProcIpcClient`）+ `ui_proto` NDJSON over stdio（壳 ↔ `mirrorstar-ui`） |
+| 进程管理 | ✅ 100% | `ProcessManager` 子进程管理 + 退出监听/崩溃检测；异常退出不自动 respawn（仅标记 `Terminated` 并通知 UI） |
 | 配置管理 | ✅ 100% | TOML + 热重载 + 原子写入 + 校验 + 缩略图管理 |
 | Tauri 应用层 | ✅ 100% | 命令注册 + 托盘 + 单实例 + DPI 感知 + 电源监控 |
 | Web 壁纸子进程 | ✅ 100% | 壳 `--wp-proc` 模式（`mirrorstar-wp-proc` 库 crate）+ `WpProcIpcClient` + `WebRenderer` |
@@ -146,11 +146,9 @@ graph LR
 1. **精细鼠标交互**：RawInput 全局鼠标捕获 + 消息转发，解决交互模式下桌面图标不可点击问题。
 2. **应用规则系统**：pause / ignore / kill 规则，支持按窗口标题/进程规则处置。
 3. **多显示器感知暂停**：仅暂停全屏显示器上的壁纸（当前全屏检测为全局暂停）。
-4. **Win7 兼容回退**：`Progman` 直接嵌入的回退方案。
-5. **高对比度模式**：检测系统高对比度并切换到 bottom-most 渲染。
-6. **duplicate 显示器模式**：同壁纸在多显示器上重复显示。
-7. **国际化**：多语言支持。
-8. **更多壁纸类型**：Unity / Godot 等外部程序壁纸。
+4. **高对比度模式**：检测系统高对比度并切换到 bottom-most 渲染。
+5. **国际化**：多语言支持。
+6. **更多壁纸类型**：Unity / Godot 等外部程序壁纸。
 
 ***
 

@@ -21,11 +21,11 @@
 
 ## 1. 模块总览
 
-MirrorStar 由 **11 个 `mirrorstar-core` 模块**（真实代码中的 `pub mod`：audio/config/desktop/ipc/layout/perf/process/pure_mode/scheduler/ui_proto/wallpaper）与 3 个应用/子进程 crate（`src-tauri`、`crates/mirrorstar-ui`、`crates/mirrorstar-wp-proc`）构成。
+MirrorStar 由 **12 个 `mirrorstar-core` 模块**（真实代码中的 `pub mod`：audio/config/desktop/ipc/layout/log_retention/perf/process/pure_mode/scheduler/ui_proto/wallpaper）与 3 个应用/子进程 crate（`src-tauri`、`crates/mirrorstar-ui`、`crates/mirrorstar-wp-proc`）构成。
 
 > **仓库目录与文件清单**：各 crate / 模块的目录布局与文件清单统一见《[项目目录结构](../03-实施与验证/03-项目目录结构-Project-Structure.md)》，本文只描述模块职责、依赖与进程架构，不再逐一罗列文件。
 
-### 1.1 mirrorstar-core 模块（11 个 `pub mod`）
+### 1.1 mirrorstar-core 模块（12 个 `pub mod`）
 
 | # | 模块 | 路径 | 状态 |
 |---|------|------|------|
@@ -34,28 +34,31 @@ MirrorStar 由 **11 个 `mirrorstar-core` 模块**（真实代码中的 `pub mod
 | 3 | desktop (桌面集成) | `crates/mirrorstar-core/src/desktop/` | ✅ 已实现 |
 | 4 | ipc (进程间通信) | `crates/mirrorstar-core/src/ipc/` | ✅ 已实现 |
 | 5 | layout (布局策略) | `crates/mirrorstar-core/src/layout/` | ✅ 已实现 |
-| 6 | perf (内存归因埋点) | `crates/mirrorstar-core/src/perf.rs` | ✅ 已实现 |
-| 7 | process (进程管理) | `crates/mirrorstar-core/src/process/` | ✅ 已实现 |
-| 8 | pure_mode (纯净壁纸模式) | `crates/mirrorstar-core/src/pure_mode/` | ✅ 已实现 |
-| 9 | scheduler (轮换调度) | `crates/mirrorstar-core/src/scheduler/` | ✅ 已实现 |
-| 10 | ui_proto (壳↔UI 协议) | `crates/mirrorstar-core/src/ui_proto/` | ✅ 已实现 |
-| 11 | wallpaper (壁纸引擎) | `crates/mirrorstar-core/src/wallpaper/` | ✅ 已实现 |
+| 6 | log_retention (日志留存) | `crates/mirrorstar-core/src/log_retention.rs` | ✅ 已实现 |
+| 7 | perf (内存归因埋点) | `crates/mirrorstar-core/src/perf.rs` | ✅ 已实现 |
+| 8 | process (进程管理) | `crates/mirrorstar-core/src/process/` | ✅ 已实现 |
+| 9 | pure_mode (纯净壁纸模式) | `crates/mirrorstar-core/src/pure_mode/` | ✅ 已实现 |
+| 10 | scheduler (轮换调度) | `crates/mirrorstar-core/src/scheduler/` | ✅ 已实现 |
+| 11 | ui_proto (壳↔UI 协议) | `crates/mirrorstar-core/src/ui_proto/` | ✅ 已实现 |
+| 12 | wallpaper (壁纸引擎) | `crates/mirrorstar-core/src/wallpaper/` | ✅ 已实现 |
+
+> **日志留存（`log_retention`）**：应用日志按日轮转、保留 `APP_LOG_KEEP = 7` 个历史文件（`tracing-appender` 的 `max_log_files` 直接控制，启动期 `prune_logs` 兜底再剪一次）；mpv 实例日志保留最新 `MPV_LOG_KEEP = 20` 个（每次构建实例日志路径时增量剪枝 + 启动期全量兜底）；`crash.log` 超过 `CRASH_LOG_MAX_BYTES = 1MiB` 时轮转为 `crash.log.1`（仅保留一份备份，panic hook 追加写前亦会调用）。全部为 best-effort，失败仅 `warn`。
 
 ### 1.2 应用 / 子进程 crate
 
 | # | 名称 | 路径 | 类型 | 状态 |
 |---|------|------|------|------|
-| 12 | src-tauri（Tauri 应用壳） | `src-tauri/src/` | 应用主程序（壳 exe） | ✅ 已实现 |
-| 13 | mirrorstar-ui（原生 UI 子进程） | `crates/mirrorstar-ui/` | 二进制 crate（`mirrorstar-ui.exe`） | ✅ 已实现 |
-| 14 | mirrorstar-wp-proc（Web 壁纸子进程） | `crates/mirrorstar-wp-proc/` | **库 crate**（经壳 exe `--wp-proc` 模式运行，**非独立 exe**） | ✅ 已实现 |
+| 13 | src-tauri（Tauri 应用壳） | `src-tauri/src/` | 应用主程序（壳 exe） | ✅ 已实现 |
+| 14 | mirrorstar-ui（原生 UI 子进程） | `crates/mirrorstar-ui/` | 二进制 crate（`mirrorstar-ui.exe`） | ✅ 已实现 |
+| 15 | mirrorstar-wp-proc（Web 壁纸子进程） | `crates/mirrorstar-wp-proc/` | **库 crate**（经壳 exe `--wp-proc` 模式运行，**非独立 exe**） | ✅ 已实现 |
 
-> **架构决策**：采用混合进程架构——仅 Web 壁纸运行在独立子进程（壳 exe 的 `--wp-proc` 模式），按需创建；Image/Gif/Video 渲染器保留在壳进程内。mirrorstar-watchdog 独立进程已在阶段2移除（空壳 crate 已删除）。
+> **架构决策**：采用混合进程架构——Web 壁纸运行在壳 exe 的 `--wp-proc` 模式独立子进程；视频壁纸运行在 `mpv.exe` 独立子进程；Image/GIF 在主进程内渲染（GDI 双缓冲线程）；主窗口为独立 `mirrorstar-ui.exe` 子进程。独立看门狗**进程**已移除（空壳 crate 已删除）；存在进程内 `liveness_watchdog` 任务（5s 采样 / 1.3s 确认 / 60s 冷却）做视频停滞自愈。
 >
 > **已删除/不存在的模块**：
 > - **input（输入控制）**：已在代码评审 cycle4a 作为死代码删除（生产代码无调用方，交互模式切换由 `wallpaper/manager.rs` 直接调用 renderer 的 `set_interaction_mode`）。
 > - **前端 UI**：已整体删除（由原生 UI 子进程取代）。
 > - **tray（系统托盘 core 模块）**：不存在。托盘功能在 Tauri 应用层内联实现（Tauri `TrayIconBuilder`），并非独立 core 模块。
-> - **watchdog（看门狗进程）**：已移除。
+> - **watchdog（独立看门狗进程）**：已移除；进程内 `liveness_watchdog` 任务仍存在。
 
 ### 1.3 混合进程架构示意
 
@@ -163,7 +166,7 @@ MirrorStar 由 **11 个 `mirrorstar-core` 模块**（真实代码中的 `pub mod
 **已实现：**
 - WorkerW 查找三重策略：直接 EnumWindows 查找 → 发送 0x052C 消息触发创建 → 5 次重试（50ms 间隔）→ 备用回调方法
 - 壁纸窗口嵌入（SetParent + SetWindowPos HWND_BOTTOM + ShowWindow）
-- Explorer 重启检测与恢复（TaskbarCreated 事件驱动 + WorkerW 5 分钟轮询兜底，调用 `check_and_reinitialize` 重建）
+- Explorer 重启检测与恢复（事件驱动：`TaskbarCreated` + WorkerW/Progman 销毁 WinEvent 等统一经 `try_heal_desktop_layer` 自愈；另由 `workerw_check` 任务 300s 周期兜底，调用 `WallpaperEngine::heal_desktop_layer`（内部 `check_and_reinitialize`）重建）
 - 原始系统壁纸保存与恢复（SystemParametersInfoW）
 - 窗口操作（无边框 `make_borderless`、移除任务栏 `remove_from_taskbar`、鼠标穿透 `set_mouse_passthrough`）
 - 显示器枚举 `enumerate_displays()`（EnumDisplayMonitors + GetMonitorInfoW）
@@ -181,12 +184,12 @@ MirrorStar 由 **11 个 `mirrorstar-core` 模块**（真实代码中的 `pub mod
 **已实现：**
 
 **核心抽象：**
-- WallpaperRenderer trait 完整生命周期定义（play/pause/resume/set_volume/set_position/terminate/hwnd/state/set_speed/navigate/set_scaling_mode/set_mouse_passthrough/set_interaction_mode/create_pause_sender）
+- WallpaperRenderer trait 完整生命周期定义（play/pause/resume/set_volume/set_position/terminate/hwnd/state/set_speed/set_scaling_mode/set_mouse_passthrough/set_interaction_mode/create_pause_sender）
 - WallpaperEngine 管理器（manager.rs）：set/close/pause/resume/shutdown + 快速路径控制
-- **PauseSender 快速通道**：绕过引擎互斥锁，直接发送暂停/恢复/音量命令
-- 5 种缩放模式（Fill/Fit/Stretch/Center/Original）
+- **PauseSender 快速通道**：命令层短暂持 engine 锁定位 sender，经 mpsc 直接投递暂停/恢复/音量命令，不等待渲染器处理
+- 5 种缩放模式（Fill/Fit/Stretch/Center/Tile）
 - WallpaperMode 双路径（Native/WorkerW）
-- `update_positions` 多显示器位置更新（span 和 per_monitor）
+- 多显示器位置更新：`set_arrangement` 记录排列，调度器按 `layout::LayoutPlane` 重建/重嵌渲染器；`WallpaperRenderer::set_position` 负责渲染器窗口几何
 - **子进程退出监听**：仅存在 `spawn_proc_exit_monitor`（`wallpaper/mod.rs`）退出监听，监听子进程状态，异常退出时更新为 `Terminated` 状态并 `notify_state_changed` 通知引擎；**无自动 respawn（无自动重启逻辑）**
 
 **四种渲染器：**
@@ -232,7 +235,7 @@ MirrorStar 由 **11 个 `mirrorstar-core` 模块**（真实代码中的 `pub mod
 - 连接重试机制：mpv `MPV_CONNECT_RETRIES` = 40 × 50ms = 2s；wp-proc `WP_PROC_CONNECT_RETRIES` = 160 × 50ms = 8s；窗口查找重试 = 20 × 100ms = 2s（均位于 `wallpaper/subprocess_base.rs`）
 - `send_command` 命令发送 + request_id 响应匹配
 - `get_property` / `set_property` 属性读写
-- `pause` / `resume` / `set_volume` / `set_speed` / `quit` 控制命令（wp-proc 另有 play/terminate/set_position/navigate）
+- `pause` / `resume` / `set_volume` / `set_speed` / `quit` 控制命令（wp-proc 另有 play/terminate/set_position/pause/resume/set_volume/toggle_mute）
 
 > IPC 协议完整定义见[进程架构与 IPC](./03-进程架构与IPC-Process-Architecture-and-IPC.md)。
 
@@ -316,18 +319,18 @@ MirrorStar 由 **11 个 `mirrorstar-core` 模块**（真实代码中的 `pub mod
 **代码规模（审计记录，以实测为准）：** 详见[项目目录结构](../03-实施与验证/03-项目目录结构-Project-Structure.md)
 
 **已实现：**
-- **24 个 Tauri 命令全部完整实现**（无空操作），均为 `#[tauri::command]` 注解命令；托盘菜单的"暂停/恢复壁纸"复用 `pause_wallpaper`/`resume_wallpaper` 命令：
-  `get_wallpapers`, `add_wallpaper`, `generate_thumbnail`, `regenerate_thumbnails`, `remove_wallpaper`, `set_wallpaper`, `pause_wallpaper`, `resume_wallpaper`, `get_config`, `update_config`, `set_volume`, `toggle_mute`, `set_interaction_mode`, `toggle_interaction`, `get_displays`, `get_wallpaper_state`, `open_file_dialog`, `toggle_auto_start`, `get_auto_start_status`, `set_scaling_mode`, `set_speed`, `update_positions`, `check_desktop_status`, `quit_app`
-- 系统托盘（**在 lib.rs setup 中构建（state.rs 管理状态），菜单仅 3 项：打开主窗口 / 暂停-恢复壁纸 / 退出；无音量子菜单、无显示器子菜单**）+ 左键单击图标按主窗口**可见性**切换：可见且未最小化则隐藏、最小化则还原、已隐藏则显示（300ms 防抖；用户主动唤起时置前聚焦，使任务栏按钮恢复一次点击最小化；不判断系统前台）；壳 → UI 控制动作新增 `Toggle`；`Show` 语义为"确保窗口可见并置前聚焦"（隐藏→显示、最小化→还原、已可见→置前聚焦）
+- **36 个 Tauri 命令全部完整实现**（无空操作），均为 `#[tauri::command]` 注解命令；托盘菜单的"暂停/恢复壁纸"复用 `pause_wallpaper`/`resume_wallpaper` 命令：
+  `get_wallpapers`, `reorder_wallpapers`, `add_wallpaper`, `remove_wallpaper`, `set_wallpaper`, `pause_wallpaper`, `resume_wallpaper`, `get_config`, `update_config`, `get_arrangement`, `update_arrangement`, `set_volume`, `toggle_mute`, `set_interaction_mode`, `get_displays`, `get_memory_report`, `report_lifecycle_mark`, `get_wallpaper_state`, `open_file_dialog`, `toggle_auto_start`, `get_auto_start_status`, `set_scaling_mode`, `set_speed`, `check_desktop_status`, `get_rotation_config`, `update_rotation_config`, `list_pools`, `create_pool`, `update_pool`, `delete_pool`, `reorder_pools`, `get_unit_states`, `set_active_pool`, `set_rotation_enabled`, `next_wallpaper`, `prev_wallpaper`
+- 系统托盘（**在 lib.rs setup 中构建（state.rs 管理状态），菜单共 5 项：打开主窗口（`open`）/ 下一张壁纸（`next_wallpaper`）/ 暂停-恢复壁纸（`pause_resume`）/ 纯净壁纸（`pure_mode`，`CheckMenuItem` 勾选项）/ 退出（`quit`）；无音量子菜单、无显示器子菜单**）+ 左键单击图标按主窗口**可见性**切换：可见且未最小化则隐藏、最小化则还原、已隐藏则显示（300ms 防抖；用户主动唤起时置前聚焦，使任务栏按钮恢复一次点击最小化；不判断系统前台）；壳 → UI 控制动作新增 `Toggle`；`Show` 语义为"确保窗口可见并置前聚焦"（隐藏→显示、最小化→还原、已可见→置前聚焦）
 - 单实例保护（Win32 `CreateMutexW`）+ 二次启动唤起（命名事件 `MirrorStarWallpaper_ShowMainWindow`，主实例等待线程收到信号后走 `open_main_window` 并置前聚焦；事件不可用时回退提示对话框）
-- Explorer 重启后台检测（TaskbarCreated 事件驱动 + WorkerW 5 分钟轮询兜底，**无 30 秒轮询**）
-- 全屏应用检测（**纯 SetWinEventHook(EVENT_SYSTEM_FOREGROUND) 事件驱动** + 状态去抖 + 自身窗口排除；**无 2 秒轮询回退**）— **全局暂停/恢复**（`pause_all_fast`），**非按显示器粒度**
+- Explorer 重启/桌面层自愈：**事件驱动**（`TaskbarCreated` + WorkerW/Progman 销毁 WinEvent + 电源/会话事件，经 `try_heal_desktop_layer` 自愈；销毁事件 1s 去抖）+ **`workerw_check` 300s 周期兜底**（无 30 秒轮询）
+- 全屏应用检测（**SetWinEventHook(EVENT_SYSTEM_FOREGROUND) 事件驱动** + 状态去抖 + 自身窗口排除；另由 `spawn_fullscreen_review_thread` **每 2s 周期复查兜底**"无前台切换事件"的退出场景）— **全局暂停/恢复**（`pause_all_fast`），**非按显示器粒度**
 - 退出时壁纸恢复（`perform_shutdown`）
 - 配置热重载已启用
 - 主窗口按需启动原生 UI 子进程（`mirrorstar-ui.exe`），事件循环用 `run_event_loop_until_quit()` 保证窗口隐藏后进程存活（`run_event_loop()` 会在隐藏最后一个窗口时返回并结束进程），空闲超时（默认 300s）后由壳侧回收；关闭按钮/Alt+F4 走 `close_requested` 隐藏并上报 `WindowHidden`
 - PerMonitorV2 DPI 感知
 - **COM STA 初始化**：主进程显式调用 `CoInitializeEx(None, COINIT_APARTMENTTHREADED)`（STA），wp-proc 子进程同样使用 STA
-- PauseSender 快速路径（绕过引擎互斥锁）
+- PauseSender 快速路径（短暂持 engine 锁定位 sender，mpsc 直投渲染线程）
 - 2 个插件（tauri-plugin-dialog, tauri-plugin-autostart）
 
 ---
@@ -353,7 +356,7 @@ MirrorStar 由 **11 个 `mirrorstar-core` 模块**（真实代码中的 `pub mod
 - WebView2 环境：`CreateCoreWebView2Environment` + `CreateCoreWebView2Controller` + URL 导航（支持 http/https 和 file://）
 - 窗口类注册：固定类名 `MirrorStarWebWallpaperCls`，窗口标题使用 `--title` 参数（用于 `FindWindowW` 查找）
 - 主消息循环：`GetMessageW` + `WM_WEB_COMMAND`（`WM_USER + 20`）处理
-- 命令处理：Play（导航到源）、Terminate（销毁窗口+退出）、SetPosition（`SetWindowPos` + `SetBounds`）、Navigate（`webview.Navigate`）、Pause/Resume（状态标记）
+- 命令处理：Play（导航到源）、Terminate（销毁窗口+退出）、SetPosition（`SetWindowPos` + `SetBounds`）、Pause/Resume（状态标记）、SetVolume / ToggleMute（插件侧音量与静音控制）
 - **COM 初始化**：`CoInitializeEx(None, COINIT_APARTMENTTHREADED)`（STA，与主进程一致）
 - **崩溃隔离**：子进程异常退出时，壳进程 `wallpaper/mod.rs` 的 `spawn_proc_exit_monitor` 会检测到退出并把状态更新为 `Terminated` 并 `notify_state_changed` 通知引擎，**无自动重启逻辑**
 
@@ -364,9 +367,10 @@ MirrorStar 由 **11 个 `mirrorstar-core` 模块**（真实代码中的 `pub mod
 {"command":"play","request_id":1,"source":"https://..."}
 {"command":"terminate","request_id":2}
 {"command":"set_position","request_id":3,"x":0,"y":0,"width":1920,"height":1080}
-{"command":"navigate","request_id":4,"url":"https://..."}
-{"command":"pause","request_id":5}
-{"command":"resume","request_id":6}
+{"command":"pause","request_id":4}
+{"command":"resume","request_id":5}
+{"command":"set_volume","request_id":6,"volume":0.5}
+{"command":"toggle_mute","request_id":7}
 ```
 
 响应（子进程 → 壳进程）：

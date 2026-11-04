@@ -18,9 +18,9 @@
 ```text
 mirrorstar-wallpaper/
 ├── .cargo/
-│   └── config.toml              # Cargo 配置（不配镜像；windows 注入 /MANIFESTDEPENDENCY）
+│   └── config.toml              # Cargo 配置（不配镜像；[net] git-fetch-with-cli = true；windows 注入 /MANIFESTDEPENDENCY 与静态 CRT（-C target-feature=+crt-static））
 ├── crates/
-│   ├── mirrorstar-core/         # 共享核心库（配置/桌面/壁纸/音频/IPC/进程/调度/布局/性能/UI 协议）
+│   ├── mirrorstar-core/         # 共享核心库（配置/桌面/壁纸/音频/IPC/进程/调度/布局/性能/日志留存/UI 协议）
 │   ├── mirrorstar-ui/           # 原生主窗口 UI 子进程（Slint，独立二进制 mirrorstar-ui.exe）
 │   └── mirrorstar-wp-proc/      # Web 壁纸逻辑库（壳 --wp-proc 模式复用，WebView2 隔离）
 ├── docs/                        # 项目文档
@@ -53,7 +53,7 @@ members = [
     "crates/mirrorstar-wp-proc",
     "crates/mirrorstar-ui",
 ]
-# [workspace.package] version = "0.1.3", edition = "2021", rust-version = "1.80"
+# [workspace.package] version = "0.1.4", edition = "2021", rust-version = "1.80"
 # 依赖在 [workspace.dependencies] 统一声明，子 crate 以 workspace = true 引用
 ```
 
@@ -63,17 +63,17 @@ members = [
 
 ### 3.1 crates/mirrorstar-core（共享核心库）
 
-`crates/mirrorstar-core/src/` 按业务子系统组织：
+`crates/mirrorstar-core/src/` 按业务子系统组织，共 **12 个模块**：`audio`、`config`、`desktop`、`ipc`、`layout`、`log_retention`、`perf`、`process`、`pure_mode`、`scheduler`、`ui_proto`、`wallpaper`。
 
 | 目录 / 文件 | 职责概述 |
 |------|----------|
-| `lib.rs`、`perf.rs` | crate 根与模块导出；性能计数器/指标采样 |
-| `config/` | 配置加载/保存/热重载/校验、设置结构体、显示器检测、缩略图生成（`manager.rs`、`settings.rs`、`playback.rs`、`detect.rs`、`hot_reload.rs`、`thumbnail.rs`、`validation.rs`） |
-| `wallpaper/` | 壁纸生命周期管理；图片/视频/GIF/网页四类渲染与快速路径、GDI 基础与缓存、模式分发、子进程基类（`manager.rs`、`image.rs`、`video.rs`、`gif*.rs`、`web.rs`、`fast_path.rs`、`mode_dispatch.rs`、`subprocess_base.rs`） |
-| `desktop/` | 桌面窗口、原生壁纸后端、WorkerW 定位（`window.rs`、`native_wallpaper.rs`、`worker_w.rs`） |
-| `audio/` | 音量控制（`volume.rs`） |
-| `ipc/` | IPC 客户端、mpv JSON 协议、Web 子进程协议封装（`client.rs`、`mpv_protocol.rs`、`wp_proc.rs`） |
-| `process/` | 子进程启动/监控/停止（`manager.rs`） |
+| `lib.rs`、`perf.rs`、`log_retention.rs` | crate 根、模块导出与日志初始化；性能计数器/指标采样；日志留存（应用日志按日轮转保留 7 个、mpv 实例日志保留 20 个、`crash.log` 超 1 MiB 轮转为 `crash.log.1`，并在启动期做兜底清理） |
+| `config/` | 配置加载/保存/热重载/校验、设置结构体、显示器检测、缩略图生成（`mod.rs`、`manager.rs`、`settings.rs`、`playback.rs`、`detect.rs`、`hot_reload.rs`、`thumbnail.rs`、`validation.rs`） |
+| `wallpaper/` | 壁纸生命周期管理；图片/视频/GIF/网页四类渲染与快速路径、GDI 基础与缓存、模式分发、子进程基类（`mod.rs`、`manager.rs`、`image.rs`、`video.rs`、`gif.rs`/`gif_decode.rs`/`gif_memory.rs`、`web.rs`、`fast_path.rs`、`mode_dispatch.rs`、`subprocess_base.rs`、`gdi_base.rs`、`gdi_cache.rs`） |
+| `desktop/` | 桌面窗口、原生壁纸后端、WorkerW 定位（`mod.rs`、`window.rs`、`native_wallpaper.rs`、`worker_w.rs`） |
+| `audio/` | 音量控制（`mod.rs`、`volume.rs`） |
+| `ipc/` | IPC 客户端、mpv JSON 协议、Web 子进程协议封装（`mod.rs`、`client.rs`、`mpv_protocol.rs`、`wp_proc.rs`） |
+| `process/` | 子进程启动/监控/停止（`mod.rs`、`manager.rs`） |
 | `scheduler/` | 壁纸轮换调度（`mod.rs`、`order.rs`、`boot.rs`） |
 | `layout/` | 多屏排列/布局（`mod.rs`） |
 | `pure_mode/` | 纯模式（`mod.rs`） |
@@ -118,12 +118,12 @@ members = [
 | 目录 / 文件 | 职责概述 |
 |------|----------|
 | `src/lib.rs` | 应用构建 / 命令注册 / 托盘 / 单实例 / 事件回调 |
-| `src/main.rs` | 二进制入口，调用 `lib::run()` |
+| `src/main.rs` | 二进制入口：先做单实例检测，并在 `ensure_single_instance()` 之前按 `--wp-proc` 分派到网页壁纸子进程模式；其余情况调用 `lib::run()` |
 | `src/state.rs` | `AppState`：config_manager / wallpaper_engine / desktop 共享状态 |
 | `src/scheduler.rs` | 壳侧轮换调度驱动 |
-| `src/commands/` | Tauri 命令：`wallpaper.rs`（壁纸生命周期）、`system.rs`（显示器/自启/对话框）、`config.rs`（配置读写）、`rotation.rs`（轮换） |
+| `src/commands/` | Tauri 命令：`wallpaper.rs`（壁纸生命周期）、`system.rs`（显示器/内存归因/生命周期埋点/自启/对话框）、`config.rs`（配置读写）、`rotation.rs`（轮换） |
 | `src/platform/` | 平台集成：`fullscreen.rs`（全屏检测/处置）、`power.rs`（电源）、`explorer.rs`、`workerw_check.rs`、`pure_mode.rs`、`pure_mode_input.rs`、`liveness_watchdog.rs` |
-| `src/ui_process/` | UI 子进程管理：`paths.rs`（路径解析）、`bridge.rs`（stdio 桥接） |
+| `src/ui_process/` | UI 子进程管理：`mod.rs`（UI 进程管理器主体：spawn / 握手 / 空闲退出 / 单实例）、`paths.rs`（路径解析）、`bridge.rs`（stdio 桥接、命令与事件转发） |
 | `build.rs`、`manifest.xml` | 构建脚本与 Windows 清单 |
 | `capabilities/default.json` | 权限清单 |
 | `gen/schemas/` | 构建期自动生成的 schema |
@@ -149,7 +149,7 @@ members = [
 
 ## 6. mpv 捆绑
 
-仓库根 `mpv/` 包含 `mpv.exe`（视频播放器）与 `license`（许可证），通过 `bundle.resources` 随安装包分发（见 §5）。运行时查找策略为：捆绑路径优先，找不到时回退到系统 `PATH`。`mpv/` 被 `.gitignore` 忽略（体积超限），需本地手动放置 `mpv.exe`。
+仓库根 `mpv/` 包含 `mpv.exe`（视频播放器）与 `license`（许可证），通过 `bundle.resources` 随安装包分发（见 §5）。运行时查找策略为三级（`SubprocessRendererBase::find_bundled_executable`）：① `<exe_dir>/mpv/mpv.exe`（安装后随包资源位置）；② 从 exe 所在目录向上回溯最多 8 层祖先目录，查找 `<祖先>/mpv/mpv.exe`（开发模式下 exe 位于 `target/debug/`、mpv 位于仓库根）；③ 以上均未命中时交由系统 `PATH` 查找。`mpv/` 被 `.gitignore` 忽略（体积超限），需本地手动放置 `mpv.exe`。
 
 ## 7. 已删除的历史结构
 

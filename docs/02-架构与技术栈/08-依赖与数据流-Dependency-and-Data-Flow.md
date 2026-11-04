@@ -20,7 +20,7 @@ graph LR
     Native["原生壁纸<br/>native_wallpaper"]
     ProcMgr["进程管理<br/>ProcessManager"]
     Config["配置管理<br/>ConfigManager"]
-    Audio["音频控制<br/>AudioController"]
+    Audio["音频控制<br/>VolumeControl"]
     Tray["系统托盘<br/>（lib.rs setup + state.rs）"]
     IPC["IPC 通信<br/>MpvIpcClient / WpProcIpcClient / ui_proto"]
 
@@ -35,8 +35,7 @@ graph LR
 
     ProcMgr --> IPC : 与子进程通信<br/>（mpv + wp-proc 命名管道）
 
-    Tray --> Engine : 暂停/恢复/退出
-    Tray --> Config : 读取/修改设置
+    Tray --> Engine : 暂停/恢复；下一张壁纸<br/>（经调度器 manual_tx）
 
     Config -.-> Engine : 配置热重载通知
 
@@ -64,8 +63,7 @@ graph LR
 | 壁纸引擎 → 配置管理 | 单向 | 引擎读取壁纸配置和用户设置           |
 | 壁纸引擎 → 音频控制 | 单向 | 引擎控制壁纸音频的音量和静音          |
 | 进程管理 → IPC  | 单向 | 进程管理器通过命名管道与子进程通信（mpv 原生 JSON IPC + wp-proc 自定义协议；壳↔UI 另有 `ui_proto` stdio 通道）      |
-| 系统托盘 → 壁纸引擎 | 单向 | 托盘菜单操作（内联于 lib.rs，仅 open / pause_resume / quit 三项）触发引擎暂停/恢复         |
-| 系统托盘 → 配置管理 | 单向 | 托盘菜单修改设置（如开机自启）         |
+| 系统托盘 → 壁纸引擎 | 单向 | 托盘菜单操作（内联于 lib.rs，**5 项**：open / next_wallpaper / pause_resume / pure_mode / quit）触发暂停/恢复或手动下一张（`next_wallpaper` 经 `scheduler.manual_tx`）         |
 | 配置管理 → 壁纸引擎 | 事件 | 配置热重载时通知引擎应用新配置         |
 
 ***
@@ -79,7 +77,7 @@ flowchart TD
     A[用户选择壁纸文件] --> B{识别文件类型}
     B -->|视频| C1[创建 VideoRenderer]
     B -->|GIF| C2[创建 GifRenderer]
-    B -->|HTML/URL| C3[创建 WebRenderer]
+    B -->|本地 HTML/HTM| C3[创建 WebRenderer]
     B -->|图片| C4[创建 ImageRenderer]
 
     C1 --> D1[ProcessManager 启动 mpv.exe 子进程]
@@ -146,7 +144,7 @@ flowchart TD
 
 ### 2.3 暂停/恢复数据流
 
-> **PauseSender 快速通道**：暂停/恢复/音量/静音等高频操作通过 `AppState.pause_senders`（mpsc 通道）直接发送到各渲染线程，绕过引擎 Mutex，避免锁竞争导致的延迟。机制细节详见《06-暂停恢复机制》。
+> **PauseSender 快速通道**：暂停/恢复/音量/静音等高频操作在命令层短暂获取 engine 锁定位 `PauseSender` 后，经 mpsc 通道直接投递到各渲染线程，不等待渲染器处理或 IPC 往返（并非完全绕过 engine 锁）。机制细节详见《06-暂停恢复机制》。
 
 ```mermaid
 flowchart TD
@@ -158,17 +156,17 @@ flowchart TD
     E -->|是| F[暂停壁纸]
     E -->|否| D
 
-    F --> G[WallpaperEngine::pause_wallpaper]
+    F --> G[WallpaperEngine::pause_wallpaper_fast]
     G --> H[IPC: 发送 {"command":"pause","request_id":1}]
     H --> I[子进程暂停播放]
-    G --> J[AudioController::mute_wallpaper]
+    G --> J[VolumeControl::set_process_mute(pid, true)]
     J --> K[ISimpleAudioVolume::SetMute(true)]
     G --> L[切换托盘菜单文本为"恢复壁纸"]
 
-    D --> M[WallpaperEngine::resume_wallpaper]
+    D --> M[WallpaperEngine::resume_wallpaper_fast]
     M --> N[IPC: 发送 {"command":"resume","request_id":2}]
     N --> O[子进程恢复播放]
-    M --> P[AudioController::unmute_wallpaper]
+    M --> P[VolumeControl::set_process_mute(pid, false)]
     P --> Q[ISimpleAudioVolume::SetMute(false)]
     M --> R[切换托盘菜单文本为"暂停壁纸"]
 ```
@@ -185,9 +183,9 @@ flowchart TD
     E -->|否| G[保留旧配置 + 记录日志]
 
     F --> H{配置项类型}
-    H -->|音量变更| I[AudioController::set_volume]
+    H -->|音量变更| I[VolumeControl::set_process_volume]
     H -->|暂停策略变更| J[更新全屏检测逻辑<br/>（platform/fullscreen.rs SetWinEventHook 回调）]
-    H -->|壁纸排列变更| K[WallpaperEngine::update_positions]
+    H -->|壁纸排列变更| K[WallpaperEngine::set_arrangement<br/>+ 调度器按 LayoutPlane 重建/重嵌]
     H -->|开机自启变更| L[注册表/启动文件夹操作]
 
     I --> M[IPC: {"command":"set_volume","request_id":3,"volume":0.8}]
@@ -214,7 +212,7 @@ MirrorStar 采用三类跨进程通信通道（两套命名管道 + 一套 stdio
 | **Web 壁纸通信** | 命名管道 JSON IPC（WpProcIpcClient，wp-proc 自定义协议，`ipc/wp_proc.rs`） |
 | **全屏检测通知** | SetWinEventHook 回调 → AtomicBool 去抖 |
 | **配置变更通知** | notify crate → RwLock（500ms 防抖） |
-| **暂停/恢复控制** | PauseSender 快速通道（绕过引擎互斥锁） |
+| **暂停/恢复控制** | PauseSender 快速通道（短暂持 engine 锁定位 sender，mpsc 直投渲染线程） |
 | **崩溃恢复** | Web 子进程异常退出通过退出监听（spawn_proc_exit_monitor）识别，OS 自动回收子进程，无自动 respawn |
 
 ### 3.2 关键设计说明
@@ -223,7 +221,7 @@ MirrorStar 采用三类跨进程通信通道（两套命名管道 + 一套 stdio
 
 2. **渲染线程通信**：图片/GIF 渲染器在专用线程中运行，通过 mpsc 通道发送命令，PostMessageW 唤醒消息循环处理。该设计保证线程安全，避免并发阻塞 UI 主线程。
 
-3. **PauseSender 快速通道**：绕过引擎互斥锁直接发送暂停/恢复/音量命令，避免高优先级操作被引擎锁阻塞，显著降低响应延迟。
+3. **PauseSender 快速通道**：短暂持 engine 锁定位 sender 后，经 mpsc 直接投递暂停/恢复/音量命令，避免高优先级操作等待渲染器处理/IPC 往返，降低响应延迟。
 
 4. **崩溃恢复**：Web 壁纸子进程异常退出由退出监听（`spawn_proc_exit_monitor`）识别并通知引擎；主进程崩溃时操作系统自动回收子进程（父子进程关系）。无需独立看门狗进程，依赖 Rust 的线程安全和 RAII 保证资源释放。
 
@@ -252,18 +250,22 @@ MirrorStar 采用三类跨进程通信通道（两套命名管道 + 一套 stdio
 ├── config.toml        # 应用配置
 ├── wallpapers.toml    # 壁纸库（条目 + 元数据）
 ├── playback.toml      # 轮换播放状态（独立于配置，见《10-壁纸轮换调度器》）
-├── wallpapers/        # 壁纸文件
+├── wallpapers/{id}/   # 外部壁纸文件的托管副本（添加时复制入库）
 ├── thumbnails/        # 缩略图
 ├── logs/              # 日志（mirrorstar.log.<日期> + mpv-*.log），受保留上限约束
+├── webview2-cache/    # WebView2 UDF：<pid>/（网页壁纸）、ui-<pid>/（UI 预览）
+├── mpv/               # mpv --config-dir 重定向目录（避免写穿 %APPDATA%\mpv）
 └── config.lock        # 写锁
 ```
 
 ### 4.3 AppConfig 结构（实测自 settings.rs）
 
-`AppConfig`（`mirrorstar-core/src/config/settings.rs`）分 6 段：`general` / `audio` / `pause` / `display` / `video` / `gif`。
+`AppConfig`（`mirrorstar-core/src/config/settings.rs`）为**顶层 `arrangement` + 7 个配置段**：`general` / `audio` / `pause` / `video` / `gif` / `rotation` / `scaling`。
 
 ```toml
 # config.toml（示例，含默认值）
+arrangement = "per_monitor"      # 顶层布局：per_monitor | all_same | span
+
 [general]
 auto_start = false          # 开机自启
 minimize_to_tray = true     # 关闭窗口最小化到托盘
@@ -271,22 +273,30 @@ minimize_to_tray = true     # 关闭窗口最小化到托盘
 [audio]
 volume = 0.8                # 全局音量 (0.0~1.0)
 muted = false
+preview_volume = 0.5        # 预览音量
+preview_muted = false
 
 [pause]
 fullscreen_action = "terminate"  # 全屏处置 none/pause/terminate（默认 terminate）
 pause_on_battery = false         # 电池供电时暂停
 
-[display]
-arrangement = "per_monitor"      # 壁纸排列 per_monitor/span
-
 [video]
 hwdec = true                # 硬件解码
-speed = 1.0                 # 播放速度
+speed = 1.0                 # 播放速度（0.25~4.0）
 
 [gif]
 memory_strategy = "balanced"     # Aggressive/Balanced/Performance/Adaptive
 balanced_keep_frames = 10        # 平衡模式保留帧数（[1,1000]）
 max_memory_mb = 40               # 帧像素内存预算（[10,500]）
+
+[rotation]
+enabled = false             # 轮换主开关
+on_boot = false             # 应用启动时推进下一张
+interval_minutes = 30       # 1–1440
+order = "sequential"        # sequential | shuffle_bag | pseudo_random
+
+[scaling.modes]
+all = "fill"                # display_id → 缩放模式；"all" 为兜底
 ```
 
 ### 4.4 校验（validate 策略）
@@ -294,7 +304,7 @@ max_memory_mb = 40               # 帧像素内存预算（[10,500]）
 各子 config 的 `validate(&mut self)` 采用**"内部修正 + warn 日志，调用方透明"**策略（不返回 `Result`）：越界/非法值就地 clamp 或回退默认，通过 `tracing::warn!` 记录原值与修正后值。
 
 - `AudioConfig.volume`：clamp 到 `[0.0, 1.0]`（NaN / 越界回退 0.8）
-- `VideoConfig.speed`：`> 0` 且 ≤ `MAX_VIDEO_SPEED`（10.0），非法回退 1.0
+- `VideoConfig.speed`：`0.25 ~ 4.0`（共享 `mpv_protocol::SPEED_MIN/SPEED_MAX`），非法回退 1.0
 - `GifConfig.balanced_keep_frames`：`≥ 1` 且 ≤ `MAX_BALANCED_KEEP_FRAMES`（1000）
 - `GifConfig.max_memory_mb`：`[10, 500]`
 

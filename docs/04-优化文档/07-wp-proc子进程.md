@@ -9,7 +9,7 @@
 
 ### 1.1 模块职责
 
-wp-proc 是 MirrorStar 的 Web 壁纸子进程，由壳进程 `mirrorstar-wallpaper.exe` 的 `--wp-proc` 模式运行（同一 exe、双入口），将 WebView2 渲染隔离到独立进程，通过命名管道接收主进程的 IPC 命令（Play/Pause/Resume/Seek/SetPosition/Navigate/Terminate）。模块由 5 个源文件组成：
+wp-proc 是 MirrorStar 的 Web 壁纸子进程，由壳进程 `mirrorstar-wallpaper.exe` 的 `--wp-proc` 模式运行（同一 exe、双入口），将 WebView2 渲染隔离到独立进程，通过命名管道接收主进程的 IPC 命令（`WpProcCommand` 共 7 个变体：Play/Pause/Resume/SetPosition/SetVolume/ToggleMute/Terminate）。模块由 5 个源文件组成：
 
 - **`lib.rs`** — 库入口（Cli 解析、COM/窗口类/窗口/WebView2/管道初始化、消息循环、IPC 线程协调、Drop 顺序契约、优雅退出）。注：该文件在 v6.0 文档中记为 `main.rs`，crate 重构为纯库 crate 后已更名为 `lib.rs`（不再产出独立 exe，由壳 exe `--wp-proc` 模式调用 `run_with_argv`）。
 - **`command.rs`** — IPC 命令处理（`navigate_to_url`、`execute_script_and_report`、`handle_command`、`ok/error_response` 辅助、控制命令队列 `run_control_command`/`execute_control_command`/`flush_pending_control_commands`、`build_post_message_failed_response`、`NavigationCompletedHandlerGuard` RAII）
@@ -25,13 +25,14 @@ wp-proc 是 MirrorStar 的 Web 壁纸子进程，由壳进程 `mirrorstar-wallpa
 
 | 文件 | 行数 | 主要内容 |
 |---|---|---|
-| lib.rs | 491 | 库入口（Cli 解析、COM/窗口类/窗口/WebView2/管道初始化、消息循环、IPC 线程协调、Drop 顺序契约） |
-| command.rs | 1525 | IPC 命令处理（navigate_to_url、execute_script_and_report、handle_command、ok/error_response 辅助、控制命令队列、build_post_message_failed_response、NavigationCompletedHandlerGuard RAII） |
-| com.rs | 103 | ComGuard RAII（CoInitializeEx/CoUninitialize 配对、RPC_E_CHANGED_MODE 处理、is_initialized 测试访问器） |
-| ipc_server.rs | 1471 | 命名管道服务端（OwnedHandle RAII、SecurityAttributesGuard、build_pipe_security_attributes、create_pipe_server、process_line、format_response、read_line_with_limit、notify_main_exit、ipc_thread） |
-| webview.rs | 2205 | WebView2 控制（parse_rect、default_rect、WindowClassGuard、register_window_class、create_window、ControllerGuard RAII、wait_with_pump_timeout、create_webview、build_webview2_*、harden_webview、install_crash_recovery、build_url、percent_encode_path、corewebview2_error） |
+| lib.rs | 457 | 库入口（Cli 解析、COM/窗口类/窗口/WebView2/管道初始化、消息循环、IPC 线程协调、Drop 顺序契约） |
+| command.rs | 1412 | IPC 命令处理（navigate_to_url、execute_script_and_report、handle_command、ok/error_response 辅助、控制命令队列、build_post_message_failed_response、NavigationCompletedHandlerGuard RAII） |
+| com.rs | 96 | ComGuard RAII（CoInitializeEx/CoUninitialize 配对、RPC_E_CHANGED_MODE 处理、is_initialized 测试访问器） |
+| ipc_server.rs | 1334 | 命名管道服务端（OwnedHandle RAII、SecurityAttributesGuard、build_pipe_security_attributes、create_pipe_server、process_line、format_response、read_line_with_limit、notify_main_exit、ipc_thread） |
+| webview.rs | 2035 | WebView2 控制（parse_rect、default_rect、WindowClassGuard、register_window_class、create_window、ControllerGuard RAII、wait_with_pump_timeout、create_webview、build_webview2_*、harden_webview、install_crash_recovery、build_url、percent_encode_path、corewebview2_error） |
 
-> 校正说明（v8 深度审查，2026-10-11）：原表记 `main.rs` 441 / `command.rs` 1132 / `com.rs` 114 / `ipc_server.rs` 1469 / `webview.rs` 1274，为 v6.0 时期快照。`main.rs` 已更名为 `lib.rs`（纯库 crate 化），各行数已按当前代码更新（见 §6.5）。§2 / §3 中历史 finding 记录的 `main.rs:NNN` 行号为当时快照，保留不改写。
+> 校正说明（v8 深度审查，2026-10-11）：原表记 `main.rs` 441 / `command.rs` 1132 / `com.rs` 114 / `ipc_server.rs` 1469 / `webview.rs` 1274，为 v6.0 时期快照。`main.rs` 已更名为 `lib.rs`（纯库 crate 化）。§2 / §3 中历史 finding 记录的 `main.rs:NNN` 行号为当时快照，保留不改写。
+> 行数快照（2026-11-04）：lib.rs 457 / command.rs 1412 / com.rs 96 / ipc_server.rs 1334 / webview.rs 2035（合计 5124 行），上表已按此快照更新；§6 中的 5795 行为 v8 审查（2026-10-11）时的快照，保留作历史记录。
 
 ### 1.3 测试覆盖
 
@@ -96,11 +97,11 @@ wp-proc 是 MirrorStar 的 Web 壁纸子进程，由壳进程 `mirrorstar-wallpa
 
 **建议**：添加防御性长度校验 `if buffer.len() < std::mem::size_of::<TOKEN_USER>() { return None; }`，并用 `IsValidSid` 验证 SID 有效性。
 
-### [WP-006] [Medium] [逻辑] command.rs:20-33, 48-59, 135-146 — Play/Navigate 不等待导航完成即返回 Ok ✅ 已修复
+### [WP-006] [Medium] [逻辑] [历史 finding] command.rs:20-33, 48-59, 135-146 — Play/Navigate 不等待导航完成即返回 Ok ✅ 已修复
 
 **描述**：`navigate_to_url` 调用 `webview.Navigate(&url)` 后立即返回 `Ok(())`，`handle_command` 据此返回 `WpProcResponse { status: Ok }`。但 `Navigate` 是异步操作——仅触发导航流程并立即返回，导航是否真正完成（或失败）通过 `NavigationCompleted` 事件异步通知。导航失败时父进程已收到 `Ok` 误以为播放成功，用户看到空白窗口而父进程无法感知。
 
-**修复状态**：✅ 已修复于 v4.0 Wave 2D
+**修复状态**：✅ 已修复于 v4.0 Wave 2D（历史 finding：该条记录于 v4.0 时期，当时命令集包含 `Navigate`；当前 `WpProcCommand` 已无 `Navigate`/`Seek` 变体，仅 7 个命令，见 §1.1。`navigate_to_url` 现为 `Play` 的内部实现，本条仅保留历史修复结论）
 
 **建议**：方案 A（推荐）：注册 `NavigationCompletedEventHandler`，在导航完成（成功或失败）后再通过 channel 通知 `handle_command` 返回响应，需设置超时避免永久阻塞（可复用 `wait_with_pump_timeout`）。方案 B：在 `navigate_to_url` 注释和 IPC 协议文档中明确 `Play`/`Navigate` 返回 `Ok` 仅表示"导航已启动"，不保证内容已加载。
 
@@ -289,7 +290,7 @@ wp-proc 是 MirrorStar 的 Web 壁纸子进程，由壳进程 `mirrorstar-wallpa
 
 ## 6. 深度审查（v8，2026-10-11）
 
-> 维度：死代码 / 冗余代码 / 过度抽象 | 范围：`crates/mirrorstar-wp-proc/src/` 全部 5 个源文件（491 + 1525 + 103 + 1471 + 2205 = 5795 行）
+> 维度：死代码 / 冗余代码 / 过度抽象 | 范围：`crates/mirrorstar-wp-proc/src/` 全部 5 个源文件（491 + 1525 + 103 + 1471 + 2205 = 5795 行；此为 2026-10-11 审查快照，当前行数见 §1.2）
 > 方法：逐文件审查 + 全仓（`crates/`、`src-tauri/src/`）引用搜索 + 跨 crate 契约核对；判定口径见 §6.7
 > 结论：**无生产死代码**；主要问题为跨文件/跨 crate 的骨架重复与注释陈旧；已实施 6 项零行为变更清理（§6.7），涉及公开 API 与跨模块契约的项一律标记「待确认」（§6.8）
 
@@ -350,7 +351,7 @@ wp-proc 是 MirrorStar 的 Web 壁纸子进程，由壳进程 `mirrorstar-wallpa
 | 文档位置 | 判定 | 说明 |
 |---|---|---|
 | §1.1 模块职责 | **描述失真** | 文件清单以 `main.rs` 为主；`webview.rs` 职责列表缺失 `build_webview2_*`/`harden_webview`/`install_crash_recovery`。已就地校正 |
-| §1.2 文件清单 | **描述失真** | `main.rs`(441) → `lib.rs`(491)；command 1132→1525、com 114→103、ipc_server 1469→1471、webview 1274→2205。已就地校正 |
+| §1.2 文件清单 | **描述失真** | `main.rs`(441) → `lib.rs`(491)；command 1132→1525、com 114→103、ipc_server 1469→1471、webview 1274→2205。已就地校正（以上为 2026-10-11 快照；2026-11-04 复核值见 §1.2） |
 | §1.3 测试覆盖 | **描述失真** | 「main.rs 11 个测试」及各行数估算过时；实测合计 128 个 `#[test]`、0 `#[ignore]`。已就地校正 |
 | §2 `WP-001`~`WP-013` | **仍存在（已修复）** | 逐条代码核验：WP-001（`execute_script_and_report` 已提取）、WP-002（`ControllerGuard` RAII）、WP-003（`GetClientRect`/`SetBounds` 返回 Error）、WP-004（降级 warn）、WP-005（buffer 长度 + `IsValidSid`）、WP-006（`NavigationCompleted` 等待）、WP-007（`PeekMessageW`/`DispatchMessageW`）、WP-008（`return Err` 触发 RAII）、WP-009（回退串保留 request_id）、WP-010（`FALLBACK_SCREEN_*` 常量）、WP-011（`hex_upper` 免分配）、WP-012（`#[cfg(test)]`）、WP-013（SAFETY 注释 + SendHwnd 方向）——全部与当前代码一致 |
 | §3 `WP-TD-001`~`WP-TD-007`、`WP-TD-010`~`WP-TD-015` | **仍存在（已清理）** | 核验一致：`corewebview2_error`/`CLASS_NAME`/`notify_main_exit` 抽取仍在；`is_initialized` doc 精简版仍在（未含 v41-WP-009 投机段）；lib.rs 无 `v41-WP-001`/`v41-WP-002` 前缀；command.rs 无 `[New]-11.3`/`Wave 2I`；ipc_server.rs 无 `std::process::exit(1)` 陈旧串；W-009 陈旧 doc 已移除 |

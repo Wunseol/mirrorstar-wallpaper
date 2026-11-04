@@ -26,7 +26,7 @@ MirrorStar 的架构围绕以下几项关键设计决策进行根本性重构，
 * **独立 IPC 协议**：对外部渲染进程分别建立命名管道协议（mpv 原生 JSON IPC + wp-proc 自定义协议），并对壳↔UI 使用 stdio NDJSON 协议（`ui_proto`），实现稳定的跨进程通信。
 * **TOML 配置**：使用 TOML（serde）作为配置格式，简洁、类型安全且便于解析。
 * **编译期内存安全**：依托 Rust 所有权模型在编译期保证无数据竞争、无悬垂指针、无缓冲区溢出，规避运行时 GC 泄漏风险。
-* **精简进程模型**：采用"壳进程 + 原生 UI 子进程 + 壁纸子进程"模型，不引入独立看门狗进程（watchdog 已移除），子进程异常退出由操作系统自动回收。
+* **精简进程模型**：采用"壳进程 + 原生 UI 子进程 + 壁纸子进程"模型，**无独立看门狗进程**；存在进程内 `liveness_watchdog` 任务（5s 采样 / 1.3s 确认 / 60s 冷却），子进程异常退出由操作系统自动回收。
 * **原生 UI 子进程**：主窗口改为独立进程 `mirrorstar-ui.exe`（Slint 1.18，绑定软件渲染），壳（Tauri）不再创建任何 WebView2 主窗口；壳与 UI 之间通过 `mirrorstar-core::ui_proto` 的 NDJSON 行协议（over stdio）通信，业务逻辑仅保留在壳侧。
 
 ### 1.2 设计原则
@@ -35,16 +35,16 @@ MirrorStar 的架构围绕以下几项关键设计决策进行根本性重构，
 
 * **功能精简**：仅保留视频、GIF、网页、静态图片四种壁纸类型，去除 Unity/Godot/模拟器/YouTube/壁纸创建器等非核心功能
 * **依赖最小化**：无 .NET Runtime 依赖，仅依赖系统自带的 WebView2 Runtime 和随程序分发的外部 mpv.exe
-* **体积控制**：目标二进制 < 10MB，单文件部署
+* **体积控制**：目标主程序二进制 < 10MB；安装包另随附 `mirrorstar-ui.exe` 与外部 `mpv.exe`
 * **静态壁纸零资源**：JPG/JPEG/PNG/BMP/TIF/TIFF/DIB 使用 Windows 原生壁纸 API（`SystemParametersInfoW`），无需创建窗口、线程或 GDI 对象
-* **UI 子进程按需启动**：主窗口 UI 运行在独立进程 `mirrorstar-ui.exe`（Slint 原生渲染），启动时仅创建系统托盘图标；窗口隐藏超时（默认 300s）后 UI 子进程退出回收内存（壳侧≈7.6MB），再次打开时按需拉起；同一时刻至多一个实例
+* **UI 子进程按需启动**：主窗口 UI 运行在独立进程 `mirrorstar-ui.exe`（Slint 原生渲染），启动时仅创建系统托盘图标；窗口隐藏超时（默认 300s）后 UI 子进程退出回收内存（壳侧≈7.6MB，历史数据/待复测），再次打开时按需拉起；同一时刻至多一个实例
 
 #### 1.2.2 高性能（High Performance）
 
-* **事件驱动**：以 SetWinEventHook 替代轮询，暂停态 CPU 占用目标为 0%
+* **事件驱动**：以 SetWinEventHook 替代轮询，暂停态 CPU 占用目标为 **< 0.1%**
 * **零成本抽象**：利用 Rust 的 trait 系统实现多态，编译期单态化，无虚函数表开销
 * **硬件加速**：视频播放利用 GPU 硬件解码，GIF 渲染利用 CPU 软件渲染
-* **PauseSender 快速通道**：暂停/恢复/音量/静音操作绕过引擎 Mutex，通过 `tokio::sync::mpsc::UnboundedSender<PauseCommand>` 直接发送到渲染器线程，消除锁竞争
+* **PauseSender 快速通道**：暂停/恢复/音量/静音操作通过 `tokio::sync::mpsc::UnboundedSender<PauseCommand>` 直接投递到渲染器线程；命令层仅短暂持 engine 锁定位 sender，不等待渲染器处理或 IPC 往返
 * **WorkerW 异步初始化**：`DesktopIntegrator::new()` 通过后台线程预初始化 WorkerW，不阻塞主进程启动
 
 #### 1.2.3 内存安全（Memory Safety）
@@ -78,8 +78,8 @@ graph TB
         BIZ_ProcMgr["进程管理器<br/>ProcessManager"]
         BIZ_UiMgr["UI 子进程管理<br/>spawn / 握手 / 空闲退出 / 单实例"]
         BIZ_Config["配置管理器<br/>ConfigManager"]
-        BIZ_Audio["音频控制<br/>AudioController"]
-        BIZ_PauseSender["PauseSender 快速通道<br/>绕过 Mutex，直接 mpsc 通道"]
+        BIZ_Audio["音频控制<br/>VolumeControl"]
+        BIZ_PauseSender["PauseSender 快速通道<br/>mpsc 直投渲染线程（短暂持 engine 锁）"]
     end
 
     subgraph SYS["系统层 (Rust Core + windows-rs)"]
@@ -111,14 +111,14 @@ graph TB
 
 | 层次        | 职责                      | 关键技术                                        |
 | --------- | ----------------------- | ------------------------------------------- |
-| **UI 层**  | 用户交互、壁纸库展示、设置面板、拖放处理；主窗口为独立进程 `mirrorstar-ui.exe`（Slint 原生，按需启动 + 隐藏超时退出 + 单实例 + stdio NDJSON 协议），不复制业务逻辑、不直接读写配置；系统托盘在 Tauri 壳应用层构建（lib.rs setup + state.rs 状态管理，3 项菜单：打开/暂停-恢复/退出）；全屏检测在 platform/fullscreen.rs（SetWinEventHook 事件驱动） | Slint 1.18（软件渲染）、`mirrorstar-core::ui_proto`（Hello/Request/Response/Event/Control）、tray-icon |
+| **UI 层**  | 用户交互、壁纸库展示、设置面板、拖放处理；主窗口为独立进程 `mirrorstar-ui.exe`（Slint 原生，按需启动 + 隐藏超时退出 + 单实例 + stdio NDJSON 协议），不复制业务逻辑、不直接读写配置；系统托盘在 Tauri 壳应用层构建（lib.rs setup + state.rs 状态管理，5 项菜单：打开主窗口 / 下一张壁纸 / 暂停-恢复壁纸 / 纯净壁纸（CheckMenuItem）/ 退出）；全屏检测在 platform/fullscreen.rs（SetWinEventHook 事件驱动） | Slint 1.18（软件渲染）、`mirrorstar-core::ui_proto`（Hello/Request/Response/Event/Control）、tray-icon |
 | **业务逻辑层** | 壁纸生命周期管理（WallpaperMode 双路径）、进程调度、配置读写、音频控制、PauseSender 快速通道 | Rust、tokio 异步运行时、mpsc 通道 |
 | **系统层**   | 桌面窗口嵌入（异步初始化）、原生壁纸 API（SystemParametersInfoW + 注册表） | windows-rs、SetWinEventHook、SystemParametersInfoW |
 | **OS 层**  | Windows 系统调用、硬件加速、进程操作、原生壁纸设置 | Win32 API、Core Audio、mpv.exe（外部子进程）、WebView2、SystemParametersInfoW、注册表 |
 
 ### 2.3 模块依赖关系
 
-项目由 4 个 workspace 成员构成：`src-tauri`（应用主进程）、`crates/mirrorstar-core`（核心库）、`crates/mirrorstar-wp-proc`（**库 crate**，网页壁纸子进程逻辑，经壳 exe 的 `--wp-proc` 模式运行）、`crates/mirrorstar-ui`（Slint 主窗口独立进程）。其中 `mirrorstar-core` 内部进一步划分为 11 个 `pub mod` 子模块：`audio` / `config` / `desktop` / `ipc` / `layout` / `perf` / `process` / `pure_mode` / `scheduler` / `ui_proto` / `wallpaper`。
+项目由 4 个 workspace 成员构成：`src-tauri`（应用主进程）、`crates/mirrorstar-core`（核心库）、`crates/mirrorstar-wp-proc`（**库 crate**，网页壁纸子进程逻辑，经壳 exe 的 `--wp-proc` 模式运行）、`crates/mirrorstar-ui`（Slint 主窗口独立进程）。其中 `mirrorstar-core` 内部进一步划分为 12 个 `pub mod` 子模块：`audio` / `config` / `desktop` / `ipc` / `layout` / `log_retention` / `perf` / `process` / `pure_mode` / `scheduler` / `ui_proto` / `wallpaper`。
 
 ```mermaid
 graph TD
@@ -136,6 +136,7 @@ graph TD
         PROCESS[process<br/>进程管理]
         WALLPAPER[wallpaper<br/>壁纸渲染]
         LAYOUT[layout]
+        LOGKEEP[log_retention]
         PERF[perf]
         PURE[pure_mode]
         SCHED[scheduler]
@@ -152,6 +153,7 @@ graph TD
     CORE --> PROCESS
     CORE --> WALLPAPER
     CORE --> LAYOUT
+    CORE --> LOGKEEP
     CORE --> PERF
     CORE --> PURE
     CORE --> SCHED
@@ -165,7 +167,7 @@ graph TD
     classDef member fill:#4a90d9,stroke:#2c5f9e,color:#fff
     classDef module fill:#7bb3e8,stroke:#4a90d9,color:#000
     class APP,CORE,WPPROC member
-    class AUDIO,CONFIG,DESKTOP,IPC,PROCESS,WALLPAPER,LAYOUT,PERF,PURE,SCHED,UIPROTO module
+    class AUDIO,CONFIG,DESKTOP,IPC,PROCESS,WALLPAPER,LAYOUT,LOGKEEP,PERF,PURE,SCHED,UIPROTO module
 ```
 
 各模块的职责与状态见《[模块设计](./02-模块设计-Module-Design.md)》，仓库目录布局见《[项目目录结构](../03-实施与验证/03-项目目录结构-Project-Structure.md)》。
@@ -190,9 +192,10 @@ graph TD
 | 核心语言 | Rust | 1.80（`rust-version`） | 应用主体开发（workspace edition 2021） | MIT / Apache-2.0 |
 | 应用壳 | Tauri | v2.11（启用 `tray-icon` feature） | 桌面应用壳（托盘 / 壁纸引擎 / 轮换调度 / 命令桥 / UI 子进程管理，Rust） | MIT / Apache-2.0 |
 | 主窗口 UI | Slint（原生 UI 子进程 `mirrorstar-ui.exe`） | 1.18（`default-features=false` + `renderer-software`） | 主窗口界面渲染（Rust 原生声明式 UI，无 Web 运行时，软件渲染） | GPL-3.0 / 商业（双许可） |
+| 原生窗口句柄 | raw-window-handle | 0.6 | `mirrorstar-ui` 直接依赖：从 Slint 窗口取原生 HWND 挂载原生文件拖放（`DragAcceptFiles` / `WM_DROPFILES`） | MIT / Apache-2.0 |
 | Windows API | windows-rs | 0.58 | Windows 系统 API 绑定 | MIT / Apache-2.0 |
 | 视频播放 | mpv.exe（外部子进程） | 外部进程（无 Rust crate） | 通过 mpv.exe 播放视频，捆绑于 `<exe_dir>/mpv/` 或 PATH | GPL-2.0 (mpv) |
-| 图片 / GIF | image crate | 0.25（`default-features=false`，启用 png/jpeg/gif/bmp/webp/tiff + rayon） | 静态图片与 GIF 解码（WebP 回退路径 + GIF 渲染） | MIT |
+| 图片 / GIF | image crate | 0.25（`default-features=false`，启用 png/jpeg/gif/bmp/webp/tiff/ico + rayon） | 静态图片与 GIF 解码（WebP 回退路径 + GIF 渲染） | MIT |
 | 网页壁纸 | webview2-com | 0.34 | WebView2 SDK Rust 绑定（由壳进程 `--wp-proc` 模式子进程使用） | MIT |
 | 配置管理 | serde + toml | serde 1 / toml 0.8 | TOML 配置读写 | MIT |
 | 热重载 | notify | 7 | 配置文件系统监控 | CC0-1.0 / MIT |
@@ -207,12 +210,11 @@ graph TD
 | 系统目录 | dirs | 6 | 获取系统目录路径 | MIT / Apache-2.0 |
 | 注册表操作 | winreg | 0.55 | 开机自启与壁纸缩放模式注册表读写 | MIT |
 | UUID | uuid | 1（`v4`） | 命名管道、实例等唯一标识 | MIT / Apache-2.0 |
-| URL 工具 | percent-encoding | 2 | （**已废弃**）`wpfile://` 自定义协议路径解码，随旧前端删除已移除 | MIT / Apache-2.0 |
 | 文件对话框 | tauri-plugin-dialog | 2.7 | Tauri 文件选择对话框插件 | MIT / Apache-2.0 |
 | 开机自启 | tauri-plugin-autostart | 2.5 | Tauri 开机自启插件 | MIT / Apache-2.0 |
 | 构建 / 测试工具 | Cargo / Tauri CLI / Rust 测试 | tauri-cli（`cargo install`）/ `cargo test` | 构建与测试（**无 npm / Vite / Vitest / ESLint / Prettier**） | MIT / Apache-2.0 |
 
-> 说明：早期文档中列出的 `anyhow`、`bitflags`、`softbuffer`、`raw-window-handle` 均为虚构依赖，实际代码未引入，已从本表移除。
+> 说明：早期文档中列出的 `anyhow`、`bitflags`、`softbuffer` 均为未直接引入的依赖（不在 workspace 直接依赖中，已从本表移除）；`raw-window-handle 0.6` 则是 `crates/mirrorstar-ui` 的直接依赖，用于获取原生 HWND 以挂载文件拖放，实际存在。
 
 ***
 
@@ -248,7 +250,7 @@ Rust 的零运行时依赖与无 GC 特性，确保壁纸渲染在长时间运�
 x86_64-pc-windows-msvc
 ```
 
-使用 MSVC 工具链，确保与 Windows SDK 和 WebView2 的最佳兼容性。Release 构建启用 `lto = true`、`codegen-units = 1`、`strip = "symbols"`、`panic = "abort"` 以减小体积。
+使用 MSVC 工具链，确保与 Windows SDK 和 WebView2 的最佳兼容性。`.cargo/config.toml` 为所有 Windows 目标统一注入 `-C target-feature=+crt-static`（静态链接 CRT，运行时免除对 VCRUNTIME140.dll / VCRUNTIME140_1.dll 的依赖）与 `-C link-arg=/MANIFESTDEPENDENCY:...`（声明 Common-Controls v6，避免 `cargo test` 生成的 exe 在 comctl32 5.82 上以 `0xC0000139` 崩溃）；两个 flag 必须共存。Release 构建启用 `lto = true`、`codegen-units = 1`、`strip = "symbols"`、`panic = "abort"` 以减小体积。
 
 ***
 
@@ -262,7 +264,7 @@ x86_64-pc-windows-msvc
 
 **选择理由：**
 
-- **内存优先**：WebView2 主窗口需拉起多进程 Chromium 基线（约 +150-300MB），与"极低资源占用"目标冲突；原生 Slint UI 子进程软件渲染后在主窗口打开并静置时，壳 + UI 合计 private ≈ **16.8MB**（验收门槛 ≤40MB）
+- **内存优先**：WebView2 主窗口需拉起多进程 Chromium 基线（约 +150-300MB），与"极低资源占用"目标冲突；原生 Slint UI 子进程软件渲染后在主窗口打开并静置时，壳 + UI 合计 private ≈ **16.8MB**（历史数据/待复测，验收门槛 ≤40MB）
 - **Slint 1.18**：Rust 原生声明式 UI，无 Node/Chromium 运行时依赖，二进制体积小、启动快
 - **壳-UI 进程解耦**：UI 崩溃不影响壳与壁纸引擎，可持续驻留托盘
 - **Rust 后端**：业务逻辑继续用 Rust 编写（`src-tauri/` + `mirrorstar-core`），与核心业务代码无缝集成
@@ -353,7 +355,7 @@ graph TB
     WebPlayer --> DesktopAPI
 ```
 
-> 说明：图中 UI 层已更新为**原生 UI 子进程**（Slint）结构；早期文档所示"前端层 (WebView2) + Tauri Core→WebView2 主窗口"为历史结构。基础设施"错误处理（thiserror + anyhow）"已更正为仅 `thiserror`；`anyhow` / `bitflags` / `softbuffer` / `raw-window-handle` 均为虚构依赖，未引入。
+> 说明：图中 UI 层已更新为**原生 UI 子进程**（Slint）结构；早期文档所示"前端层 (WebView2) + Tauri Core→WebView2 主窗口"为历史结构。基础设施"错误处理（thiserror + anyhow）"已更正为仅 `thiserror`；`anyhow` / `bitflags` / `softbuffer` 均为未直接引入的依赖；`raw-window-handle 0.6` 由 `mirrorstar-ui` 直接依赖（原生 HWND 拖放），实际存在。
 
 ### 6.2 技术方案概览
 
@@ -380,7 +382,7 @@ MirrorStar 的技术选型围绕「零运行时依赖、事件驱动、轻量渲
 ### 6.3 关键优势总结
 
 1. **零运行时依赖**：无需 .NET Framework，无需安装任何运行时
-2. **低内存占用**：Rust 无 GC，壁纸播放更流畅；静态图片走 Native 路径零资源；主窗口走原生 UI 子进程（≈16.8MB）
+2. **低内存占用**：Rust 无 GC，壁纸播放更流畅；静态图片走 Native 路径零资源；主窗口走原生 UI 子进程（≈16.8MB，历史数据/待复测）
 3. **事件驱动**：`SetWinEventHook` 事件驱动通知，全屏检测更及时
 4. **独立 IPC 通道**：命名管道（mpv / wp-proc）与 stdio（`ui_proto`）提供可靠的双向通信
 5. **轻量网页渲染**：WebView2 取自系统预装，无需捆绑 ~200MB CEF
@@ -391,16 +393,16 @@ MirrorStar 的技术选型围绕「零运行时依赖、事件驱动、轻量渲
 
 | 指标 | 目标值 | 实测值 | 状态 |
 |------|--------|--------|------|
-| 暂停态内存 | <20MB | 17.14MB | 已达成 |
-| 暂停态 CPU | 0% | 0% | 已达成 |
-| 冷启动时间 | <2s | <1s | 已达成 |
-| GIF 内存预算 | 40MB | 40MB | 已达成 |
-| 暂停响应延迟 | <1ms | ~0.01ms | 已达成 |
+| 暂停态内存 | <20MB | 17.14MB（历史数据） | 历史数据/待复测 |
+| 暂停态 CPU | 0% | 0%（历史数据） | 历史数据/待复测 |
+| 冷启动时间 | <2s | <1s（历史数据） | 历史数据/待复测 |
+| GIF 内存预算 | 40MB | 40MB（配置默认） | 已达成（配置默认） |
+| 暂停响应延迟 | <10ms（GIF/图片）/ <50ms（视频，含 IPC） | 待复测 | 待复测 |
 | 壁纸切换时间 | <1s | ~3s（历史） | 需复测验证 |
 
 **说明**：
 
-- 暂停态指标已全面达成目标，得益于事件驱动架构与子进程暂停机制。
+- 暂停态各项指标多为历史记录（17.14MB 等），当前版本尚未复测，不应视为当前已达成；响应延迟目标已按渲染路径拆分为 GIF/图片 `<10ms` 与视频（含 IPC）`<50ms`，实测值待补。
 - 壁纸切换时间历史文档记载为 ~3s（超出 1s 目标，主要瓶颈在子进程启动与窗口嵌入开销）；v4.0 审计中 P-002/P-003 进一步指出 `ProcessManager::Drop`/`start()` 最坏阻塞 8s，是切换延迟的主因。**需复测验证**：`docs/03-实施与验证/05-测试报告-Test-Reports.md` 记录 NFR-007 实测达标（静态 `<1s` / 视频 `~0.5s`，以 mpv 日志时间戳佐证：启动→IPC 连接→窗口找到→开始播放→嵌入完成约 0.5s），但该测试先于后续多轮优化（v4.1/v5/v6）执行，当前真实切换耗时需重新实测确认，以实测为准。
 
 ***
@@ -419,7 +421,7 @@ MirrorStar 的技术选型围绕「零运行时依赖、事件驱动、轻量渲
 
 | 风险 | 说明 | 缓解措施 |
 |------|------|----------|
-| **运行时缺失** | 极少数旧版系统未安装 | Windows 10 (2004+) / Windows 11 已预装；缺失时引导安装 |
+| **运行时缺失** | 极少数旧版系统未安装 | Windows 10 (2004+) / Windows 11 已预装；缺失时网页壁纸/预览不可用，程序无内置引导安装（需用户自行安装） |
 | **进程隔离** | 独立进程，崩溃不影响主应用 | 已是优势，无需额外处理 |
 
 ### windows-rs
@@ -434,13 +436,13 @@ MirrorStar 的技术选型围绕「零运行时依赖、事件驱动、轻量渲
 
 | 风险 | 说明 | 缓解措施 |
 |------|------|----------|
-| **格式支持** | 高动态范围 / 少用格式 | `default-features=false` 仅启用实际格式（png/jpeg/gif/bmp/webp/tiff），减体积与编译时间 |
+| **格式支持** | 高动态范围 / 少用格式 | `default-features=false` 仅启用实际格式（png/jpeg/gif/bmp/webp/tiff/ico + rayon），减体积与编译时间 |
 
 ### 依赖更新策略
 
 - **锁定策略**：workspace 依赖采用 minor 精确版本（如 tokio 1.52、tauri 2.11），依赖升级由人工评估，避免在 minor 内引入 breaking change
 - **可复现构建**：`Cargo.lock` 纳入版本控制
-- **最小依赖**：仅引入必要依赖；已移除 `protocol-asset` 等无用 feature 与虚构依赖
+- **最小依赖**：仅引入必要依赖；已移除 `protocol-asset` 等无用 feature 与未直接引入的依赖（`anyhow` / `bitflags` / `softbuffer`）
 
 ***
 

@@ -5,7 +5,7 @@
 ## 模块概览 / 现状与文件清单
 
 > 本文档整合 `audio`（WASAPI 音量控制）、`ipc`（命名管道 IPC 协议）、`process`（子进程管理）三个紧密协作的核心库子模块，共同支撑视频壁纸（mpv）与网页壁纸（wp-proc）的进程级控制链路。
-> 本节"现状"与文件清单源自 **v6.0 技术债审查**（audio/ipc/process 模块），反映了代码当前状态。
+> 本节"现状"与文件清单源自 **v6.0 技术债审查**（audio/ipc/process 模块）；audio、ipc、process 的行数与测试数均已于 2026-11-04 按当前代码复核（含 `#[cfg(test)]` 测试代码）。
 
 ### 1.1 模块职责
 
@@ -20,23 +20,25 @@
 | 文件 | 行数 | 主要内容 |
 |---|---|---|
 | `crates/mirrorstar-core/src/audio/mod.rs` | 1 | 仅 `pub mod volume;` |
-| `crates/mirrorstar-core/src/audio/volume.rs` | 1131 | `VolumeControl` 实现 + `is_pid_running` / `collect_stale_pids` 辅助 + 24 个测试 |
+| `crates/mirrorstar-core/src/audio/volume.rs` | 1418 | `VolumeControl` 实现 + `is_pid_running` / `collect_stale_pids` 辅助 + 26 个测试（含 1 个 `#[ignore]`） |
+
+> **2026-11-04 复核**：`volume.rs` 实测 **1418** 行、**26** 个 `#[test]`（其中 **1** 个 `#[ignore]`）；原文档的 1131 行 / 24 个测试为 2026-10-11 历史快照。表中 ipc / process 的行数与测试数沿用 2026-10-11 快照，未在本次校正中改写。
 
 #### ipc 子模块
 
 | 文件 | 行数 | 主要内容 |
 |---|---|---|
 | `crates/mirrorstar-core/src/ipc/mod.rs` | 27 | 模块级 `//!` 文档（含超时对照表 I-006）+ 子模块声明 |
-| `crates/mirrorstar-core/src/ipc/client.rs` | 1046 | `NamedPipeClient<T>` 泛型基类 + `connect_named_pipe` / `read_line_with_limit` / `read_line_with_timeout` / `Backoff` + 30+ 测试 |
-| `crates/mirrorstar-core/src/ipc/mpv_protocol.rs` | 347 | `MpvIpcClient` + `MpvCommand` / `MpvResponse` + 14 测试 |
-| `crates/mirrorstar-core/src/ipc/wp_proc.rs` | 717 | `WpProcIpcClient` + `WpProcCommand` / `WpProcResponse` / `ResponseStatus` + 18 测试（含 I04 真实管道超时测试） |
+| `crates/mirrorstar-core/src/ipc/client.rs` | 1348 | `NamedPipeClient<T>` 泛型基类 + `connect_named_pipe` / `read_line_with_limit` / `read_line_with_timeout` / `Backoff` + 41 个测试 |
+| `crates/mirrorstar-core/src/ipc/mpv_protocol.rs` | 343 | `MpvIpcClient` + `MpvCommand` / `MpvResponse` + 10 个测试 |
+| `crates/mirrorstar-core/src/ipc/wp_proc.rs` | 789 | `WpProcIpcClient` + `WpProcCommand` / `WpProcResponse` / `ResponseStatus` + 12 个测试（含 I04 真实管道超时测试） |
 
 #### process 子模块
 
 | 文件 | 行数 | 主要内容 |
 |---|---|---|
 | `crates/mirrorstar-core/src/process/mod.rs` | 1 | 仅 `pub mod manager;` |
-| `crates/mirrorstar-core/src/process/manager.rs` | 1204 | `ProcessManager` 实现 + `escape_windows_arg` MSVCRT 转义 + `wait_and_terminate` / `terminate_and_wait` 共享逻辑 + 29 测试 |
+| `crates/mirrorstar-core/src/process/manager.rs` | 1070 | `ProcessManager` 实现 + `escape_windows_arg` MSVCRT 转义 + `wait_and_terminate` / `terminate_and_wait` 共享逻辑 + 29 个测试 |
 
 #### 集成测试
 
@@ -46,8 +48,8 @@
 
 ### 1.3 测试覆盖
 
-- **audio**：24 个单元测试，覆盖 `new_disabled` 降级路径、`set_process_volume` clamp、`is_pid_running` / `collect_stale_pids` 辅助函数、v41-A-001 COM 恢复路径。**核心 WASAPI 交互路径（`with_session` cache hit/miss + 真实会话枚举）仅在 `#[ignore]` 真机测试中覆盖**（`v41_a003_real_com_cache_hit_miss_e2e`），CI 中无端到端验证。
-- **ipc**：30+ 单元测试覆盖 `Backoff` 序列、`read_line_with_limit` OOM 防护与 I-001 / v41-I-001 UTF-8 截断处理；3 个集成测试（`tests/ipc_timeout.rs`）通过真实命名管道验证 I01/I03 总体超时；`wp_proc.rs` 内嵌 2 个 I04 真实管道超时测试。覆盖较完整。
+- **audio**：26 个单元测试（2026-11-04 复核实测；24 为历史快照），覆盖 `new_disabled` 降级路径、`set_process_volume` clamp、`is_pid_running` / `collect_stale_pids` 辅助函数、v41-A-001 COM 恢复路径。**核心 WASAPI 交互路径（`with_session` cache hit/miss + 真实会话枚举）仅在 `#[ignore]` 真机测试中覆盖**（`v41_a003_real_com_cache_hit_miss_e2e`），CI 中无端到端验证。
+- **ipc**：63 个单元测试（`client.rs` 41 + `mpv_protocol.rs` 10 + `wp_proc.rs` 12，2026-11-04 实测），覆盖 `Backoff` 序列、`read_line_with_limit` OOM 防护与 I-001 / v41-I-001 UTF-8 截断处理；3 个集成测试（`tests/ipc_timeout.rs`）通过真实命名管道验证 I01/I03 总体超时；`wp_proc.rs` 内嵌 2 个 I04 真实管道超时测试。覆盖较完整。
 - **process**：29 个测试覆盖 `escape_windows_arg`（含 N-009/P-005 拒绝换行/NUL）、P01 STILL_ACTIVE 误判修复、P03 pid() 退出后返回 None、P-001 句柄泄漏量化测试。**仅 1 个测试标 `#[ignore]`（`start_after_stop_immediate_does_not_reuse_pid`，PID 复用属 OS 行为，防 CI flaky）；句柄泄漏量化测试已重命名为 `start_after_exit_does_not_leak_handles`（10 轮/阈值 8）且 CI 可执行**。
 
 ---

@@ -146,7 +146,7 @@ fn ensure_single_instance() -> bool {
   - WebView2 环境：`CreateCoreWebView2Environment` + `CreateCoreWebView2Controller` + URL 导航（支持 http/https 和 file://）
   - 窗口类注册：固定类名 `MirrorStarWebWallpaperCls`，窗口标题使用 `--title` 参数
   - 主消息循环：`GetMessageW` + `WM_WEB_COMMAND`（`WM_USER + 20`）处理
-  - 命令处理：Play（导航到源）、Terminate（销毁窗口+退出）、SetPosition（`SetWindowPos` + `SetBounds`）、Navigate（`webview.Navigate`）、Pause/Resume（状态标记）
+  - 命令处理：Play（导航到源）、Terminate（销毁窗口+退出）、SetPosition（`SetWindowPos` + `SetBounds`）、Pause/Resume（状态标记）、SetVolume、ToggleMute
 
 #### mirrorstar-ui.exe（原生 UI 子进程）
 
@@ -157,6 +157,7 @@ fn ensure_single_instance() -> bool {
 - **生命周期**：按需启动 → 握手（`Hello`）→ 窗口隐藏后按空闲超时（默认 300s，环境变量 `MIRRORSTAR_UI_IDLE_TIMEOUT_SECS`）退出回收内存 → 再次请求可重新拉起；**同一时刻至多一个实例**
 - **用户主动唤起时置前聚焦**：托盘 / 菜单 / 二次启动触发的显示、还原、置前会调用 `SetForegroundWindow`（壳侧先 `AllowSetForegroundWindow(ui_pid)`），使任务栏按钮恢复「一次点击最小化、再一次还原」；受 Windows 前台锁限制时仅记日志。纯净模式等非用户主动场景仍禁止抢前台；窗口标题保持"镜星壁纸"，被全屏检测按标题精确排除
 - **网格与预览**：原生 Slint 虚拟化壁纸网格（固定卡尺寸 + 固定列数，仅实例化可见区间 ±2 行缓冲）；缩略图按本地文件路径直读（不经 IPC 传字节）；图片/GIF 自绘，视频在 UI 进程内 spawn mpv 子窗口，网页按需创建临时 WebView2 子窗口（关闭后 `msedgewebview2.exe` 计数回落 0）
+- **事件转发**：壳侧事件桥以 `bridge::FORWARDED_EVENTS`（14 个：壁纸增/删/更新、缩略图失败、源缺失、状态变更、轮换、加载、GIF 超大、配置变更、配置加载错误、桌面状态、音频禁用、显示器热插拔）为唯一事实来源，仅在 UI 进程运行时惰性转发为 `Event`（无 UI 进程时零开销、零报错）
 
 ### 1.4 COM 初始化策略
 
@@ -244,7 +245,7 @@ MirrorStar 在壳进程与子进程之间使用**三套独立**的通信协议�
 - **管道**：`\\.\pipe\mirrorstar-wp-{uuid}`（pipe_name 通过 `--pipe-name` CLI 参数传入子进程）
 - **格式**：自定义 JSON + 换行分隔，request_id 匹配响应
 - **连接重试**：160 次尝试 × 50ms 间隔（`ipc.connect(WP_PROC_CONNECT_RETRIES, WP_PROC_CONNECT_INTERVAL_MS) = 8s` 总超时，覆盖 WebView2 冷启动）
-- **命令**：`Play{source}` / `Terminate` / `SetPosition{x,y,w,h}` / `Navigate{url}` / `Pause` / `Resume`
+- **命令**：`Play{source}` / `Terminate` / `SetPosition{x,y,w,h}` / `Pause` / `Resume` / `SetVolume{volume}` / `ToggleMute`
 
 **命令示例**（壳进程 → 子进程）：
 
@@ -252,9 +253,10 @@ MirrorStar 在壳进程与子进程之间使用**三套独立**的通信协议�
 {"command":"play","request_id":1,"source":"https://..."}
 {"command":"terminate","request_id":2}
 {"command":"set_position","request_id":3,"x":0,"y":0,"width":1920,"height":1080}
-{"command":"navigate","request_id":4,"url":"https://..."}
 {"command":"pause","request_id":5}
 {"command":"resume","request_id":6}
+{"command":"set_volume","request_id":7,"volume":0.8}
+{"command":"toggle_mute","request_id":8}
 ```
 
 **响应示例**（子进程 → 壳进程）：
@@ -299,7 +301,7 @@ MirrorStar 在壳进程与子进程之间使用**三套独立**的通信协议�
 - **混合进程架构**：Image/Gif 渲染器在壳进程专用线程中运行，Video（mpv）与 Web（wp-proc 模式）通过独立子进程渲染，均按需启动
 - **崩溃隔离**：Web 壁纸经壳进程 `--wp-proc` 模式子进程渲染，仍是独立进程，崩溃不影响壳进程
 - **起进程监控**：通过 `spawn_proc_exit_monitor` 监听子进程退出 + 操作系统自动回收，无需独立看门狗进程（watchdog crate 已在阶段2移除）
-- **逻辑暂停**：通过 PauseSender 快速通道绕过引擎互斥锁，直接发送暂停/恢复/音量命令，实现安全优雅的暂停
+- **逻辑暂停**：通过 PauseSender 快速通道经 mpsc 直接投递暂停/恢复/音量命令（命令层短暂持 engine 锁定位 sender，不等待渲染器处理）
 - **原生 UI 子进程**：主窗口由 `mirrorstar-ui.exe`（Slint 软件渲染）承载，按需启动、空闲超时退出、单实例，经 `ui_proto` NDJSON（stdio）与壳通信；业务逻辑仅在壳侧
 - **内存优化**：无 Web 壁纸、无主窗口时零子进程开销，WebView2 运行时仅按需加载，关闭 Web 壁纸即终止子进程释放全部内存；UI 子进程在窗口隐藏超时后退出回收内存
 
@@ -314,27 +316,29 @@ MirrorStar 在壳进程与子进程之间使用**三套独立**的通信协议�
 MirrorStar 的主窗口不在应用启动时创建，也不由壳创建任何 WebView2 窗口（`tauri.conf.json` 的 `app.windows` 为 `[]`）：
 
 - **按需启动**：用户左键单击托盘图标或选择"打开主窗口"时，壳侧 UI 子进程管理模块 spawn `mirrorstar-ui.exe`，先握手（`Hello`）再显示
-- **空闲退出**：窗口隐藏后按空闲超时（默认 300s，环境变量 `MIRRORSTAR_UI_IDLE_TIMEOUT_SECS`）退出 UI 子进程回收内存（回落至壳内存量级 ≈7.6MB），再次请求可重新拉起
+- **空闲退出**：窗口隐藏后按空闲超时（默认 300s，环境变量 `MIRRORSTAR_UI_IDLE_TIMEOUT_SECS`）退出 UI 子进程回收内存（历史记录中"回落至壳内存量级 ≈7.6MB"为旧口径，数值待复测），再次请求可重新拉起
 - **单实例**：同一时刻至多一个 UI 子进程实例
 - **用户主动唤起时置前聚焦**：显示 / 还原 / 置前路径调用 `SetForegroundWindow`（壳侧先 `AllowSetForegroundWindow(ui_pid)`），使任务栏按钮恢复「一次点击最小化、再一次还原」；受前台锁限制时仅记日志。纯净模式等非用户主动场景仍禁止抢前台；窗口标题保持"镜星壁纸"，被全屏检测按标题精确排除
 
 此策略的优势：
 
 - 托盘常驻场景下，用户不操作 UI 时零 UI 进程开销，聚焦壁纸渲染性能
-- 主窗口静置时壳 + UI 合计 private ≈ 16.8MB，远低于 WebView2 方案
+- 主窗口静置时壳 + UI 的内存占用显著低于旧 WebView2 方案（历史记录中的合计 private ≈ 16.8MB 为旧口径，数值待复测）
 
 ### 3.2 系统托盘
 
-`src-tauri/src/lib.rs` 通过 Tauri 2 内置 `tray-icon` feature 创建托盘，菜单共 3 项：
+`src-tauri/src/lib.rs` 通过 Tauri 2 内置 `tray-icon` feature 创建托盘，菜单共 5 项（菜单 ID 依次为 `open` / `next_wallpaper` / `pause_resume` / `pure_mode` / `quit`）：
 
 ```
 镜星壁纸
-├── 打开主窗口
-├── 暂停壁纸（点击切换为"恢复播放"）
-└── 退出
+├── 打开主窗口（open）
+├── 下一张壁纸（next_wallpaper）
+├── 暂停壁纸（pause_resume，点击切换为"恢复播放"）
+├── 纯净壁纸（按任意键退出）（pure_mode，勾选项 CheckMenuItem）
+└── 退出（quit）
 ```
 
-托盘菜单 3 项的 handle 分别存储（`tray_pause_resume_item`），暂停/恢复项文本随状态动态更新。托盘图标缺失时优雅降级（不因图标文件异常导致启动失败）。
+托盘菜单中可动态更新的 2 个 handle 分别存储于 `tray_pause_resume_item`（`OnceLock<MenuItem>`，暂停/恢复项文本随状态动态更新）与 `tray_pure_mode_item`（`OnceLock<CheckMenuItem>`，勾选态与真实运行态双向同步）；`next_wallpaper` 触发手动换图（不受暂停限制）。托盘图标缺失时优雅降级（不因图标文件异常导致启动失败）。
 
 > 底层基于 `Shell_NotifyIcon`；托盘不作为独立 crate 依赖，直接启用 workspace `tauri = { version = "2.11", features = ["tray-icon"] }`。
 
@@ -371,7 +375,7 @@ MirrorStar 的主窗口不在应用启动时创建，也不由壳创建任何 We
 | 管道路径 | `\\.\pipe\mirrorstar-wp-{uuid}`（由 wp-proc 子进程创建） |
 | 协议格式 | `WpProcCommand` JSON + 换行分隔（自定义协议） |
 | 通信方式 | 壳进程作为客户端连接 wp-proc 管道服务端 |
-| 命令 | `Play` / `Terminate` / `SetPosition` / `Navigate` / `Pause` / `Resume` |
+| 命令 | `Play` / `Terminate` / `SetPosition` / `Pause` / `Resume` / `SetVolume` / `ToggleMute` |
 
 #### 3. `ui_proto` NDJSON over stdio（壳 ↔ 原生 UI 子进程）
 
@@ -380,7 +384,7 @@ MirrorStar 的主窗口不在应用启动时创建，也不由壳创建任何 We
 | 定义位置 | `mirrorstar-core::ui_proto`（壳与 `mirrorstar-ui` 共享） |
 | 传输方式 | UI 子进程标准输入 / 标准输出（**非**命名管道；同步 stdio 行读写） |
 | 协议格式 | 一行一条 JSON（NDJSON 行协议） |
-| 消息类型 | `Hello`（握手）/ `Request`（业务请求 + request_id）/ `Response`（应答）/ `Event`（壳→UI 异步推送）/ `Control`（生命周期控制：`Show` / `Hide` / `Toggle` / `Exit`） |
+| 消息类型 | `Hello`（握手）/ `Request`（业务请求 + request_id）/ `Response`（应答）/ `Event`（壳→UI 异步推送，源为 `FORWARDED_EVENTS` 的 14 个事件）/ `Control`（生命周期控制：壳→UI 的 `Show` / `Hide` / `Toggle` / `Exit`，UI→壳的 `WindowHidden` / `WindowShown` 供空闲退出计时） |
 
 ### 4.3 连接重试（实测自 subprocess_base.rs）
 

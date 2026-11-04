@@ -83,7 +83,7 @@ graph LR
 
 | 优化点     | 方案                                   | 预期效果        |
 | ------- | ------------------------------------ | ----------- |
-| 主进程工作集  | 使用 `SetProcessWorkingSetSize` 提示系统缩减 | 暂停态 < 20MB  |
+| 主进程工作集  | 历史基线/待复测 | 暂停态 < 20MB（历史基线，待复测）  |
 | 配置缓存    | `RwLock<AppConfig>` 单实例共享            | 避免重复解析      |
 | 缩略图     | 按需生成，磁盘缓存                            | 不占用运行时内存    |
 | 日志缓冲    | `tracing-appender` 非阻塞写入             | 避免日志 I/O 阻塞 |
@@ -123,25 +123,22 @@ JPG/JPEG/PNG/BMP/TIF/TIFF/DIB 静态壁纸使用 `SystemParametersInfoW(SPI_SETD
 
 ## 9. PauseSender 快速通道
 
-暂停/恢复/音量/静音操作绕过引擎 `Mutex<WallpaperEngine>`，通过 `tokio::sync::mpsc::UnboundedSender<PauseCommand>` 直接发送到渲染器线程。
+暂停/恢复/音量/静音操作在命令层短暂获取 engine 锁定位 `PauseSender` 后，通过 `tokio::sync::mpsc::UnboundedSender<PauseCommand>` 直接投递到渲染器线程；不等待渲染器处理或 IPC 往返。
 
-| 场景 | 旧方案（Mutex） | 新方案（PauseSender） |
-|------|----------------|---------------------|
-| 无锁竞争 | ~1ms | ~0.01ms |
-| 有锁竞争 | 10~100ms | ~0.01ms（不受 Mutex 阻塞） |
+当前无同口径实测数值（历史毫秒级旧口径表已移除）。按设计目标：GIF/图片渲染线程仅需本地状态切换与重绘通知，响应 **<10ms**；视频需经 mpv IPC 往返，响应 **<50ms**。以上为设计目标值，**待真机复测**。
 
-**优化效果**：暂停响应不受引擎 Mutex 阻塞，响应延迟降低 2~4 个数量级。机制见《06-暂停恢复机制》。
+**优化效果**：避免高优先级暂停操作等待渲染器处理或 IPC 往返（历史口径中 10~100ms 级的处理等待已消除），具体端到端延迟待复测。机制见《06-暂停恢复机制》。
 
 ## 10. GIF 内存预算优化
 
-GIF 内存预算从 200MB 降至 40MB（`MAX_GIF_MEMORY_MB`）。暂停时释放所有帧（仅保留当前帧），恢复时从文件重新解码。
+GIF 帧像素预算默认 40MB（配置项 `GifConfig.max_memory_mb`，合法范围 10–500MB，上限校验常量 `MAX_GIF_MEMORY_MB_LIMIT = 500`；库解码层默认 `DEFAULT_MAX_GIF_MEMORY_MB = 15`）。暂停时不统一"仅保留当前帧"，而是按内存策略释放：默认 **Balanced** 保留当前帧 ±`balanced_keep_frames`（默认 10 帧），Aggressive 仅保留当前帧，Performance 保留全部帧。
 
-| 状态 | 旧方案（200MB 预算） | 新方案（40MB 预算） |
+| 状态 | 旧方案（200MB 预算，历史基线） | 新方案（40MB 预算默认） |
 |------|---------------------|---------------------|
-| 播放中 | 最高 200MB | 最高 40MB |
-| 暂停中 | 保留所有帧，仍占 200MB | 仅保留当前帧，~1-5MB |
+| 播放中 | 最高 200MB（历史） | 帧像素预算 ≤40MB（配置默认；库层默认 15MB） |
+| 暂停中 | 保留所有帧，仍占 200MB（历史） | 按策略释放：默认 Balanced 保留约 11 帧（当前帧 ±10） |
 
-**优化效果**：GIF 内存占用降低 80%，暂停态降低 95%+。
+**优化效果**：预算较 200MB 历史基线降低 80%（40MB 口径）；暂停态实际占用取决于内存策略，**待真机复测**。
 
 ## 11. 子进程 IPC 连接超时优化
 
@@ -197,8 +194,12 @@ GIF 内存预算从 200MB 降至 40MB（`MAX_GIF_MEMORY_MB`）。暂停时释放
 --autoplay-policy=no-user-gesture-required
 --renderer-process-limit=1
 --js-flags=--max-old-space-size=512
---disk-cache-size=52428800
+--disk-cache-size=10485760
+--disable-gpu-program-cache
+--disable-gpu-shader-disk-cache
 ```
+
+> **适用范围**：上述 WebView2 参数当前实际用于**网页壁纸子进程（`mirrorstar-wp-proc`）与原生 UI 预览的临时 WebView2**（见 §17、§22.5），并非已删除的主窗口 WebView2；主窗口侧 `MAIN_WINDOW_BROWSER_ARGS` 已随原生 UI 重构移除，本节仅作历史记录。
 
 | 参数 | 用途 / 预期效果 |
 |------|----------------|
@@ -210,7 +211,9 @@ GIF 内存预算从 200MB 降至 40MB（`MAX_GIF_MEMORY_MB`）。暂停时释放
 | `--autoplay-policy=no-user-gesture-required` | **wry 默认项，必须保留**（维持原媒体自动播放语义） |
 | `--renderer-process-limit=1` | 复用单个 renderer 进程，省去额外 renderer 内存基线 |
 | `--js-flags=--max-old-space-size=512` | 限制 renderer 的 V8 老生代堆上限（默认可达数 GB），压低 JS 堆峰值 |
-| `--disk-cache-size=52428800` | 磁盘缓存上限 50MB（默认近乎无上限） |
+| `--disk-cache-size=10485760` | 磁盘缓存上限 10MB（默认近乎无上限） |
+| `--disable-gpu-program-cache` | 禁用 GPU 程序缓存（节省约 5MB，历史口径） |
+| `--disable-gpu-shader-disk-cache` | 禁用 GPU shader 磁盘缓存 |
 
 **关键点（务必保留默认项）**：Tauri/wry 的 `additional_browser_args` 语义是「**替换**」而非「追加」wry 默认串——wry 0.55.1 在 `create_environment`（`wry-0.55.1/src/webview2/mod.rs:294`）对该字段使用 `unwrap_or_else(...)`。因此常量内**显式保留**了 wry 默认的 `msWebOOUI,msPdfOOUI,msSmartScreenProtection` 与 `--autoplay-policy=no-user-gesture-required`，否则会静默丢失默认 UI/SmartScreen 裁剪与自动播放策略。所有禁用特性合并进**同一个** `--disable-features=` 列表（Chromium 多值合并语义不保证确定）。
 
@@ -373,6 +376,8 @@ GIF 内存预算从 200MB 降至 40MB（`MAX_GIF_MEMORY_MB`）。暂停时释放
 
 ## 21. 主窗口原生 UI 子进程内存/CPU（当前策略，`rewrite-main-window-native-ui`）
 
+> 本节 **§21 验收实测结论** 与 §22.4 复用基线中的 16.8MB / 7.6MB / 0.4% / 10.5% 均为原生 UI 重构初期的**历史验收基线**，当前未复测；引用时应标注“历史数据/待复测”，不得视为当前实测结论。
+
 主窗口已由 Tauri 内嵌 WebView2 重构为独立原生 UI 子进程 `mirrorstar-ui.exe`（Slint 1.18，**绑定软件渲染**：`default-features=false` + 仅 `renderer-software`，不编译 femtovg/skia，避免 winit 选 OpenGL 后端导致 +67MB 内存）。壳不再创建任何 WebView2 主窗口，也不再裁剪 WebView2 启动参数或做 WebView2 挂起（§14 / §15 已失效）。
 
 **当前内存/CPU 策略：**
@@ -461,7 +466,7 @@ GIF 内存预算从 200MB 降至 40MB（`MAX_GIF_MEMORY_MB`）。暂停时释放
 | 25 | 纯净壁纸模式 | 叠加 | 壁纸窗口置顶 `HWND_TOPMOST` + `WS_EX_NOACTIVATE` + 低级输入钩子 + 存活看护线程 | 同底层渲染器 | +钩子/看护线程 | — | 增（Native 下需**另建临时顶层呈现窗口**） | 增 | 同底层 | + | 【导】`platform/pure_mode.rs`、`pure_mode_input.rs` |
 | 26 | 多屏·PerMonitor（默认） | 叠加 | 每显示器一个渲染器实例（N＝显示器数） | ×N 相应子进程 | ×N | ×N | ×N | ×N | ×N | ×N | 【导】`scheduler.rs`、`wallpaper/manager.rs` |
 | 27 | 多屏·AllSame | 叠加 | 各屏同壁纸，仍为 N 个渲染器 | ×N（同上） | ×N | ×N | ×N | ×N | ×N | ×N | 【导】`config/settings.rs` |
-| 28 | 多屏·Span（跨屏拉伸） | 叠加 | **单**跨屏渲染器贯通虚拟桌面 | 壁纸侧 ×1 | ×1 | ×1 | ×1 | ×1 | ×1 | 低 | 【导】`desktop/worker_w.rs::embed_wallpaper` |
+| 28 | 多屏·Span（跨屏合并） | 叠加 | 当前为 N 个渲染器逐屏 apply（每屏窗口覆盖虚拟桌面）；单跨屏渲染器为设计目标 | 壁纸侧 ×N | ×N | ×N | ×N | ×N | ×N | 低 | 【导】`desktop/worker_w.rs::embed_wallpaper`、`scheduler.rs` |
 | 29 | 壁纸轮换调度运行 | 叠加 | 壳内单条 tokio 主循环（`select!`），无「每显示器一线程」 | Main×1 | 复用 | — | 复用 | 复用 | — | 切换瞬时 | 【导】`scheduler.rs` |
 | 30 | 电池供电暂停（`pause_on_battery`） | 叠加 | `pause_all_fast(BATTERY)`，语义同对应类型的暂停 | 同底层类型 | 同暂停语义 | 同暂停语义 | 同暂停语义 | 同暂停语义 | — | ~0 | 【导】`platform/power.rs` |
 | 31 | 全屏暂停（`fullscreen_action=pause`） | 叠加 | 同对应类型的暂停（视频/网页**仅 IPC，不释放子进程**） | 同底层类型 | 不释放 | 不释放 | ≈播放态 | ≈播放态 | ≈播放态 | ~0 | 【导】`platform/fullscreen.rs` |
@@ -499,23 +504,23 @@ GIF 内存预算从 200MB 降至 40MB（`MAX_GIF_MEMORY_MB`）。暂停时释放
 | 资源点 | 上界 / 预算 | 代码来源 |
 |---|---|---|
 | 视频/网页子进程内存 | Job Object 单进程上限 `SUBPROCESS_MEMORY_LIMIT_BYTES = 2GB` | `wallpaper/subprocess_base.rs` |
-| mpv 解码内存限流 | `--cache=no`（省 ~75MB）、`--vd-queue-max-bytes=16MB`、`--ad-queue-max-bytes=4MB`、`--demuxer-max-back-bytes=0`、`--cache-secs=0`、`--demuxer-readahead-secs=0.5`、`--vd-lavc-threads=4`；队列自适应 `max(16MB, 帧字节×3)` | `video.rs::build_mpv_args`/`probe_video_size_and_tune_queue` |
+| mpv 解码内存限流 | `--cache=no`（省 ~75MB，历史口径）、`--vd-queue-max-bytes=16MB`、`--ad-queue-max-bytes=4MB`、`--demuxer-max-back-bytes=0`、`--cache-secs=0`、`--demuxer-readahead-secs=0.5`、`--vd-lavc-threads=4`；队列自适应 `max(16MB, 帧字节×3)` | `video.rs::build_mpv_args`/`probe_video_size_and_tune_queue` |
 | GIF 帧像素预算 | 配置层默认 `max_memory_mb = 40`（合法 10–500）；库解码层默认 `DEFAULT_MAX_GIF_MEMORY_MB = 15`；帧数上限 `.min(1000)`；单帧预取 ≤8MB | `config/settings.rs`、`gif_decode.rs` |
 | GIF 暂停保留帧 | `balanced_keep_frames = 10`（合法 1–1000）；流式窗口 `current±1` | `gif_memory.rs`、`gif_decode.rs` |
-| 网页 WebView2 限流 | `--renderer-process-limit=1`、`--js-flags=--max-old-space-size=512`、`--disk-cache-size=10MB`、禁用 `MediaCache,FontCache,GpuMemDiscardable,BackForwardCache` | `mirrorstar-wp-proc/src/webview.rs` |
+| 网页 WebView2 限流 | `--renderer-process-limit=1`、`--js-flags=--max-old-space-size=512`、`--disk-cache-size=10485760`（10MB）、`--disable-gpu-program-cache`、`--disable-gpu-shader-disk-cache`、禁用 `MediaCache,FontCache,GpuMemDiscardable,BackForwardCache` | `mirrorstar-wp-proc/src/webview.rs` |
 | 图片解码上限 | `MAX_WALLPAPER_DIMENSION=7680`、`MAX_UPSCALE_FACTOR=2.0`、`MAX_IMAGE_DIMENSION=16384` | `wallpaper/image.rs` |
 | 预览图片上限 | `PREVIEW_MAX_W=1280` × `PREVIEW_MAX_H=720` | `preview/photo.rs` |
 | 内存归因能力 | `sample_memory_report()`（分类别进程数/WS/Private/总计）、`MEM-ATTRIB` 周期采样（≥30s）、`MEM-TIMELINE`/`MEM-MARK` 启动期；入口 Tauri 命令 `get_memory_report` | `crates/mirrorstar-core/src/perf.rs`、`src-tauri/src/commands/system.rs` |
 
 ### 22.6 关键结论（易被忽略的占用点）
 
-1. **Native 静态图是唯一「零运行时资源」情形**：无渲染器、无窗口、无线程、无 GDI，仅写注册表 + `SystemParametersInfoW`；其暂停为 no-op。WebP 因不在原生支持集而**必然**回退 WorkerW/GDI。
+1. **Native 静态图是唯一「零运行时资源」情形**：无渲染器、无窗口、无线程、无 GDI，仅写注册表 + `SystemParametersInfoW`；其暂停为 no-op。WebP/ICO 因不在原生支持集而**必然**回退 WorkerW/GDI。
 2. **视频 / 网页的「暂停」不等于释放**：`pause()` 仅发 IPC，`mpv.exe` / `--wp-proc`+WebView2 **持续常驻**；只有全屏 `terminate`（默认策略）才真正销毁子进程。因此「暂停态内存低」的直觉对视频/网页类型不成立。
 3. **预览会叠加额外子进程**：视频预览在 UI 进程内**另起独立 mpv**（+1 进程）；网页预览在 UI 进程内**另起 WebView2**（+若干 `msedgewebview2.exe`）。它们与壁纸侧渲染器完全独立、不可复用。
-4. **多屏按显示器数线性放大**：PerMonitor/AllSame 下渲染器与子进程数 ≈ 显示器数（N 个视频屏 ⇒ 最多 N 个 `mpv.exe`；N 个网页屏 ⇒ 最多 N 套 `--wp-proc`+WebView2）；Span 则为单跨屏渲染器。
+4. **多屏按显示器数线性放大**：PerMonitor/AllSame/Span 下渲染器与子进程数均 ≈ 显示器数（N 个视频屏 ⇒ 最多 N 个 `mpv.exe`；N 个网页屏 ⇒ 最多 N 套 `--wp-proc`+WebView2）；当前 Span 也是 N 个渲染器逐屏 apply（单跨屏渲染器为设计目标，尚未落地）。
 5. **纯净模式**有额外常驻（置顶窗口 + 低级输入钩子 + 存活看护线程）；Native 壁纸下还需为此**另建临时顶层呈现窗口**（打破其「零窗口」特性）。
 6. **壳侧常驻线程**：调度主循环、看护(5s)、热插拔(3s)、WorkerW 检查(300s) 均常驻，是「仅壳」情形的固定成本来源。
-7. **主窗口 UI 是独立进程且按需启停**：打开 ≈16.8MB（壳+UI，§21），关闭后 UI 空闲超时退出回落 ≈7.6MB——UI 不常驻。
+7. **主窗口 UI 是独立进程且按需启停**：历史验收基线为打开 ≈16.8MB（壳+UI，§21）、关闭后 UI 空闲超时退出回落 ≈7.6MB（均待复测）——UI 不常驻。
 
 ### 22.7 缺口（待实测）
 
@@ -676,16 +681,18 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass `
 
 | 项目 | 字节 | MiB | 证据 | 压缩后占安装包比例 |
 | ---- | ---- | --- | ---- | ------------------ |
-| NSIS 安装包 | 43,049,955 B | 41.06 MiB | `target/release/bundle/nsis/MirrorStar Wallpaper_0.1.3_x64-setup.exe` | 100% |
+| NSIS 安装包 | 43,184,314 B | 41.18 MiB | `target/release/bundle/nsis/MirrorStar Wallpaper_0.1.3_x64-setup.exe` | 100% |
 | 随包 `mpv/mpv.exe` | 123,164,160 B | 117.46 MiB | bundle resources | 压缩后 ≈ 34.1 MiB，≈ **83%** |
-| 随包 `mirrorstar-ui.exe` | 11,689,984 B | 11.15 MiB | bundle resources | 压缩后 ≈ 4.16 MiB，≈ **10%** |
-| 随包 `mirrorstar-wallpaper.exe` | 9,684,992 B | 9.24 MiB | bundle 主程序 | 压缩后 ≈ 2.80 MiB，≈ **7%** |
+| 随包 `mirrorstar-ui.exe` | 11,845,632 B | 11.30 MiB | bundle resources | 压缩后 ≈ 4.16 MiB，≈ **10%** |
+| 随包 `mirrorstar-wallpaper.exe` | 9,849,856 B | 9.39 MiB | bundle 主程序 | 压缩后 ≈ 2.80 MiB，≈ **7%** |
 | 随包 `mpv/license` | 19,873 B | — | bundle resources | 可忽略 |
-| **未压缩载荷合计** | **144,559,009 B** | **137.86 MiB** | 上列随包载荷求和 | — |
+| **未压缩载荷合计** | **144,879,521 B** | **138.16 MiB** | 上列随包载荷求和 | — |
 
-**压缩证据**：内存内 Deflate(Optimal) 实测压缩率——`mpv.exe` 39.5%、`mirrorstar-ui.exe` 51.0%、主 `mirrorstar-wallpaper.exe` 41.4%（v0.1.1 同构载荷基线）；NSIS 采用 LZMA，实压缩比 Deflate 再优约 **26.6%**（v0.1.3 安装包 43,049,955 / Deflate 合计 58,621,322 ≈ 0.734）。
+**压缩证据**：内存内 Deflate(Optimal) 实测压缩率——`mpv.exe` 39.5%、`mirrorstar-ui.exe` 51.0%、主 `mirrorstar-wallpaper.exe` 41.4%（v0.1.1 同构载荷基线）；NSIS 采用 LZMA，实压缩比 Deflate 再优约 **26.6%**（v0.1.3 安装包 43,049,955 / Deflate 合计 58,621,322 ≈ 0.734）；上述压缩率为历史基线，未含 2026-11-03 静态 CRT 增量（两 exe 合计 +294,912 B）。
 
 > **版本复核（v0.1.3，2026-10-27）**：上表的安装包与随包 exe 字节数已按 `MirrorStar Wallpaper_0.1.3_x64-setup.exe` 重新打包后复核更新（本次实测：安装包 43,049,955 B / 41.06 MiB @16:25:50，`mirrorstar-ui.exe` 11,689,984 B @16:19:13，`mirrorstar-wallpaper.exe` 9,684,992 B @16:25:51）；`mpv.exe` 与 `mpv/license` 未变（未纳入版本控制，体积不可由 git 追溯）。
+
+> **版本复核（静态 CRT 重打包，2026-11-03）**：安装包 43,184,314 B / 41.18 MiB @16:51:38，`mirrorstar-ui.exe` 11,845,632 B @16:47:45，`mirrorstar-wallpaper.exe` 9,849,856 B @16:51:38；较 2026-10-27 制品安装包 +134,359 B（+0.31%），两个自研 exe 合计 +294,912 B（各自携带一份静态 CRT，属预期成本）。
 
 **主因排序**：
 
@@ -724,7 +731,7 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass `
 
 > **注意**：`Cargo.toml` 注释称「对齐 winreg 0.55 避免编译两份」，但实际仍存在 `0.10.1`（链路为 tauri-plugin-autostart → auto-launch），**该目标未完全达成**，如实记录。
 
-**疑似未使用依赖（3 项，均可删，但体积收益 ≈ 0，属依赖卫生问题）**：
+**未使用依赖（3 个，均已删除，change-id `apply-zero-risk-cleanups`；体积收益 ≈ 0，属依赖卫生问题）**：
 
 - `crates/mirrorstar-wp-proc/Cargo.toml` 的 `serde`；
 - `src-tauri/Cargo.toml` 的 `tracing-subscriber`；
@@ -743,8 +750,8 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass `
 
 **本轮新增 2 项（均 Low 级「疑似」）**：
 
-1. **预览速度量程 `[0.25, 4.0]` 重复硬编码**：在 `crates/mirrorstar-ui/src/settings.rs:367-370` 与 `crates/mirrorstar-core/src/ipc/mpv_protocol.rs:211` 各硬编码一份，**无共享常量**。
-2. **三套速度校验语义不同且分散**：`core/src/wallpaper/mod.rs:810`（`> 0`）、`core/src/ipc/mpv_protocol.rs:211`（`[0.25, 4.0]`）、`core/src/config/validation.rs:29`（`(0, 10]`），跨层定义、规则不一致。
+1. **预览速度量程 `[0.25, 4.0]` 曾重复硬编码**：原在 `crates/mirrorstar-ui/src/settings.rs` 与 `crates/mirrorstar-core/src/ipc/mpv_protocol.rs` 各硬编码一份（无共享常量）；已在 `apply-zero-risk-cleanups` 中收敛为 `SPEED_MIN` / `SPEED_MAX`，UI 侧改为别名引用（见 §26.7 第 2 项）。
+2. **速度校验分层语义**：`core/src/config/validation.rs` 与 `core/src/ipc/mpv_protocol.rs` 均为 `[0.25, 4.0]`（复用同一组 `SPEED_MIN` / `SPEED_MAX`）；trait 层（`core/src/wallpaper/mod.rs` 的 `validate_renderer_speed`）仅要求**有限值且 `> 0`**（渲染器语义层，不设上界）。属分层职责，非规则冲突。
 
 **其余复核结论**：
 
@@ -808,10 +815,10 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass `
 | 壁纸类型  | 4 种                     | 精简非核心类型         |
 | IPC   | 三套协议（mpv 原生命名管道 + wp-proc 自定义命名管道 + 壳↔UI `ui_proto` stdio） | 分别针对不同子进程的通信需求  |
 | 配置    | TOML                    | 更好的可读性和手动编辑体验   |
-| 看门狗   | 无独立看门狗进程（watchdog 已移除，依赖 OS 自动回收子进程） | 更简洁，无需额外进程     |
-| 暂停方式  | 逻辑暂停 PauseSender + VolumeMixer | 逻辑暂停更安全，避免死锁    |
+| 看门狗   | 无独立看门狗进程；存在进程内 liveness 自愈任务（视频停滞自愈） | 更简洁，无需额外进程     |
+| 暂停方式  | 逻辑暂停 PauseSender + VolumeControl | 逻辑暂停更安全，避免死锁    |
 | 日志    | tracing                 | Rust 生态标准方案     |
-| 二进制体积 | 单文件 < 10MB              | 无运行时依赖          |
+| 二进制体积 | 主程序 < 10MB（安装包另含 UI 子进程/ mpv） | 无运行时依赖          |
 
 ## 附录 B：关键 Windows API 参考
 
@@ -828,7 +835,7 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass `
 | **WorkerW 检查** | 5min 间隔（Tokio 异步运行时） |
 | **缩略图生成** | image crate，320x180，JPEG 质量 85 |
 | **配置写入** | 原子写入(文件锁+临时文件+rename) + 300ms 防抖 |
-| **进程暂停** | 逻辑暂停(PauseSender 快速通道绕过引擎锁) |
+| **进程暂停** | 逻辑暂停（PauseSender 经 mpsc 直投渲染线程，短暂持 engine 锁） |
 | **原生壁纸 API** | SystemParametersInfoW + 注册表（零资源占用） |
 | **主窗口 UI** | 原生 UI 子进程（Slint 软件渲染，按需启动，空闲超时退出，虚拟化网格） |
 | **WebView2** | 仅网页壁纸子进程（按需启动，关闭即销毁）+ 参数裁剪（renderer 限单、V8 堆上限）；主窗口已不使用 WebView2 |
@@ -844,7 +851,7 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass `
 
 3. **原生壁纸 API**：对静态图片使用 SystemParametersInfoW + 注册表设置，零资源占用（无窗口、无线程）。
 
-4. **PauseSender 快速通道**：绕过引擎互斥锁，直接发送暂停/恢复/音量命令，避免高优先级操作被阻塞。
+4. **PauseSender 快速通道**：短暂持 engine 锁定位 sender 后，经 mpsc 直接投递暂停/恢复/音量命令，避免高优先级操作等待渲染器处理。
 
 5. **WebView2 按需子进程**：WebView2 运行在独立子进程（壳进程 `--wp-proc` 模式，仍是独立进程）中，仅在设置 Web 壁纸时启动，关闭 Web 壁纸即终止子进程，释放全部内存。
 

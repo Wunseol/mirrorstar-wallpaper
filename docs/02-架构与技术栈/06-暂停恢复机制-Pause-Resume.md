@@ -19,7 +19,7 @@
 
 - `SHARED_ENGINE`：`OnceLock<Arc<tokio::sync::Mutex<WallpaperEngine>>>`，全屏检测/电源监控共享的引擎引用
 - `SHARED_CONFIG`：`OnceLock<Arc<ConfigManager>>`，全屏检测/电源监控共享的配置管理器引用
-- `FULLSCREEN_WAS`：`AtomicBool`（非 OnceLock），跟踪全屏状态（true=当前有全屏窗口）
+- `FULLSCREEN_WAS`：`AtomicBool`（非 OnceLock），跟踪全屏事件状态（true=当前有全屏窗口），仅作事件状态标志；暂停协调由 `PauseReason` 位图负责
 
 ```rust
 // 全局共享状态（src-tauri/src/state.rs:109-114）
@@ -84,11 +84,24 @@ unsafe extern "system" fn foreground_event_callback(
         None => return,
     };
 
-    // 检查配置开关：若 pause_on_fullscreen 被禁用，仅恢复并返回
-    let pause_enabled = config.get_config().pause.pause_on_fullscreen;
-    if !pause_enabled {
-        // 若 FULLSCREEN_WAS 为 true 则调用 engine.resume_all_fast(PauseReason::FULLSCREEN)
-        // 并将 FULLSCREEN_WAS 置 false（C-008：仅当返回失败列表为空时才更新）
+    // 按配置选择全屏处置策略：none / pause / terminate（默认 terminate）
+    let action = config.get_config().pause.fullscreen_action;
+    // none：不做处置；若此前已处置过（运行中切换到 none），恢复壁纸并清理残留
+    if action == FullscreenAction::None {
+        if FULLSCREEN_WAS.load(Ordering::Acquire) {
+            let failed = {
+                let mut engine = match engine.try_lock() {
+                    Ok(e) => e,
+                    Err(_) => return,
+                };
+                engine
+                    .resume_all_fast(PauseReason::FULLSCREEN)
+                    .unwrap_or_default()
+            };
+            if failed.is_empty() {
+                FULLSCREEN_WAS.store(false, Ordering::Release);
+            }
+        }
         return;
     }
 
@@ -97,13 +110,21 @@ unsafe extern "system" fn foreground_event_callback(
     let was_fullscreen = FULLSCREEN_WAS.load(Ordering::Acquire);
 
     if is_fullscreen && !was_fullscreen {
-        // 进入全屏 → 暂停所有壁纸（实例方法，返回失败 display_id 列表）
+        // 进入全屏 → 按 action 暂停或终止所有壁纸（实例方法，返回失败 display_id 列表）
         let failed = {
-            let engine = match engine.try_lock() {
+            let mut engine = match engine.try_lock() {
                 Ok(e) => e,
                 Err(_) => return, // engine 锁忙，跳过本次事件（WM 会重复触发，可容忍偶发跳过）
             };
-            engine.pause_all_fast(PauseReason::FULLSCREEN).unwrap_or_default()
+            match action {
+                FullscreenAction::Terminate => engine
+                    .terminate_all_fast(PauseReason::FULLSCREEN)
+                    .unwrap_or_default(),
+                FullscreenAction::Pause => engine
+                    .pause_all_fast(PauseReason::FULLSCREEN)
+                    .unwrap_or_default(),
+                FullscreenAction::None => unreachable!(),
+            }
         };
         if failed.is_empty() {
             FULLSCREEN_WAS.store(true, Ordering::Release);
@@ -111,7 +132,7 @@ unsafe extern "system" fn foreground_event_callback(
     } else if !is_fullscreen && was_fullscreen {
         // 退出全屏 → 恢复壁纸（实例方法）
         let failed = {
-            let engine = match engine.try_lock() {
+            let mut engine = match engine.try_lock() {
                 Ok(e) => e,
                 Err(_) => return,
             };
@@ -128,7 +149,7 @@ unsafe extern "system" fn foreground_event_callback(
 
 ### 1.2 前台窗口切换处理
 
-实际实现中，前台窗口切换处理逻辑已内联在 `foreground_event_callback`（见 §1.1）中，**不使用** `ProcessMonitor::on_foreground_changed` 方法。全屏判断与特殊窗口排除合并到单一辅助函数 `is_foreground_fullscreen`（直接调用 `GetForegroundWindow()` 获取前台窗口，不依赖回调传入的 `hwnd` 参数），暂停/恢复通过 `WallpaperEngine` 的实例方法实现：
+实际实现中，前台窗口切换处理逻辑已内联在 `foreground_event_callback`（见 §1.1）中，**不使用** `ProcessMonitor::on_foreground_changed` 方法。全屏判断与特殊窗口排除合并到单一辅助函数 `is_foreground_fullscreen`（直接调用 `GetForegroundWindow()` 获取前台窗口，不依赖回调传入的 `hwnd` 参数），暂停/恢复/终止通过 `WallpaperEngine` 的实例方法实现：
 
 ```rust
 /// 检测前台窗口是否全屏 — 独立函数，非 ProcessMonitor 方法
@@ -186,24 +207,35 @@ fn is_foreground_fullscreen() -> bool {
 
 // WallpaperEngine 上的实例方法（fast_path.rs）：
 // - pause_all_fast(reason: PauseReason) -> Result<Vec<String>, MirrorStarError>
-//     全局暂停所有壁纸，通过 PauseSender 快速通道绕过引擎 Mutex 内部锁；
+//     全局暂停所有壁纸，通过 PauseSender 快速通道经 mpsc 直接投递命令；
 //     reason 协调：若已有其他 reason 暂停过，仅 set bit 不重复发 Pause 命令。
 // - resume_all_fast(reason: PauseReason) -> Result<Vec<String>, MirrorStarError>
 //     全局恢复所有壁纸，仅 clear 指定 reason 的 bit；若其他 reason 仍活跃则不发 Resume。
+// - terminate_all_fast(reason: PauseReason) -> Result<Vec<String>, MirrorStarError>
+//     全屏激进处置：视频/网页渲染器终止子进程，GIF/图片普通暂停；
+//     同样先 set reason bit，退出全屏后由 resume_all_fast 对 Terminated 渲染器 play() 重启。
 ```
 
 ***
 
-## 2. 暂停状态跟踪
+## 2. 暂停状态跟踪（PauseReason 位图）
 
-MirrorStar **不使用** PauseReason bitflags 组合状态机。暂停状态通过两个独立标志跟踪：
+MirrorStar 使用 `PauseReason(pub u8)` 位图协调多个暂停来源（`crates/mirrorstar-core/src/wallpaper/mod.rs`）：
 
-- **全屏暂停**：使用 `AtomicBool`（`FULLSCREEN_WAS`）跟踪全屏状态。SetWinEventHook 回调检测到全屏窗口时置为 `true`，检测到非全屏时置为 `false`。无组合状态机。
-- **电池暂停**：使用 `AtomicBool`（`POWER_WAS_ON_BATTERY`，`src-tauri/src/state.rs:123`）跟踪电池供电暂停状态。
+| 常量 | 位值 | 场景 |
+|------|------|------|
+| `PauseReason::FULLSCREEN` | `0b0001` | 全屏 / 最大化自动处置 |
+| `PauseReason::BATTERY` | `0b0010` | 电池供电自动处置 |
+| `PauseReason::TRAY` | `0b0100` | 托盘手动暂停 |
+
+- **`pause_all_fast(reason)`**：锁内先 `*reasons |= reason`（set bit，关闭 TOCTOU 窗口）。仅当位图**此前为空**时才向所有 `PauseSender` 发送 `PauseCommand::Pause`；已有其他 reason 时只 set bit，不重复发 Pause。
+- **`resume_all_fast(reason)`**：仅 `*reasons &= !reason`（clear 指定 bit）。若其他 reason 仍活跃（位图非空），不发 Resume；**位图清空才发送 `Resume`**。清空时对 `Terminated` 的视频/网页渲染器走 `play()` 完整重启。
+- **部分失败不回滚 bit**：保证已成功暂停的渲染器仍能被 `resume_all_fast` 恢复。
+- `FULLSCREEN_WAS` / `POWER_WAS_ON_BATTERY` 只是**事件状态标志**（防重复触发、记录"此前是否已处置过"），**不替代 PauseReason 位图**；暂停/恢复的协调语义以位图为准。
 
 ### 2.1 电池供电监测
 
-电池供电监测采用 **`WM_POWERBROADCAST` 事件驱动**方式（`handle_power_status_change` 函数，由 `PBT_APMPOWERSTATUSCHANGE` 触发），而非 5 秒轮询 `GetSystemPowerStatus`：
+电池供电监测采用 **`WM_POWERBROADCAST` 事件驱动**方式（`handle_power_status_change` 函数，由 `PBT_APMPOWERSTATUSCHANGE` 触发），而非 5 秒轮询 `GetSystemPowerStatus`。开关 `pause.pause_on_battery` 默认 **false**（需用户在设置面板启用）：
 
 ```rust
 /// 处理电源状态变化（由 WM_POWERBROADCAST / PBT_APMPOWERSTATUSCHANGE 触发）
@@ -249,13 +281,13 @@ pub(crate) fn handle_power_status_change() {
 }
 ```
 
-> **注意**：使用 `WM_POWERBROADCAST` / `PBT_APMPOWERSTATUSCHANGE` 事件驱动，仅电源状态变化时触发检测，CPU 开销接近零。回调内通过 `SHARED_ENGINE` + `try_lock()` 获取 engine 锁（运行于 `explorer_monitor_wndproc` 窗口过程上下文，不可长时间阻塞，否则会延迟 `TaskbarCreated` 等 Explorer 事件处理），锁忙时跳过本次事件（`WM_POWERBROADCAST` 会重复触发，可容忍偶发跳过）。`ACLineStatus=255`（未知）显式保持当前策略，避免在状态不确定时误切换壁纸。
+> **注意**：电池暂停开关 `pause.pause_on_battery` 默认 **false**（不因电池供电暂停），需用户显式启用。使用 `WM_POWERBROADCAST` / `PBT_APMPOWERSTATUSCHANGE` 事件驱动，仅电源状态变化时触发检测，CPU 开销接近零。回调内通过 `SHARED_ENGINE` + `try_lock()` 获取 engine 锁（运行于 `explorer_monitor_wndproc` 窗口过程上下文，不可长时间阻塞，否则会延迟 `TaskbarCreated` 等 Explorer 事件处理），锁忙时跳过本次事件（`WM_POWERBROADCAST` 会重复触发，可容忍偶发跳过）。`ACLineStatus=255`（未知）显式保持当前策略，避免在状态不确定时误切换壁纸。
 
 ***
 
 ## 3. PauseSender 快速通道
 
-暂停/恢复/音量/静音操作绕过引擎 `Mutex<WallpaperEngine>`，通过 `tokio::sync::mpsc::UnboundedSender<PauseCommand>` 直接发送到渲染器线程，消除锁竞争导致的响应延迟。
+暂停/恢复/音量/静音操作在命令层短暂获取 engine 锁定位 `PauseSender` 后，通过 `tokio::sync::mpsc::UnboundedSender<PauseCommand>` 直接投递到渲染器线程；不等待渲染器处理或 IPC 往返（并非完全绕过 engine 锁）。
 
 ### 3.1 PauseCommand 枚举
 
@@ -290,54 +322,88 @@ pause_senders: Arc<std::sync::RwLock<HashMap<String, PauseSender>>>
 | 设置壁纸 | `Mutex<WallpaperEngine>` | 仍经 Mutex |
 | 关闭壁纸 | `Mutex<WallpaperEngine>` | 仍经 Mutex |
 
-**响应时间改善：**
+**响应时间（量级目标，待真机复测）：**
 
-| 场景 | 旧方案（Mutex） | 新方案（PauseSender） |
-|------|----------------|---------------------|
-| 无锁竞争 | ~1ms | ~0.01ms |
-| 有锁竞争（如正在设置壁纸） | 10~100ms | ~0.01ms（不受 Mutex 阻塞） |
+| 壁纸类型 | 暂停响应目标 | 说明 |
+|----------|--------------|------|
+| GIF / 图片（WorkerW） | < 10ms | PauseSender 直达渲染线程，逻辑暂停 |
+| 视频（mpv.exe） | < 50ms | 含命名管道 IPC 往返与 mpv 自身命令处理 |
+| 网页（wp-proc） | < 50ms | 含命名管道 IPC 往返与子进程处理 |
+
+> 上表为端到端量级目标（含命名管道 IPC 往返与渲染器处理），需在各机型真机复测后固化。
 
 ***
 
 ## 4. GIF 暂停内存优化
 
-GIF 渲染器暂停时释放所有帧数据（仅保留当前帧），恢复时从文件重新解码。内存预算从 200MB 降至 40MB。
+GIF 渲染器暂停时按 `GifMemoryStrategy` 管理帧数据（默认 `Balanced`，保留当前帧附近 10 帧），仅 `Aggressive` 需要恢复时重新解码。帧像素预算从 200MB 降至 40MB（配置 `gif.max_memory_mb`）。
+
+| 策略 | 暂停行为 | 恢复行为 |
+|------|----------|----------|
+| `Aggressive` | 释放到仅当前帧（`frames_loaded=false`） | 从文件重新解码并应用流式窗口 |
+| `Balanced`（默认） | 保留当前帧附近 `balanced_keep_frames`（默认 10）帧 | 直接恢复，无需解码 |
+| `Performance` | 保留所有帧 | 直接恢复 |
+| `Adaptive` | 内存充足则全保留；紧张则按可用内存计算保留帧数 | 按实际保留情况直接恢复 |
 
 ```rust
-/// GIF 渲染数据
-pub struct GifRenderData {
-    /// 壁纸文件路径（恢复时重新解码用）
+/// GIF 渲染状态
+pub struct GifRenderState {
+    /// 壁纸文件路径（Aggressive 恢复时重新解码用）
     pub image_path: String,
     /// 解码后的帧数据
     pub frames: Vec<GifFrame>,
-    /// 帧是否已加载
+    /// 当前播放帧索引
+    pub current_frame: usize,
+    /// 帧是否已全量加载（Aggressive 暂停后为 false）
     pub frames_loaded: bool,
     /// 暂停时保存的帧索引（恢复时从该帧继续）
-    pub saved_frame_index: usize,
-    /// 最大内存预算（MB）
-    pub max_memory_mb: usize,  // 默认 40
+    pub saved_frame_index: Option<usize>,
+    /// 内存管理策略（默认 Balanced）
+    pub memory_strategy: GifMemoryStrategy,
+    /// 平衡模式保留帧数（默认 10）
+    pub balanced_keep_frames: usize,
+    /// 最大内存预算（MB，默认 40）
+    pub max_memory_mb: usize,
 }
 
 impl GifRenderer {
-    /// 暂停：释放所有帧（保留当前帧）
-    fn pause(&mut self) -> Result<()> {
-        if self.data.frames.len() > 1 {
-            let current_frame = self.data.frames[self.current_index].clone();
-            self.data.frames.clear();
-            self.data.frames.push(current_frame);
-            self.data.frames_loaded = false;
-            self.data.saved_frame_index = self.current_index;
+    /// 暂停：按策略保留/释放帧
+    fn pause(&mut self) {
+        match self.memory_strategy {
+            GifMemoryStrategy::Aggressive => {
+                // 仅保留当前帧，恢复时重新解码
+                let current = self.current_frame;
+                self.frames.drain(..current);
+                self.frames.truncate(1);
+                self.current_frame = 0;
+                self.frames_loaded = false;
+                self.saved_frame_index = Some(current);
+            }
+            GifMemoryStrategy::Balanced => {
+                // 保留当前帧附近 balanced_keep_frames 帧（默认 10）
+                let keep = self.balanced_keep_frames.max(1);
+                // ... 计算窗口并 drain 窗口外帧 ...
+                self.saved_frame_index = Some(self.current_frame);
+            }
+            GifMemoryStrategy::Performance => {
+                // 保留所有帧
+                self.saved_frame_index = Some(self.current_frame);
+            }
+            GifMemoryStrategy::Adaptive => {
+                // 内存充足：保留所有帧；紧张：按自适应保留帧数裁剪
+            }
         }
-        Ok(())
     }
 
-    /// 恢复：从文件重新解码
-    fn resume(&mut self) -> Result<()> {
-        if !self.data.frames_loaded {
-            self.data.frames = decode_gif_from_file(&self.data.image_path)?;
-            self.data.frames_loaded = true;
-            self.current_index = self.data.saved_frame_index;
+    /// 恢复：仅 Aggressive 需要重新解码
+    fn resume(&mut self) -> Result<(), MirrorStarError> {
+        if !self.frames_loaded {
+            let saved_index = self.saved_frame_index.unwrap_or(0);
+            self.frames = decode_gif_streaming(&self.image_path, self.max_memory_mb, saved_index)?;
+            self.frames_loaded = true;
+            self.current_frame = saved_index.min(self.frames.len().saturating_sub(1));
         }
+        self.saved_frame_index = None;
         Ok(())
     }
 }
@@ -348,7 +414,7 @@ impl GifRenderer {
 | 状态 | 旧方案（200MB 预算） | 新方案（40MB 预算） |
 |------|---------------------|---------------------|
 | 播放中 | 最高 200MB | 最高 40MB |
-| 暂停中 | 保留所有帧，仍占 200MB | 仅保留当前帧，~1-5MB |
+| 暂停中（Balanced 默认） | 保留所有帧，仍占 200MB | 保留约 10 帧，显著低于预算上限 |
 
 ***
 
@@ -403,11 +469,11 @@ MirrorStar 的暂停通过以下方式实现：
 |----------|----------|------|
 | 视频（mpv.exe） | MpvIpcClient 发送 pause 命令 | mpv 原生 JSON IPC，mpv 自行暂停解码 |
 | 网页（壳 `--wp-proc` 模式） | WpProcIpcClient 发送 pause 命令 | wp-proc 自定义协议，子进程暂停渲染 |
-| GIF | PauseSender → 渲染线程停止 WM_TIMER | 主进程内线程，释放帧数据 |
+| GIF | PauseSender → 渲染线程停止 WM_TIMER | 主进程内线程，按 `GifMemoryStrategy` 保留/释放帧（默认 Balanced 保留 10 帧） |
 | 图片（WorkerW） | PauseSender → 渲染线程停止 | 主进程内线程，释放像素数据 |
 | 图片（Native） | 空操作（no-op） | 系统直接渲染，无需控制 |
 
-> **关键区别**：MirrorStar 采用逻辑暂停（PauseSender 快速通道绕过引擎互斥锁，直接发送暂停/恢复命令），而非线程挂起方式，因此更安全且响应更快。
+> **关键区别**：MirrorStar 采用逻辑暂停（PauseSender 快速通道经 mpsc 直接投递暂停/恢复命令，不等待渲染器处理），而非线程挂起方式，因此更安全且响应更快。
 
 ***
 
@@ -416,45 +482,73 @@ MirrorStar 的暂停通过以下方式实现：
 ```mermaid
 sequenceDiagram
     participant Hook as SetWinEventHook
-    participant Lib as lib.rs 全屏检测<br/>（内联函数）
+    participant Cfg as ConfigManager
+    participant Lib as fullscreen.rs<br/>（handle_foreground_event）
     participant Engine as WallpaperEngine
     participant IPC as Named Pipe
-    participant Child as 壁纸子进程
-    participant Audio as AudioController
-    participant Tray as 系统托盘<br/>（lib.rs setup + state.rs）
+    participant Child as 壁纸子进程 / 渲染线程
+    participant Audio as VolumeControl
+    participant Tray as 系统托盘
 
     Note over Hook: 全屏应用启动
 
-    Hook->>Lib: 回调(EVENT_SYSTEM_FOREGROUND, hwnd)
-    Lib->>Lib: is_foreground_fullscreen() → true（窗口矩形覆盖显示器）
+    Hook->>Lib: 回调(EVENT_SYSTEM_FOREGROUND)
+    Lib->>Cfg: 读取 pause.fullscreen_action
+    Cfg-->>Lib: none / pause / terminate（默认 terminate）
 
-    Lib->>Engine: pause_all_fast(PauseReason::FULLSCREEN)（全局暂停所有壁纸）
-    Engine->>IPC: 发送 pause 命令（mpv 原生 / wp-proc 自定义）
-    IPC->>Child: 收到 pause 命令
-    Child->>Child: 暂停播放（显示静态帧）
-
-    Engine->>Audio: mute_wallpaper(child_pid)
-    Audio->>Audio: ISimpleAudioVolume::SetMute(true)
-
-    Engine->>Tray: update_menu_text("恢复壁纸")
-    Tray->>Tray: 切换托盘菜单文本为恢复壁纸
+    alt 纯净壁纸模式活跃
+        Lib->>Lib: 跳过暂停/恢复/终止处置（状态冻结，退出后补跑）
+    else 正常处置
+        Lib->>Lib: is_foreground_fullscreen() → true（窗口矩形覆盖显示器）
+        alt action == None
+            Lib->>Lib: 不处置（若此前已处置则恢复并清理残留）
+        else action == Terminate
+            Lib->>Engine: terminate_all_fast(PauseReason::FULLSCREEN)
+            Engine->>Child: 终止视频/网页子进程（GIF/图片普通暂停）
+        else action == Pause
+            Lib->>Engine: pause_all_fast(PauseReason::FULLSCREEN)
+            Engine->>IPC: 发送 pause 命令（mpv 原生 / wp-proc 自定义）
+            IPC->>Child: 暂停播放（显示静态帧）
+        end
+        Note over Engine: PauseReason 位图 set FULLSCREEN bit
+        Engine->>Audio: set_process_mute(child_pid, true)
+        Audio->>Audio: ISimpleAudioVolume::SetMute(true)
+        Engine->>Tray: update_menu_text("恢复壁纸")
+    end
 
     Note over Hook: 全屏应用退出
 
     Hook->>Lib: 回调(EVENT_SYSTEM_FOREGROUND, desktop_hwnd)
     Lib->>Lib: is_foreground_fullscreen() → false（类名匹配 Progman/WorkerW/Shell_TrayWnd）
-
     Lib->>Engine: resume_all_fast(PauseReason::FULLSCREEN)
-    Engine->>IPC: 发送 resume 命令（mpv 原生 / wp-proc 自定义）
-    IPC->>Child: 收到 resume 命令
-    Child->>Child: 恢复播放
 
-    Engine->>Audio: unmute_wallpaper(child_pid)
-    Audio->>Audio: ISimpleAudioVolume::SetMute(false)
+    alt 位图仍非空（BATTERY / TRAY 等其他 reason 活跃）
+        Engine-->>Engine: clear FULLSCREEN bit，不发 Resume
+    else 位图清空
+        Engine->>IPC: 发送 resume 命令
+        IPC->>Child: 恢复播放
+        Engine->>Child: Terminated 视频/网页渲染器 play() 重启并重嵌
+        Engine->>Audio: set_process_mute(child_pid, false)
+        Audio->>Audio: ISimpleAudioVolume::SetMute(false)
+    end
 
     Engine->>Tray: update_menu_text("暂停壁纸")
-    Tray->>Tray: 切换托盘菜单文本为暂停壁纸
 ```
+
+***
+
+## 8. 纯净壁纸模式守卫
+
+纯净壁纸模式（`mirrorstar_core::pure_mode::is_active()`）运行期间，壁纸窗口被摘出桌面层并置顶，任何自动处置都会破坏沉浸画面。守卫规则：
+
+| 路径 | 守卫行为 |
+|------|----------|
+| `state.rs::try_pause_all_fast` / `try_resume_all_fast` / `try_terminate_all_fast` / `resume_all_fast_blocking` | 首部检查 `pure_mode::is_active()`，命中则直接返回 `None`，跳过暂停/恢复/终止处置；调用方不更新 `FULLSCREEN_WAS` / `POWER_WAS_ON_BATTERY`，状态冻结 |
+| `state.rs::try_heal_desktop_layer` | 模式内临时覆盖窗是顶层窗口、不挂在桌面层下，跳过桌面层自愈（返回 `None`） |
+| 轮换调度器（`scheduler.rs`） | 定时轮换与手动"下一张"均跳过（`pure_mode::is_active() || pause_reasons 非空` 即抑制）；退出时 `wake` 重算 deadline |
+
+- 纯净模式自身**不占用 `PauseReason` 位**：该位图对非空原因统一发 `PauseCommand::Pause`，而模式的目标是"抑制轮换/处置但不停播"，塞入位图会污染语义。
+- **退出后补跑**：`fullscreen::reevaluate_now()` 复用 `handle_foreground_event` 补跑一次前台全屏判定；`power::reevaluate_now()` 复用 `handle_power_status_change` 补跑一次电源判定，纠正模式期间冻结的状态漂移。
 
 ***
 

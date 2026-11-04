@@ -7,11 +7,13 @@
 | 项目名称 | MirrorStar Wallpaper（镜星壁纸） |
 | 文档版本 | v1.0                      |
 | 更新日期 | 2026-10-12                |
-| 文档状态 | 已实现（基于真实代码审计，2026-10）        |
+| 文档状态 | 历史记录归档（2026-06~07 三次测试；2026-10 审计） |
 
 > 本文合并三份历史测试报告（2026-06-25 / 2026-07-05 / 2026-07-24），按日期以二级章节分别保留其环境、方法与数据。
 >
 > **重要：全部为历史记录**（主窗口原生 UI 重构前，基于旧前端与 WebView2 主窗口）。其中涉及 `npx tauri dev`、Vite/前端 UI、WebView2 主窗口、asset protocol scope 等描述均为当时的真实状态，现已随架构重构失效，仅作演进参考。**本文不新增任何未经实测的数据。**
+>
+> **验收基线位置**：原生 UI 验收基线（历史，如 16.8MB / 7.6MB 私有工作集、0.4% idle CPU 等）**不在本文**，见 [性能优化 §21](../02-架构与技术栈/09-性能优化-Performance.md)（该节数据同样标注“历史数据/待复测”）；本文全部为历史记录。
 >
 > **当前测试体系**：Rust 单元/集成测试（`cargo test --workspace`）+ `crates/mirrorstar-ui/` 的 PowerShell 驱动脚本 e2e（见 §4）。
 
@@ -142,6 +144,8 @@
 | NFR-019 | 暂停响应 < 500ms | IPC 超时 5s | ❌ 未达标（Bug #7） |
 | NFR-020 | 托盘菜单响应 < 200ms | ~100ms | ✅ 达标 |
 
+> 注：此处 NFR 编号/指标沿用当时版本，当前定义见 [非功能性需求](../01-需求文档/03-非功能性需求-Non-Functional-Requirements.md)（当前 NFR-006 为“热启动时间 · 待复测”，无“<1.5s”指标）。
+
 ### 2.4 历史 Bug 回归结论
 
 | Bug ID | 描述 | 修复版本 | 回归状态 |
@@ -223,7 +227,9 @@
 
 - **Rust 单元/集成测试**：`cargo test --workspace`，覆盖 `mirrorstar-core` / `mirrorstar-ui` / `mirrorstar-wp-proc` / 壳（`mirrorstar-wallpaper`）；共享资源类测试标记 `#[ignore]`，由 `cargo test --workspace -- --ignored` 串行执行。
 - **e2e（真机）**：`crates/mirrorstar-ui/` 下的 PowerShell 驱动脚本（`measure_grid.ps1`、`measure_scroll_reverify.ps1`、`measure_preview.ps1`、`keyboard_smoke.ps1`、`shell_measure.ps1`、`single_instance_check.ps1`）。
-- **质量门**：本地手工执行 `cargo test --workspace` / `cargo clippy --workspace --all-targets -- -D warnings` / `cargo fmt --all --check` / `cargo test --workspace -- --ignored` / `cargo audit`，详见 [质量保障](./04-质量保障-Quality-Assurance.md)。
+- **质量门**：本地手工执行 `cargo check --workspace` / `cargo test --workspace` / `cargo clippy --workspace --all-targets -- -D warnings` / `cargo fmt --all --check` / `cargo test --workspace -- --ignored` / `cargo audit`，详见 [质量保障](./04-质量保障-Quality-Assurance.md)。
+
+> **口径说明**：原生 UI 验收基线（历史：16.8MB / 7.6MB 私有工作集、0.4% idle CPU 等）不在本文，见 [性能优化 §21](../02-架构与技术栈/09-性能优化-Performance.md)；**本文全部为历史记录**，不新增任何未经实测的数据。
 
 ***
 

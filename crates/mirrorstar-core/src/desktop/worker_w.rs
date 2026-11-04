@@ -47,10 +47,22 @@ const WM_SPAWN_WORK_LPARAM: isize = 0x1;
 /// 1000ms：给 Progman 足够时间创建子 WorkerW（raised desktop 下创建较慢）。
 const WM_SPAWN_WORK_TIMEOUT_MS: u32 = 1000;
 
+/// 嵌入后延迟 z 序复核的等待时间（毫秒）
+///
+/// 同步校验只能覆盖 `SetParent`/`SetWindowPos` 的即时结果；系统或 Explorer 可能
+/// 在随后几十毫秒内提交延迟的 z 序变更。150ms 足以覆盖一个到数个输入/合成周期，
+/// 又不会让壁纸在错误位置停留过久。
+const ZORDER_RECHECK_DELAY_MS: u64 = 150;
+
 /// find_child_by_class 递归查找子窗口的最大深度
 ///
 /// 限制递归深度避免无限递归；3 层足以覆盖 Progman/WorkerW → SHELLDLL_DefView 层级。
 const MAX_CHILD_DEPTH: u32 = 3;
+
+/// 单层最多遍历的兄弟窗口数（防止异常 z 序导致死循环）
+///
+/// 供 [`child_sibling_list`] 与 [`host_child_chain_summary`] 共用。
+const MAX_SIBLINGS: usize = 64;
 
 // v5.0 D-PERF-001: WorkerW / Progman 类名的 UTF-16LE 字面量，
 // 用于 callback 内字节级比较，避免 String::from_utf16_lossy 堆分配。
@@ -208,6 +220,54 @@ fn choose_embed_path(raised: bool, defview: Option<HWND>) -> EmbedPath {
     }
 }
 
+/// 运行期 z 序再断言的结果。
+///
+/// 供 `heal_desktop_layer` 周期体检使用：只判断"壁纸窗口是否仍在桌面图标层
+/// （`SHELLDLL_DefView`）之下"，不重嵌、不改几何。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ZOrderRepair {
+    /// 非 raised desktop、未找到 DefView，或句柄无效：本次不处理（零写入）。
+    NotApplicable,
+    /// 已在 DefView 之下：无需修复（零写入）。
+    Ok,
+    /// 曾不在 DefView 之下，已重断言锚点并完成修复。
+    Fixed,
+    /// 宿主父链不匹配（DefView 换层）：本层无法修复，需调用方重嵌。
+    NeedsReembed,
+    /// 重断言锚点失败，壁纸可能仍遮挡桌面图标。
+    Failed,
+}
+
+/// 纯函数：判定运行期 z 序体检的结论。
+///
+/// 判定顺序：
+/// 1. `!raised || !defview_present` → `NotApplicable`（非 raised / 无锚点，无从判断）；
+/// 2. `!host_resolved || !parent_matches` → `NeedsReembed`（宿主已变，重断言无意义）；
+/// 3. `already_below` → `Ok`（已在锚点之下，零写入）；
+/// 4. 其余 → `Fixed`。
+///
+/// 注意：`Fixed` 只是**判定结论**，不代表已修复——真正的 z 序写入由 Win32 封装
+/// [`reassert_below_defview`] 执行，写入失败时结果升级为 `Failed`。
+/// 本函数不调用任何 Win32 API，便于单测判定矩阵。
+fn decide_zorder_repair(
+    raised: bool,
+    defview_present: bool,
+    host_resolved: bool,
+    parent_matches: bool,
+    already_below: bool,
+) -> ZOrderRepair {
+    if !raised || !defview_present {
+        return ZOrderRepair::NotApplicable;
+    }
+    if !host_resolved || !parent_matches {
+        return ZOrderRepair::NeedsReembed;
+    }
+    if already_below {
+        return ZOrderRepair::Ok;
+    }
+    ZOrderRepair::Fixed
+}
+
 /// 判断 `hwnd` 的子树（深度 ≤ [`MAX_CHILD_DEPTH`]）是否包含指定类名的窗口。
 ///
 /// 薄封装 [`find_child_by_class`]（该函数不检查 `hwnd` 自身，仅查其子孙），
@@ -264,27 +324,20 @@ fn resolve_wallpaper_host(defview: HWND, progman: HWND) -> Option<HWND> {
     }
 }
 
-/// 汇总 Progman 直接子窗口链（`GW_CHILD` → `GW_HWNDNEXT`），供诊断日志使用。
+/// 收集宿主的直接子窗口链（`GW_CHILD` → `GW_HWNDNEXT`）。
 ///
-/// 每项格式为 `"类名#vis=0/1#0x句柄"`；最多遍历 64 个兄弟窗口以防异常 z 序导致
-/// 死循环，任何 Win32 调用失败都静默结束（不 panic、不修改窗口状态）。
-fn progman_child_chain_summary(progman: HWND) -> Vec<String> {
-    /// 单层最多遍历的兄弟窗口数（防止死循环）。
-    const MAX_SIBLINGS: usize = 64;
-
-    let mut chain = Vec::new();
-    // SAFETY: GetWindow/GetClassNameW/IsWindowVisible 仅查询窗口关系与状态。
+/// 返回顺序即 z 序自上而下：首项为宿主最上层子窗口，后续依次向下。最多收集
+/// [`MAX_SIBLINGS`] 项以防异常 z 序导致死循环；任何 Win32 调用失败都静默结束
+///（不 panic、不修改窗口状态），已收集到的部分仍然有效。
+fn child_sibling_list(parent: HWND) -> Vec<HWND> {
+    let mut siblings = Vec::new();
+    // SAFETY: GetWindow 仅查询窗口关系，不修改窗口状态。
     unsafe {
-        let Ok(mut child) = GetWindow(progman, GW_CHILD) else {
-            return chain;
+        let Ok(mut child) = GetWindow(parent, GW_CHILD) else {
+            return siblings;
         };
-        while !child.is_invalid() && chain.len() < MAX_SIBLINGS {
-            let class = class_name_of(child);
-            let visible = u8::from(IsWindowVisible(child).as_bool());
-            chain.push(format!(
-                "{}#vis={}#0x{:X}",
-                class, visible, child.0 as isize
-            ));
+        while !child.is_invalid() && siblings.len() < MAX_SIBLINGS {
+            siblings.push(child);
             let Ok(next) = GetWindow(child, GW_HWNDNEXT) else {
                 break;
             };
@@ -294,7 +347,88 @@ fn progman_child_chain_summary(progman: HWND) -> Vec<String> {
             child = next;
         }
     }
-    chain
+    siblings
+}
+
+/// 纯判定：`target` 在兄弟链中的位置是否位于 `anchor` 之后（z 序更低）。
+///
+/// 链序为自上而下（见 [`child_sibling_list`]），因此 `target` 的下标大于 `anchor`
+/// 的下标即表示目标窗口位于锚点之下；两者之间夹着其它兄弟窗口也算成立。
+/// `anchor` 或 `target` 是无效句柄，或不在链中时返回 `false`；
+/// 本函数不调用任何 Win32 API，便于单测。
+fn is_after_in_chain(chain: &[HWND], anchor: HWND, target: HWND) -> bool {
+    if anchor.is_invalid() || target.is_invalid() {
+        return false;
+    }
+    match (
+        chain.iter().position(|h| *h == anchor),
+        chain.iter().position(|h| *h == target),
+    ) {
+        (Some(anchor_idx), Some(target_idx)) => target_idx > anchor_idx,
+        _ => false,
+    }
+}
+
+/// 判定窗口是否已在锚点之下（紧邻优先，否则兄弟链中位于锚点之后）。
+///
+/// 1. 快路径：`GetWindow(hwnd, GW_HWNDPREV)` 等于锚点（紧邻其下）→ 返回 `true`，
+///    不再枚举兄弟链；
+/// 2. 否则取宿主直接子窗口链，若 `hwnd` 的链序位于锚点之后（中间夹了其它兄弟
+///    窗口但仍在锚点之下）→ 返回 `true`。
+fn is_already_below(hwnd: HWND, anchor: HWND, parent: HWND) -> bool {
+    // SAFETY: GetWindow/child_sibling_list 仅查询窗口关系，不修改窗口状态。
+    unsafe {
+        if GetWindow(hwnd, GW_HWNDPREV).is_ok_and(|prev| is_below_anchor(prev, anchor)) {
+            return true;
+        }
+    }
+    is_after_in_chain(&child_sibling_list(parent), anchor, hwnd)
+}
+
+/// 把窗口插入锚点正下方（不改位置/尺寸/激活）。
+///
+/// 成功返回 `Ok(())`；`SetWindowPos` 失败时返回包装后的
+/// [`MirrorStarError::DesktopIntegration`]，供调用方记录具体错误。
+fn insert_below(hwnd: HWND, anchor: HWND) -> Result<(), MirrorStarError> {
+    // SAFETY: SetWindowPos 仅调整 z 序，不移动、不改变大小、不激活窗口。
+    let result = unsafe {
+        SetWindowPos(
+            hwnd,
+            anchor,
+            0,
+            0,
+            0,
+            0,
+            SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
+        )
+    };
+    result.map_err(|e| {
+        MirrorStarError::DesktopIntegration(format!("SetWindowPos(插入锚点) 失败: {}", e))
+    })
+}
+
+/// 汇总宿主直接子窗口链（`child_sibling_list`），供诊断日志使用。
+///
+/// 每项格式为 `"类名#vis=0/1#0x句柄"`，自上而下排列；当该项等于 `self_hwnd` 时
+/// 追加 `"#self=1"`（例如 `MirrorStarVideoHost#vis=1#0x250C78#self=1`），用于在
+/// 多显示器（宿主链中出现多个壁纸窗口）时区分本次嵌入的壁纸窗口。
+/// 最多遍历 [`MAX_SIBLINGS`] 个兄弟窗口，任何 Win32 调用失败都静默结束。
+fn host_child_chain_summary(parent: HWND, self_hwnd: HWND) -> Vec<String> {
+    child_sibling_list(parent)
+        .into_iter()
+        .map(|child| {
+            // SAFETY: IsWindowVisible 仅查询窗口可见状态，不修改窗口状态。
+            let visible = unsafe { u8::from(IsWindowVisible(child).as_bool()) };
+            let self_mark = if child == self_hwnd { "#self=1" } else { "" };
+            format!(
+                "{}#vis={}#0x{:X}{}",
+                class_name_of(child),
+                visible,
+                child.0 as isize,
+                self_mark
+            )
+        })
+        .collect()
 }
 
 /// 单次尝试查找 Progman 和 WorkerW 窗口句柄（无重试、无 sleep）
@@ -799,39 +933,38 @@ fn is_below_anchor(prev_sibling: HWND, anchor: HWND) -> bool {
     !anchor.is_invalid() && prev_sibling == anchor
 }
 
-/// 校验 raised desktop 下壁纸窗口是否紧贴 z 序锚点（DefView）下方（best-effort）。
+/// 校验 raised desktop 下壁纸窗口是否位于 z 序锚点（DefView）下方（best-effort）。
 ///
-/// 流程：
-/// 1. `GetWindow(hwnd, GW_HWNDPREV)` 与锚点比对，通过即返回 `true`；
-/// 2. 不通过则用 `SetWindowPos(hwnd, anchor, ...)` 重试一次并再次校验；
-/// 3. 仍不通过则回退到宿主内最底层（`HWND_BOTTOM`）并记录 `warn`，返回 `false`。
+/// `parent` 为壁纸窗口的宿主（Progman 或 Progman 直接子 WorkerW），用于取兄弟链。
+/// 流程为"紧邻优先、否则按链序判定"：
+/// 1. 快路径：`GetWindow(hwnd, GW_HWNDPREV)` 等于锚点（紧邻其下）→ 返回 `true`，
+///    不做额外枚举；
+/// 2. 否则取宿主直接子窗口链，若 `hwnd` 的链序位于锚点之后（中间夹了其它兄弟
+///    窗口但仍在 DefView 之下）→ 返回 `true`，不重试、不兜底；
+/// 3. 仍不成立则用 `SetWindowPos(hwnd, anchor, ...)` 重试一次，再按 1（紧邻）
+///    或 2（链序）复核；
+/// 4. 仍不成立则回退到宿主内最底层（`HWND_BOTTOM`）并记录 `warn`，返回 `false`。
+///
+/// 采用链序判定是为避免"只认紧邻"的误判：raised desktop 下宿主子窗口链为
+/// `[SHELLDLL_DefView, WorkerW, ...]`，若误判为失败而走 `HWND_BOTTOM` 兜底，
+/// 会把壁纸放到 WorkerW 之下、被 WorkerW 的静态壁纸遮住（壁纸不可见）。
 ///
 /// 不返回 `Err`：z 序校验失败不应让已完成的嵌入整体失败，兜底后由日志
 /// `z_anchor_ok=false` 暴露问题。
-fn ensure_below_anchor(hwnd: HWND, anchor: HWND, progman: HWND) -> bool {
+fn ensure_below_anchor(hwnd: HWND, anchor: HWND, parent: HWND) -> bool {
+    // 1/2. 已在锚点之下（紧邻优先，否则链序）→ 直接成功。
+    if is_already_below(hwnd, anchor, parent) {
+        return true;
+    }
+
+    // 3. 重试一次：锚点插入可能被后续同步消息打回兄弟 z 序顶部。
+    if insert_below(hwnd, anchor).is_ok() && is_already_below(hwnd, anchor, parent) {
+        return true;
+    }
+
     // SAFETY: GetWindow/SetWindowPos 仅查询或调整 z 序，不移动、不改变大小、不激活窗口。
     unsafe {
-        if GetWindow(hwnd, GW_HWNDPREV).is_ok_and(|prev| is_below_anchor(prev, anchor)) {
-            return true;
-        }
-
-        // 重试一次：锚点插入可能被后续同步消息打回兄弟 z 序顶部。
-        if SetWindowPos(
-            hwnd,
-            anchor,
-            0,
-            0,
-            0,
-            0,
-            SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
-        )
-        .is_ok()
-            && GetWindow(hwnd, GW_HWNDPREV).is_ok_and(|prev| is_below_anchor(prev, anchor))
-        {
-            return true;
-        }
-
-        // 兜底：放到宿主内最底层，保证壁纸不会停留在兄弟 z 序顶部遮挡图标。
+        // 4. 兜底：放到宿主内最底层，保证壁纸不会停留在兄弟 z 序顶部遮挡图标。
         let prev = GetWindow(hwnd, GW_HWNDPREV).unwrap_or_default();
         let fallback_ok = SetWindowPos(
             hwnd,
@@ -846,12 +979,145 @@ fn ensure_below_anchor(hwnd: HWND, anchor: HWND, progman: HWND) -> bool {
         tracing::warn!(
             hwnd = hwnd.0 as isize,
             anchor = anchor.0 as isize,
-            progman = progman.0 as isize,
+            parent = parent.0 as isize,
             prev = prev.0 as isize,
             fallback_ok,
-            "raised desktop: z 序锚点校验失败，已回退到宿主最底层（壁纸可能覆盖桌面图标）"
+            "raised desktop: z 序锚点校验失败，已回退到宿主最底层（桌面图标不再被遮挡，但壁纸可能被静态壁纸盖住而不可见）"
         );
         false
+    }
+}
+
+/// 调度"嵌入后延迟 z 序复核"：等待 [`ZORDER_RECHECK_DELAY_MS`] 后在线程内复核一次。
+///
+/// 同步校验（[`ensure_below_anchor`]）只能覆盖 `SetParent`/`SetWindowPos` 的即时结果；
+/// 系统或 Explorer 可能在随后几十毫秒内提交延迟的 z 序变更，导致"校验时通过、之后
+/// 又被抬高"。本函数只负责起线程：不持锁、不阻塞嵌入调用方、不影响嵌入结果，
+/// 线程创建失败仅记录 warn（best-effort，已跳过）。
+fn schedule_zorder_recheck(hwnd: HWND) {
+    // HWND 内部是裸指针、未实现 Send，跨线程序列化为 isize，在复核线程内按原值重建。
+    let raw = hwnd.0 as isize;
+    if let Err(e) = std::thread::Builder::new()
+        .name("mirrorstar-zorder-recheck".to_string())
+        .spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(ZORDER_RECHECK_DELAY_MS));
+            verify_and_fix_below_defview(HWND(raw as *mut std::ffi::c_void))
+        })
+    {
+        tracing::warn!(
+            hwnd = raw,
+            error = %e,
+            "延迟 z 序复核：创建线程失败（best-effort，已跳过）"
+        );
+    }
+}
+
+/// 延迟复核壁纸窗口是否仍在 z 序锚点（当前父窗口的直接子 DefView）之下，必要时修正一次。
+///
+/// 锚点取"壁纸窗口当前父窗口的直接子 `SHELLDLL_DefView`"，因此宿主是 Progman 还是
+/// Progman 子 WorkerW 都可兼容，也不依赖缓存的 Progman 句柄。
+///
+/// 流程：窗口无效 / 父窗口无效 / 找不到直接子 DefView → 静默返回；已在锚点之下
+/// （紧邻优先，链序兜底）→ 仅 debug 日志，**零写入**；否则用
+/// `SetWindowPos(hwnd, defview, ...)` 修正一次（不改位置、不改尺寸、不激活）。
+/// 本函数任何异常都静默跳过，不向上传播。
+fn verify_and_fix_below_defview(hwnd: HWND) {
+    // SAFETY: IsWindow 仅查询窗口句柄是否有效，不修改窗口状态。
+    if !unsafe { IsWindow(hwnd) }.as_bool() {
+        // 窗口已被销毁/重建，无复核对象。
+        return;
+    }
+
+    // SAFETY: GetAncestor 仅查询窗口父链，不修改窗口状态。
+    let parent = unsafe { GetAncestor(hwnd, GA_PARENT) };
+    if parent.is_invalid() {
+        // 例如刚被纯净模式摘出，暂时没有桌面宿主。
+        return;
+    }
+
+    let Some(defview) = find_defview(parent) else {
+        return;
+    };
+
+    // 已在下方的判据：紧邻锚点优先（快路径），否则按宿主子窗口链序兜底。
+    if is_already_below(hwnd, defview, parent) {
+        tracing::debug!(
+            hwnd = hwnd.0 as isize,
+            "延迟 z 序复核：壁纸仍在 DefView 之下，无需修正"
+        );
+        return;
+    }
+
+    let prev = unsafe { GetWindow(hwnd, GW_HWNDPREV) }.unwrap_or_default();
+    match insert_below(hwnd, defview) {
+        Ok(()) => tracing::info!(
+            hwnd = hwnd.0 as isize,
+            prev = prev.0 as isize,
+            "延迟 z 序复核：壁纸曾被抬到 DefView 之上，已修正"
+        ),
+        Err(e) => tracing::warn!(
+            hwnd = hwnd.0 as isize,
+            prev = prev.0 as isize,
+            error = %e,
+            "延迟 z 序复核：修正失败（best-effort）"
+        ),
+    }
+}
+
+/// 运行期 z 序再断言：把已附着但被外部抬高的壁纸窗口重新插回 DefView 之下。
+///
+/// 供 `heal_desktop_layer` 的周期体检调用。与 [`embed_wallpaper`] 的区别：
+/// 本函数**不重嵌**（不 `SetParent`、不改窗口样式、不改几何），仅做 z 序校正，
+/// 因此对画面零打扰。
+///
+/// 流程（判定由纯函数 [`decide_zorder_repair`] 给出）：
+/// 1. 句柄无效 / 非 raised desktop / 未找到 `SHELLDLL_DefView` → `NotApplicable`；
+/// 2. 宿主不可解析或壁纸窗口父窗口不是宿主 → `NeedsReembed`（交调用方重嵌）；
+/// 3. 已在 DefView 之下（紧邻优先，链序兜底）→ `Ok`，**零写入体检**：不做任何
+///    写操作，避免每 5 分钟制造一次 z 序重排抖动；
+/// 4. 曾不在下方 → 调用 [`ensure_below_anchor`] 重断言锚点，成功 `Fixed`、
+///    失败 `Failed`。
+///
+/// 严禁调用 `SetParent` / `ShowWindow` / 任何改几何的 `SetWindowPos`：本函数
+/// 只允许 [`ensure_below_anchor`] 内部的 z 序 `SetWindowPos`（不改位置与尺寸）。
+pub fn reassert_below_defview(hwnd: HWND, progman_hwnd: HWND) -> ZOrderRepair {
+    if hwnd.is_invalid() || progman_hwnd.is_invalid() {
+        return ZOrderRepair::NotApplicable;
+    }
+    if !progman_is_raised_desktop(progman_hwnd) {
+        return ZOrderRepair::NotApplicable;
+    }
+    let Some(defview) = find_defview_deep(progman_hwnd) else {
+        return ZOrderRepair::NotApplicable;
+    };
+
+    // 宿主 = DefView 的直接父窗口；父链不匹配说明 DefView 已换层（如重建后挂到
+    // 另一个 WorkerW），此时重断言锚点只会把窗口插到错误的兄弟链里。
+    let host = resolve_wallpaper_host(defview, progman_hwnd);
+    // SAFETY: GetAncestor 仅查询窗口父链，不修改窗口状态。
+    let parent = unsafe { GetAncestor(hwnd, GA_PARENT) };
+    let parent_matches = host.is_some_and(|h| parent == h);
+
+    // 已在下方的判据：紧邻锚点优先（快路径），否则按宿主子窗口链序兜底
+    // （中间夹了其它兄弟窗口但仍在锚点之后同样算"在下方"）。
+    // 宿主未解析时无从取兄弟链，already_below 视为 false。
+    let already_below = host.is_some_and(|h| is_already_below(hwnd, defview, h));
+
+    let decision = decide_zorder_repair(true, true, host.is_some(), parent_matches, already_below);
+    match decision {
+        ZOrderRepair::NotApplicable | ZOrderRepair::Ok | ZOrderRepair::NeedsReembed => decision,
+        ZOrderRepair::Fixed => {
+            let Some(host) = host else {
+                return ZOrderRepair::NeedsReembed;
+            };
+            if ensure_below_anchor(hwnd, defview, host) {
+                ZOrderRepair::Fixed
+            } else {
+                ZOrderRepair::Failed
+            }
+        }
+        // decide_zorder_repair 不会返回 Failed（它是修复后的结论），此处仅作兜底。
+        ZOrderRepair::Failed => ZOrderRepair::Failed,
     }
 }
 
@@ -924,7 +1190,23 @@ pub fn embed_wallpaper(
             crate::desktop::window::apply_raised_desktop_style(wp_hwnd)?;
             crate::desktop::window::set_parent_verified(wp_hwnd, Some(host))?;
 
+            // 首次 ShowWindow 会把刚显示的窗口提到宿主子窗口 z 序顶部（真机日志
+            // sibling_chain 中壁纸窗口排在 DefView 之上、而 z_anchor_ok=true 的矛盾即源于
+            // 显示发生在锚点插入之后）。因此显示必须先于锚点插入，锚点 SetWindowPos 与
+            // ensure_below_anchor 才是最后一次 z 序写入；z_anchor_ok 也只有在显示之后
+            // 测量才有意义（修复前正是"显示前校验通过、最终被置顶"）。
+            //
+            // 嵌入时不主动抢占前台（不再为恢复焦点调用 SetForegroundWindow）：每次壁纸
+            // 嵌入（轮换/手动切换）都会触发 EVENT_SYSTEM_FOREGROUND，扰乱全屏检测状态机，
+            // 并在自动轮换时长按闪烁主控制窗口。需要恢复焦点时由调用方负责。
+            // ShowWindow 失败不影响已完成的嵌入流程，下一次刷新会重新显示
+            let _ = ShowWindow(wp_hwnd, SW_SHOW);
+
             // 插入到 DefView 正下方：壁纸位于桌面图标层之下。
+            //
+            // ShowWindow 已提前到此处之前，一旦锚点插入失败必须同步隐藏窗口，
+            // 否则窗口会停留在可见状态且位于 DefView 之上（盖住桌面图标），
+            // 直到调用方终止渲染器才消失。
             SetWindowPos(
                 wp_hwnd,
                 defview,
@@ -935,18 +1217,25 @@ pub fn embed_wallpaper(
                 SWP_NOACTIVATE | SWP_FRAMECHANGED,
             )
             .map_err(|e| {
-                MirrorStarError::DesktopIntegration(format!("SetWindowPos(raised) 失败: {}", e))
+                let _ = ShowWindow(wp_hwnd, SW_HIDE);
+                MirrorStarError::DesktopIntegration(format!(
+                    "SetWindowPos(raised) 失败: {}（已隐藏窗口以免遮挡桌面图标）",
+                    e
+                ))
             })?;
 
             // SetParent 会把重定父窗口放到新兄弟 z 序顶部，必须校验并兜底，
             // 否则壁纸停留在 DefView 之上会盖住桌面图标。
-            let z_anchor_ok = ensure_below_anchor(wp_hwnd, defview, progman_hwnd);
+            // 此处之后不得再出现任何改变兄弟 z 序的调用（诊断采集除外）。
+            let z_anchor_ok = ensure_below_anchor(wp_hwnd, defview, host);
 
-            // 嵌入时不主动抢占前台（不再为恢复焦点调用 SetForegroundWindow）：每次壁纸
-            // 嵌入（轮换/手动切换）都会触发 EVENT_SYSTEM_FOREGROUND，扰乱全屏检测状态机，
-            // 并在自动轮换时长按闪烁主控制窗口。需要恢复焦点时由调用方负责。
-            // ShowWindow 失败不影响已完成的嵌入流程，下一次刷新会重新显示
-            let _ = ShowWindow(wp_hwnd, SW_SHOW);
+            // 显示后系统可能把光标切到 IDC_WAIT（同类窗口在纯净模式覆盖窗场景已复现），
+            // 后台 NOACTIVATE 窗口不属于前台输入队列，蓝圈不会自行消失；异步轮询复位，
+            // 不阻塞嵌入流程（实际复位结果见独立 info 日志）。
+            let cursor_wait_reset = crate::desktop::window::reset_wait_cursor_after_show(wp_hwnd);
+
+            // 150ms 后复核一次 z 序，覆盖系统延迟提交的变更（不持锁、不阻塞嵌入）。
+            schedule_zorder_recheck(wp_hwnd);
 
             log_embed_success(
                 wp_hwnd,
@@ -957,6 +1246,7 @@ pub fn embed_wallpaper(
                 "defview",
                 host,
                 z_anchor_ok,
+                cursor_wait_reset,
                 display_id,
                 arrangement,
                 x,
@@ -1017,6 +1307,7 @@ pub fn embed_wallpaper(
             "bottom",
             workerw_hwnd,
             true,
+            false,
             display_id,
             arrangement,
             x,
@@ -1033,8 +1324,16 @@ pub fn embed_wallpaper(
 /// 字段用于真机复测直接判定走了哪条路径：`raised`、`progman`、`workerw`、
 /// `defview`（raised 且找到 DefView 时为句柄；降级/旧层级时为 0）、`parent_after`、
 /// `host`、`host_class`、`style_has_child`、`exstyle_has_layered`、`z_order_anchor`、
-/// `z_anchor_ok`、`defview_has_icon_list`、`workerw_has_defview`、
+/// `z_anchor_ok`、`cursor_wait_reset`、`defview_has_icon_list`、`workerw_has_defview`、
 /// `workerw_has_icon_list`、`sibling_chain`、`display_id`、坐标尺寸。
+///
+/// `cursor_wait_reset`：true = 光标复位流程已启动（复位线程创建成功），
+/// 实际复位结果见独立的 info 日志；旧层级不触发该流程，恒为 false。
+///
+/// `sibling_chain`：宿主（Progman 或 Progman 直接子 WorkerW）的直接子窗口链，
+/// 自上而下排列（首项为最上层），
+/// 每项 `类名#vis=0/1#0x句柄`，本次嵌入的壁纸窗口追加 `#self=1`，
+/// 多显示器时据此区分是哪一项。
 ///
 /// 降级路径的判据：`raised=true` + `defview=0` + `z_order_anchor="bottom"` +
 /// `style_has_child=false` + `exstyle_has_layered=false`。
@@ -1048,6 +1347,7 @@ fn log_embed_success(
     z_order_anchor: &str,
     host: HWND,
     z_anchor_ok: bool,
+    cursor_wait_reset: bool,
     display_id: &str,
     arrangement: Arrangement,
     x: i32,
@@ -1075,7 +1375,7 @@ fn log_embed_success(
                 defview.is_some_and(|d| subtree_has_class(d, windows::core::w!("SysListView32"))),
                 subtree_has_class(workerw, windows::core::w!("SHELLDLL_DefView")),
                 subtree_has_class(workerw, windows::core::w!("SysListView32")),
-                progman_child_chain_summary(progman),
+                host_child_chain_summary(host, hwnd),
             )
         } else {
             (false, false, false, Vec::new())
@@ -1095,6 +1395,7 @@ fn log_embed_success(
         exstyle_has_layered,
         z_order_anchor,
         z_anchor_ok,
+        cursor_wait_reset,
         defview_has_icon_list,
         workerw_has_defview,
         workerw_has_icon_list,
@@ -1479,6 +1780,40 @@ mod tests {
     }
 
     #[test]
+    fn decide_zorder_repair_matrix() {
+        // 非 raised desktop（旧层级）：不适用
+        assert_eq!(
+            decide_zorder_repair(false, true, true, true, false),
+            ZOrderRepair::NotApplicable
+        );
+        // 未找到 DefView（用户关闭"显示桌面图标"）：不适用
+        assert_eq!(
+            decide_zorder_repair(true, false, true, true, false),
+            ZOrderRepair::NotApplicable
+        );
+        // 宿主未解析（DefView 父链不在 Progman 之下）：需重嵌
+        assert_eq!(
+            decide_zorder_repair(true, true, false, true, false),
+            ZOrderRepair::NeedsReembed
+        );
+        // 父窗口不符（DefView 换层、窗口仍挂旧宿主）：需重嵌
+        assert_eq!(
+            decide_zorder_repair(true, true, true, false, false),
+            ZOrderRepair::NeedsReembed
+        );
+        // 已在锚点之下：零写入，结论 Ok
+        assert_eq!(
+            decide_zorder_repair(true, true, true, true, true),
+            ZOrderRepair::Ok
+        );
+        // 宿主正确但被外部抬高：判定需修复（Fixed 只是判定，实际写入由 Win32 封装做）
+        assert_eq!(
+            decide_zorder_repair(true, true, true, true, false),
+            ZOrderRepair::Fixed
+        );
+    }
+
+    #[test]
     fn is_below_anchor_matrix() {
         let anchor = fake_hwnd(0x100);
 
@@ -1490,6 +1825,38 @@ mod tests {
         assert!(!is_below_anchor(HWND::default(), anchor));
         // 锚点无效：不成立
         assert!(!is_below_anchor(anchor, HWND::default()));
+    }
+
+    #[test]
+    fn is_after_in_chain_matrix() {
+        let anchor = fake_hwnd(0x100);
+        let target = fake_hwnd(0x300);
+        let other = fake_hwnd(0x200);
+
+        // 链序自上而下：target 位于 anchor 之后 → 成立（紧邻与中间夹兄弟均可）
+        assert!(is_after_in_chain(&[anchor, target], anchor, target));
+        assert!(is_after_in_chain(&[anchor, other, target], anchor, target));
+        // target 位于 anchor 之前 → 不成立
+        assert!(!is_after_in_chain(&[target, anchor], anchor, target));
+        // target 缺失 → 不成立
+        assert!(!is_after_in_chain(&[anchor, other], anchor, target));
+        // anchor 缺失 → 不成立
+        assert!(!is_after_in_chain(&[other, target], anchor, target));
+        // 空链 → 不成立
+        assert!(!is_after_in_chain(&[], anchor, target));
+        // 无效句柄 → 不成立
+        assert!(!is_after_in_chain(
+            &[HWND::default(), target],
+            HWND::default(),
+            target
+        ));
+        assert!(!is_after_in_chain(
+            &[anchor, HWND::default()],
+            anchor,
+            HWND::default()
+        ));
+        // anchor 与 target 为同一窗口（互不为"之后"）→ 不成立
+        assert!(!is_after_in_chain(&[other, anchor], anchor, anchor));
     }
 
     #[test]
@@ -1561,12 +1928,12 @@ mod tests {
     }
 
     #[test]
-    fn progman_child_chain_summary_no_panic() {
+    fn host_child_chain_summary_no_panic() {
         // 真实桌面上遍历 Progman 直接子窗口链：不 panic，且长度受 64 上限约束。
         let progman = unsafe { FindWindowW(windows::core::w!("Progman"), None) };
         if let Ok(hwnd) = progman {
-            let chain = progman_child_chain_summary(hwnd);
-            assert!(chain.len() < 64, "子窗口链长度应受上限约束");
+            let chain = host_child_chain_summary(hwnd, HWND::default());
+            assert!(chain.len() <= MAX_SIBLINGS, "子窗口链长度应受上限约束");
             for item in &chain {
                 assert!(item.contains("#vis="), "每项应含可见性字段: {item}");
             }
@@ -1819,5 +2186,119 @@ mod tests {
         // 在无头/受限环境下可能返回 Err（找不到 Progman/WorkerW），但不应 panic。
         // 仅调用并丢弃结果——若 panic 则测试失败，Ok/Err 均合法。
         let _ = find_workerw_no_retry();
+    }
+
+    // ── raised 分支 z 序写入顺序（Win11 24H2 壁纸盖住桌面图标修复）────────────
+    //
+    // 真机日志 sibling_chain 曾出现"壁纸窗口排在 DefView 之上，而 z_anchor_ok=true"
+    // 的矛盾：根因是 ShowWindow 排在锚点插入之后，首次显示把窗口提到宿主子窗口 z 序
+    // 顶部，而 z 序校验发生在显示之前。此测试断言源码顺序，防止回归。
+
+    /// raised 分支内 ShowWindow → 锚点 SetWindowPos → ensure_below_anchor 的源码顺序。
+    #[test]
+    fn raised_branch_show_window_precedes_z_anchor_insert() {
+        let source = include_str!("worker_w.rs");
+        // 截取 raised 分支片段：从 EmbedPath 匹配到旧层级分支注释。
+        let branch_marker = ["if let EmbedPath::", "RaisedLayered(defview)"].join("");
+        let legacy_marker = ["旧", "层级：行为"].join("");
+        let branch_start = source.find(&branch_marker).expect("应存在 raised 分支");
+        let branch_end = branch_start
+            + source[branch_start..]
+                .find(&legacy_marker)
+                .expect("raised 分支之后应有旧层级分支");
+        let branch = &source[branch_start..branch_end];
+
+        // 搜索串运行期拼接，避免 include_str! 将测试自身字面量计入匹配。
+        let show = ["Show", "Window(wp_hwnd, SW_SHOW)"].join("");
+        let set_window_pos = ["SetWindow", "Pos("].join("");
+        let ensure_below = ["ensure_below", "_anchor("].join("");
+
+        assert_eq!(
+            branch.matches(&show).count(),
+            1,
+            "raised 分支应有 1 处 ShowWindow(wp_hwnd, SW_SHOW)"
+        );
+        let show_pos = branch.find(&show).expect("raised 分支应显示壁纸窗口");
+        let anchor_pos = branch
+            .find(&set_window_pos)
+            .expect("raised 分支应调用锚点 SetWindowPos");
+        // 锚点调用参数紧随其后，校验确实是插入到 defview 的那个调用。
+        let anchor_args = &branch[anchor_pos..(anchor_pos + 120).min(branch.len())];
+        assert!(
+            anchor_args.contains("wp_hwnd") && anchor_args.contains("defview"),
+            "raised 分支的 SetWindowPos 应为 wp_hwnd 插入到 defview 的锚点调用"
+        );
+        let ensure_pos = branch
+            .find(&ensure_below)
+            .expect("raised 分支应调用 ensure_below_anchor");
+
+        assert!(
+            show_pos < anchor_pos,
+            "ShowWindow 必须先于锚点 SetWindowPos（首次显示会把窗口提到兄弟 z 序顶部）"
+        );
+        assert!(
+            anchor_pos < ensure_pos,
+            "ensure_below_anchor 必须是最后一次 z 序写入，应位于锚点 SetWindowPos 之后"
+        );
+    }
+
+    // ── 嵌入后延迟 z 序复核（同步校验覆盖不到的系统延迟提交）─────────────
+    //
+    // 真机故障为"校验时通过、之后 z 序又被改变"：同步校验只能覆盖 SetParent /
+    // SetWindowPos 的即时结果。此测试通过 include_str! 断言源码契约存在，
+    // 搜索串运行期拼接以避免自匹配。
+
+    /// 延迟 z 序复核的源码契约：raised 分支调度复核，复核复用直接子 DefView 且只改 z 序。
+    #[test]
+    fn delayed_zorder_recheck_contract() {
+        let source = include_str!("worker_w.rs");
+
+        // raised 分支必须在嵌入成功后调度延迟复核。
+        let schedule_call = ["schedule_zorder", "_recheck(wp_hwnd)"].join("");
+        assert!(
+            source.contains(&schedule_call),
+            "raised 分支应调用 {schedule_call}（嵌入后延迟复核 z 序）"
+        );
+
+        // 截取复核函数片段：从函数声明到其后下一个函数声明。
+        let func_marker = ["fn verify_and_fix", "_below_defview"].join("");
+        let func_start = source.find(&func_marker).expect("应存在延迟 z 序复核函数");
+        let func_body_start = func_start + func_marker.len();
+        let func_end = func_body_start
+            + source[func_body_start..]
+                .find("\nfn ")
+                .expect("复核函数之后应有下一个函数");
+        let func = &source[func_start..func_end];
+
+        // 锚点必须是"当前父窗口的直接子 DefView"（兼容宿主为 Progman 或 Progman 子 WorkerW）。
+        let find_direct = ["find_", "defview(parent)"].join("");
+        assert!(
+            func.contains(&find_direct),
+            "复核应使用当前父窗口的直接子 DefView 作锚点"
+        );
+        // 修正复用 insert_below 封装（仅调整 z 序，不移动/缩放/激活）。
+        let insert_call = ["insert_", "below(hwnd, defview)"].join("");
+        assert!(
+            func.contains(&insert_call),
+            "复核应调用 {insert_call} 修正锚点"
+        );
+
+        // 截取 insert_below 片段：从函数声明到其后下一个函数声明，校验 z 序标志位。
+        let insert_marker = ["fn ", "insert_below"].join("");
+        let insert_start = source
+            .find(&insert_marker)
+            .expect("应存在 insert_below 辅助函数");
+        let insert_body_start = insert_start + insert_marker.len();
+        let insert_end = insert_body_start
+            + source[insert_body_start..]
+                .find("\nfn ")
+                .expect("insert_below 之后应有下一个函数");
+        let insert_fn = &source[insert_start..insert_end];
+
+        let set_flags = ["SWP_NOMOVE | SWP_NOSIZE | ", "SWP_NOACTIVATE"].join("");
+        assert!(
+            insert_fn.contains(&set_flags),
+            "insert_below 的 SetWindowPos 应仅调整 z 序（不移动/不缩放/不激活）"
+        );
     }
 }

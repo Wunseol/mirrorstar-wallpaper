@@ -115,7 +115,7 @@ cargo tauri build          # 生成 NSIS 安装包（含资源）
 - `build`：空对象（无 `beforeBuildCommand` / `frontendDist` / `devUrl`，不依赖前端产物）。
 - `app.security.csp`：`default-src 'self'`；`app.withGlobalTauri`: `false`；`app.windows`: `[]`。
 
-> 项目不再使用自动发布；打包由本地 `cargo tauri build` 完成。Tauri v2 NSIS 默认启用签名，需在本地配置签名私钥（环境变量 `TAURI_SIGNING_PRIVATE_KEY` / `TAURI_SIGNING_PRIVATE_KEY_PASSWORD`），否则打包失败。
+> 项目不再使用自动发布；打包由本地 `cargo tauri build` 完成。仓库 `tauri.conf.json` 未启用 updater / `createUpdaterArtifacts`，常规 NSIS 打包无需签名私钥，直接执行即可生成安装包；仅当启用 updater artifacts 时才需要配置 `TAURI_SIGNING_PRIVATE_KEY` / `TAURI_SIGNING_PRIVATE_KEY_PASSWORD`。
 
 ## 6. 构建工具链版本
 
@@ -127,7 +127,7 @@ cargo tauri build          # 生成 NSIS 安装包（含资源）
 | Tauri CLI | ^2.11 | 本地执行 `cargo install tauri-cli --version "^2.11" --locked` |
 | Slint | 1.18 | `crates/mirrorstar-ui/Cargo.toml`（`default-features = false` + `renderer-software`） |
 | webview2-com | 0.34 | 根 `Cargo.toml`（评估保持 0.34：0.38 传递依赖 windows 0.61 与 workspace windows 0.58 不兼容） |
-| mpv（运行时） | 20260903 | 手动下载官方 release `20260903`（SHA256 校验）并放入 `mpv/` |
+| mpv（运行时） | 20260903 | 需手动下载官方 release `20260903` 并放入 `mpv/`；构建期只校验文件存在（`tauri_build` 资源存在性校验），无内置哈希校验 |
 
 ### 依赖与版本要点
 
@@ -159,7 +159,7 @@ cargo tauri build          # 生成 NSIS 安装包（含资源）
 - 版本号唯一来源为 `Cargo.toml` 的 `workspace.package.version`（`tauri.conf.json` 已移除独立 `version` 字段，避免双处硬编码漂移）。
 - `Cargo.lock` 已提交（二进制应用的正确做法）。
 - CSP 使用严格策略（`default-src 'self'`），capabilities 权限最小化，`withGlobalTauri: false`，assetProtocol 已整体移除（`tauri` 依赖亦不含 `protocol-asset` feature）。
-- `.cargo/config.toml` 不配置 crates.io 镜像替换（仅保留 `[net] git-fetch-with-cli = true`）；并对 `cfg(windows)` 注入 `/MANIFESTDEPENDENCY`（Common-Controls v6），修复 `cargo test` 生成的可执行文件因缺 manifest 而 `0xC0000139` 崩溃的问题。
+- `.cargo/config.toml`：不配置 crates.io 镜像替换（仅保留 `[net] git-fetch-with-cli = true`，需要镜像请在用户级配置中添加）；Windows 目标注入两项链接 flag，**均不可移除且必须共存**：① `-C target-feature=+crt-static` 让主壳与 `mirrorstar-ui.exe` 自带 CRT，纯净 Win10/Win11 免装 VC++ 运行库（实测各增约 131 KiB / 157 KiB）；② `link-arg=/MANIFESTDEPENDENCY`（Common-Controls v6），供 `cargo test` 产物激活 comctl32 v6、避免 `0xC0000139`。第三方预编译的 `mpv/mpv.exe` 本身不依赖 VCRUNTIME，不受影响。
 
 ### 8.2 主窗口 UI sidecar 构建机制
 
@@ -178,7 +178,6 @@ cargo tauri build          # 生成 NSIS 安装包（含资源）
 
 ### 8.4 待确认项（未实施，登记备查）
 
-- `mirrorstar-ui` / `mirrorstar-wp-proc` 声明了直接依赖 `serde` 但源码仅用 `serde_json`（属依赖图声明变更，待单独处理）。
 - `capabilities/default.json` 中 `dialog:allow-open` 已被 `dialog:default` 覆盖；`gen/schemas/` 下 `desktop-schema.json` 与 `windows-schema.json` 字节相同且入库；`rustfmt.toml` 多项为默认值。
 
 ## 9. 常见问题
@@ -187,10 +186,11 @@ cargo tauri build          # 生成 NSIS 安装包（含资源）
 |------|----------|
 | `link.exe not found` | 安装 VS Build Tools，勾选 "Desktop development with C++" |
 | windows-rs 编译失败 | 确保 Windows SDK (≥ 10.0.19041) 已安装 |
-| WebView2 相关错误 | WebView2 SDK 随 VS Build Tools 安装（仅网页壁纸/预览需要） |
+| WebView2 相关错误 | 网页壁纸/预览需系统已安装 WebView2 Runtime；Rust 绑定由 `webview2-com` 0.34 crate 提供（随 `cargo build` 拉取），无需安装 WebView2 SDK |
 | 找不到 `mirrorstar-ui.exe` | 正常构建会自动生成并复制到 `target/release/`；若手动运行，先 `cargo build -p mirrorstar-ui` |
 | 缺少 `mpv.exe` 导致 `src-tauri` 编译失败 | 将 mpv.exe 放入 `mpv/`（`tauri_build::try_build` 编译期校验其存在） |
 | 中文/空格路径 | 项目路径避免中文字符与空格 |
+| 干净 Win10 未预装 WebView2 Runtime | 已知限制：网页壁纸与网页预览依赖 WebView2 Runtime；本版本未做离线内嵌安装，需联网安装该运行时，或使用已预装 WebView2 的 Win11 |
 
 ***
 

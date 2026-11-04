@@ -1313,6 +1313,13 @@ impl WallpaperEngine {
     /// - 300s 兜底轮询每次都会走到本方法，若无条件重嵌，会每 5 分钟制造一次
     ///   重排/合成抖动（视频宿主还可能因 `SWP_FRAMECHANGED` 闪一帧）。
     ///
+    /// 附着判定只确认父窗口正确，不能保证 z 序仍然正确（运行期可能被 DefView
+    /// 重建、第三方置顶工具等外部因素抬高）。因此仍附着的窗口会先做一次**零写入**
+    /// 的 z 序体检（`reassert_zorder`）：仅在检测到 z 序错误时才重断言锚点
+    ///（`ZOrderRepair::Fixed`，只做 z 序写入、不重嵌）；宿主已变
+    ///（`ZOrderRepair::NeedsReembed`）才落到下面的重嵌逻辑；重断言失败
+    ///（`ZOrderRepair::Failed`）只记 `warn` 不重嵌（避免每 5 分钟抖动）。
+    ///
     /// # 锁顺序（重要）
     ///
     /// `check_and_reinitialize` 与逐屏重嵌都在 `self.desktop` 锁内执行，而重建路径
@@ -1384,8 +1391,36 @@ impl WallpaperEngine {
                         .map(|desktop| desktop.is_attached_to_wallpaper_layer(hwnd))
                         .unwrap_or(false);
                     if attached {
-                        skipped += 1;
-                        continue;
+                        // 附着只说明父窗口对；z 序可能被外部改变（DefView 重建、第三方工具置顶等）。
+                        let repair = self
+                            .desktop
+                            .lock()
+                            .map(|desktop| desktop.reassert_zorder(hwnd))
+                            .unwrap_or(crate::desktop::worker_w::ZOrderRepair::NotApplicable);
+                        match repair {
+                            crate::desktop::worker_w::ZOrderRepair::Ok
+                            | crate::desktop::worker_w::ZOrderRepair::NotApplicable => {
+                                skipped += 1;
+                                continue;
+                            }
+                            crate::desktop::worker_w::ZOrderRepair::Fixed => {
+                                healed += 1;
+                                tracing::info!(
+                                    display_id,
+                                    "桌面层自愈：壁纸 z 序被外部改变，已重断言锚点（未重嵌）"
+                                );
+                                continue;
+                            }
+                            crate::desktop::worker_w::ZOrderRepair::Failed => {
+                                failed += 1;
+                                tracing::warn!(
+                                    display_id,
+                                    "桌面层自愈：z 序重断言失败，壁纸可能仍在 DefView 之上遮挡桌面图标"
+                                );
+                                continue;
+                            }
+                            crate::desktop::worker_w::ZOrderRepair::NeedsReembed => {}
+                        }
                     }
                     // 半脱离（仍在但父级不对，如历史上半摘出残留）→ 重嵌恢复。
                     let embed_result = self
@@ -2747,6 +2782,18 @@ mod tests {
         assert!(
             body.contains("在逐屏循环前释放"),
             "desktop 锁必须在逐屏循环前释放（重建路径会再次获取同一把锁，锁不可重入）"
+        );
+        // 运行期 z 序体检（零写入）+ z 序错误时重断言锚点（不重嵌）。
+        // 运行期拼接搜索串，避免 include_str! 把测试自身的字面量计入匹配。
+        let reassert = ["reassert_", "zorder"].join("");
+        assert!(
+            body.contains(&reassert),
+            "仍附着的窗口应做运行期 z 序体检（{reassert}）"
+        );
+        let fixed_marker = ["ZOrderRepair::", "Fixed"].join("");
+        assert!(
+            body.contains(&fixed_marker),
+            "z 序错误（{fixed_marker}）时应重断言锚点而非重嵌"
         );
     }
 

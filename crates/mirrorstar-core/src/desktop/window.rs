@@ -1,4 +1,7 @@
-use windows::Win32::Foundation::{GetLastError, SetLastError, COLORREF, HWND, WIN32_ERROR};
+use std::time::{Duration, Instant};
+
+use windows::Win32::Foundation::{GetLastError, SetLastError, COLORREF, HWND, POINT, WIN32_ERROR};
+use windows::Win32::System::Threading::{AttachThreadInput, GetCurrentThreadId};
 use windows::Win32::UI::WindowsAndMessaging::*;
 
 use crate::MirrorStarError;
@@ -444,6 +447,230 @@ fn refresh_frame_changed(hwnd: HWND) {
     }
 }
 
+// ── 显示后等待光标复位（Win11 raised desktop / 后台 NOACTIVATE 窗口）──────
+
+/// 检测系统等待态（`IDC_WAIT`）的轮询间隔（毫秒）。
+///
+/// 壁纸窗口 `ShowWindow(SW_SHOW)` 后 Windows 才把光标切到 `IDC_WAIT`；固定延迟
+/// 会留下可感知的等待指针窗口。改为短间隔轮询，检测到等待态立即复位，
+/// 把可见等待压缩到 1 帧以内。
+///
+/// 壁纸路径与纯净模式路径共用同一份取值。
+pub const CURSOR_WAIT_POLL_INTERVAL_MS: u64 = 2;
+
+/// 等待系统进入等待态的最长轮询时间（毫秒）。
+///
+/// 正常显示窗口后系统在一个输入周期内设置等待态；250ms 足够覆盖慢机/低帧率。
+/// 超时说明鼠标不在壁纸窗口上（或系统未设置等待态），无需继续挂接。
+///
+/// 壁纸路径与纯净模式路径共用同一份取值。
+pub const CURSOR_WAIT_POLL_MAX_MS: u64 = 250;
+
+/// 判定鼠标下窗口是否属于壁纸窗口子树（纯函数，便于单测）。
+///
+/// `hover` 为 `WindowFromPoint` 返回的鼠标下窗口，`hover_parent` /
+/// `hover_grandparent` 为其父窗口与祖父窗口（由 `GetAncestor(GA_PARENT)` 逐级取得），
+/// 用于覆盖 mpv 视频输出等非顶层子窗口。任一无效句柄按不匹配处理：`WindowFromPoint`
+/// 在鼠标位于桌面空白处时可能返回 Progman/DefView，不能据此改动非壁纸窗口的光标。
+fn is_wallpaper_subtree(
+    hover: HWND,
+    hwnd: HWND,
+    hover_parent: HWND,
+    hover_grandparent: HWND,
+) -> bool {
+    if hwnd.is_invalid() {
+        return false;
+    }
+    let matches = |h: HWND| !h.is_invalid() && h == hwnd;
+    matches(hover) || matches(hover_parent) || matches(hover_grandparent)
+}
+
+/// 判定系统光标是否处于"指针下后台窗口忙碌"表现（纯函数，便于单测）。
+///
+/// 后台窗口（如带 `WS_EX_NOACTIVATE` 的壁纸窗口）忙碌时，系统会给出两种忙碌态光标：
+/// `IDC_WAIT`（纯蓝圈）与 `IDC_APPSTARTING`（箭头+蓝圈），二者都需复位为箭头。
+/// `current` 为无效句柄（`GetCursorInfo` 失败或光标隐藏）时按不匹配处理。
+fn is_busy_cursor(current: HCURSOR, wait_cursor: HCURSOR, appstarting_cursor: HCURSOR) -> bool {
+    if current.is_invalid() {
+        return false;
+    }
+    current == wait_cursor || current == appstarting_cursor
+}
+
+/// 是否应把当前线程挂接到目标线程以复位光标（纯函数，便于单测）。
+///
+/// 目标线程为 0（取不到线程）、与当前线程相同（当前线程已拥有该输入队列，直接
+/// `SetCursor` 即可、无需挂接）或目标窗口无响应（挂接可能一起挂死）时返回 false。
+pub fn should_attach_cursor_thread(target_tid: u32, current_tid: u32, target_hung: bool) -> bool {
+    target_tid != 0 && target_tid != current_tid && !target_hung
+}
+
+/// 把箭头光标强制设到目标线程的输入队列（`AttachThreadInput` → `SetCursor` → 解挂）。
+///
+/// 成功返回被替换的旧光标（供调用方记录 previous_cursor）；加载箭头失败或挂接失败
+/// 返回 None（失败原因已由内部 warn 记录）。挂接成功后无论 SetCursor 结果如何都必须
+/// 解挂，避免长期共享输入队列。调用方负责判定"何时该复位"。
+pub fn force_arrow_cursor(target_tid: u32) -> Option<HCURSOR> {
+    // SAFETY: LoadCursorW 仅加载系统预置光标资源，不分配需显式释放的句柄。
+    let arrow = match unsafe { LoadCursorW(None, IDC_ARROW) } {
+        Ok(cursor) => cursor,
+        Err(e) => {
+            tracing::warn!(error = %e, "光标复位：加载箭头光标失败");
+            return None;
+        }
+    };
+    // SAFETY: GetCurrentThreadId 无额外前置条件。
+    let current_tid = unsafe { GetCurrentThreadId() };
+    // SAFETY: AttachThreadInput 挂接到目标线程的输入队列；两线程同属当前桌面，
+    // 目标线程有效性由调用方判定。
+    if !unsafe { AttachThreadInput(current_tid, target_tid, true) }.as_bool() {
+        tracing::warn!(target_tid, "光标复位：AttachThreadInput 挂接失败");
+        return None;
+    }
+    // SAFETY: 已挂接目标线程输入队列，SetCursor 在其输入队列上生效，仅改光标形状。
+    let previous = unsafe { SetCursor(arrow) };
+    // SAFETY: 必须解除挂接，避免长期共享输入队列。
+    if !unsafe { AttachThreadInput(current_tid, target_tid, false) }.as_bool() {
+        tracing::warn!(target_tid, "光标复位：AttachThreadInput 解除失败");
+    }
+    Some(previous)
+}
+
+/// 复位壁纸窗口的等待态光标；返回复位流程是否已启动（线程创建成功）。
+///
+/// # 根因
+///
+/// raised desktop 下壁纸窗口（`MirrorStarVideoHost` 窗口类）由后台线程创建、
+/// 带 `WS_EX_NOACTIVATE` 并以 `SWP_NOACTIVATE` 嵌入显示。Windows 会在这类
+/// "后台出现的全屏窗口"上显示系统 `IDC_WAIT`（Win11 的纯蓝圈）；该窗口不属于前台
+/// 输入队列，`WM_SETCURSOR` / `SetCursor` 无法改写光标形状，蓝圈会持续到窗口隐藏。
+/// 同一窗口类在纯净模式覆盖窗场景已复现并修复（见
+/// `src-tauri/src/platform/pure_mode.rs` 的 `reset_pure_mode_cursor`）。
+///
+/// # 手段
+///
+/// 立即返回并在独立线程内以 2ms 间隔、最长 250ms 轮询系统光标：一旦出现 `IDC_WAIT` /
+/// `IDC_APPSTARTING` 且鼠标位于壁纸窗口（或其子窗口）上，把该线程临时 `AttachThreadInput`
+/// 到鼠标下窗口所属线程，`SetCursor(IDC_ARROW)` 后立即解除挂接（见
+/// [`force_arrow_cursor`]）。实测可在**不抢前台**的前提下把 `IDC_WAIT` /
+/// `IDC_APPSTARTING` 复位为箭头。
+///
+/// 只处理"鼠标下窗口属于壁纸窗口子树"的情形；桌面 / 任务栏 / 其它应用窗口一律不碰。
+/// 线程创建失败仅 warn 并返回 false，不阻断调用方。
+pub(crate) fn reset_wait_cursor_after_show(hwnd: HWND) -> bool {
+    // HWND 内部是裸指针、未实现 Send，跨线程序列化为 isize，在复位线程内按原值重建。
+    let raw = hwnd.0 as isize;
+    match std::thread::Builder::new()
+        .name("mirrorstar-cursor-reset".to_string())
+        .spawn(move || poll_and_reset_wait_cursor(HWND(raw as *mut std::ffi::c_void)))
+    {
+        Ok(_) => true,
+        Err(e) => {
+            tracing::warn!(
+                hwnd = raw,
+                error = %e,
+                "壁纸窗口光标复位：创建复位线程失败，系统等待光标可能持续"
+            );
+            false
+        }
+    }
+}
+
+/// 光标复位线程主体：轮询忙碌态并在命中时复位（根因与手段见调用方文档）。
+///
+/// 忙碌态同时覆盖 `IDC_WAIT`（纯蓝圈）与 `IDC_APPSTARTING`（箭头+蓝圈）。
+/// 先在当前线程强制创建输入队列（`AttachThreadInput` 需要同桌面输入队列），
+/// 再按 2ms 间隔轮询；窗口销毁 / 超时 / 鼠标不在壁纸窗口上均直接退出。
+fn poll_and_reset_wait_cursor(hwnd: HWND) {
+    // SAFETY: PeekMessageW 传入 PM_NOREMOVE 只强制创建当前线程的输入队列，
+    // 不取出、不销毁任何消息（返回值无需关心）。
+    unsafe {
+        let _ = PeekMessageW(&mut MSG::default(), None, 0, 0, PM_NOREMOVE);
+    }
+
+    // SAFETY: LoadCursorW 仅加载系统预置光标资源，不分配需显式释放的句柄。
+    let wait_cursor = match unsafe { LoadCursorW(None, IDC_WAIT) } {
+        Ok(cursor) => cursor,
+        Err(e) => {
+            tracing::warn!(error = %e, "壁纸窗口光标复位：加载等待光标失败");
+            return;
+        }
+    };
+    // SAFETY: 同上，IDC_APPSTARTING 亦为系统预置光标资源。
+    let appstarting_cursor = match unsafe { LoadCursorW(None, IDC_APPSTARTING) } {
+        Ok(cursor) => cursor,
+        Err(e) => {
+            tracing::warn!(error = %e, "壁纸窗口光标复位：加载忙碌光标失败");
+            return;
+        }
+    };
+    let deadline = Instant::now() + Duration::from_millis(CURSOR_WAIT_POLL_MAX_MS);
+    while Instant::now() < deadline {
+        // SAFETY: IsWindow 仅查询句柄有效性，不解引用窗口对象。
+        if !unsafe { IsWindow(hwnd) }.as_bool() {
+            return;
+        }
+        let mut info = CURSORINFO {
+            cbSize: std::mem::size_of::<CURSORINFO>() as u32,
+            ..Default::default()
+        };
+        // SAFETY: GetCursorInfo 仅把系统光标状态写入栈上结构体，cbSize 已按规范初始化。
+        if unsafe { GetCursorInfo(&mut info) }.is_ok()
+            && is_busy_cursor(info.hCursor, wait_cursor, appstarting_cursor)
+        {
+            // 忙碌态已出现：鼠标不在壁纸窗口上则立即结束，不做无意义挂接。
+            let mut point = POINT::default();
+            // SAFETY: GetCursorPos 仅读取光标屏幕坐标。
+            if unsafe { GetCursorPos(&mut point) }.is_err() {
+                return;
+            }
+            // SAFETY: WindowFromPoint 仅按坐标返回鼠标下窗口句柄，不修改窗口状态。
+            let hover = unsafe { WindowFromPoint(point) };
+            // SAFETY: GetAncestor 仅查询窗口关系，不修改窗口状态。
+            let hover_parent = unsafe { GetAncestor(hover, GA_PARENT) };
+            let hover_grandparent = unsafe { GetAncestor(hover_parent, GA_PARENT) };
+            if !is_wallpaper_subtree(hover, hwnd, hover_parent, hover_grandparent) {
+                tracing::debug!(
+                    hover = hover.0 as isize,
+                    "壁纸窗口光标复位：鼠标不在壁纸窗口上，跳过"
+                );
+                return;
+            }
+
+            // SAFETY: GetWindowThreadProcessId 仅查询窗口所属线程/进程标识。
+            let target_tid = unsafe { GetWindowThreadProcessId(hover, None) };
+            // SAFETY: GetCurrentThreadId 无额外前置条件。
+            let current_tid = unsafe { GetCurrentThreadId() };
+            // SAFETY: IsHungAppWindow 仅查询窗口响应状态，不发送消息。
+            let target_hung = unsafe { IsHungAppWindow(hover) }.as_bool();
+            if !should_attach_cursor_thread(target_tid, current_tid, target_hung) {
+                tracing::debug!(
+                    target_tid,
+                    current_tid,
+                    target_hung,
+                    "壁纸窗口光标复位：目标线程不可挂接，跳过"
+                );
+                return;
+            }
+
+            // 失败已由 force_arrow_cursor 内部 warn 记录，此处无需额外处理。
+            if let Some(previous) = force_arrow_cursor(target_tid) {
+                tracing::info!(
+                    target_tid,
+                    previous_cursor = previous.0 as isize,
+                    "壁纸窗口光标已从系统等待/忙碌态复位为箭头"
+                );
+            }
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(CURSOR_WAIT_POLL_INTERVAL_MS));
+    }
+    tracing::debug!(
+        hwnd = hwnd.0 as isize,
+        "壁纸窗口光标复位：未观察到系统等待态，跳过"
+    );
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -672,5 +899,123 @@ mod tests {
             set_mouse_passthrough(hwnd, true);
         }
         // Progman 找不到时（极端情况）跳过，不 panic 即通过
+    }
+
+    // ── is_wallpaper_subtree 判定矩阵（壁纸窗口等待光标复位）──────────────
+    //
+    // 光标复位只允许作用在壁纸窗口子树上，误判会把等待光标复位到桌面/任务栏等
+    // 其它窗口。此处用伪造句柄覆盖判定矩阵，不依赖真实桌面环境。
+
+    /// 构造伪造 HWND：仅用于纯函数判定，不解引用、不传给 Win32 API。
+    fn fake_hwnd(value: isize) -> HWND {
+        HWND(value as *mut std::ffi::c_void)
+    }
+
+    /// 鼠标下窗口为壁纸窗口自身 / 直接子窗口 / 孙窗口时成立；无关窗口与无效句柄不成立。
+    #[test]
+    fn is_wallpaper_subtree_matrix() {
+        let wallpaper = fake_hwnd(0x1234);
+        let child = fake_hwnd(0x5678);
+        let grandchild = fake_hwnd(0x9ABC);
+        let unrelated = fake_hwnd(0xDEF0);
+
+        // 鼠标下窗口即壁纸窗口本身
+        assert!(is_wallpaper_subtree(
+            wallpaper, wallpaper, unrelated, unrelated
+        ));
+        // 鼠标下窗口为直接子窗口（父窗口 == 壁纸窗口）
+        assert!(is_wallpaper_subtree(child, wallpaper, wallpaper, unrelated));
+        // 鼠标下窗口为孙窗口（祖父窗口 == 壁纸窗口）
+        assert!(is_wallpaper_subtree(
+            grandchild, wallpaper, unrelated, wallpaper
+        ));
+        // 与壁纸窗口无关的窗口：不成立
+        assert!(!is_wallpaper_subtree(
+            unrelated, wallpaper, unrelated, unrelated
+        ));
+        // 壁纸窗口无效（已销毁）：一律不成立
+        assert!(!is_wallpaper_subtree(
+            wallpaper,
+            HWND::default(),
+            unrelated,
+            unrelated
+        ));
+        // 祖先句柄无效（GetAncestor 取不到）：按不匹配处理
+        assert!(!is_wallpaper_subtree(
+            child,
+            wallpaper,
+            HWND::default(),
+            HWND::default()
+        ));
+        // 空句柄自身不应与任何窗口匹配
+        assert!(!is_wallpaper_subtree(
+            HWND::default(),
+            wallpaper,
+            HWND::default(),
+            HWND::default()
+        ));
+    }
+
+    // ── is_busy_cursor 判定矩阵（IDC_WAIT / IDC_APPSTARTING 两类忙碌态）──────
+    //
+    // 系统忙碌光标有纯蓝圈（IDC_WAIT）与箭头+蓝圈（IDC_APPSTARTING）两种，
+    // 仅这两种需要复位；其它光标与无效句柄都不能误伤。
+
+    /// 构造伪造 HCURSOR：仅用于纯函数判定，不解引用、不传给 Win32 API。
+    fn fake_cursor(value: isize) -> HCURSOR {
+        HCURSOR(value as *mut std::ffi::c_void)
+    }
+
+    /// IDC_WAIT / IDC_APPSTARTING 命中；其它光标与无效句柄不命中。
+    #[test]
+    fn is_busy_cursor_matrix() {
+        let wait = fake_cursor(0x1111);
+        let appstarting = fake_cursor(0x2222);
+        let arrow = fake_cursor(0x3333);
+        let unrelated = fake_cursor(0x4444);
+
+        // 纯蓝圈（IDC_WAIT）命中
+        assert!(is_busy_cursor(wait, wait, appstarting));
+        // 箭头+蓝圈（IDC_APPSTARTING）命中
+        assert!(is_busy_cursor(appstarting, wait, appstarting));
+        // 普通箭头/其它光标不命中
+        assert!(!is_busy_cursor(arrow, wait, appstarting));
+        assert!(!is_busy_cursor(unrelated, wait, appstarting));
+        // 无效句柄（GetCursorInfo 失败或光标隐藏）按不匹配处理
+        assert!(!is_busy_cursor(HCURSOR::default(), wait, appstarting));
+    }
+
+    // ── force_arrow_cursor 契约（挂接序列已收敛到核心）────────────────────
+
+    /// `force_arrow_cursor` 必须完整执行「挂接 → SetCursor → 解挂」：
+    /// 挂接与解挂各一次（`AttachThreadInput` 出现≥2 次），且确实调用了 `SetCursor`。
+    #[test]
+    fn force_arrow_cursor_contract() {
+        let source = include_str!("window.rs");
+        // 运行期拼接搜索串，避免 include_str! 把测试自身的字面量计入匹配。
+        let attach = ["Attach", "ThreadInput"].join("");
+        let set_cursor = ["Set", "Cursor"].join("");
+        let fn_head = "fn force_arrow_cursor";
+        let fn_start = source
+            .find(fn_head)
+            .expect("源码应含 force_arrow_cursor 定义");
+        let body_start = fn_start + fn_head.len();
+        let fn_end = body_start
+            + source[body_start..]
+                .find("fn ")
+                .expect("force_arrow_cursor 之后应另有函数定义");
+        let body = &source[fn_start..fn_end];
+        assert!(
+            body.contains(&attach),
+            "force_arrow_cursor 应使用 {attach} 挂接到目标线程输入队列"
+        );
+        assert!(
+            body.contains(&set_cursor),
+            "force_arrow_cursor 应使用 {set_cursor} 写入箭头光标"
+        );
+        assert!(
+            body.matches(&attach).count() >= 2,
+            "force_arrow_cursor 挂接成功后必须解挂（{attach} 应出现≥2 次）"
+        );
     }
 }

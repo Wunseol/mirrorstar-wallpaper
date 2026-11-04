@@ -6,7 +6,8 @@
 > - **v4.0 findings**：17 项（ST-001~ST-017），已逐项对照代码核验，全部修复或已评估接受。
 > - **v6.0 技术债**：24 项（ST-TD-001~ST-TD-024），已按 `cleanup-v6-src-tauri-tech-debt-2026-07-26` spec 全部清理（7 P0 + 12 P1/P2 + 5 P3 保留现状）。
 > - 审查日期：2026-07-25 | 模块路径：`src-tauri/src/` | 源文件数：12
-> - **2026-10-11 深度审查复核**：实际源文件数已增至 **20**（约 14,115 行），本文件 §1~§5 的历史数字多为失真，详见新增 **§6 深度审查**。
+> - **2026-10-11 深度审查复核（历史）**：当时实际源文件数已增至 **20**（约 14,115 行），本文件 §1~§5 的历史数字多为失真，详见新增 **§6 深度审查**。
+> - **2026-11-04 复核**：当前实际源文件数为 **21**（含新增 `single_instance.rs`，约 **15,110** 行），§1.1/§1.2 已按当前代码校正。
 
 > **注（主窗口原生 UI 重构后，2026-10-02）**：本文涉及的主窗口 WebView2 相关实现（`WebviewWindowBuilder`、`MAIN_WINDOW_BROWSER_ARGS`、`webview_memory` 挂起/裁剪、CSP、`wpfile://`）已随主窗口重构**移除**；壳不再创建 WebView2 主窗口，主窗口改由 `mirrorstar-ui.exe`（Slint）承载。本文保留为历史记录。
 
@@ -26,56 +27,58 @@
 
 ### 1.2 文件清单
 
-> **2026-10-11 复核**：以下文件清单为**核实后的当前状态**（20 个源文件、约 14,115 行）；原文档仅记 12 文件约 5,630 行，已失真。
+> **2026-10-11 复核（历史）**：以下文件清单为当时核实后的状态（20 个源文件、约 14,115 行）；原文档仅记 12 文件约 5,630 行，已失真。
+> **2026-11-04 复核**：以下行数已按当前代码重新统计（共 21 个源文件，含 `single_instance.rs`，合计约 **14,482** 行）。
 
 #### commands/
 | 文件 | 行数 | 主要内容 |
 |---|---|---|
-| mod.rs | 123 | 命令模块导出（`pub use config::*; pub use rotation::*; pub use system::*; pub use wallpaper::*;`，4 个子模块） |
-| config.rs | 252 | 配置命令（`get_config` / `update_config` / `get_arrangement` / `update_arrangement`）+ `validate_config_fields` 字段范围校验（委托 `mirrorstar-core::config::validation`，ST-TD-005） |
-| rotation.rs | 260 | 轮播命令 12 个（`get_rotation_config` / `update_rotation_config` / `list_pools` / `create_pool` / `update_pool` / `delete_pool` / `reorder_pools` / `get_unit_states` / `set_active_pool` / `set_rotation_enabled` / `next_wallpaper` / `prev_wallpaper`）**（原文档缺失）** |
-| system.rs | 277 | 系统级命令 8 个（`get_displays` / `get_memory_report` / `report_lifecycle_mark` / `check_desktop_status` / `set_interaction_mode` / `open_file_dialog` / `toggle_auto_start` / `get_auto_start_status`；原文档所列 `toggle_interaction` / `quit_app` **已不存在**）+ ST-002 回调式文件对话框 |
-| wallpaper.rs | 2351 | 壁纸生命周期命令 12 个 + `ComGuard` RAII + `DisplaySettingGuard` 防竞态 + `validate_wallpaper_file_path` / `validate_volume` / `validate_speed` / `parse_scaling_mode` 纯函数 + 36 个单元测试 |
+| mod.rs | 124 | 命令模块导出（`pub use config::*; pub use rotation::*; pub use system::*; pub use wallpaper::*;`，4 个子模块） |
+| config.rs | 235 | 配置命令（`get_config` / `update_config` / `get_arrangement` / `update_arrangement`）+ `validate_config_fields` 字段范围校验（委托 `mirrorstar-core::config::validation`，ST-TD-005） |
+| rotation.rs | 233 | 轮播命令 12 个（`get_rotation_config` / `update_rotation_config` / `list_pools` / `create_pool` / `update_pool` / `delete_pool` / `reorder_pools` / `get_unit_states` / `set_active_pool` / `set_rotation_enabled` / `next_wallpaper` / `prev_wallpaper`）**（原文档缺失）** |
+| system.rs | 262 | 系统级命令 8 个（`get_displays` / `get_memory_report` / `report_lifecycle_mark` / `check_desktop_status` / `set_interaction_mode` / `open_file_dialog` / `toggle_auto_start` / `get_auto_start_status`；原文档所列 `toggle_interaction` / `quit_app` **已不存在**）+ ST-002 回调式文件对话框 |
+| wallpaper.rs | 2183 | 壁纸生命周期命令（注册 12 个）+ `ComGuard` RAII + `DisplaySettingGuard` 防竞态 + `validate_wallpaper_file_path` / `validate_volume` / `validate_speed` / `parse_scaling_mode` 纯函数 + 36 个单元测试 |
 
 #### platform/
 | 文件 | 行数 | 主要内容 |
 |---|---|---|
-| mod.rs | 11 | 平台模块导出（3 个 `pub(crate) use` + `pub(crate) mod liveness_watchdog / pure_mode / pure_mode_input`）|
-| explorer.rs | 约 490 | `start_explorer_restart_monitor`：隐藏顶层窗口（`WS_EX_TOOLWINDOW \| WS_POPUP`，刻意不用 `HWND_MESSAGE`）+ `explorer_monitor_wndproc`（TaskbarCreated / WorkerW·Progman 销毁 / WM_WTSSESSION_CHANGE / WM_POWERBROADCAST / WM_DESTROY），统一转 `try_heal_desktop_layer` |
-| fullscreen.rs | 1801 | `start_fullscreen_monitor`：`SetWinEventHook(EVENT_SYSTEM_FOREGROUND)` + `foreground_event_callback` + 纯函数 + 56 个纯函数单元测试 |
-| liveness_watchdog.rs | 490 | 视频卡帧常驻看护（`video_playback_stalled` / 采样确认 / 自愈），随 runtime 结束**（原文档缺失）** |
-| power.rs | 246 | `handle_power_status_change`：`GetSystemPowerStatus` + `interpret_ac_line_status` + 电池↔AC 切换暂停/恢复 |
-| pure_mode.rs | 878 | 纯净壁纸模式编排（进入/退出/自愈）**（原文档缺失）** |
-| pure_mode_input.rs | 1112 | 纯净模式低级键鼠钩子 + 隐藏顶层窗口（刻意不用 `HWND_MESSAGE`）**（原文档缺失）** |
-| workerw_check.rs | 245 | `start_workerw_check`：5 分钟 interval + `WORKERW_CHECK_NOTIFY` 即时唤醒 |
+| mod.rs | 10 | 平台模块导出（3 个 `pub(crate) use` + `pub(crate) mod liveness_watchdog / pure_mode / pure_mode_input`）|
+| explorer.rs | 449 | `start_explorer_restart_monitor`：隐藏顶层窗口（`WS_EX_TOOLWINDOW \| WS_POPUP`，刻意不用 `HWND_MESSAGE`）+ `explorer_monitor_wndproc`（TaskbarCreated / WorkerW·Progman 销毁 / WM_WTSSESSION_CHANGE / WM_POWERBROADCAST / WM_DESTROY），统一转 `try_heal_desktop_layer` |
+| fullscreen.rs | 1639 | `start_fullscreen_monitor`：`SetWinEventHook(EVENT_SYSTEM_FOREGROUND)` + `foreground_event_callback` + 纯函数 + 56 个纯函数单元测试 |
+| liveness_watchdog.rs | 450 | 视频卡帧常驻看护（`video_playback_stalled` / 采样确认 / 自愈），随 runtime 结束**（原文档缺失）** |
+| power.rs | 229 | `handle_power_status_change`：`GetSystemPowerStatus` + `interpret_ac_line_status` + 电池↔AC 切换暂停/恢复 |
+| pure_mode.rs | 1039 | 纯净壁纸模式编排（进入/退出/自愈）**（原文档缺失）** |
+| pure_mode_input.rs | 1007 | 纯净模式低级键鼠钩子 + 隐藏顶层窗口（刻意不用 `HWND_MESSAGE`）**（原文档缺失）** |
+| workerw_check.rs | 218 | `start_workerw_check`：5 分钟 interval + `WORKERW_CHECK_NOTIFY` 即时唤醒 |
 
 #### 顶层
 | 文件 | 行数 | 主要内容 |
 |---|---|---|
-| lib.rs | 1292 | `run()` 入口：日志 + COM STA + WorkerW 预初始化 + VolumeControl + Engine + Config + Scheduler + UI 子进程 + 监控线程 + Tauri Builder + setup 闭包 |
+| lib.rs | 1399 | `run()` 入口：日志 + COM STA + WorkerW 预初始化 + VolumeControl + Engine + Config + Scheduler + UI 子进程 + 监控线程 + Tauri Builder + setup 闭包 |
 | main.rs | 78 | `main()` + `--wp-proc` 双入口分派 + `ensure_single_instance()`（`CreateMutexW` 单实例互斥体） |
-| scheduler.rs | 2114 | 轮播调度器：主循环 / 暂停抑制 / 原子交换 / 显示器热插拔 / 排列变更即时重建**（原文档缺失）** |
-| state.rs | 1165 | `AppState` + 21 个全局静态量 + `try_pause_all_fast` / `try_resume_all_fast` + `signal_thread_exit` / `join_monitor_thread` + `try_lock_with_timeout<T>` + `perform_shutdown_blocking` |
+| single_instance.rs | 105 | 二次启动唤醒：命名事件（`CreateEventW` / `OpenEventW` / `SetEvent`）+ `signal_primary_instance` / `install_listener`（主实例经 `ui_process::open_main_window` 显示窗口） |
+| scheduler.rs | 1952 | 轮播调度器：主循环 / 暂停抑制 / 原子交换 / 显示器热插拔 / 排列变更即时重建**（原文档缺失）** |
+| state.rs | 1239 | `AppState` + 23 个全局静态量 + `try_pause_all_fast` / `try_resume_all_fast` + `signal_thread_exit` / `join_monitor_thread` + `try_lock_with_timeout<T>` + `perform_shutdown_blocking` |
 
 #### ui_process/（原文档缺失）
 | 文件 | 行数 | 主要内容 |
 |---|---|---|
-| mod.rs | 629 | `UiProcessManager`（托管 `mirrorstar-ui.exe`）+ `UiJobGuard`（Job Object）+ 空闲退出 + 单实例槽位 |
-| bridge.rs | 435 | 与 UI 子进程的事件转发 / 请求分派协议桥（复用 `mirrorstar_core::ui_proto::framing`） |
-| paths.rs | 67 | `mirrorstar-ui.exe` 路径解析（同目录命中 / PATH 兜底） |
+| mod.rs | 725 | `UiProcessManager`（托管 `mirrorstar-ui.exe`）+ `UiJobGuard`（Job Object）+ 空闲退出 + 单实例槽位 |
+| bridge.rs | 379 | 与 UI 子进程的事件转发 / 请求分派协议桥（复用 `mirrorstar_core::ui_proto::framing`） |
+| paths.rs | 59 | `mirrorstar-ui.exe` 路径解析（同目录命中 / PATH 兜底） |
 
-> **合计**：20 个源文件、约 **14,115** 行。
+> **合计（2026-11-04 复核）**：21 个源文件、约 **14,482** 行。
 
 ### 1.3 测试覆盖
 
-- **单元测试**（**2026-10-11 复核**：全 `src-tauri/src/` 实测 `#[test]` 178 + `#[tokio::test]` 18 = **约 196 个**，原文档记 49 个已失真）：`commands/wallpaper.rs`（36）、`platform/fullscreen.rs`（56）、`scheduler.rs`（34）、`platform/pure_mode_input.rs`（12）、`state.rs`（10，含 2 个 `#[ignore]`）、`ui_process/bridge.rs`（10）、`liveness_watchdog.rs`（7）、`ui_process/{mod,paths}.rs`（6）、`platform/pure_mode.rs`（5）、`lib.rs`（5）、`commands/{config,rotation}.rs`（4）、`commands/system.rs`（4）、`platform/power.rs`（4）、`platform/workerw_check.rs`（3）。
-- **集成测试**（**2026-10-11 复核**）：`tests/config_flow.rs`（6 个 ConfigManager 增删改流程测试，纯逻辑无 `#[ignore]`）、`tests/wallpaper_flow.rs`（**35 个**：33 `#[test]` + 2 `#[tokio::test]`，其中 **29 个 `#[ignore]`** 需 Windows COM/音频环境，**6 个**纯逻辑测试 CI 可执行）、`tests/common/mod.rs`（MockRenderer + 测试辅助函数，207 行）。原文档记「约 25 个 / 仅 4 个 CI 可执行」已失真。
+- **单元测试**（**2026-11-04 复核**：全 `src-tauri/src/` 实测 `#[test]` + `#[tokio::test]` 共 **204 个**；2026-10-11 的 196 个为历史快照）：`commands/wallpaper.rs`（36）、`platform/fullscreen.rs`（56）、`scheduler.rs`（34）、`state.rs`（14）、`platform/pure_mode_input.rs`（12）、`ui_process/bridge.rs`（9）、`platform/pure_mode.rs`（7）、`liveness_watchdog.rs`（7）、`lib.rs`（6）、`commands/system.rs`（4）、`platform/power.rs`（4）、`ui_process/mod.rs`（4）、`platform/workerw_check.rs`（3）、`ui_process/paths.rs`（3）、`commands/{config,rotation}.rs`（各 2）、`platform/explorer.rs`（1）。
+- **集成测试**（**2026-11-04 复核**）：`tests/config_flow.rs`（6 个 ConfigManager 增删改流程测试，纯逻辑无 `#[ignore]`）、`tests/wallpaper_flow.rs`（**35 个**：33 `#[test]` + 2 `#[tokio::test]`，其中 **29 个 `#[ignore]`** 需 Windows COM/音频环境，**6 个**纯逻辑测试 CI 可执行）、`tests/common/mod.rs`（MockRenderer + 测试辅助函数，192 行）。
 - **测试盲区**：`mirrorstar-ui.exe` 子进程托管端到端 / Tauri Builder setup 闭包 / Win32 回调路径（`foreground_event_callback` 等）无法单元测试，依赖手动端到端验证。
 
 ### 1.4 核心结构与设计模式（v4 概要浓缩）
 
 - **核心结构**：`AppState`（`Arc<ConfigManager>` + `Arc<tokio::sync::Mutex<WallpaperEngine>>` + `Arc<Mutex<DesktopIntegrator>>` + `tray_paused: AtomicBool` + `tray_pause_resume_item: OnceLock<MenuItem>`）。
-- **21 个全局可变静态量**（state.rs，**2026-10-11 复核**：原文档记 19 个，新增 `SHARED_APP_HANDLE`(187) / `SHARED_SCHEDULER`(198)）：`SHARED_ENGINE`/`SHARED_CONFIG`/`SHARED_APP_HANDLE`/`SHARED_SCHEDULER`/`FULLSCREEN_WAS`/`EXPLORER_DESKTOP`/`TASKBAR_CREATED_MSG`/`POWER_WAS_ON_BATTERY`/`WIN_EVENT_HOOK`/`FULLSCREEN_MONITOR_RUNNING`/`FULLSCREEN_MONITOR_THREAD_ID`/`FULLSCREEN_MONITOR_THREAD`/`EXPLORER_MONITOR_RUNNING`/`EXPLORER_MONITOR_THREAD_ID`/`EXPLORER_MONITOR_THREAD`/`WORKERW_CHECK_RUNNING`/`WORKERW_CHECK_TASK`/`WORKERW_CHECK_NOTIFY`/`WORKERW_INIT_THREAD`/`THUMBNAIL_TASK`/`SHUTDOWN_DONE`。
+- **23 个全局可变静态量**（state.rs，**2026-11-04 复核**；原文档记 19 个、2026-10-11 记 21 个）：`SHARED_ENGINE`/`SHARED_CONFIG`/`SHARED_APP_HANDLE`/`SHARED_SCHEDULER`/`FULLSCREEN_WAS`/`EXPLORER_MONITOR_HWND`/`DESKTOP_LAYER_HEAL_EPOCH`/`DESKTOP_LAYER_HEAL_LAST_MS`/`TASKBAR_CREATED_MSG`/`POWER_WAS_ON_BATTERY`/`WIN_EVENT_HOOK`/`FULLSCREEN_MONITOR_RUNNING`/`FULLSCREEN_MONITOR_THREAD_ID`/`FULLSCREEN_MONITOR_THREAD`/`EXPLORER_MONITOR_RUNNING`/`EXPLORER_MONITOR_THREAD_ID`/`EXPLORER_MONITOR_THREAD`/`WORKERW_CHECK_RUNNING`/`WORKERW_CHECK_TASK`/`WORKERW_CHECK_NOTIFY`/`WORKERW_INIT_THREAD`/`THUMBNAIL_TASK`/`SHUTDOWN_DONE`。
 - **4 类系统监控线程**（**2026-10-11 复核**：原文档记 3 类，补 `liveness_watchdog`）：`fullscreen_monitor`（`SetWinEventHook` 事件驱动）、`power_monitor`（`WM_POWERBROADCAST` 事件驱动）、`explorer_restart_monitor`（`TaskbarCreated` 消息事件驱动）、`liveness_watchdog`（视频卡帧常驻看护，5s 周期）。
 - **事件发射**：`wallpaper-added`/`wallpaper-updated`/`wallpaper-removed`/`wallpaper-state-changed`/`wallpaper-thumbnail-failed`/`desktop-status-changed`/`wallpaper-regenerate-progress`。
 - **设计模式**：ComGuard RAII（T16）｜shutdown 流程幂等守卫 + LIFO + 3s 引擎锁超时（Bug #6/T04/ST-002/ST-003/ST-014）｜锁顺序约定（engine→desktop，顶部文档化）｜输入验证（T08/T12/SEC-001/SEC-002）｜per-display 防竞态（`DisplaySettingGuard`）｜Win32 回调安全（unsafe Send/Sync 论证、try_lock 非阻塞）。
@@ -385,7 +388,7 @@
 
 ## 5. v17.0 内存优化（2026-10-02）
 
-本轮针对「设置动态壁纸后应用组内存偏高」，新增内存归因埋点并实施 6 项手段；本模块涉及 **Task 1（归因埋点）、Task 2（主窗口参数裁剪）、Task 3（非活跃态挂起/降级）**。
+本轮针对「设置动态壁纸后应用组内存偏高」，新增内存归因埋点并实施 6 项手段；本模块涉及 **Task 1（归因埋点）、Task 2（主窗口参数裁剪）、Task 3（非活跃态挂起/降级）**。其中 Task 2/3 已随主窗口原生 UI 重构移除，见 §5.2/§5.3 的历史记录标注。
 
 ### 5.1 Task 1：内存归因埋点（`mirrorstar-core/src/perf.rs` + `commands/system.rs` + `lib.rs`）
 
@@ -418,6 +421,8 @@
 
 常量文档注释与守卫测试已固化；`state.rs` 内另有测试注释说明「替换语义」与默认项保留契约。
 
+> **2026-11-04 复核**：当前 wp-proc 子进程与 UI 预览使用的缓存参数为 `--disk-cache-size=10485760`（`crates/mirrorstar-wp-proc/src/webview.rs:656`、`crates/mirrorstar-ui/src/preview/web.rs:149`）；52428800 仅为上述已移除主窗口的历史值。
+
 ### 5.3 Task 3：非活跃态 WebView2 挂起 / 目标等级降级（`platform/webview_memory.rs`）—— ⚠️ 历史记录，代码已移除
 
 > **2026-10-11 复核：已消解**。`platform/webview_memory.rs` 文件与 `suspend_main_webview` / `resume_main_webview` / `TrySuspend` / `SetMemoryUsageTargetLevel` 等符号在代码中**全部零命中**，随主窗口重构移除。以下为历史记录。
@@ -434,7 +439,9 @@
 - **`TrySuspend` 前置条件与降级策略**：文档要求 `controller.IsVisible == false` 否则返回 `ERROR_INVALID_STATE`（best-effort，完成回调 `isSuccessful=false`）。本模块不主动置 `IsVisible=false`（避免恢复闪失导致白屏），故最小化场景下 `TrySuspend` 很可能失败；但**目标等级降级无此前置条件，始终生效**。所有失败仅 `warn!`，不 panic、不影响窗口操作；旧运行时缺接口时优雅跳过。
 - **依赖对齐**：`Cargo.toml` 新增 `webview2-com = "0.38"` 与 `windows 0.61`（别名 `windows61`），必须与 wry 0.55.1 / tauri-runtime-wry 2.11.2 同源。
 
-### 5.4 关闭主窗口语义（核实修正）
+### 5.4 关闭主窗口语义（核实修正）—— ⚠️ 历史记录，代码已移除
+
+> **2026-11-04 复核**：壳已不再创建 WebView2 主窗口（主窗口由 `mirrorstar-ui.exe` 子进程承载），代码中已无 `on_window_event` / `CloseRequested` / `prevent_close` 命中；当前退出语义由 `RunEvent::ExitRequested` 的 `code` 分支与 `perform_shutdown_blocking` 承担。以下为历史记录。
 
 `lib.rs` 的 `on_window_event` 主窗口 `CloseRequested` 分支**不调用 `api.prevent_close()`**，让 Tauri 默认销毁主窗口、释放 WebView2 子进程树——即「关闭即销毁」而非「关闭即隐藏（hide）」。文档 `09-性能优化-Performance.md` §11.7 已据此修正。
 
@@ -531,7 +538,7 @@
 | DOC-9 | §2 `ST-001`~`ST-017` | 核心判定成立，行号失真 | 抽查 ST-001/002/010 判定仍成立，但所引行号普遍漂移（如 `state.rs:361-362`→**374-375**） |
 | DOC-10 | §3.1 `ST-TD-001`~`ST-TD-024` | 多数已消解，叙述偏乐观 | ST-TD-011/012 声称「前缀清理」，`v41-ST-`/`X-PERF-` 确已零命中，但 `ST-`/`T` 前缀注释与测试标识符仍大面积残留 |
 | DOC-11 | §5.2 / §5.3 | 已消解 | `MAIN_WINDOW_BROWSER_ARGS`、`platform/webview_memory.rs`、`TrySuspend`、`SetMemoryUsageTargetLevel` 全部零命中（两节标题已加「历史记录，代码已移除」） |
-| DOC-12 | §5.1 / §5.4 | 仍存在 | `get_memory_report`、`spawn_memory_attribution_sampler` 均在；「不调用 `api.prevent_close()`」与代码一致 |
+| DOC-12 | §5.1 / §5.4 | 仍存在（§5.4 后续失效） | `get_memory_report`、`spawn_memory_attribution_sampler` 均在；§5.4「不调用 `api.prevent_close()`」当时与代码一致，2026-11-04 复核时主窗口 WebView2 已移除，该节已标注为历史记录 |
 | DOC-13 | §1.1 职责 3 / §1.4 | 描述失真 | `run()` 序列未含新增的 `SchedulerHandle` 与 `ui_process` |
 | DOC-14 | §1.2 mod.rs | 描述失真 | `platform/mod.rs` 8→**11** 行；`commands/mod.rs` 95→**123** 行、3→**4** 个 `pub use` |
 | DOC-15 | §1.2 explorer.rs / system.rs | 描述失真 | `explorer.rs` 329→**289** 行；`system.rs` 含 `toggle_interaction`/`quit_app` 已不存在 |
