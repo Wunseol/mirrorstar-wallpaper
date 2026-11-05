@@ -287,23 +287,7 @@ GIF 帧像素预算默认 40MB（配置项 `GifConfig.max_memory_mb`，合法范
 
 ## 18. 预览媒体呈现策略（⚠️ 已被原生 UI 预览方案取代，历史条目）
 
-> **已被取代**：前端（`src/scripts/ui/preview-modal.ts`）已删除，预览改由 `mirrorstar-ui.exe` 原生实现（图片自绘 / 视频 UI 进程内 mpv 子窗口 / GIF 逐帧动画 / 网页按需临时 WebView2 子窗口）。以下前端 `wpfile://` + `<video>` 策略为历史记录。
-
-`src/scripts/ui/preview-modal.ts` 的预览媒体按类型区分呈现，**不再统一静态化**：
-
-- **视频（Video）：真实 `<video>` 流式播放**（`showVideoPreview`）。`video.src = convertFileSrc(wp.file_path, "wpfile")`，并设 `preload="metadata"`、`playsInline=true`、`loop=false`；有缩略图时设 `video.poster`，无缩略图时 `removeAttribute("poster")`。关闭预览或切换预览时 `resetMedia` 调用 `releaseVideoElement` 清空 `src` 并同时清理 poster，释放媒体引用。
-
-- **GIF：保持静态缩略图并显示显式降级提示**（`showGifStaticPreview`）。优先使用 `wp.thumbnail`（320x180 JPEG 缩略图）作为 `<img>` 显示，无缩略图时回退为类型图标占位（`typeIcon`，容器为 `index.html` 的 `#preview-placeholder`），同时显示「动图预览暂不可用，当前显示缩略图」提示（`index.html` 的 `#preview-gif-note`，样式 `.preview-gif-note` 见 `src/styles/main.css`）。
-
-**视频「内存有界」的依据**：`wpfile://` 自定义协议已支持 HTTP Range 流式读取（`src-tauri/src/lib.rs` 的 `wpfile` handler）——视频播放器按需请求字节范围，handler 返回 `206 Partial Content` 并携带 `Accept-Ranges: bytes`，且单次 Range 被限制为最多 1MB（`MAX_RANGE_LEN`）；HEAD 请求仅返回 `Content-Length`/`Accept-Ranges` 供播放器探测文件大小。因此 `<video>` 是**按需流式解码、内存有界**，而非一次性拉取并解码整段视频。据此，Task 6「`<video>` 会二次解码整段视频、应统一静态化」的优化前提不成立（且已构成「视频预览功能消失」的功能回归），故本轮（变更 `restore-video-preview-playback`）恢复视频真实播放。
-
-> **注**：`wpfile://` 自定义协议随旧前端一并废弃；原生 UI 预览改由 UI 进程内 mpv 子窗口实现。
-
-**GIF 静态化的依据**：Chromium 的 `<video>` 不支持 `image/gif`，塞入 `<video>` 本就不工作，故保持静态缩略图并显式提示降级。
-
-仅使用 class 切换与 `textContent`（DOM API）操作，遵守无 `unsafe-inline` 的 CSP。
-
-**预期效果**：视频预览按需流式解码、内存有界（单次 Range ≤1MB），关闭预览即释放媒体引用；GIF 预览明确降级并提示用户。实测数值待真机补测（可对比打开/关闭预览前后 `get_memory_report` 的总计）。
+§18 历史记录：旧前端预览实现（`src/scripts/ui/preview-modal.ts`、`wpfile://` 自定义协议、`<video>` 流式播放）已随 2026-10-02 主窗口原生 UI 重构整体删除。当前预览由 `mirrorstar-ui` 原生实现：图片自绘、GIF 逐帧、视频用 UI 进程内 mpv 子窗口（`--wid`）、网页按需临时 WebView2 子窗口；实现见 `crates/mirrorstar-ui/src/preview/`，旧前端细节归档于 `docs/04-优化文档/08-前端.md`。
 
 ## 19. 本轮内存实测基线采集方法（待真机）
 
@@ -312,12 +296,12 @@ GIF 帧像素预算默认 40MB（配置项 `GifConfig.max_memory_mb`，合法范
 1. 运行应用 → 打开主窗口 → 播放视频壁纸 → 稳态 ≥60s；
 2. 触发 `get_memory_report` 命令，或读取 `logs/mirrorstar.log` 中 target `mirrorstar::perf` 的 `MEM-ATTRIB` 日志，按类别（主进程 / `msedgewebview2` / `mpv` / `wp-proc`）与总计记录工作集与私有提交；
 3. 与优化前基线（同口径）对比；
-4. 额外记录**最小化态**与**预览开关态**内存，分别验证 §15（Task 3）与 §18（视频流式播放按需解码、关闭预览即释放引用）的效果。
+4. 额外记录**最小化态**与**预览开关态**内存，分别验证 §15（Task 3）与 §21（打开/关闭原生 UI 预览，以及壳 + UI 内存回落）的效果。
 5. 若需定位**启动 / 打开主窗口的秒级峰值**（既有 60s 周期采样无法捕捉），见 §20 的启动期内存时间线（`MEM-TIMELINE` / `MEM-MARK`）采集方法。
 
 ## 20. 启动期内存时间线（v17，`optimize-startup-memory-peak`）
 
-> **说明**：本节为历史优化记录。其中涉及前端（`src/scripts/main.ts` / `report_lifecycle_mark` / `main_window_created` / `frontend_init_done` / `wallpaper_list_rendered`）与主窗口 WebView2 的埋点、标记与数值，已随前端删除、主窗口原生 UI 重构而**失效**；后端 `mirrorstar::perf` 归因采样（`MEM-ATTRIB` / `MEM-TIMELINE` / `MEM-MARK`）机制仍然有效。当前主窗口内存数值见 §21。
+> **说明**：本节为历史优化记录。其中涉及前端生命周期标记（前端初始化完成、壁纸列表渲染完成等）与主窗口 WebView2 的埋点、标记与数值，已随前端删除、主窗口原生 UI 重构而**失效**；后端 `mirrorstar::perf` 归因采样（`MEM-ATTRIB` / `MEM-TIMELINE` / `MEM-MARK`）机制仍然有效。当前主窗口内存数值见 §21。
 
 **背景**：既有内存归因埋点为 60 秒周期采样（见 §13 的 `spawn_memory_attribution_sampler` / `MEM-ATTRIB`）。60 秒粒度**无法捕捉启动与打开主窗口阶段的秒级峰值**，导致「约 500MB 峰值由谁产生、为何回落」无法定量归因。本次变更在 `crates/mirrorstar-core/src/perf.rs` 新增启动期细粒度时间线与生命周期事件打点。
 
@@ -349,30 +333,15 @@ GIF 帧像素预算默认 40MB（配置项 `GifConfig.max_memory_mb`，合法范
 | `boot_wallpaper_applied <key:Type,...>` | `src-tauri/src/scheduler.rs` `apply_boot` 后 | 开机壁纸应用完成，含各显示单元壁纸类型（如 `boot_wallpaper_applied primary:Video,secondary:Image`；无壁纸时为 `none`） |
 | `main_window_created` | `src-tauri/src/state.rs` `create_or_show_main_window` 成功分支 | 主窗口创建成功 |
 | `main_window_page_loaded` | `src-tauri/src/state.rs` `on_page_load` 的 `PageLoadEvent::Finished` | 主窗口页面加载完成 |
-| `frontend_init_done` | `src/scripts/main.ts` `init()` 末尾（经命令 `report_lifecycle_mark` 上报） | 前端初始化完成（**已随前端删除失效**） |
-| `wallpaper_list_rendered` | `src/scripts/main.ts` 壁纸列表渲染后（经命令 `report_lifecycle_mark` 上报） | 壁纸列表渲染完成（**已随前端删除失效**） |
 
 **真机采集方法**：分别采集两条时间线，读取 `logs/mirrorstar.log` 中 target `mirrorstar::perf` 的 `MEM-TIMELINE` / `MEM-MARK` 记录，比较各分类别峰值与回落时机：
 
-1. **仅启动（不打开主窗口）**：启动应用后静置 ≥60s，不打开主窗口。观察 `log_init` / `engine_ready` / `boot_wallpaper_applied …` 处的 `MEM-MARK` 跳变，以及前 60s `MEM-TIMELINE` 各分类别（主进程 / `msedgewebview2` / `mpv` / `wp-proc` / 其他）的峰值与回落时机——此线用于隔离「主进程 + 开机壁纸子进程」基线，不含主窗口 WebView2。
-2. **打开主窗口**：启动后打开主窗口，观察各 `MEM-MARK` 差值，定位打开瞬间的峰值由哪一阶段 / 哪一类别拉起，以及何时回落。
+1. **仅启动（不打开主窗口）**：启动应用后静置 ≥60s，不打开主窗口。观察 `log_init` / `engine_ready` / `boot_wallpaper_applied …` 处的 `MEM-MARK` 跳变，以及前 60s `MEM-TIMELINE` 各分类别（主进程 / `msedgewebview2` / `mpv` / `wp-proc` / 其他）的峰值与回落时机——此线用于隔离「主进程 + 开机壁纸子进程」基线，不含主窗口（`mirrorstar-ui.exe` 子进程）。
+2. **打开主窗口（`mirrorstar-ui.exe`）**：启动后打开主窗口，观察各 `MEM-MARK` 差值，定位打开瞬间的峰值由哪一阶段 / 哪一类别拉起，以及何时回落。
 
-对比两条线各分类别峰值与总计峰值，即可判断峰值主因（WebView2 冷启动基线 / 开机壁纸子进程 / 前端列表渲染 / 其他）；建议每场景重复 ≥3 次取中位数以降低噪声。
+对比两条线各分类别峰值与总计峰值，即可判断峰值主因（主窗口 UI 子进程 / 开机壁纸子进程 / 网页壁纸 WebView2 / 其他）；建议每场景重复 ≥3 次取中位数以降低噪声。
 
-**实测归因结论（2026-10-02，`target/debug/logs/mirrorstar.log.2026-10-02`，历史口径）**：
-
-| 阶段 | 相对启动 | 总计 WS (MB) | 总计私有提交 (MB) | WebView2 进程数 |
-|------|---------|-------------|------------------|----------------|
-| `log_init` | 0ms | 11.5 | 5.4 | 0 |
-| `boot_wallpaper_applied DISPLAY1:none` | 35ms | 18.6 | 6.9 | 0 |
-| 启动后 60s 静置（无主窗口） | 0–60s | 18.8 | 约 7 | 0 |
-| `main_window_created` | 71937ms | 245.7 | 97.6 | 6 |
-| `main_window_page_loaded` | 72102ms | 319.0 | 179.3 | 6 |
-| `frontend_init_done` | 72144ms | 324.4 | 182.9 | 6 |
-| `wallpaper_list_rendered` | 72150ms | 325.0 | 183.2 | 6 |
-| `wallpaper_list_rendered`（视频壁纸 mpv 已在跑） | 91595ms | 518.3 | 599.0 | 6 |
-
-结论（历史）：启动本身极轻；约 500MB 峰值只出现在「打开主窗口」瞬间，来自当时的主窗口 WebView2；主窗口关闭后 WebView2 进程全部退出无残留。该口径已被 §21 的原生 UI 子进程方案取代。
+**历史实测说明**：2026-10-02 曾基于 `target/debug/logs/mirrorstar.log.2026-10-02` 采集过一组启动期内存数据，但其口径为旧 WebView2 主窗口（含 `msedgewebview2.exe` 进程计数与「约 500MB 峰值」的结论），已随主窗口原生 UI 重构整体失效；当前主窗口相关数值以 §21 / §22 为准，本节不再保留该历史数据。
 
 ## 21. 主窗口原生 UI 子进程内存/CPU（当前策略，`rewrite-main-window-native-ui`）
 

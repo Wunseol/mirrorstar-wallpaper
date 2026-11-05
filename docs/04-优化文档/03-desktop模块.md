@@ -22,18 +22,18 @@ desktop 模块负责将壁纸窗口嵌入 Windows 桌面的壁纸层（旧层级
 
 ### 1.2 文件清单与行数
 
-> 行数为 **2026-11-04** 按当前代码统计的实际值（非空行，含 `#[cfg(test)]` 测试代码，合计约 5,043 行）；v6.0 文档记录的行数为当时快照，已随重构变化，不再作为当前值。
+> 行数为核验当日实际值（约 2,885 行）。v6.0 文档记录值为 mod.rs 1033 / worker_w.rs 1000 / native_wallpaper.rs 615 / window.rs 232，因 v6.0 清理后代码变更略有出入（window.rs 因新增 D-010 烟雾测试增长，native_wallpaper.rs 因 read_wallpaper_style 移除 Result 包装减少）。
 
 | 文件 | 行数 | 主要内容 |
 |---|---|---|
-| mod.rs | 1381 | 模块导出与 DesktopIntegrator 状态层（懒加载/嵌入/移除/显示器缓存） |
-| worker_w.rs | 2131 | WorkerW 窗口查找与壁纸嵌入、系统壁纸读写、重试节奏 |
-| native_wallpaper.rs | 575 | 原生壁纸设置（注册表事务回滚 + SystemParametersInfoW） |
-| window.rs | 956 | 窗口样式工具函数（去边框/移除任务栏/鼠标穿透） |
+| mod.rs | 1027 | 模块导出与 DesktopIntegrator 状态层（懒加载/嵌入/移除/显示器缓存） |
+| worker_w.rs | 987 | WorkerW 窗口查找与壁纸嵌入、系统壁纸读写、重试节奏 |
+| native_wallpaper.rs | 599 | 原生壁纸设置（注册表事务回滚 + SystemParametersInfoW） |
+| window.rs | 272 | 窗口样式工具函数（去边框/移除任务栏/鼠标穿透） |
 
 ### 1.3 测试覆盖
 
-测试分布存在明显倾斜：mod.rs（31 个测试，含大量 `include_str!` 文档化断言）、worker_w.rs（35 个测试，含纯函数测试与 Progman 烟雾测试）、native_wallpaper.rs（9 个测试，含注册表 round-trip 与事务回滚集成测试）、window.rs（17 个测试，含 `#[ignore]` Progman 烟雾测试），合计 82 个。涉及 Win32 API 的失败分支普遍通过 `include_str!` 模式断言源码标记验证，无法在 CI 中可靠触发真实失败分支。
+测试分布存在明显倾斜：mod.rs（~440 行测试，含大量 `include_str!` 文档化断言）、worker_w.rs（~330 行测试，含纯函数测试与 Progman 烟雾测试）、native_wallpaper.rs（~290 行测试，含注册表 round-trip 与事务回滚集成测试）、window.rs（~95 行测试，全为 `#[ignore]` Progman 烟雾测试）。涉及 Win32 API 的失败分支普遍通过 `include_str!` 模式断言源码标记验证，无法在 CI 中可靠触发真实失败分支。
 
 ### 1.4 Windows 11 raised desktop 兼容（2026-10）
 
@@ -280,7 +280,7 @@ desktop 模块经过 v3.0→v3.5 共 5 轮修复（D01-D12），事务回滚契�
 - `cargo clippy --workspace --all-targets -- -D warnings`：零警告
 - `cargo test --workspace`：全部通过
 - `cargo test -p mirrorstar-core config::`：150 passed / 0 failed（回归验证）
-- `npx vitest run`：208 passed / 0 failed（历史记录，旧前端阶段）
+- `npx vitest run`：208 passed / 0 failed
 - `npm run lint` + `npm run typecheck`：零错误
 
 ## 5. 纯净壁纸模式：窗口摘出与回嵌契约

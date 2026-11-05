@@ -18,8 +18,6 @@
 桌面集成模块负责：WorkerW 窗口查找与嵌入、窗口样式修改、多显示器定位、DPI 感知、Explorer 重启检测与重建、纯净壁纸模式（窗口层级临时提升）以及鼠标输入处理。
 
 > **渲染路径说明**：静态图片（JPG/JPEG/PNG/BMP/TIF/TIFF/DIB）使用 Windows 原生壁纸 API（`SystemParametersInfoW` + 注册表）实现零资源占用，其余格式走 WorkerW 嵌入。两条路径的选择规则、对比表与原生 API 实现详见[壁纸渲染](./05-壁纸渲染-Wallpaper-Rendering.md)。
->
-> **格式边界**：原生 API 支持 `.dib`，但文件名检测的添加识别列表（`crates/mirrorstar-core/src/config/detect.rs` 的 `IMAGE_EXTS`：`jpg` / `jpeg` / `png` / `bmp` / `webp` / `tiff` / `tif` / `ico`）不含 `dib`，因此 `.dib` 当前无法通过添加入口加入壁纸库；添加识别含 `ico`（走 WorkerW 渲染，原生列表不含 `ico`）。
 
 ### 1.1 WorkerW 嵌入完整流程
 
@@ -357,7 +355,7 @@ MirrorStar 声明为 Per-Monitor DPI Aware V2 应用，确保在不同 DPI 缩�
 
 #### 1.5.1 DPI 感知声明
 
-壳进程使用 `src-tauri/manifest.xml`，UI 子进程使用 `crates/mirrorstar-ui/app.manifest`，两者均声明 Per-Monitor DPI Aware V2：
+在应用程序 manifest 中声明 Per-Monitor DPI Aware V2：
 
 ```xml
 <application xmlns="urn:schemas-microsoft-com:asm.v3">
@@ -616,11 +614,11 @@ FR-034 定义了五种壁纸缩放模式，各模式渲染逻辑如下：
 
 | 模式 | 说明 | 视频实现 | GIF/图片实现 | 网页实现 | 原生壁纸实现 |
 |------|------|----------|-------------|----------|-------------|
-| Fill | 填满屏幕，保持比例，裁剪溢出 | mpv `--panscan=1.0` | GDI 双缓冲缩放+裁剪 | CSS object-fit: cover | 注册表 WallPaperStyle=10, TileWallpaper=0 |
-| Fit | 适配屏幕，保持比例，留黑边 | mpv `--panscan=0.0` | GDI 双缓冲缩放+居中 | CSS object-fit: contain | 注册表 WallPaperStyle=6, TileWallpaper=0 |
-| Stretch | 拉伸填满，不保持比例 | mpv `--keepaspect=no` | GDI 双缓冲拉伸 | CSS object-fit: fill | 注册表 WallPaperStyle=2, TileWallpaper=0 |
-| Center | 原始大小居中，超出裁剪 | mpv `--video-unscaled=yes` | GDI 双缓冲居中+裁剪 | CSS object-fit: none | 注册表 WallPaperStyle=0, TileWallpaper=0 |
-| Tile | 原始大小平铺重复填满 | mpv `--video-unscaled=yes`（mpv 无原生平铺，回退为居中） | GDI 按原尺寸网格重复绘制 | WebView2 自行渲染（不适用） | 注册表 WallPaperStyle=0, TileWallpaper=1 |
+| Fill | 填满屏幕，保持比例，裁剪溢出 | mpv --panscan=1.0 | GDI 双缓冲缩放+裁剪 | CSS object-fit: cover | 注册表 WallPaperStyle=10, TileWallpaper=0 |
+| Fit | 适配屏幕，保持比例，留黑边 | mpv --keepaspect | GDI 双缓冲缩放+居中 | CSS object-fit: contain | 注册表 WallPaperStyle=6, TileWallpaper=0 |
+| Stretch | 拉伸填满，不保持比例 | mpv --no-keepaspect | GDI 双缓冲拉伸 | CSS object-fit: fill | 注册表 WallPaperStyle=2, TileWallpaper=0 |
+| Center | 原始大小居中，超出裁剪 | mpv --no-keepaspect --panscan=0 | GDI 双缓冲居中+裁剪 | CSS object-fit: none | 注册表 WallPaperStyle=0, TileWallpaper=0 |
+| Original | 原始大小，左上角对齐 | mpv 默认 | GDI 双缓冲原始大小 | CSS 无缩放 | 注册表 WallPaperStyle=0, TileWallpaper=0 |
 
 缩放模式通过 IPC `set_scaling_mode` 命令传递给子进程，子进程的 WallpaperRenderer 实现类根据模式调整渲染参数。对于原生壁纸模式（jpg/jpeg/png/bmp/tif/tiff/dib），缩放模式通过注册表 `WallPaperStyle` 和 `TileWallpaper` 值控制。
 
@@ -662,11 +660,11 @@ fn set_mouse_passthrough(hwnd: HWND, enabled: bool) {
 
 #### 1.9.2 鼠标交互模式（FR-033）
 
-交互模式是全局鼠标输入开关，当前仅 Image / Video 渲染器实际改写窗口穿透样式；GIF / Web 渲染器沿用 trait 默认实现（no-op）：
-- 交互模式开启：关闭鼠标穿透（`set_mouse_passthrough(false)`），Image / Video 壁纸窗口可接收鼠标
-- 交互模式关闭：恢复鼠标穿透（`set_mouse_passthrough(true)`，`WS_EX_TRANSPARENT`）
+交互模式用于网页壁纸，允许用户直接与网页内容交互（如点击链接）：
+- 交互模式开启：壁纸窗口正常接收鼠标消息，WebView2 处理输入
+- 交互模式关闭：同鼠标穿透模式，使用 `WS_EX_TRANSPARENT`
 
-交互模式只经 Tauri 命令 `set_interaction_mode` 切换（内部映射为渲染器的 `set_interaction_mode` → `set_mouse_passthrough(!enabled)`）；`set_mouse_passthrough` 是内部 Win32 函数（`desktop::window::set_mouse_passthrough`），**不是** Tauri 命令。仅 Image / Video 渲染器实际改写窗口穿透样式，GIF / Web 渲染器沿用 trait 默认实现（no-op）。
+两种模式通过 IPC `set_mouse_passthrough` 和 `set_interaction_mode` 命令控制，互为补充。
 
 ***
 
@@ -789,7 +787,6 @@ windows = { version = "0.58", features = [
 - `SystemParametersInfoW(SPI_SETDESKWALLPAPER)` — 设置桌面壁纸（需要与 `SPIF_UPDATEINIFILE | SPIF_SENDCHANGE` 配合持久化）
 - `SystemParametersInfoW(SPI_GETDESKWALLPAPER)` — 读取当前壁纸路径
 - 用于静态图片壁纸的 Native 路径，零运行时资源占用（实现细节见[壁纸渲染](./05-壁纸渲染-Wallpaper-Rendering.md)）
-- **失败语义**：`set_native_wallpaper_internal` 在原生 API 失败时直接向上返回错误，**不回退 WorkerW 嵌入**；由调用方（命令层 / 引擎）按错误处理，不自动切换渲染路径
 
 #### 窗口管理与嵌入
 
