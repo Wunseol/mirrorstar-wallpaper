@@ -170,9 +170,14 @@ impl<T> NamedPipeClient<T> {
             }
             // 查询内核管道当前可用字节；为 0 立即结束，避免任何阻塞读取
             let mut avail: u32 = 0;
-            unsafe { PeekNamedPipe(handle, None, 0, None, Some(&mut avail), None) }.map_err(|e| {
-                MirrorStarError::IpcError(format!("丢弃管道残留数据时 PeekNamedPipe 失败: {}", e))
-            })?;
+            unsafe { PeekNamedPipe(handle, None, 0, None, Some(&mut avail), None) }.map_err(
+                |e| {
+                    MirrorStarError::IpcError(format!(
+                        "丢弃管道残留数据时 PeekNamedPipe 失败: {}",
+                        e
+                    ))
+                },
+            )?;
             if avail == 0 {
                 break;
             }
@@ -180,10 +185,9 @@ impl<T> NamedPipeClient<T> {
             let to_read = (avail as usize)
                 .min(READ_CHUNK_BYTES)
                 .min((MAX_DISCARD_BYTES - discarded) as usize);
-            let n = reader
-                .get_mut()
-                .read(&mut buf[..to_read])
-                .map_err(|e| MirrorStarError::IpcError(format!("丢弃管道残留数据时读取失败: {}", e)))?;
+            let n = reader.get_mut().read(&mut buf[..to_read]).map_err(|e| {
+                MirrorStarError::IpcError(format!("丢弃管道残留数据时读取失败: {}", e))
+            })?;
             if n == 0 {
                 break;
             }
@@ -1322,9 +1326,7 @@ mod tests {
             .expect("等待服务端就绪超时");
 
         let started = std::time::Instant::now();
-        let discarded = client
-            .discard_pending_output()
-            .expect("空管道丢弃不应报错");
+        let discarded = client.discard_pending_output().expect("空管道丢弃不应报错");
         let elapsed = started.elapsed();
 
         assert_eq!(discarded, 0, "空管道不应丢弃任何字节");
@@ -1352,11 +1354,7 @@ mod tests {
         let discarded = client
             .discard_pending_output()
             .expect("丢弃真实管道数据失败");
-        assert!(
-            discarded >= 64,
-            "应丢弃至少 64 字节，实际: {}",
-            discarded
-        );
+        assert!(discarded >= 64, "应丢弃至少 64 字节，实际: {}", discarded);
 
         let _ = done_tx.send(());
         join.join().expect("服务端线程 panic");

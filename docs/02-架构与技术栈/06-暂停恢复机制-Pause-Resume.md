@@ -60,7 +60,7 @@ pub(crate) fn start_fullscreen_monitor(
 }
 ```
 
-> **注意**：纯 `SetWinEventHook(EVENT_SYSTEM_FOREGROUND)` 事件驱动，无任何轮询回退。`SetWinEventHook` 失败时仅记录错误并退出全屏监控线程（详见《07-错误处理-Error-Handling.md》§3）。
+> **注意**：上方代码仅示意系统事件钩子。实际实现为**两个钩子**（系统事件 `EVENT_SYSTEM_FOREGROUND..EVENT_SYSTEM_MINIMIZEEND` + 对象事件 `EVENT_OBJECT_DESTROY..EVENT_OBJECT_UNCLOAKED`），统一回调为 `win_event_callback`，详见 §1.3。主检测为事件快路径；另有 500ms 轻量探针（QUNS + 前台根快照）与每 2s 全量兜底调和（`mirrorstar-fullscreen-probe`）作为漏检兜底。系统事件钩子安装失败时记录错误并退出全屏监控线程，对象事件钩子失败时仅告警并继续（详见《07-错误处理-Error-Handling.md》§3）。
 
 ```rust
 /// WinEvent 回调函数（独立的 extern "system" 函数，非 ProcessMonitor 方法）
@@ -215,6 +215,224 @@ fn is_foreground_fullscreen() -> bool {
 //     全屏激进处置：视频/网页渲染器终止子进程，GIF/图片普通暂停；
 //     同样先 set reason bit，退出全屏后由 resume_all_fast 对 Terminated 渲染器 play() 重启。
 ```
+
+***
+
+### 1.3 全屏状态调和（事件驱动，2026-11-04 真机修复）
+
+#### 1.3.1 根因：只监听前台事件会漏检"进入独占全屏"
+
+旧实现只注册 `EVENT_SYSTEM_FOREGROUND`，把"前台窗口变化"当作唯一的全屏状态输入。
+但**独占全屏（D3D `ChangeDisplaySettings` / borderless→exclusive）是在同一个前台窗口
+内部切换**：窗口句柄与前台窗口都不变，因此**不会产生任何前台事件**。
+
+真机日志 `mirrorstar.log.2026-11-04` 印证了这一顺序错误：
+
+| 时间 | 现象 |
+|------|------|
+| 13:53:10 | `MEM-ATTRIB` 显示 mpv 仍在运行（全屏游戏期间壁纸内存始终未释放） |
+| 13:53:33.640 | **首次**"检测到真全屏"并执行终止（进入全屏的整段时间都没有被感知） |
+| 13:53:33.640 + 14µs | 紧接着进入退出分支并恢复壁纸 |
+| ~13:53:34.561 | 桌面闪现原始静态壁纸约 0.9~1.0s（终止 + 500ms 恢复冷却 + 2s 复查 + mpv 冷启动叠加） |
+
+即：直到用户**退出**全屏的瞬间才第一次检测到"真全屏"并终止，随后立即恢复，形成
+"全屏期间不省内存、退出时反而闪一下静态壁纸"的错误顺序。
+
+#### 1.3.2 两个 WinEvent 钩子
+
+| 钩子 | 事件范围 | 标志 | 安装失败处理 |
+|------|----------|------|--------------|
+| 系统事件 | `EVENT_SYSTEM_FOREGROUND .. EVENT_SYSTEM_MINIMIZEEND` | `WINEVENT_OUTOFCONTEXT` | 记录 `error` 并**停止全屏监控线程**（置 `FULLSCREEN_MONITOR_RUNNING=false`） |
+| 对象事件 | `EVENT_OBJECT_DESTROY .. EVENT_OBJECT_UNCLOAKED`（0x8001..0x8015） | `WINEVENT_OUTOFCONTEXT \| WINEVENT_SKIPOWNPROCESS` | 记录 `warn` 并**继续运行**：前台事件 + 500ms 轻量探针 + 2s 全量兜底仍生效，但独占全屏的发现时延会上升 |
+
+两个钩子句柄统一存入 `WIN_EVENT_HOOKS: Mutex<Vec<SendWinEventHook>>`（`state.rs`），
+退出/重启时全部 `UnhookWinEvent`（谁先取到列表谁负责注销，幂等安全）。
+
+#### 1.3.3 事件路由与过滤
+
+`win_event_callback` 只做"事件类型过滤 + 根祖先比较 + 节流判定 + 调和"，
+不在回调节点加锁执行重活：
+
+| 事件 | 过滤条件 | 动作 |
+|------|----------|------|
+| `EVENT_SYSTEM_FOREGROUND` | 无（先于 HWND 判空处理） | `reconcile_fullscreen("foreground")` |
+| `EVENT_SYSTEM_MINIMIZESTART` | 根祖先 == 会话 HWND | `end_session("minimize")` + 调和 |
+| `EVENT_SYSTEM_MINIMIZEEND` | 根祖先 == 会话 HWND | 调和（`"restore"`） |
+| `EVENT_OBJECT_DESTROY` | 原始 HWND == 会话 HWND | `end_session("session_destroyed")` + 调和 |
+| `EVENT_OBJECT_HIDE` | 原始 HWND == 会话 HWND | `end_session("session_hidden")` + 调和 |
+| `EVENT_OBJECT_CLOAKED` | 原始 HWND == 会话 HWND | `end_session("session_cloaked")` + 调和 |
+| `EVENT_OBJECT_UNCLOAKED` | 原始/根 HWND == 会话 HWND | 调和（`"uncloak"`） |
+| `EVENT_OBJECT_LOCATIONCHANGE` / `STATECHANGE` | 根祖先 == 会话 HWND **或** 根祖先 == 当前前台根；且通过 **≥100ms** 节流 | 调和（`"window_state"`） |
+| 其它事件 / 其它窗口 | — | 直接忽略 |
+
+- `DESTROY`/`HIDE`/`CLOAKED` 直接用**原始 HWND** 比较（窗口销毁后 `GetAncestor` 不可靠）；
+  其余统一用 `GetAncestor(GA_ROOT)` 换算根祖先（纯 Win32 封装，回调内不加锁）。
+- `LOCATIONCHANGE`/`STATECHANGE` 是发现"同一前台窗口内部切到独占全屏"的关键信号；
+  `WINDOW_STATE_THROTTLE_MS=100` 节流保证普通窗口拖动/缩放不会高频进入状态机。
+
+#### 1.3.4 全屏会话与 400ms 确认
+
+`FULLSCREEN_SESSION`（会话根 HWND + 登记级别 + 诊断用 `display_id`）取代原来的"宽限期"定时器：
+
+| 步骤 | 行为 |
+|------|------|
+| 1. 统一入口 | 前台事件、生命周期事件、500ms 探针、2s 全量兜底、启动初始化、纯净模式退出补跑都调用 `reconcile_fullscreen(reason)`；内部用 `RECONCILE_GUARD.try_lock()` 串行化（拿不到锁直接跳过）；纯净模式活跃时直接返回（状态冻结） |
+| 2. 幂等短路 | 同一会话（前台根相同）且级别未变 → 只更新诊断字段，不重复处置（NoOp） |
+| 3. 登记会话 | 新会话写入 `FULLSCREEN_SESSION`（`hwnd` / `level` / `display_id`）、置 `FULLSCREEN_WAS=true`、递增 `PENDING_ACTION_GENERATION`，spawn 独立线程 `mirrorstar-fullscreen-confirm` |
+| 4. 400ms 复核 | 等待 `CONFIRM_DELAY=400ms` 后判定：意图代数未变、会话未被替换（`SessionIdentity { hwnd, level }`）、会话窗口 `IsWindow && IsWindowVisible && !IsIconic` 且未被 DWM Cloak（`DWMWA_CLOAKED`）；`level_now` 由**同一观测 + `resolve_fullscreen`** 得出，与登记级别一致**或**原全屏窗口仍覆盖显示器（任务管理器/Alt-Tab 覆盖层）**或** QUNS 仍明确为全屏 |
+| 5. 执行 | 复核通过才调用 `pause_all_fast_blocking` / `terminate_all_fast_blocking`（阻塞式，仅运行在独立线程，不阻塞 WinEvent 回调）；两者在**取得 engine 锁之后、执行处置之前**再做一次 `still_valid` 最终校验（见 §1.3.8），`false` 则记录 `info`「等待 engine 锁期间会话已结束，取消全屏终止/暂停」并返回 `None`；终止成功后 `record_terminate_time()` + 递增 `TERMINATION_GENERATION` |
+| 6. 取消 | 会话销毁/隐藏/Cloak/最小化、级别变化、策略切 `none` → **立即**递增意图代数并清空会话，确认线程醒来判定过期后直接返回，**mpv 与壁纸窗口保持存活** |
+
+> 400ms 只用于过滤"刚进入全屏就被销毁/隐藏"的瞬态窗口；真正的取消由窗口生命周期事件
+> 完成，不再依赖"等了多久"的猜测。`TERMINATE_COOLDOWN=1000ms` 终止防抖仍保留。
+> 由于复核改走"同一观测 + `resolve_fullscreen`"，**覆盖层场景仍然有效**：任务管理器 /
+> Alt-Tab 出现在前台不会把 `level_now` 拉回覆盖层窗口，确认不会被误取消。
+>
+> **确认线程存在两级校验**：400ms 复核（意图代数 / 会话身份 / 窗口健康 / 级别）决定"是否还要处置"，
+> 取得 engine 锁后的 `still_valid` 最终校验决定"此刻是否仍然值得处置"。后者失败会记录
+> `info`「等待 engine 锁期间会话已结束，取消全屏终止/暂停」，与前者记录的"确认取消"日志可区分，
+> 便于按日志判断取消发生在复核阶段还是锁等待阶段（仍无法撤销已发出的 mpv quit，见 §1.3.8）。
+
+#### 1.3.5 权威退出立即恢复（无冷却、无等待）
+
+| 权威退出信号 | 处理 |
+|--------------|------|
+| 会话窗口 `DESTROY` / `HIDE` / `CLOAKED` | 结束会话 → `resume_from_fullscreen_exit()` |
+| 会话窗口最小化（`MINIMIZESTART`） | 结束会话 → 恢复；会话因最小化而**不活跃**（`alive=false`），**即使 QUNS 仍滞留为全屏也不会新建会话**，直接立即恢复 |
+| 前台级别回落（`TrueFullscreen → None`） | 结束会话 → 立即恢复 |
+| 前台窗口被 DWM Cloak（`DWMWA_CLOAKED` 非零 → 不可信） | `resolve_fullscreen` 级别判为 `None`（UWP 挂起/切后台后桌面已暴露）→ 结束会话 → 立即恢复 |
+| `TrueFullscreen` 降为 `Maximized` | 会话级别降级，**不恢复**（桌面仍被覆盖） |
+| 临时覆盖层（原全屏窗口仍覆盖显示器） | **不恢复**、不结束会话 |
+
+- 退出判定不再依赖"QUNS 回落"：QUNS 可能因覆盖层/锁屏而滞留为全屏，只要会话不活跃
+  （销毁/隐藏/Cloak/最小化）或前台不再 100% 覆盖，级别即为 `None` 并立即恢复；
+  反之，QUNS 单独存在不会创建新会话（见 §1.3.7）。
+- 已删除 `RESUME_COOLDOWN`（500ms）、`in_resume_cooldown*`、`remaining_resume_cooldown*`、
+  `schedule_resume_after_cooldown` 与 `mirrorstar-fullscreen-resume-delay` 线程；
+  退出全屏（级别回落 / 会话销毁/隐藏/Cloak/最小化）直接调用 `resume_from_fullscreen_exit()`。
+- 保留 `RESUME_IN_PROGRESS` 去重（同一时刻仅一个后台恢复线程）与终止代数比对
+  （`TERMINATION_GENERATION`，防止慢跑的旧恢复覆盖后续新终止）。
+
+#### 1.3.6 兜底与启动初始化
+
+| 路径 | 行为 |
+|------|------|
+| 500ms 轻量探针 + 2s 全量兜底（`mirrorstar-fullscreen-probe`） | 每 `PROBE_INTERVAL=500ms` 采集一次快照（`quns` / `foreground_root` / `iconic` / `cloaked`）；快照变化 → `reconcile_fullscreen("probe")`；每 4 个 tick（`FULL_RECONCILE_EVERY_TICKS`，≈2s）→ `reconcile_fullscreen("watchdog")` 全量调和，同时兜底漏检的**进入**与**退出**（对象钩子失效、无前台切换、独占 D3D 全屏、最小化/Cloak 等），不再只在 `FULLSCREEN_WAS=true` 时检查。探针不进入 engine 锁、不执行处置 |
+| 监控线程启动 | 安装钩子后、进入消息循环前调用 `reconcile_fullscreen("startup")`，识别"应用启动时已处于全屏"的前台窗口 |
+| 纯净壁纸模式 | `reconcile_fullscreen` 直接返回、`state.rs` 共享 helper 首部守卫同样返回 `None`，`FULLSCREEN_LEVEL` / `FULLSCREEN_SESSION` / `FULLSCREEN_WAS` 保持冻结；退出后 `reevaluate_now()` 以 `"pure_mode_exit"` 补跑一次 |
+
+> 确认线程允许使用 `blocking_lock`（不运行于 WinEvent 回调线程），因此不会因 engine
+> 锁忙而丢弃处置；WinEvent 回调线程本身仍只做 lightweight 判定与登记。
+
+> 兜底路径的 `reason`：`probe`（探针快照变化）、`watchdog`（每 2s 全量）、`startup`（启动初始化）、`pure_mode_exit`（纯净模式退出补跑）；事件路径与完整 reason 列表见 §1.3.7。
+
+#### 1.3.7 会话优先的全屏判定与 500ms 探针（对齐主流实现，2026-11-06 修订）
+
+对象事件是"尽力而为"的变更通知：独占 D3D 全屏（游戏 / 播放器调用 `ChangeDisplaySettings`）**不保证**发出 `EVENT_OBJECT_LOCATIONCHANGE` / `STATECHANGE`，仅靠钩子仍可能整段漏检。微软官方对 `SHQueryUserNotificationState` 的 Remarks 亦明确：**全屏应用启动 / 停止不会发送 WM 通知，调用方必须轮询**——因此 500ms 轻量探针是必要组件，而不是可选的兜底。
+
+**会话身份与权威信号解耦**：
+
+- **QUNS 只负责"触发 / 维持 / 确认"**：探针据此发现状态变化、维持已有全屏会话、为 400ms 复核提供"系统仍全屏"的证据；
+- **窗口矩形负责"身份"**：谁能成为全屏会话的锚定窗口，由前台窗口的可信度 + DWM 可见边界 **100% 覆盖**决定；
+- **会话负责"事实"**：会话一旦登记，级别与身份优先沿用；覆盖层（任务管理器 / Alt-Tab 等不覆盖前台）不得改写会话与 `LAST_FULLSCREEN`；
+- **QUNS 不单独创建 `TrueFullscreen` 会话**：若 QUNS 报告全屏但前台是不可信 / 不覆盖窗口，级别仍为 `None`，避免把覆盖层当成全屏应用身份（旧的"由 QUNS 直接决定前台级别"会导致此类误判）。
+
+**一次观测 + 纯函数解析**（`observe_fullscreen` / `resolve_fullscreen`）：
+
+- `FullscreenObservation`：一次采集 `quns`、`quns_verdict`、前台根 HWND `fg_root`、`fg_credible`（排除自身窗口 / 系统桌面组件 / 自家渲染器 / Cloak / 最小化）、`fg_covers`（DWM 可见边界 100% 覆盖）、`fg_maximized`（`IsZoomed` 或 ≥95%）、`fg_iconic`、`fg_cloaked`、`display_id`（`MONITORINFOEXW.szDevice`）；一次调和与一次会话复核**各只读一次 QUNS**；
+- `SessionProbe { hwnd, level, alive, covers, cloaked }`：当前会话的健康快照；`ObservedForeground { root, credible, covers, maximized }`：前台几何 / 可信度；
+- `resolve_fullscreen(session, quns_fullscreen, fg) -> Resolution { level, anchor, switch_to }`：纯函数（便于单元测试）；`switch_to` 仅表示"全屏应用切换，只更新会话身份，不重复暂停 / 终止"。
+
+**QUNS 映射**（`SHQueryUserNotificationState`，`Win32::UI::Shell`；仅作维持 / 确认证据）：
+
+| QUNS 状态 | 值 | 作用（不再直接决定前台级别） |
+|-----------|----|------|
+| `QUNS_NOT_PRESENT`（锁屏 / 屏保） | 1 | 不提供全屏证据（`NotFullscreen`）；会话维持仅依赖窗口覆盖 |
+| `QUNS_BUSY`（全屏应用 / 全屏优化） | 2 | 全屏证据：触发探针、维持已有会话、支撑确认复核 |
+| `QUNS_RUNNING_D3D_FULL_SCREEN`（D3D 独占全屏） | 3 | 全屏证据（同上） |
+| `QUNS_PRESENTATION_MODE`（演示模式） | 4 | 全屏证据（同上） |
+| `QUNS_ACCEPTS_NOTIFICATIONS` / `QUNS_QUIET_TIME` / `QUNS_APP` | 5 / 6 / 7 | 无证据（`Fallback`），只依赖前台覆盖 / 最大化判定 |
+| 调用失败（HRESULT 错误） | — | `debug` 记录，按无证据处理；仍可由前台覆盖 + 会话优先解析得出结果 |
+
+> `QUNS_RUNNING_D3D_FULL_SCREEN` 是 Lively Wallpaper 等主流实现识别独占全屏的官方信号；对 `ChangeDisplaySettings` 型全屏，QUNS 是可靠的"系统仍在全屏"证据，但**全屏应用身份仍必须由 100% 覆盖的前台窗口给出**。Windows 的全屏优化（fullscreen optimizations）可能让全屏应用报为 `QUNS_BUSY` 而非 `QUNS_RUNNING_D3D_FULL_SCREEN`，映射表已一并覆盖。
+
+**DWM 精化**：
+
+- `DwmGetWindowAttribute(DWMWA_EXTENDED_FRAME_BOUNDS)` 取**可见窗口边界**（不含 Win10/11 的不可见 resize 边框），失败或返回空矩形时回退 `GetWindowRect`；
+- `DwmGetWindowAttribute(DWMWA_CLOAKED)` 非零 → 该窗口**不可信**（UWP 挂起 / 切后台时窗口不可见）：作为前台时级别判为 `None`；作为会话时判定为不活跃，结束会话后立即恢复；
+- 依赖 features：workspace `Cargo.toml` 的 `windows` 新增 `Win32_Graphics_Dwm`、`Win32_UI_Shell`（QUNS 与 DWM API 的编译期门控）。
+
+**会话新增 `display_id`**：会话登记时记录 `MONITORINFOEXW.szDevice`（如 `\\.\DISPLAY1`）。当前仅用于调和 / 会话日志诊断，并为后续"按显示器分别处置"预留；处置仍是全局的（任一显示器真全屏即按配置暂停 / 终止全部壁纸）。
+
+**级别计算优先级**（`resolve_fullscreen`，会话优先）：
+
+| 顺序 | 判据 | 结果 |
+|------|------|------|
+| 1 | 存在**活跃会话**（会话存在、窗口存活、未 Cloak，且会话窗口仍 100% 覆盖显示器 **或** QUNS 仍为全屏） | 沿用会话级别与身份；若此时出现新的"可信且 100% 覆盖"前台窗口（HWND 与会话不同），仅以 `switch_to` 更新会话身份，级别仍为 `TrueFullscreen`，不重复暂停 / 终止 |
+| 2 | 无活跃会话，且前台可信并 **100% 覆盖**显示器 | `TrueFullscreen`（新会话） |
+| 3 | 无活跃会话，且前台可信并最大化（`IsZoomed` 或 ≥95%） | `Maximized` |
+| 4 | 其余（含 QUNS 单独为全屏、前台为不覆盖的覆盖层或不可信窗口） | `None` |
+
+> 覆盖层（任务管理器 / Alt-Tab）在前台时，只要会话仍存活且覆盖，级别保持 `TrueFullscreen`，会话与 `LAST_FULLSCREEN` 均不被改写；只有"可信且 100% 覆盖"的前台窗口才能改写身份。
+
+**500ms 轻量探针 + 2s 全量兜底**（线程 `mirrorstar-fullscreen-probe`）：
+
+- 每 `PROBE_INTERVAL=500ms` 采集 `ProbeSnapshot`：`quns`（原始值，失败为 `None`）、`foreground_root`（前台根 HWND）、`iconic`（`IsIconic`）、`cloaked`（`DWMWA_CLOAKED`）；
+- 快照与上次不同 → `reconcile_fullscreen("probe")`；每 4 个 tick（`FULL_RECONCILE_EVERY_TICKS`，≈2s）→ `reconcile_fullscreen("watchdog")` 全量兜底；
+- **探针不进入 engine 锁、不执行处置**：只做只读查询与状态登记，暂停/终止仍由 400ms 确认线程统一执行；
+- 效果：无事件的独占全屏发现时延 ≤1s，事件快路径仍保持前台切换的近实时响应。
+
+**会话确认（`ConfirmCheck`）与调和共用同一观测**：
+
+- 复核不再单独重算"前台级别"，而是用同一 `FullscreenObservation` + `resolve_fullscreen` 得到 `level_now`，因此覆盖层场景不会被误判为退出；
+- `ConfirmCheck.session_now` 为 `SessionIdentity { hwnd, level }`（复核只关心身份与级别，不搬运 `display_id`）；
+- 会话窗口被 DWM Cloak → 复核失败，取消暂停/终止（壁纸保持播放）；
+- `level_now` 与登记级别一致 → 继续执行；`TrueFullscreen` 会话即使 `level_now` 回落，只要原全屏窗口仍覆盖显示器 **或** QUNS 仍明确为全屏（任务管理器 / Alt-Tab 覆盖层）→ 仍继续执行；
+- QUNS 回落（不再明确为全屏）且原全屏窗口不再覆盖显示器 → 取消暂停/终止。
+
+**主流实现对比**：
+
+| 实现 | 检测机制 | 权威信号 | 处置策略 |
+|------|----------|----------|----------|
+| Lively Wallpaper | 500ms 定时器；foreground / all / grid / gamemode 多种检测模式 | GameMode 使用 `SHQueryUserNotificationState`（QUNS 2/3/4） | 暂停 / 停止壁纸播放 |
+| Wallpaper Engine（WPE） | 公开文档：应用规则（按进程）+ 性能规则 | 内部检测未公开 | 按规则暂停 / 停止（释放内存）/ 保持运行 |
+| 本项目 MirrorStar | WinEvent 事件快路径 + 500ms QUNS / 前台根轻量探针 + 每 2s 全量兜底 | QUNS 触发 / 维持 + 前台 100% 覆盖身份 + 会话优先 | 默认 `terminate`（销毁子进程），另有 `pause` / `none` |
+
+> 调和 debug 日志新增 `quns` / `fg_root` / `fg_credible` / `fg_covers` / `fg_maximized` / `fg_iconic` / `fg_cloaked` / `session`（含 `display_id`）字段；`reason` 可能为 `foreground` / `window_state` / `minimize` / `session_destroyed` / `session_hidden` / `session_cloaked` / `uncloak` / `probe` / `watchdog` / `startup` / `pure_mode_exit`。
+
+#### 1.3.8 Win11 壁纸消失问题覆盖矩阵（审查结论）
+
+针对「Win11 下全屏应用期间壁纸消失 / 退出后桌面短暂露出原生壁纸」的专项审查（change-id `audit-win11-flash-coverage`），逐项给出「已修复 / 固有残差 / 未覆盖」判定。
+
+**已修复（6 项）**
+
+| # | 问题 | 处置（对应代码） |
+|---|------|------------------|
+| 1 | 退出瞬间的旧前台事件误终止 mpv | 会话确认 + 生命周期取消：会话销毁/隐藏/Cloak/最小化立即递增意图代数，确认线程判定过期直接返回（§1.3.4 / §1.3.5） |
+| 2 | 覆盖层（任务管理器 / Alt-Tab）改写会话身份导致确认取消 | 会话优先解析 + 覆盖层免疫：级别沿用活跃会话，只有「可信且 100% 覆盖」的前台窗口才能 `switch_to` 改写身份（§1.3.7） |
+| 3 | 恢复依赖 500ms 冷却 + 2s 轮询（慢） | 权威退出立即恢复：删除 `RESUME_COOLDOWN` 与延迟恢复线程，级别回落 / 会话结束直接 `resume_from_fullscreen_exit()`（§1.3.5） |
+| 4 | 独占 D3D 全屏不产生前台 / 对象事件（漏检） | 500ms QUNS 轻量探针 + 每 2s 全量兜底，无事件也能在 ≤1s 内发现进入与退出（§1.3.6 / §1.3.7） |
+| 5 | Win10/11 不可见边框误判与 UWP Cloak | `DWMWA_EXTENDED_FRAME_BOUNDS` 取可见边界；`DWMWA_CLOAKED` 非零视为不可信（前台判 `None`、会话判不活跃）（§1.3.7） |
+| 6 | 全屏应用最小化后 QUNS 滞留导致壁纸持续终止 | QUNS 不单独创建会话：QUNS 仅作触发 / 维持 / 确认证据，会话身份由可信且 100% 覆盖的前台窗口决定（§1.3.7） |
+
+> 本次加固补充：`state.rs` 的 `pause_all_fast_blocking(reason, still_valid)` / `terminate_all_fast_blocking(reason, still_valid)` 接收 `still_valid: impl FnOnce() -> bool`，在**成功取得 engine 锁之后、执行处置之前**再校验一次；`false` → 记录 `info`「等待 engine 锁期间会话已结束，取消全屏终止/暂停」并返回 `None`。调用侧由 `mirrorstar-fullscreen-confirm` 线程传入 `|| generation_still_valid(expected, PENDING_ACTION_GENERATION.load(...))`（`expected == current` 即仍有效）。这关闭的是「400ms 复核已通过、但等待 engine 锁期间应用关闭」的窗口。
+
+**固有残差（接受）**
+
+| 残差 | 说明 |
+|------|------|
+| `terminate` 策略下的 mpv 冷启动窗口 | 真实退出全屏后需重新拉起 `mpv.exe`，原生壁纸窗口约 **0.35–0.5s**，属策略代价而非检测缺陷 |
+| 处置执行开始后应用恰好关闭 | 终止过程本身约 **128ms**，其间若应用关闭仍可能闪现；`still_valid` 最终校验只能关闭「等待 engine 锁」这一段，**无法撤销已发出的 mpv quit** |
+
+> **零闪烁请使用 `fullscreen_action = pause`**：进程驻留、仅发 IPC `pause`，退出全屏秒级恢复、无冷启动窗口；代价是全屏期间保留 mpv 内存（视频/网页子进程不释放，见《09-性能优化》§22.3 情形 #15 / #18 / #31）。
+
+**未覆盖 / 待办**
+
+| 项 | 状态 |
+|----|------|
+| 启动后 **18.2s** 才出现视频壁纸 | 已补 boot 日志（`PERF-BOOT` 阶段耗时 + `boot_wallpaper_applied`），根因待下次真机日志确认 |
+| Explorer 重启 / WorkerW 重建导致的桌面层空窗 | 既有自愈路径（WorkerW 周期检查 + 桌面层自愈）存在，未纳入本次审查范围 |
+| 按显示器暂停、按 exe 应用规则 | 产品能力缺失（当前处置为全局、`display_id` 仅诊断用），非检测正确性问题 |
 
 ***
 
@@ -481,58 +699,74 @@ MirrorStar 的暂停通过以下方式实现：
 
 ```mermaid
 sequenceDiagram
-    participant Hook as SetWinEventHook
+    participant WEv as WinEvent 钩子<br/>（系统事件 + 对象事件）
     participant Cfg as ConfigManager
-    participant Lib as fullscreen.rs<br/>（handle_foreground_event）
+    participant Lib as fullscreen.rs<br/>（reconcile_fullscreen）
     participant Engine as WallpaperEngine
     participant IPC as Named Pipe
     participant Child as 壁纸子进程 / 渲染线程
     participant Audio as VolumeControl
     participant Tray as 系统托盘
 
-    Note over Hook: 全屏应用启动
+    Note over WEv: 进入全屏（独占全屏可能不产生前台事件）
+    Note over Lib: 500ms 探针读 QUNS，可发现无事件的独占全屏；QUNS 不单独创建会话
+    Note over Lib: 会话身份由 100% 覆盖的可信前台窗口决定，覆盖层不改写会话
 
-    Hook->>Lib: 回调(EVENT_SYSTEM_FOREGROUND)
+    WEv->>Lib: 回调（FOREGROUND / LOCATIONCHANGE / STATECHANGE 等）
     Lib->>Cfg: 读取 pause.fullscreen_action
     Cfg-->>Lib: none / pause / terminate（默认 terminate）
 
     alt 纯净壁纸模式活跃
-        Lib->>Lib: 跳过暂停/恢复/终止处置（状态冻结，退出后补跑）
+        Lib->>Lib: 跳过调和（状态冻结，退出后补跑）
     else 正常处置
-        Lib->>Lib: is_foreground_fullscreen() → true（窗口矩形覆盖显示器）
+        Lib->>Lib: resolve_fullscreen()（会话优先）→ TrueFullscreen / Maximized / None
         alt action == None
             Lib->>Lib: 不处置（若此前已处置则恢复并清理残留）
-        else action == Terminate
-            Lib->>Engine: terminate_all_fast(PauseReason::FULLSCREEN)
-            Engine->>Child: 终止视频/网页子进程（GIF/图片普通暂停）
-        else action == Pause
-            Lib->>Engine: pause_all_fast(PauseReason::FULLSCREEN)
-            Engine->>IPC: 发送 pause 命令（mpv 原生 / wp-proc 自定义）
-            IPC->>Child: 暂停播放（显示静态帧）
+        else 同一会话且级别未变
+            Lib->>Lib: NoOp（幂等，仅更新诊断字段）
+        else 新全屏会话
+            Lib->>Lib: 登记 FULLSCREEN_SESSION + 递增确认意图代数
+            Lib->>Lib: 确认线程 mirrorstar-fullscreen-confirm 等待 CONFIRM_DELAY（400ms）
+            alt 复核通过（意图未取消 / 会话未替换 / 窗口健康 / 级别未变或原窗口仍覆盖）
+                alt action == Terminate
+                    Lib->>Engine: terminate_all_fast_blocking(PauseReason::FULLSCREEN)
+                    Engine->>Child: 终止视频/网页子进程（GIF/图片普通暂停）
+                else action == Pause
+                    Lib->>Engine: pause_all_fast_blocking(PauseReason::FULLSCREEN)
+                    Engine->>IPC: 发送 pause 命令（mpv 原生 / wp-proc 自定义）
+                    IPC->>Child: 暂停播放（显示静态帧）
+                end
+                Note over Engine: PauseReason 位图 set FULLSCREEN bit
+                Engine->>Audio: set_process_mute(child_pid, true)
+                Audio->>Audio: ISimpleAudioVolume::SetMute(true)
+                Engine->>Tray: update_menu_text("恢复壁纸")
+            else 复核失败（会话已结束 / 意图过期 / 级别回落）
+                Lib->>Lib: 放弃处置，壁纸保持播放
+            end
         end
-        Note over Engine: PauseReason 位图 set FULLSCREEN bit
-        Engine->>Audio: set_process_mute(child_pid, true)
-        Audio->>Audio: ISimpleAudioVolume::SetMute(true)
-        Engine->>Tray: update_menu_text("恢复壁纸")
     end
 
-    Note over Hook: 全屏应用退出
+    Note over WEv: 退出全屏
 
-    Hook->>Lib: 回调(EVENT_SYSTEM_FOREGROUND, desktop_hwnd)
-    Lib->>Lib: is_foreground_fullscreen() → false（类名匹配 Progman/WorkerW/Shell_TrayWnd）
-    Lib->>Engine: resume_all_fast(PauseReason::FULLSCREEN)
-
-    alt 位图仍非空（BATTERY / TRAY 等其他 reason 活跃）
-        Engine-->>Engine: clear FULLSCREEN bit，不发 Resume
-    else 位图清空
-        Engine->>IPC: 发送 resume 命令
-        IPC->>Child: 恢复播放
-        Engine->>Child: Terminated 视频/网页渲染器 play() 重启并重嵌
-        Engine->>Audio: set_process_mute(child_pid, false)
-        Audio->>Audio: ISimpleAudioVolume::SetMute(false)
+    WEv->>Lib: 权威信号（DESTROY / HIDE / CLOAKED / MINIMIZESTART / 级别回落）
+    Lib->>Lib: end_session(...) 立即取消确认意图
+    alt 临时覆盖层（原全屏窗口仍覆盖显示器）
+        Lib->>Lib: 不恢复，壁纸保持暂停
+    else 真正退出全屏
+        Lib->>Engine: resume_from_fullscreen_exit()（立即，无冷却）
+        alt 位图仍非空（BATTERY / TRAY 等其他 reason 活跃）
+            Engine-->>Engine: clear FULLSCREEN bit，不发 Resume
+        else 位图清空
+            Engine->>IPC: 发送 resume 命令
+            IPC->>Child: 恢复播放
+            Engine->>Child: Terminated 视频/网页渲染器 play() 重启并重嵌
+            Engine->>Audio: set_process_mute(child_pid, false)
+            Audio->>Audio: ISimpleAudioVolume::SetMute(false)
+        end
+        Engine->>Tray: update_menu_text("暂停壁纸")
     end
 
-    Engine->>Tray: update_menu_text("暂停壁纸")
+    Note over Lib: 500ms 轻量探针（快照变化即调和）+ 每 2s 全量兜底，仅作漏检兜底
 ```
 
 ***
@@ -543,12 +777,12 @@ sequenceDiagram
 
 | 路径 | 守卫行为 |
 |------|----------|
-| `state.rs::try_pause_all_fast` / `try_resume_all_fast` / `try_terminate_all_fast` / `resume_all_fast_blocking` | 首部检查 `pure_mode::is_active()`，命中则直接返回 `None`，跳过暂停/恢复/终止处置；调用方不更新 `FULLSCREEN_WAS` / `POWER_WAS_ON_BATTERY`，状态冻结 |
+| `state.rs::try_pause_all_fast` / `try_resume_all_fast` / `pause_all_fast_blocking` / `terminate_all_fast_blocking` / `resume_all_fast_blocking` | 首部检查 `pure_mode::is_active()`，命中则直接返回 `None`，跳过暂停/恢复/终止处置；调用方不更新 `FULLSCREEN_WAS` / `POWER_WAS_ON_BATTERY`，状态冻结 |
 | `state.rs::try_heal_desktop_layer` | 模式内临时覆盖窗是顶层窗口、不挂在桌面层下，跳过桌面层自愈（返回 `None`） |
 | 轮换调度器（`scheduler.rs`） | 定时轮换与手动"下一张"均跳过（`pure_mode::is_active() || pause_reasons 非空` 即抑制）；退出时 `wake` 重算 deadline |
 
 - 纯净模式自身**不占用 `PauseReason` 位**：该位图对非空原因统一发 `PauseCommand::Pause`，而模式的目标是"抑制轮换/处置但不停播"，塞入位图会污染语义。
-- **退出后补跑**：`fullscreen::reevaluate_now()` 复用 `handle_foreground_event` 补跑一次前台全屏判定；`power::reevaluate_now()` 复用 `handle_power_status_change` 补跑一次电源判定，纠正模式期间冻结的状态漂移。
+- **退出后补跑**：`fullscreen::reevaluate_now()` 调用 `reconcile_fullscreen("pure_mode_exit")` 补跑一次全屏状态调和；`power::reevaluate_now()` 复用 `handle_power_status_change` 补跑一次电源判定，纠正模式期间冻结的状态漂移。
 
 ***
 

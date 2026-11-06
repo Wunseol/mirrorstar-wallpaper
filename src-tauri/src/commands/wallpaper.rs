@@ -811,7 +811,9 @@ pub async fn remove_wallpaper(
         // 删除对应缩略图（若有），同样先做 data_dir 边界校验防越界删除。
         // 缩略图按含 uuid 的源路径 hash 命名，逐 id 删除安全，不会误删其他壁纸。
         if !entry.thumbnail.is_empty()
-            && validate_path_within_data_dir(&entry.thumbnail).await.is_ok()
+            && validate_path_within_data_dir(&entry.thumbnail)
+                .await
+                .is_ok()
         {
             if let Err(e) = tokio::fs::remove_file(&entry.thumbnail).await {
                 tracing::warn!(error = %e, path = %entry.thumbnail, "删除缩略图失败（配置已移除）");

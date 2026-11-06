@@ -95,9 +95,8 @@ pub fn install_listener(app: AppHandle) {
         .name("mirrorstar-second-instance".to_string())
         .spawn(move || loop {
             // SAFETY: 句柄由本线程独占持有；自动重置事件在每次等待返回后自动复位。
-            let wait = unsafe {
-                WaitForSingleObject(HANDLE(event_handle as *mut c_void), INFINITE)
-            };
+            let wait =
+                unsafe { WaitForSingleObject(HANDLE(event_handle as *mut c_void), INFINITE) };
             if wait != WAIT_OBJECT_0 {
                 tracing::warn!("单实例显示事件等待失败，停止监听");
                 break;

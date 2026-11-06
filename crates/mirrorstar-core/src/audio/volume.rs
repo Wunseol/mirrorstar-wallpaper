@@ -4,7 +4,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{channel, Receiver, RecvTimeoutError, Sender};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
-use windows::core::{implement, Interface, PCWSTR, Result as WinResult};
+use windows::core::{implement, Interface, Result as WinResult, PCWSTR};
 use windows::Win32::Foundation::{CloseHandle, HANDLE, STILL_ACTIVE};
 use windows::Win32::Media::Audio::*;
 use windows::Win32::System::Com::*;
@@ -526,7 +526,10 @@ impl VolumeControl {
         // A-001：仅在成功下发后更新缓存（失败不更新以避免脏值），
         // 供设备变更后向新端点上的会话重下发用户设定。
         if result.is_ok() {
-            let mut cached = self.cached_setting.lock().unwrap_or_else(|e| e.into_inner());
+            let mut cached = self
+                .cached_setting
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
             cached.pid = Some(pid);
             cached.volume = Some(volume);
         }
@@ -550,7 +553,10 @@ impl VolumeControl {
         };
         // A-001：仅在成功下发后更新缓存（失败不更新以避免脏值）。
         if result.is_ok() {
-            let mut cached = self.cached_setting.lock().unwrap_or_else(|e| e.into_inner());
+            let mut cached = self
+                .cached_setting
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
             cached.pid = Some(pid);
             cached.mute = Some(mute);
         }
@@ -1496,7 +1502,10 @@ mod tests {
         assert!(should_redispatch_on_default_change(eRender, eMultimedia));
         // 假：同一次切换附带的另外两个角色
         assert!(!should_redispatch_on_default_change(eRender, eConsole));
-        assert!(!should_redispatch_on_default_change(eRender, eCommunications));
+        assert!(!should_redispatch_on_default_change(
+            eRender,
+            eCommunications
+        ));
         // 假：捕获端点（与视频壁纸音量无关）
         assert!(!should_redispatch_on_default_change(eCapture, eMultimedia));
     }

@@ -197,9 +197,7 @@ pub fn open_main_window(app: &AppHandle) {
 pub fn toggle_main_window(app: &AppHandle) {
     let now = Instant::now();
     let accepted = {
-        let mut last = LAST_TRAY_TOGGLE
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let mut last = LAST_TRAY_TOGGLE.lock().unwrap_or_else(|e| e.into_inner());
         if should_accept_tray_toggle(*last, now, TRAY_TOGGLE_DEBOUNCE) {
             *last = Some(now);
             true

@@ -1,7 +1,7 @@
 mod commands;
 mod platform;
-pub mod single_instance;
 mod scheduler;
+pub mod single_instance;
 mod state;
 // UI 子进程管理器与协议桥（壳模式下托管原生主窗口 UI 子进程）。
 mod ui_process;

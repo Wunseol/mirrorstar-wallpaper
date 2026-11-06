@@ -96,7 +96,9 @@ fn prune_matching(
                 freed += len;
             }
             // Windows 下文件可能被占用/共享冲突，忽略并继续
-            Err(e) => tracing::warn!(path = %path.display(), error = %e, "删除日志文件失败，已忽略"),
+            Err(e) => {
+                tracing::warn!(path = %path.display(), error = %e, "删除日志文件失败，已忽略")
+            }
         }
     }
     (deleted, freed)

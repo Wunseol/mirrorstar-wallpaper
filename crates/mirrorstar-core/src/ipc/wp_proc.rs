@@ -393,8 +393,17 @@ mod tests {
             let v: serde_json::Value = serde_json::from_str(&json).unwrap();
 
             // 每个变体都必须带正确的 snake_case command tag 与 request_id
-            assert_eq!(v["command"], *expected_tag, "命令 {:?} 的 command tag 不符", cmd);
-            assert_eq!(v["request_id"], cmd.request_id(), "命令 {:?} 的 request_id 不符", cmd);
+            assert_eq!(
+                v["command"], *expected_tag,
+                "命令 {:?} 的 command tag 不符",
+                cmd
+            );
+            assert_eq!(
+                v["request_id"],
+                cmd.request_id(),
+                "命令 {:?} 的 request_id 不符",
+                cmd
+            );
 
             // 各变体特有的关键字段
             match cmd {
@@ -418,7 +427,10 @@ mod tests {
                     // 反序列化往返：确保 volume 能被还原
                     let back: WpProcCommand = serde_json::from_str(&json).unwrap();
                     match back {
-                        WpProcCommand::SetVolume { volume: back_volume, .. } => {
+                        WpProcCommand::SetVolume {
+                            volume: back_volume,
+                            ..
+                        } => {
                             assert_eq!(back_volume, *volume)
                         }
                         other => panic!("期望 SetVolume，实际: {:?}", other),

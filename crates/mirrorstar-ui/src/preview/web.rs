@@ -269,7 +269,11 @@ impl WebPending {
                 },
             ));
             unsafe {
-                let host = self.host.as_ref().map(PreviewHost::hwnd).unwrap_or_default();
+                let host = self
+                    .host
+                    .as_ref()
+                    .map(PreviewHost::hwnd)
+                    .unwrap_or_default();
                 if let Err(e) = env.CreateCoreWebView2Controller(host, &callback) {
                     return WebPoll::Failed(format!("CreateCoreWebView2Controller 调用失败: {e}"));
                 }

@@ -16,9 +16,7 @@
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 
-use mirrorstar_core::config::settings::{
-    AppConfig, Arrangement, FullscreenAction, RotationConfig,
-};
+use mirrorstar_core::config::settings::{AppConfig, Arrangement, FullscreenAction, RotationConfig};
 use mirrorstar_core::config::{DisplayInfo, Pool, WallpaperEntry, WallpaperType};
 use mirrorstar_core::ui_proto::{Hello, UiEvent, UnitStateDto};
 use mirrorstar_core::wallpaper::{ScalingMode, WallpaperState};

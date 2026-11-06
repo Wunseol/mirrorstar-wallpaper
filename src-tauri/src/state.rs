@@ -46,7 +46,7 @@ use tauri::AppHandle;
 /// 快速路径命令（`pause_wallpaper` / `resume_wallpaper` / `set_volume` /
 /// `toggle_mute`）获取 engine 锁后调用 `*_fast` 方法。托盘菜单通过全局
 /// `SHARED_ENGINE` 使用 `blocking_lock()` 获取 engine 锁。Win32 回调（全屏
-/// 检测 `foreground_event_callback`、电源监控 `handle_power_status_change`）
+/// 检测 `win_event_callback`、电源监控 `handle_power_status_change`）
 /// 运行于 Win32 消息循环 / 窗口过程回调上下文（`DispatchMessageW` /
 /// `explorer_monitor_wndproc`），不可长时间阻塞（否则会延迟
 /// `TaskbarCreated` 等 Explorer 事件处理），因此通过全局 `SHARED_ENGINE`
@@ -112,7 +112,7 @@ use tauri::AppHandle;
 ///
 /// ## Win32 回调访问全局静态量（非 AppState 字段）
 ///
-/// Win32 回调（`foreground_event_callback` / `handle_power_status_change` /
+/// Win32 回调（`win_event_callback` / `handle_power_status_change` /
 /// `explorer_monitor_wndproc`）是 `extern "system" fn` 函数指针，无法接收
 /// `State` 或 `AppHandle` 参数，需通过 `SHARED_ENGINE` / `SHARED_CONFIG` /
 /// `EXPLORER_MONITOR_HWND` 等全局静态量访问。这些静态量在 `lib.rs` setup 中通过
@@ -140,7 +140,7 @@ pub struct AppState {
 //
 // 全局静态量清单（按可收敛性分类）。评估结论：**全部保留，不做收敛**。理由如下：
 //
-// 核心约束：Win32 回调（`foreground_event_callback`、`explorer_monitor_wndproc`）
+// 核心约束：Win32 回调（`win_event_callback`、`explorer_monitor_wndproc`）
 // 是 `extern "system" fn` 函数指针，**无法捕获闭包变量**，也无法访问 Tauri 的
 // `AppState`（AppState 需通过 `AppHandle::try_state` 获取，而回调签名不接受
 // AppHandle 参数）。因此回调所需状态必须通过进程级全局可访问。
@@ -148,9 +148,9 @@ pub struct AppState {
 // 按可收敛性分类：
 //
 // A. 必须保留（Win32 回调直接访问，无法移入 AppState）—— 6 个：
-//   - `SHARED_ENGINE`         : foreground_event_callback / handle_power_status_change 访问
-//   - `SHARED_CONFIG`         : foreground_event_callback / handle_power_status_change 访问
-//   - `FULLSCREEN_WAS`        : foreground_event_callback 的全屏状态机
+//   - `SHARED_ENGINE`         : win_event_callback / handle_power_status_change 访问
+//   - `SHARED_CONFIG`         : win_event_callback / handle_power_status_change 访问
+//   - `FULLSCREEN_WAS`        : win_event_callback 的全屏状态机
 //   - `EXPLORER_MONITOR_HWND` : desktop_layer_destroy_callback 向监控窗口 PostMessage
 //   - `DESKTOP_LAYER_HEAL_LAST_MS`（含 `DESKTOP_LAYER_HEAL_EPOCH`）
 //                             : explorer_monitor_wndproc 的桌面层自愈去抖时间戳
@@ -171,8 +171,8 @@ pub struct AppState {
 //
 // C. 必须保留（退出守卫，跨调用点幂等）—— 2 个：
 //   - `SHUTDOWN_DONE`         : perform_shutdown_blocking 幂等守卫，必须进程级可见
-//   - `WIN_EVENT_HOOK`        : 退出时（或二次调用 start 时）UnhookWinEvent 释放，
-//                               C-014/C-015 后改为 Mutex<Option> 以支持 take/replace
+//   - `WIN_EVENT_HOOKS`      : 退出时（或二次调用 start 时）UnhookWinEvent 释放全部钩子，
+//                               C-014/C-015 后改为 Mutex<Vec> 以支持 take/replace 与多事件源
 //
 // 替代方案考虑（已否决）：
 //   - 移入 AppState：破坏 Win32 回调访问（A 类），且 ExitRequested 路径需重构。
@@ -233,12 +233,12 @@ pub(crate) static TASKBAR_CREATED_MSG: OnceLock<u32> = OnceLock::new();
 /// 电源状态跟踪：是否因电池供电暂停过
 pub(crate) static POWER_WAS_ON_BATTERY: AtomicBool = AtomicBool::new(false);
 
-/// SetWinEventHook 句柄，用于退出时通过 UnhookWinEvent 释放
+/// SetWinEventHook 句柄列表，用于退出/重启时通过 UnhookWinEvent 释放
 ///
-/// 使用 `Mutex<Option<...>>`（而非 OnceLock）以支持 C-014/C-015：二次调用
-/// `start_fullscreen_monitor` 时先 `take()` 旧句柄并 `UnhookWinEvent`，再重新 start。
-/// `Mutex` 保证 take/replace 期间独占访问，无并发写风险。
-pub(crate) static WIN_EVENT_HOOK: Mutex<Option<SendWinEventHook>> = Mutex::new(None);
+/// 使用 `Mutex<Vec<...>>`（而非 OnceLock）以支持 C-014/C-015 与多事件源：
+/// 全屏监控同时注册"系统事件"与"对象事件"两个钩子；二次调用 `start_fullscreen_monitor`
+/// 时先取出并注销全部旧钩子，再重新 start。`Mutex` 保证 take/replace 期间独占访问。
+pub(crate) static WIN_EVENT_HOOKS: Mutex<Vec<SendWinEventHook>> = Mutex::new(Vec::new());
 
 /// HWINEVENTHOOK 的 Send/Sync 包装器（原始类型包含裸指针，未实现 Send/Sync）
 pub(crate) struct SendWinEventHook(pub windows::Win32::UI::Accessibility::HWINEVENTHOOK);
@@ -250,14 +250,13 @@ pub(crate) struct SendWinEventHook(pub windows::Win32::UI::Accessibility::HWINEV
 //
 // Send 安全性：句柄是普通数值令牌（HANDLE 类型别名），在线程间移动所有权不会产生
 // 数据竞争或别名问题。句柄创建于 `start_fullscreen_monitor` 线程，存入全局
-// `WIN_EVENT_HOOK: Mutex<Option<SendWinEventHook>>`，后续仅在 `perform_shutdown_blocking`
-// 或二次调用 `start_fullscreen_monitor` 时通过 `take()` 取出用于 `UnhookWinEvent`。
+// `WIN_EVENT_HOOKS: Mutex<Vec<SendWinEventHook>>`，后续仅在 `perform_shutdown_blocking`
+// 或二次调用 `start_fullscreen_monitor` 时取出用于 `UnhookWinEvent`。
 // `Mutex` 保证 take/replace 期间独占访问，无并发写。
 //
 // Sync 安全性：`UnhookWinEvent` 按 Win32 文档可在任意线程调用（与 SetWinEventHook
-// 所在线程无关），内部不依赖线程局部状态。本包装器存入 `Mutex<Option<...>>` 后，
-// 所有 take/replace 均在 Mutex 守卫下进行，不存在 `&SendWinEventHook` 别名，
-// 因此跨线程共享安全。
+// 所在线程无关），内部不依赖线程局部状态。本包装器存入 `Mutex<Vec<...>>` 后，
+// 所有读写均在 Mutex 守卫下进行，不存在 `&SendWinEventHook` 别名，因此跨线程共享安全。
 //
 // 参考: https://learn.microsoft.com/windows/win32/api/winuser/nf-winuser-unhookwinevent
 //   "UnhookWinEvent can be called from any thread."
@@ -415,7 +414,7 @@ pub(crate) static SHUTDOWN_DONE: AtomicBool = AtomicBool::new(false);
 /// # 设计要点
 ///
 /// - `try_lock` 而非 `blocking_lock`：本函数运行于 Win32 回调上下文
-///   （`foreground_event_callback` / `handle_power_status_change`），blocking_lock 会
+///   （`win_event_callback` / `handle_power_status_change`），blocking_lock 会
 ///   阻塞消息循环，延迟 `TaskbarCreated` / `EVENT_SYSTEM_FOREGROUND` 处理（T-001）。
 /// - 锁忙时返回 `None`：事件会重复触发（`WM_POWERBROADCAST` / `EVENT_SYSTEM_FOREGROUND`），
 ///   可容忍偶发跳过。
@@ -428,7 +427,7 @@ pub(crate) fn try_pause_all_fast(reason: PauseReason) -> Option<Vec<String>> {
         tracing::warn!(reason = ?reason, "纯净壁纸模式运行中，跳过壁纸暂停/恢复/终止处置（模式退出后会补跑判定）");
         return None;
     }
-    // 原子交换进行中跳过暂停（与 try_terminate_all_fast / resume_all_fast_blocking 一致）：
+    // 原子交换进行中跳过暂停（与 terminate_all_fast_blocking / resume_all_fast_blocking 一致）：
     // 轮换原子交换 build 阶段（新渲染器构建/嵌入中）触发的 Pause 会让旧渲染器无谓暂停，
     // 并在主窗口打开时触发 hide→restore 闪烁。返回 None 与"锁忙跳过"语义一致：
     // 调用方不更新状态，事件会重复触发。
@@ -573,7 +572,7 @@ pub(crate) fn resume_all_fast_blocking(reason: PauseReason) -> Option<Vec<String
         tracing::warn!(reason = ?reason, "纯净壁纸模式运行中，跳过壁纸暂停/恢复/终止处置（模式退出后会补跑判定）");
         return None;
     }
-    // 原子交换进行中时跳过全屏恢复（语义同 try_terminate_all_fast）。
+    // 原子交换进行中时跳过全屏恢复（语义同 terminate_all_fast_blocking）。
     // 返回 None 使调用方保留 FULLSCREEN_WAS，由周期复查线程在交换结束后重试恢复。
     if atomic_swap_in_progress() {
         tracing::warn!(reason = ?reason, "原子交换进行中，跳过 resume_all_fast_blocking（周期复查线程会重试）");
@@ -590,40 +589,78 @@ pub(crate) fn resume_all_fast_blocking(reason: PauseReason) -> Option<Vec<String
     Some(failed)
 }
 
-/// 尝试终止所有壁纸子进程的快速路径（全屏终止释放内存）
+/// 阻塞式全屏终止入口（供全屏会话确认线程使用）
 ///
-/// 与 [`try_pause_all_fast`] 对称，调用 `terminate_all_fast`。返回值语义相同：
-/// - `None`：`SHARED_ENGINE` 未设置或锁忙，调用方应跳过本次事件，不更新状态标志
+/// 全屏处置由 `fullscreen.rs` 在登记会话后延迟 `CONFIRM_DELAY`（400ms）复核执行；
+/// 会话窗口销毁/隐藏/Cloak/最小化或级别变化会取消本次处置。本函数由专用后台线程
+/// `mirrorstar-fullscreen-confirm` 调用，可用 `blocking_lock` 等待 engine 锁，
+/// 不会因锁忙而丢弃处置，同时不阻塞 WinEvent 回调线程。
+///
+/// `still_valid` 在**成功取得 engine 锁之后、执行终止之前**调用一次：若等待锁期间
+/// 会话已被取消（`DESTROY`/`HIDE` 递增意图代数），则放弃终止，避免在退出瞬间误杀 mpv。
+///
+/// # 返回值
+///
+/// - `None`：`SHARED_ENGINE` 未设置、守卫命中或 `still_valid` 为 false。
+///   调用方应保留 `FULLSCREEN_WAS`，由周期复查/后续事件兜底。
 /// - `Some(failed)`：已调用 `terminate_all_fast`，`failed` 为失败的 display_id 列表
-pub(crate) fn try_terminate_all_fast(reason: PauseReason) -> Option<Vec<String>> {
-    // 纯净壁纸模式守卫（D5）：模式内跳过终止处置，状态冻结（避免终止 mpv 后画面消失）。
-    // 返回 None 语义同"原子交换进行中跳过"——调用方不更新状态标志，
-    // 由模式退出后的补跑判定统一纠正。
+///   （空表示全部成功）。调用方据此决定是否更新终止时间戳与代数。
+pub(crate) fn terminate_all_fast_blocking<F>(
+    reason: PauseReason,
+    still_valid: F,
+) -> Option<Vec<String>>
+where
+    F: FnOnce() -> bool,
+{
     if mirrorstar_core::pure_mode::is_active() {
         tracing::warn!(reason = ?reason, "纯净壁纸模式运行中，跳过壁纸暂停/恢复/终止处置（模式退出后会补跑判定）");
         return None;
     }
-    // 原子交换进行中时跳过全屏终止。原子交换阶段 A→C 期间 WorkerW
-    // 正在被新窗嵌入/换槽，此时终止会重建 WorkerW 导致 commit 前校验失败
-    // （"新窗父窗口已非当前 WorkerW"）与首帧等待超时。返回 None 与"锁忙跳过"语义
-    // 一致：调用方不更新状态，事件会重复触发。
     if atomic_swap_in_progress() {
-        tracing::warn!(reason = ?reason, "原子交换进行中，跳过 terminate_all_fast（事件会重复触发）");
+        tracing::warn!(reason = ?reason, "原子交换进行中，跳过 terminate_all_fast_blocking（后续事件会重试）");
         return None;
     }
     let engine = SHARED_ENGINE.get()?;
-    let mut engine = match engine.try_lock() {
-        Ok(e) => e,
-        Err(e) => {
-            tracing::debug!(
-                error = ?e,
-                reason = ?reason,
-                "engine 锁忙，跳过 terminate_all_fast（事件会重复触发，可容忍偶发跳过）"
-            );
-            return None;
-        }
-    };
+    let mut engine = engine.blocking_lock();
+    // 最终并发校验：等待锁期间若会话被取消，放弃处置（否则会在退出瞬间误杀 mpv）
+    if !still_valid() {
+        tracing::info!(
+            reason = ?reason,
+            "等待 engine 锁期间会话已结束，取消全屏终止"
+        );
+        return None;
+    }
     Some(engine.terminate_all_fast(reason).unwrap_or_default())
+}
+
+/// 阻塞式全屏暂停入口（供全屏会话确认线程使用）
+///
+/// 与 [`terminate_all_fast_blocking`] 对称：确认窗口结束后才调用，因此运行于专用后台线程
+/// （`mirrorstar-fullscreen-confirm`），可用 `blocking_lock` 等待 engine 锁，不阻塞
+/// WinEvent 回调线程。守卫（纯净模式 / 原子交换）与 `try_pause_all_fast` 一致；
+/// `still_valid` 同样在取得锁后、执行前做最终校验。
+pub(crate) fn pause_all_fast_blocking<F>(reason: PauseReason, still_valid: F) -> Option<Vec<String>>
+where
+    F: FnOnce() -> bool,
+{
+    if mirrorstar_core::pure_mode::is_active() {
+        tracing::warn!(reason = ?reason, "纯净壁纸模式运行中，跳过壁纸暂停/恢复/终止处置（模式退出后会补跑判定）");
+        return None;
+    }
+    if atomic_swap_in_progress() {
+        tracing::warn!(reason = ?reason, "原子交换进行中，跳过 pause_all_fast_blocking（后续事件会重试）");
+        return None;
+    }
+    let engine = SHARED_ENGINE.get()?;
+    let engine = engine.blocking_lock();
+    if !still_valid() {
+        tracing::info!(
+            reason = ?reason,
+            "等待 engine 锁期间会话已结束，取消全屏暂停"
+        );
+        return None;
+    }
+    Some(engine.pause_all_fast(reason).unwrap_or_default())
 }
 
 /// 退出清理辅助：take 线程 ID 并向消息循环线程 PostThreadMessage WM_QUIT 唤醒退出
@@ -731,7 +768,7 @@ fn try_lock_with_timeout<T>(
 ///      （停止周期性保存定时器）+ `stop_watching()`（take 并 drop 文件监视器）
 ///   3. **唤醒消息循环线程**：`signal_thread_exit` 向 FULLSCREEN/EXPLORER
 ///      监控线程 `PostThreadMessageW(WM_QUIT)` 唤醒 `GetMessageW` 阻塞
-///   4. **释放 SetWinEventHook**：`UnhookWinEvent(WIN_EVENT_HOOK)` 取消事件钩子，
+///   4. **释放 SetWinEventHook**：`UnhookWinEvent` 注销全部事件钩子（系统 + 对象），
 ///      保证后续 engine.shutdown() 期间不再收到 WinEvent 回调
 ///   5. **join 监控线程**：FULLSCREEN / EXPLORER / WORKERW_INIT 三类监控线程
 ///      join 等待退出，避免线程泄漏与回调访问已释放资源
@@ -799,9 +836,13 @@ pub(crate) fn perform_shutdown_blocking(
     // 因此清理应反向进行：先 unhook WinEvent → join 监控线程 → 再 shutdown engine → 再 flush 配置 → 最后 CoUninitialize。
     // 先 unhook 可保证 engine.shutdown() 期间不再收到 WinEvent 回调，避免回调访问已释放的资源。
 
-    // 释放 SetWinEventHook 句柄（最先初始化的资源，最后清理则相反——先 unhook）
-    // take 句柄：C-014/C-015 后改为 Mutex<Option>，take 后清空
-    if let Some(hook) = WIN_EVENT_HOOK.lock().ok().and_then(|mut h| h.take()) {
+    // 释放全部 SetWinEventHook 句柄（系统事件 + 对象事件）
+    // take 列表：C-014/C-015 后改为 Mutex<Vec>，take 后清空
+    let hooks = WIN_EVENT_HOOKS
+        .lock()
+        .map(|mut h| std::mem::take(&mut *h))
+        .unwrap_or_default();
+    for hook in hooks {
         unsafe {
             // 退出清理路径：UnhookWinEvent 返回 BOOL（windows-rs 0.58），
             // 失败时钩子句柄随进程退出自动回收，无需传播错误
@@ -1202,9 +1243,9 @@ mod tests {
 
     // ── 纯净壁纸模式状态守卫契约（D5）──────────────────────────────────────
 
-    /// D5：4 个共享 helper（`try_pause_all_fast` / `try_resume_all_fast` /
-    /// `try_terminate_all_fast` / `resume_all_fast_blocking`）均须含纯模式守卫，
-    /// 使模式内全屏/电源处置动作被跳过（返回 None，状态冻结）。
+    /// D5：全部共享 helper（`try_pause_all_fast` / `try_resume_all_fast` /
+    /// `pause_all_fast_blocking` / `terminate_all_fast_blocking` / `resume_all_fast_blocking`）
+    /// 均须含纯模式守卫，使模式内全屏/电源处置动作被跳过（返回 None，状态冻结）。
     #[test]
     fn pure_mode_guards_present_in_all_shared_helpers() {
         let source = include_str!("state.rs");
@@ -1216,8 +1257,9 @@ mod tests {
         for name in [
             "try_pause_all_fast",
             "try_resume_all_fast",
+            "pause_all_fast_blocking",
+            "terminate_all_fast_blocking",
             "resume_all_fast_blocking",
-            "try_terminate_all_fast",
         ] {
             let sig = ["pub(crate) fn ", name].join("");
             let start = source

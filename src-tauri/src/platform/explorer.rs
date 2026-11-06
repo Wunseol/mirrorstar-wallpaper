@@ -86,12 +86,13 @@ unsafe extern "system" fn desktop_layer_destroy_callback(
     };
     let monitor = windows::Win32::Foundation::HWND(*raw_hwnd as *mut core::ffi::c_void);
     // PostMessageW 失败忽略：下一次事件或 300s 兜底轮询会兜底
+    // LPARAM 携带被销毁窗口句柄数值，供窗口过程记录/辨识具体是哪个桌面层窗口
     let _ = unsafe {
         PostMessageW(
             monitor,
             WM_APP_DESKTOP_LAYER_CHANGED,
             windows::Win32::Foundation::WPARAM(0),
-            windows::Win32::Foundation::LPARAM(0),
+            windows::Win32::Foundation::LPARAM(hwnd.0 as isize),
         )
     };
 }
@@ -155,7 +156,16 @@ fn trigger_heal_desktop_layer(reason: &str, debounce: bool) {
         return;
     };
     DESKTOP_LAYER_HEAL_LAST_MS.store(now_ms, Ordering::SeqCst);
-    tracing::info!(reason, did_reinit, "桌面层自愈完成");
+    if did_reinit {
+        tracing::info!(reason, did_reinit, "桌面层自愈完成");
+    } else {
+        // 无实际重初始化（如 Explorer 临时创建/销毁非当前壁纸层 WorkerW）：仅校验、零写入
+        tracing::debug!(
+            reason,
+            did_reinit,
+            "桌面层自愈完成（桌面层无实际重初始化，仅校验/零写入）"
+        );
+    }
 }
 
 /// Explorer 重启监控窗口过程的消息处理体
@@ -187,6 +197,11 @@ fn handle_explorer_message(
 
     // WorkerW / Progman 被销毁（WinEvent 回调转发）
     if msg == WM_APP_DESKTOP_LAYER_CHANGED {
+        let destroyed = lparam.0;
+        tracing::debug!(
+            destroyed_hwnd = destroyed,
+            "收到桌面层销毁事件（类名过滤：WorkerW/Progman）"
+        );
         trigger_heal_desktop_layer("desktop_layer_destroyed", true);
         return windows::Win32::Foundation::LRESULT(0);
     }

@@ -456,15 +456,19 @@ mod tests {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .drop = Arc::new(move |paths: Vec<String>| {
-                calls_in_cb.fetch_add(1, Ordering::SeqCst);
-                *seen_in_cb
-                    .lock()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner()) = paths;
-            });
+            calls_in_cb.fetch_add(1, Ordering::SeqCst);
+            *seen_in_cb
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()) = paths;
+        });
 
         dispatch_drop(&shared, vec![r"C:\tmp\beta.jpg".to_string()]);
 
-        assert_eq!(calls.load(Ordering::SeqCst), 1, "panic 后新回调应被调用一次");
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "panic 后新回调应被调用一次"
+        );
         assert_eq!(
             *seen.lock().unwrap_or_else(|poisoned| poisoned.into_inner()),
             vec![r"C:\tmp\beta.jpg".to_string()],

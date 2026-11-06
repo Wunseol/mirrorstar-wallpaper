@@ -66,7 +66,7 @@ use tokio::sync::Notify;
 ///
 /// 构造时置位 `ATOMIC_SWAP_IN_PROGRESS`，Drop 时复位。在 `apply_to_display` 的
 /// 原子交换路径（阶段 A 嵌入 → B 首帧就绪 → C commit）创建，确保：
-/// - 全屏终止/恢复检测到标志时跳过本次（state.rs 见 try_terminate_all_fast /
+/// - 全屏终止/恢复检测到标志时跳过本次（state.rs 见 terminate_all_fast_blocking /
 ///   resume_all_fast_blocking），避免交换期间重建 WorkerW / 冷启动 mpv
 /// - 任何错误路径（wait_new_ready 失败 / commit 校验失败）退出作用域时自动复位，
 ///   不会残留 true 卡死后续全屏处置
@@ -750,8 +750,13 @@ fn invalidate_all_samplers(handle: &SchedulerHandle, layout: &LayoutPlane) {
 // ── 开机 / 唤醒解析（一次 apply，DR-12 / DR-18 / DR-21）─────────────────────
 
 async fn apply_boot(handle: &SchedulerHandle, layout: &LayoutPlane, app: &tauri::AppHandle) {
+    let boot_started = std::time::Instant::now();
     let cfg = handle.config_manager.get_config();
+    let mut units = 0usize;
+    let mut applied = 0usize;
+    let mut failed = 0usize;
     for key in layout::unit_keys(layout) {
+        units += 1;
         let unit = handle
             .playback
             .lock()
@@ -792,24 +797,82 @@ async fn apply_boot(handle: &SchedulerHandle, layout: &LayoutPlane, app: &tauri:
             },
         );
 
+        // 开机决策落日志：排查真机"启动后桌面空窗"时，需区分是 boot 未恢复上次壁纸，
+        // 还是用户随后手动设置。decision 在 match 中会被 move，故此处借用生成标签。
+        let (decision_label, wallpaper_id) = match &decision {
+            BootDecision::Restore(id) => ("restore", Some(id.clone())),
+            BootDecision::Advance => ("advance", None),
+            BootDecision::None => ("none", None),
+        };
+        tracing::info!(
+            key = %key,
+            current_exists,
+            decision = decision_label,
+            wallpaper_id = ?wallpaper_id,
+            pool_count = count,
+            "开机壁纸解析结果"
+        );
+
+        let unit_started = std::time::Instant::now();
         match decision {
             BootDecision::Restore(id) => {
-                if apply_wallpaper_to_unit(
+                let result = apply_wallpaper_to_unit(
                     handle, layout, &key, &id, /* record_history = */ true, app,
                 )
-                .await
-                    == UnitApplyResult::Applied
-                {
+                .await;
+                if result == UnitApplyResult::Applied {
                     emit_rotated(app, &key, &id);
+                    applied += 1;
+                } else {
+                    failed += 1;
                 }
+                let result_label = match result {
+                    UnitApplyResult::Applied => "applied",
+                    UnitApplyResult::Failed => "failed",
+                    UnitApplyResult::Busy => "busy",
+                };
+                tracing::info!(
+                    key = %key,
+                    result = result_label,
+                    elapsed_ms = unit_started.elapsed().as_millis() as u64,
+                    "开机壁纸应用完成"
+                );
             }
             BootDecision::Advance => {
-                // sample_and_apply_unit 内部 emit rotated；此处无需利用返回值。
-                sample_and_apply_unit(handle, layout, &key, app).await;
+                // sample_and_apply_unit 内部 emit rotated；返回 Some(id) 表示应用成功，
+                // None 表示无可换（池不足 / 采样为空 / apply 失败），仅用于日志区分。
+                let result = sample_and_apply_unit(handle, layout, &key, app).await;
+                let result_label = if result.is_some() {
+                    applied += 1;
+                    "applied"
+                } else {
+                    "skipped"
+                };
+                tracing::info!(
+                    key = %key,
+                    result = result_label,
+                    elapsed_ms = unit_started.elapsed().as_millis() as u64,
+                    "开机壁纸应用完成"
+                );
             }
-            BootDecision::None => {}
+            BootDecision::None => {
+                tracing::info!(
+                    key = %key,
+                    result = "none",
+                    elapsed_ms = unit_started.elapsed().as_millis() as u64,
+                    "开机壁纸应用完成"
+                );
+            }
         }
     }
+
+    tracing::info!(
+        units,
+        applied,
+        failed,
+        total_ms = boot_started.elapsed().as_millis() as u64,
+        "开机壁纸应用汇总"
+    );
 
     // 启动期内存埋点：开机壁纸应用完成，标签带上各单元当前壁纸类型。
     // 先取出 current id 并释放 playback 锁，再查配置解析类型，避免跨锁嵌套。
@@ -1712,7 +1775,7 @@ mod tests {
 
     /// 测试 b：跳过决策判定条件。
     ///
-    /// state.rs 的 `try_terminate_all_fast` / `resume_all_fast_blocking` 在
+    /// state.rs 的 `terminate_all_fast_blocking` / `resume_all_fast_blocking` 在
     /// `atomic_swap_in_progress()` 为 true 时跳过本次全屏终止/恢复并 warn 返回 None
     /// （与"锁忙跳过"语义一致，调用方不更新状态，事件会重复触发）。本测试验证该
     /// 判定条件的置位/复位行为：guard 存活期间为 true（跳过分支命中），drop 后为

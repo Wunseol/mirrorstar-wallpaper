@@ -1468,7 +1468,18 @@ impl WallpaperEngine {
             }
         }
 
-        tracing::info!(did_reinit, healed, skipped, failed, "桌面层自愈完成");
+        if did_reinit || healed > 0 || failed > 0 {
+            tracing::info!(did_reinit, healed, skipped, failed, "桌面层自愈完成");
+        } else {
+            // 无实际变化（如 Explorer 临时创建/销毁非当前壁纸层 WorkerW）：降噪为 debug
+            tracing::debug!(
+                did_reinit,
+                healed,
+                skipped,
+                failed,
+                "桌面层自愈无实际变化（临时 WorkerW 销毁等事件，跳过重复重嵌）"
+            );
+        }
         Ok(did_reinit)
     }
 
@@ -2009,11 +2020,26 @@ impl WallpaperEngine {
         let all_hwnds = self.collect_pure_mode_hwnds(&lifted);
         crate::pure_mode::register_lifted(&all_hwnds);
 
+        // 日志必须在 `lifted` move 进 `PureModeState` 之前按局部变量计算数量，
+        // 并按实际进入路径给出文案（摘出置顶 / 临时覆盖窗 / 两者混合）。
+        let lifted_count = lifted.len();
         let temp_count = self.pure_mode_temp.len();
+        let entry_msg = if lifted_count > 0 {
+            format!(
+                "已进入纯净壁纸模式（{lifted_count} 个壁纸窗口已摘出并置顶全屏，{temp_count} 个临时覆盖窗）"
+            )
+        } else if temp_count > 0 {
+            format!("已进入纯净壁纸模式（{temp_count} 个显示器使用临时覆盖窗，原壁纸窗口未搬动）")
+        } else {
+            format!(
+                "已进入纯净壁纸模式（{lifted_count} 个壁纸窗口已摘出并置顶全屏，{temp_count} 个临时覆盖窗）"
+            )
+        };
         tracing::info!(
-            displays = lifted.len(),
+            displays = lifted_count,
             temp_windows = temp_count,
-            "已进入纯净壁纸模式（壁纸窗口已摘出并置顶全屏）"
+            "{}",
+            entry_msg
         );
         self.pure_mode = Some(PureModeState {
             lifted,

@@ -79,6 +79,8 @@ graph LR
 | 电池影响      | 持续唤醒       | 无唤醒      |
 | 代码复杂度     | 低          | 中        |
 
+> 上表为「纯事件驱动」的理论对比。当前实现为**事件快路径 + 500ms 轻量探针**混合：探针每 tick 仅做 `QUNS` / 前台根 HWND / `IsIconic` / `DWMWA_CLOAKED` 四项只读查询，快照不变时不触发任何调和，稳态空闲开销为每 500ms 数次只读系统调用。级别解析采用**会话优先**模型——QUNS 仅负责触发 / 维持 / 确认证据，全屏身份由「可信且 100% 覆盖的前台窗口」决定；一次调和只读一次 QUNS（`FullscreenObservation` 一次采集后供解析与日志复用），覆盖层（任务管理器 / Alt-Tab）不改写会话与 `LAST_FULLSCREEN`，因此不会额外产生查询或处置开销。会话新增的 `display_id`（`MONITORINFOEXW.szDevice`）仅用于诊断与后续按显示器预留，复用同一 `GetMonitorInfoW` 调用，不增加额外开销。
+
 ## 5. 内存使用优化
 
 | 优化点     | 方案                                   | 预期效果        |
@@ -439,9 +441,18 @@ GIF 帧像素预算默认 40MB（配置项 `GifConfig.max_memory_mb`，合法范
 | 29 | 壁纸轮换调度运行 | 叠加 | 壳内单条 tokio 主循环（`select!`），无「每显示器一线程」 | Main×1 | 复用 | — | 复用 | 复用 | — | 切换瞬时 | 【导】`scheduler.rs` |
 | 30 | 电池供电暂停（`pause_on_battery`） | 叠加 | `pause_all_fast(BATTERY)`，语义同对应类型的暂停 | 同底层类型 | 同暂停语义 | 同暂停语义 | 同暂停语义 | 同暂停语义 | — | ~0 | 【导】`platform/power.rs` |
 | 31 | 全屏暂停（`fullscreen_action=pause`） | 叠加 | 同对应类型的暂停（视频/网页**仅 IPC，不释放子进程**） | 同底层类型 | 不释放 | 不释放 | ≈播放态 | ≈播放态 | ≈播放态 | ~0 | 【导】`platform/fullscreen.rs` |
-| 32 | 全屏终止（`fullscreen_action=terminate`，默认） | 叠加 | 销毁子进程（视频 mpv / 网页 wp-proc+WebView2） | Main×1 | 释放 | 释放 | 回落 | 回落 | — | — | 【导】`fullscreen.rs` |
+| 32 | 全屏终止（`fullscreen_action=terminate`，默认） | 叠加 | 销毁子进程（视频 mpv / 网页 wp-proc+WebView2）；**检测为 500ms QUNS / 前台根轻量探针 + 每 2s 全量兜底（`QUNS` 仅作触发 / 维持 / 确认证据，会话身份由可信且 100% 覆盖的前台窗口决定，会话优先）；进入真全屏后走 400ms 会话确认 + 取得 engine 锁后的 `still_valid` 最终校验 + 生命周期事件取消 + 权威退出立即恢复（无 500ms 冷却 / 无 2s 等待）；固有残差 ≈0.35–0.5s（mpv 冷启动，属策略代价；零闪烁请用 `pause`）** | Main×1 | 释放 | 释放 | 回落 | 回落 | — | — | 【导】`fullscreen.rs` |
 | 33 | 显示器热插拔 3s 轮询 | 叠加 | 壳内 `interval(3s)`，仅集合真变时推 `displays-changed` 并重建 | Main×1 | 复用 | — | 复用 | 复用 | — | ~0 | 【导】`scheduler.rs` |
 | 34 | 启动期峰值 | 叠加 | 冷启动初始化（引擎/配置/WorkerW/开机壁纸） | Main×1（UI 不创建） | — | — | 【底】历史口径见 §20（WebView2 时代，**已失效**） | — | — | — | 【底】 |
+
+> **事件源与开销（全屏检测）**：
+>
+> - **对象事件钩子**覆盖 `EVENT_OBJECT_DESTROY..EVENT_OBJECT_UNCLOAKED`（0x8001..0x8015），回调内只做事件类型 / 根祖先的廉价过滤；`LOCATIONCHANGE` / `STATECHANGE` 仅对前台根或会话窗口放行，并做 **≥100ms 节流**，普通窗口拖动不会进入全屏状态机。
+> - **500ms 轻量探针**（线程 `mirrorstar-fullscreen-probe`）：每次只读 `SHQueryUserNotificationState` + `GetForegroundWindow` 根 HWND + `IsIconic` + `DWMWA_CLOAKED` 四项快照，**仅在快照变化时**才调用 `reconcile_fullscreen("probe")`；每 **4 个 tick（≈2s）**再执行一次 `reconcile_fullscreen("watchdog")` 全量调和。探针不获取 engine 锁、不执行暂停/终止，稳态开销仅为每 500ms 数次只读系统调用。
+> - **会话优先解析**：`QUNS` 只作为触发 / 维持 / 确认证据，全屏身份由可信且 100% 覆盖的前台窗口（DWM `DWMWA_EXTENDED_FRAME_BOUNDS`）决定；一次调和只读一次 QUNS（`FullscreenObservation` 一次采集后复用），覆盖层（任务管理器 / Alt-Tab）不改写会话与 `LAST_FULLSCREEN`，不会引发重复暂停 / 终止。
+> - **权威信号**：`QUNS` 是独占 D3D 全屏（`ChangeDisplaySettings` 不保证发对象事件）的可靠"系统仍在全屏"证据（官方 Remarks 明确全屏应用启动 / 停止不发送 WM 通知，故必须轮询）；DWM 的 `DWMWA_EXTENDED_FRAME_BOUNDS` / `DWMWA_CLOAKED` 均为只读查询，开销可忽略。会话记录的 `display_id` 仅用于诊断，不额外发起查询。
+> - **确认执行前的 `still_valid` 最终校验**：`pause_all_fast_blocking` / `terminate_all_fast_blocking` 在取得 engine 锁之后、执行处置之前再校验一次会话代号（`generation_still_valid(expected, PENDING_ACTION_GENERATION)`）；失败则放弃本次处置并记录 `info`「等待 engine 锁期间会话已结束，取消全屏终止/暂停」。该检查只读一个原子量，**不增加系统调用**，用于关闭「确认通过但等锁期间应用已关闭」的窗口。
+> - **`terminate` 的固有残差（≈0.35–0.5s，mpv 冷启动）**：默认策略 `fullscreen_action=terminate` 会销毁 `mpv.exe` / `--wp-proc` 子进程，退出全屏后需重新拉起渲染器，其间桌面短暂露出原生壁纸（见 §22.3 情形 #16 / #19 / #32）。这是**策略代价，不是检测缺陷**——检测侧已做到权威退出立即恢复（无 500ms 冷却）。**零闪烁请改用 `pause`**（仅 IPC 暂停、进程驻留、退出秒恢复），代价是全屏期间保留子进程内存（情形 #15 / #18 / #31）。另：处置执行开始后的约 128ms 终止过程若恰好应用关闭仍可能闪现，`still_valid` 无法撤销已发出的 mpv quit。
 
 ### 22.4 实测明细（对正在运行的视频壁纸实例，只读采样）
 
@@ -797,7 +808,7 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass `
 
 | 维度 | MirrorStar 策略 |
 |----------|-----------|
-| **全屏检测** | SetWinEventHook 事件驱动(0 CPU) + AtomicBool 去抖 |
+| **全屏检测** | SetWinEventHook 事件快路径 + 500ms QUNS/前台根轻量探针 + 每 2s 全量兜底 + 原子标志去抖 |
 | **图片加载** | 超屏幕分辨率自动降采样 + 暂停释放像素 |
 | **GIF 内存** | 40MB 内存预算 + 暂停释放帧 + 速度控制 |
 | **GIF 渲染** | GDI 对象缓存 + 双缓冲 + WM_TIMER |

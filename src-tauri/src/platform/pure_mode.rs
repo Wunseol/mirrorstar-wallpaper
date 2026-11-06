@@ -164,8 +164,10 @@ fn reset_pure_mode_cursor_when_waiting() {
         if !mirrorstar_core::pure_mode::is_active() {
             return;
         }
-        let mut info = CURSORINFO::default();
-        info.cbSize = std::mem::size_of::<CURSORINFO>() as u32;
+        let mut info = CURSORINFO {
+            cbSize: std::mem::size_of::<CURSORINFO>() as u32,
+            ..Default::default()
+        };
         if unsafe { GetCursorInfo(&mut info) }.is_ok() && info.hCursor == wait_cursor {
             // 等待态已出现：复位一次；若鼠标不在覆盖窗上则立即结束，不做无意义挂接。
             let _ = reset_pure_mode_cursor();

@@ -161,10 +161,17 @@ flowchart TD
 | mpv.exe 缺失/启动失败   | 视频壁纸不可用，提示用户检查 mpv.exe（随程序分发或 PATH 查找）         |
 | 配置文件损坏             | 使用默认配置启动，记录警告日志                   |
 | 音频控制失败             | 壁纸正常播放，仅音频控制不可用                   |
-| SetWinEventHook 失败 | 记录错误并退出全屏监控线程；已启动的 2s 周期复查线程仍可处理“已暂停状态”的退出恢复，但无法检测新的全屏进入 |
+| SetWinEventHook 失败 | **系统事件钩子**（返回 0）：记录 `error` 并退出全屏监控线程，不再检测新的进入/退出；**对象事件钩子**（返回 0）：记录 `warn` 并继续——前台切换事件仍可用，500ms 轻量探针 + 每 2s 全量兜底同时覆盖进入与退出 |
 | Native 壁纸 API 失败  | 返回错误，**不回退** WorkerW 嵌入模式，记录错误日志           |
 
-> **SetWinEventHook 降级说明**：全屏**进入**检测依赖 `SetWinEventHook(EVENT_SYSTEM_FOREGROUND)` 事件；钩子设置失败（返回 `nullptr`）时，fullscreen.rs 记录错误并退出监控线程，不再检测新的全屏进入。另有独立的 2s 周期复查线程，仅用于兜底“已暂停但退出全屏时无前台切换事件”的恢复场景，不能替代进入检测。
+> **SetWinEventHook 降级说明**：全屏检测注册**两个** `WINEVENT_OUTOFCONTEXT` 钩子——系统事件（`EVENT_SYSTEM_FOREGROUND..EVENT_SYSTEM_MINIMIZEEND`）与对象事件（`EVENT_OBJECT_DESTROY..EVENT_OBJECT_UNCLOAKED`，附加 `WINEVENT_SKIPOWNPROCESS`）。**对象事件用于发现"独占全屏在同一个前台窗口内部切换"**：D3D `ChangeDisplaySettings` / borderless→exclusive 不产生前台事件，可依靠对象事件中的 `LOCATIONCHANGE` / `STATECHANGE` 识别，并由 500ms QUNS 轻量探针兜底。
+>
+> - **系统事件钩子失败（返回 0）**：`fullscreen.rs` 记录 `error` 并停止全屏监控线程（置 `FULLSCREEN_MONITOR_RUNNING=false`），不再检测新的全屏进入/退出；已启动的 500ms 探针线程仍会运行。
+> - **对象事件钩子失败（返回 0）**：记录 `warn` 并继续运行；前台切换（`EVENT_SYSTEM_FOREGROUND`）与最小化/还原事件仍可用，独立线程 `mirrorstar-fullscreen-probe` 的 500ms 轻量探针在快照变化时触发调和，并每 2s 执行一次全量兜底，**同时覆盖漏检的进入与退出**（不再是"仅退出"），但独占全屏的即时性会下降。
+> - **`SHQueryUserNotificationState` 调用失败**：`fullscreen.rs` 仅 `debug` 记录（"SHQueryUserNotificationState 调用失败，回退矩形判定"）并按"无全屏证据"处理，不影响事件钩子与暂停/恢复主流程。级别解析为**会话优先**模型，QUNS 只负责触发 / 维持 / 确认证据，因此调用失败时仍可由「可信且 100% 覆盖的前台窗口 + 已有会话」正常解析；**不会因 QUNS 失败创建错误的全屏会话**（覆盖层不会被当成全屏身份）。
+> - **`DwmGetWindowAttribute(DWMWA_EXTENDED_FRAME_BOUNDS)` 失败或返回空矩形**：回退 `GetWindowRect`；两者都失败时本次级别判定返回 `None`。
+> - **`DwmGetWindowAttribute(DWMWA_CLOAKED)` 失败**：按"未 Cloak"处理，避免因查询失败而误判为非全屏并提前恢复壁纸。
+> - 以上三者均为只读查询，失败只影响单次全屏级别判定的精度，**不影响壁纸显示与暂停/恢复主流程**。
 
 ***
 
