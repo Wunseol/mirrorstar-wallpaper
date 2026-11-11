@@ -554,6 +554,9 @@ const DEFAULT_INTERVAL_MINUTES: u32 = 30;
 /// 定时间隔下限（分钟），DR-16：clamp 到 1 分钟，防短间隔反复 spawn/kill 视频进程。
 /// `pub`：命令层 `update_rotation_config`（src-tauri，外部 crate）用同一下限做硬校验（P2-9）。
 pub const MIN_INTERVAL_MINUTES: u32 = 1;
+/// 定时间隔上限（分钟）：与设置面板 `NumberStepper.max-value`（1440）同源，
+/// 防止 UI 之外（手改 config / 旧版本）写入无意义的超大间隔。
+pub const MAX_INTERVAL_MINUTES: u32 = 1440;
 
 fn default_interval_minutes() -> u32 {
     DEFAULT_INTERVAL_MINUTES
@@ -573,8 +576,9 @@ impl Default for RotationConfig {
 }
 
 impl RotationConfig {
-    /// DR-16：`interval_minutes` 范围校验，下限 clamp 到 1 分钟（60s）。
+    /// DR-16：`interval_minutes` 范围校验，clamp 到 `[1, 1440]` 分钟。
     ///
+    /// 上限与设置面板 `NumberStepper.max-value` 同源；冷启动读取手改配置时同样生效。
     /// 遵循现有 `validate()` 策略：就地修正 + `tracing::warn!`，调用方透明。
     pub fn validate(&mut self) {
         if self.interval_minutes < MIN_INTERVAL_MINUTES {
@@ -585,6 +589,14 @@ impl RotationConfig {
                 "RotationConfig.interval_minutes < 下限（1 分钟，DR-16），回退到下限"
             );
             self.interval_minutes = MIN_INTERVAL_MINUTES;
+        }
+        if self.interval_minutes > MAX_INTERVAL_MINUTES {
+            tracing::warn!(
+                value = self.interval_minutes,
+                max = MAX_INTERVAL_MINUTES,
+                "RotationConfig.interval_minutes > 上限（1440 分钟），回退到上限"
+            );
+            self.interval_minutes = MAX_INTERVAL_MINUTES;
         }
     }
 }

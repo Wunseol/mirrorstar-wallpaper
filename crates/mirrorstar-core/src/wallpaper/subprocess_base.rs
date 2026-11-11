@@ -80,10 +80,14 @@ pub(crate) const WP_PROC_CONNECT_INTERVAL_MS: u64 = 50;
 /// 从 20 降为 5：静音视频（无音轨）已由 Task 2 的音轨探测在调用
 /// `set_process_volume` 前剔除，此循环仅服务"有音轨但会话尚未注册"的短暂等待。
 /// 且 `with_session` 已对"未找到会话"静默处理（不刷新、不重试、不刷屏），
-/// 故此循环只在最终失败时打一条 WARN。5 × 150ms ≈ 0.75s。
-pub(crate) const AUDIO_VOLUME_RETRIES: u32 = 5;
+/// 故此循环只在最终失败时打一条 WARN。
+///
+/// v5.3 修复（P1）：5 × 150ms ≈ 0.75s 对 4K / 冷盘场景注册过晚的会话覆盖不足，
+/// 音量/静音会静默失效（mpv 回落 100% / 未静音）。调整为 10 × 200ms ≈ 2s，
+/// 配合调用方在窗口耗尽后的单次延迟兜底重试（见 `video.rs::apply_initial_audio`）。
+pub(crate) const AUDIO_VOLUME_RETRIES: u32 = 10;
 /// 初始音量设置重试间隔（毫秒）
-pub(crate) const AUDIO_VOLUME_RETRY_INTERVAL_MS: u64 = 150;
+pub(crate) const AUDIO_VOLUME_RETRY_INTERVAL_MS: u64 = 200;
 
 /// 子进程渲染器窗口识别的窗口属性名
 ///

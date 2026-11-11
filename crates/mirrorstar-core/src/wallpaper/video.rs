@@ -143,6 +143,89 @@ fn probe_audio_track(ipc: &Arc<std::sync::Mutex<Option<MpvIpcClient>>>) -> Probe
     }
 }
 
+/// 会话晚注册的兜底延迟：重试窗口耗尽后再等一次，覆盖 4K / 冷盘慢启动。
+const AUDIO_SESSION_LATE_RETRY_MS: u64 = 2000;
+
+/// 向 mpv 进程下发初始音量与静音（best-effort）。
+///
+/// WASAPI 音频会话注册晚于 mpv 启动，故按 `AUDIO_VOLUME_RETRIES` 轮询重试；
+/// 仍失败时延迟 [`AUDIO_SESSION_LATE_RETRY_MS`] 再试一次，避免慢启动时音量/静音
+/// 静默失效（回落 100% / 未静音，实际响度与面板显示不符）。
+/// 返回音量是否成功下发（静音只在音量成功后应用，与既有语义一致）。
+///
+/// 每次尝试独立加锁，sleep 期间不持锁，避免阻塞其他显示器的音量操作。
+fn apply_initial_audio(
+    vc: &std::sync::Mutex<VolumeControl>,
+    pid: u32,
+    volume: f32,
+    muted: bool,
+    warn_on_failure: bool,
+) -> bool {
+    let mut volume_ok = false;
+    let mut last_err = None;
+    for _ in 0..super::subprocess_base::AUDIO_VOLUME_RETRIES {
+        let result = vc
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .set_process_volume(pid, volume);
+        match result {
+            Ok(()) => {
+                volume_ok = true;
+                break;
+            }
+            Err(e) => {
+                last_err = Some(e);
+                std::thread::sleep(std::time::Duration::from_millis(
+                    super::subprocess_base::AUDIO_VOLUME_RETRY_INTERVAL_MS,
+                ));
+            }
+        }
+    }
+    if !volume_ok {
+        // 重试窗口耗尽仍未成功：慢启动（4K / 冷盘）时会话可能更晚注册，延迟再试一次。
+        std::thread::sleep(std::time::Duration::from_millis(AUDIO_SESSION_LATE_RETRY_MS));
+        let result = vc
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .set_process_volume(pid, volume);
+        match result {
+            Ok(()) => {
+                volume_ok = true;
+                last_err = None;
+            }
+            Err(e) => last_err = Some(e),
+        }
+    }
+    if let Some(e) = last_err {
+        if warn_on_failure {
+            tracing::warn!(
+                pid,
+                volume,
+                error = ?e,
+                "set_process_volume 失败（重试窗口与兜底延迟后音频会话仍不可用）"
+            );
+        } else {
+            tracing::debug!(
+                pid,
+                volume,
+                error = ?e,
+                "set_process_volume 失败（探测超时回退，仅 debug）"
+            );
+        }
+    }
+    if muted && volume_ok {
+        // 创建时静音走 WASAPI 静音标志；随后的 SetVolume / 取消静音会清除该标志（见 PauseCommand 处理）
+        let result = vc
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .set_process_mute(pid, true);
+        if let Err(e) = result {
+            tracing::warn!(pid, error = ?e, "set_process_mute 失败（后台线程）");
+        }
+    }
+    volume_ok
+}
+
 /// 计算视频解码队列上限：单帧字节 = 宽×高×1.5（YUV420 8bit）。
 /// 仅当单帧超 16MB（4K 以上）时才需要放大队列，否则保持 16MB 内存优先默认。
 fn vd_queue_max_bytes(video_w: u64, video_h: u64) -> u64 {
@@ -275,6 +358,8 @@ pub struct VideoRenderer {
     volume: f32,
     /// 是否静音
     muted: bool,
+    /// 当前播放速度（after_embed 与 set_speed 同步）
+    speed: f32,
     /// 音量控制器（缓存 COM 接口），测试中可为 None
     volume_control: Option<Arc<Mutex<VolumeControl>>>,
     /// 视频宿主窗口（mpv 通过 --wid 渲染到它的子窗口；桌面嵌入操作的是宿主）
@@ -530,6 +615,9 @@ impl VideoRenderer {
         file_path: String,
         scaling_mode: ScalingMode,
         volume_control: Option<Arc<Mutex<VolumeControl>>>,
+        volume: f32,
+        muted: bool,
+        speed: f32,
     ) -> Self {
         let pipe_name = format!("mirrorstar-mpv-{}", uuid::Uuid::new_v4());
         let mpv_path = Self::find_mpv();
@@ -538,8 +626,9 @@ impl VideoRenderer {
             base: SubprocessRendererBase::new(mpv_path, pipe_name, scaling_mode),
             file_path,
             ipc: Arc::new(Mutex::new(None)),
-            volume: 1.0,
-            muted: false,
+            volume,
+            muted,
+            speed,
             volume_control,
             host: None,
         }
@@ -932,6 +1021,13 @@ impl WallpaperRenderer for VideoRenderer {
         // 0. 清理旧宿主（revive 场景），确保不会复用已销毁的 HWND
         self.shutdown_host();
 
+        // revive 时沿用运行时设定：全屏恢复重建 mpv 前，先同步 PauseSender 中
+        // 由用户实时调整后的音量/静音，避免回到配置初始值（配置仅在新建时种入）。
+        if let Some(sender) = &self.base.pause_sender {
+            self.volume = sender.volume();
+            self.muted = sender.is_muted();
+        }
+
         // 1. 创建隐藏宿主窗口：mpv 通过 --wid 只创建子窗口，永不产生顶层窗口。
         //    宿主创建即隐藏且带 WS_EX_TOOLWINDOW，任务栏/Alt+Tab 不会出现 mpv；
         //    embed_wallpaper 操作的是宿主，SetParent / layered 不再作用于 mpv 的 D3D11 窗口。
@@ -1075,60 +1171,18 @@ impl WallpaperRenderer for VideoRenderer {
                     }
                     match outcome {
                         ProbeOutcome::HasAudio => {
-                            // 有音轨（或探测不确定时保守视为有音轨）：执行音量重试循环。
-                            // 循环内无逐次日志，仅结束失败时打一条 WARN。
-                            let vc = vc.lock().unwrap_or_else(|e| e.into_inner());
-                            let mut volume_ok = false;
-                            let mut last_err = None;
-                            for _ in 0..super::subprocess_base::AUDIO_VOLUME_RETRIES {
-                                match vc.set_process_volume(pid_for_audio, volume) {
-                                    Ok(()) => {
-                                        volume_ok = true;
-                                        break;
-                                    }
-                                    Err(e) => {
-                                        last_err = Some(e);
-                                        std::thread::sleep(std::time::Duration::from_millis(
-                                            super::subprocess_base::AUDIO_VOLUME_RETRY_INTERVAL_MS,
-                                        ));
-                                    }
-                                }
-                            }
-                            if let Some(e) = last_err {
-                                tracing::warn!(error = ?e, "set_process_volume 失败（后台线程，重试窗口内音频会话未就绪）");
-                            }
-                            if muted && volume_ok {
-                                if let Err(e) = vc.set_process_mute(pid_for_audio, true) {
-                                    tracing::warn!(error = ?e, "set_process_mute 失败（后台线程）");
-                                }
-                            }
+                            // 有音轨（或探测不确定时保守视为有音轨）：WASAPI 会话注册晚于
+                            // mpv 启动，故按重试预算轮询下发音量/静音，失败仅 warn。
+                            apply_initial_audio(vc.as_ref(), pid_for_audio, volume, muted, true);
                         }
                         ProbeOutcome::Silent => {
                             // 确认无音轨（静音视频）：直接跳过 WASAPI，不打 WARN。
                             tracing::debug!(pid = pid_for_audio, "视频无音轨，跳过 WASAPI 音量设置");
                         }
                         ProbeOutcome::TimedOut => {
-                            // mpv 未在等待预算内进入播放：回退为单次静默 WASAPI 尝试，
-                            // 仅 debug 级日志，保证不因探测时序引入功能回归。
-                            let vc = vc.lock().unwrap_or_else(|e| e.into_inner());
-                            match vc.set_process_volume(pid_for_audio, volume) {
-                                Ok(()) => {
-                                    if muted {
-                                        if let Err(e) = vc.set_process_mute(pid_for_audio, true) {
-                                            tracing::debug!(
-                                                error = ?e,
-                                                "探测超时回退：set_process_mute 失败（单次尝试）"
-                                            );
-                                        }
-                                    }
-                                }
-                                Err(e) => {
-                                    tracing::debug!(
-                                        error = ?e,
-                                        "探测超时回退：单次 set_process_volume 失败（仅 debug）"
-                                    );
-                                }
-                            }
+                            // 探测超时回退：仍按重试预算下发（含延迟兜底），仅 debug 级日志，
+                            // 保证 4K / 冷盘慢启动时音量与静音不静默失效。
+                            apply_initial_audio(vc.as_ref(), pid_for_audio, volume, muted, false);
                         }
                     }
 
@@ -1271,6 +1325,8 @@ impl WallpaperRenderer for VideoRenderer {
             tracing::warn!(speed, "无效的视频播放速度，已忽略（speed 必须 > 0 且有限）");
             return;
         }
+        // 先记录字段：全屏恢复重新 play（after_embed）时仍用最近速度
+        self.speed = speed;
         let mut ipc = self.ipc.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(ref mut ipc) = *ipc {
             if let Err(e) = ipc.set_speed(speed) {
@@ -1337,6 +1393,14 @@ impl WallpaperRenderer for VideoRenderer {
         match ipc.as_mut() {
             Some(ipc_client) => {
                 ipc_client.loadfile(&self.file_path)?;
+                // loadfile 成功后按当前速度下发（best-effort，失败不影响加载语义）
+                if let Err(e) = ipc_client.set_speed(self.speed) {
+                    tracing::warn!(
+                        error = %e,
+                        speed = self.speed,
+                        "loadfile 后下发播放速度失败（已跳过，不影响视频加载）"
+                    );
+                }
                 tracing::info!(
                     file_path = %self.file_path,
                     "窗口已嵌入 WorkerW，通过 IPC loadfile 从头加载视频"
@@ -1369,19 +1433,27 @@ impl WallpaperRenderer for VideoRenderer {
     }
 
     fn create_pause_sender(&mut self, display_id: &str) -> Option<crate::wallpaper::PauseSender> {
+        // 重建 PauseSender（桌面自愈 / 重新嵌入）时继承旧 sender 的运行时音量与静音，
+        // 避免回落到创建时的配置值导致静音/音量跳变。
+        if let Some(sender) = &self.base.pause_sender {
+            self.volume = sender.volume();
+            self.muted = sender.is_muted();
+        }
+
         let (sender, mut rx, shared_state) = create_pause_channel();
 
         // 初始化共享状态
         {
             let mut s = shared_state.write().unwrap_or_else(|e| e.into_inner());
             s.state = self.base.state();
-            s.volume = self.volume;
+            s.seed_playback(self.volume, self.muted);
         }
 
         let ipc = self.ipc.clone();
         let volume_control = self.volume_control.clone();
         let audio_state = Arc::new(Mutex::new(VideoAudioState {
-            pre_mute_volume: None,
+            // 静音态与共享状态一致，使首次 ToggleMute 走向「恢复音量」而不是再设 0
+            pre_mute_volume: self.muted.then_some(self.volume),
             current_volume: self.volume,
             pid: self.base.process_pid(),
         }));
@@ -1460,6 +1532,13 @@ impl WallpaperRenderer for VideoRenderer {
                                             tracing::warn!(error = ?e, "SetVolume set_process_volume 失败");
                                         }
                                     }
+                                    // 清除创建时静音写入的 WASAPI 静音标志（同时刷新
+                                    // VolumeControl 的 cached_setting），否则取消静音后仍无声。
+                                    if volume > 0.0 {
+                                        if let Err(e) = vc.set_process_mute(p, false) {
+                                            tracing::warn!(error = ?e, "SetVolume 清除 WASAPI 静音失败");
+                                        }
+                                    }
                                 }
                             } else if !com_initialized {
                                 tracing::debug!("COM 未初始化，跳过 SetVolume WASAPI 调用");
@@ -1495,6 +1574,13 @@ impl WallpaperRenderer for VideoRenderer {
                                             tracing::debug!(error = ?e, "ToggleMute set_process_volume：静音视频无音频会话，跳过");
                                         } else {
                                             tracing::warn!(error = ?e, "ToggleMute set_process_volume 失败");
+                                        }
+                                    }
+                                    // 恢复方向（目标音量 > 0）：清除创建时静音写入的 WASAPI
+                                    // 静音标志，否则恢复音量后仍然无声。静音方向不新增调用。
+                                    if maybe_shared_volume.is_some() {
+                                        if let Err(e) = vc.set_process_mute(p, false) {
+                                            tracing::warn!(error = ?e, "ToggleMute 清除 WASAPI 静音失败");
                                         }
                                     }
                                 }
@@ -1595,7 +1681,23 @@ mod tests {
 
     fn create_renderer(mode: ScalingMode) -> VideoRenderer {
         // 测试中不需要 VolumeControl（不会实际调用 COM）
-        VideoRenderer::new("test_video.mp4".to_string(), mode, None)
+        VideoRenderer::new("test_video.mp4".to_string(), mode, None, 0.8, false, 1.0)
+    }
+
+    /// 验证 `new()` 按传入值初始化音量 / 静音 / 速度（配置种入路径，不触发进程启动）。
+    #[test]
+    fn video_renderer_new_applies_playback_settings_initially() {
+        let renderer = VideoRenderer::new(
+            "test_video.mp4".to_string(),
+            ScalingMode::Fill,
+            None,
+            0.3,
+            true,
+            1.5,
+        );
+        assert_eq!(renderer.volume, 0.3, "音量应初始化为传入值");
+        assert!(renderer.muted, "静音状态应初始化为传入值");
+        assert_eq!(renderer.speed, 1.5, "播放速度应初始化为传入值");
     }
 
     // ========== video_first_frame_ready 纯函数测试（DR-33 原子交换就绪判断） ==========
@@ -2028,8 +2130,14 @@ mod tests {
     #[test]
     #[ignore = "需要随包 mpv 与交互式桌面：验证宿主 + --wid 端到端"]
     fn video_host_wid_play_terminate_smoke() {
-        let mut renderer =
-            VideoRenderer::new("test_video.mp4".to_string(), ScalingMode::Fill, None);
+        let mut renderer = VideoRenderer::new(
+            "test_video.mp4".to_string(),
+            ScalingMode::Fill,
+            None,
+            0.8,
+            false,
+            1.0,
+        );
         renderer.play().expect("宿主 + --wid 启动应成功");
 
         let host = renderer.hwnd().expect("play 后应返回宿主 HWND");
@@ -2643,6 +2751,7 @@ mod tests {
             ipc: Arc::new(Mutex::new(None)),
             volume: 1.0,
             muted: false,
+            speed: 1.0,
             volume_control: None,
             host: None,
         };

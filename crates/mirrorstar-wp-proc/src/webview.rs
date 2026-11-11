@@ -122,6 +122,47 @@ const INJECT_CSP_SCRIPT: &str = r#"
 })();
 "#;
 
+/// 每个文档创建时注入：从 sessionStorage 恢复应用设定的音量/静音。
+///
+/// 覆盖两类不经过父进程命令的路径：页面自刷新（`location.reload()`）与渲染进程崩溃后
+/// 的 `Reload()` 自愈——两者都会重建媒体元素，使此前的 SetVolume/ToggleMute 丢失。
+/// 仅顶层文档生效（与 CSP 注入一致，iframes 提前返回）。
+///
+/// 写入方是 `command.rs` 的 `build_audio_persist_script`（键 `__mirrorstar_audio`
+/// 的字段 `v` = 音量、`m` = 静音态）。恢复时机：文档创建即扫描一次，`DOMContentLoaded`
+/// 再扫描一次（覆盖解析期之后才创建的元素），并监听捕获阶段的 `play` 事件
+/// （处理页面自行创建/重建的媒体元素）。
+const INJECT_AUDIO_RESTORE_SCRIPT: &str = r#"
+(function () {
+  if (window.top !== window.self) return;
+  var KEY = '__mirrorstar_audio';
+  var st = null;
+  try {
+    var raw = window.sessionStorage.getItem(KEY);
+    if (!raw) return;
+    st = JSON.parse(raw);
+  } catch (e) { return; }
+  if (!st) return;
+  var apply = function (m) {
+    try {
+      if (typeof st.v === 'number') m.volume = Math.max(0, Math.min(1, st.v));
+      if (typeof st.m === 'boolean') { m.muted = st.m; m.dataset._muted = st.m ? 'true' : 'false'; }
+    } catch (e) {}
+  };
+  var scan = function () {
+    try { document.querySelectorAll('video, audio').forEach(apply); } catch (e) {}
+  };
+  scan();
+  if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', scan, { once: true });
+  } else { scan(); }
+  document.addEventListener('play', function (e) {
+    var t = e.target;
+    if (t && (t.tagName === 'VIDEO' || t.tagName === 'AUDIO')) apply(t);
+  }, true);
+})();
+"#;
+
 /// 将 `controller.CoreWebView2()` 失败转换为 `MirrorStarError::DesktopIntegration`。
 ///
 /// 统一 3 处"获取 WebView 失败"错误转换模式（navigate_to_url /
@@ -805,6 +846,25 @@ fn harden_webview(webview: &ICoreWebView2) {
             .AddScriptToExecuteOnDocumentCreated(&HSTRING::from(INJECT_CSP_SCRIPT), &csp_handler)
         {
             tracing::warn!(error = %e, "注入 CSP 脚本失败");
+        }
+    }
+
+    // 5. 注入音量/静音恢复脚本。每个文档（含 iframe，脚本内仅顶层生效）创建时执行：
+    //    从 sessionStorage 读回应用设定的音量/静音，覆盖页面自刷新与渲染进程崩溃后
+    //    `Reload()` 自愈这两条不经过父进程命令的路径。与 CSP 注入同样是纯 DOM 操作，
+    //    不调用 document.write，因此不影响 Play 命令等待的 NavigationCompleted
+    //    （否则页面导航永不完成）；仅为 DOM 事件监听 + 属性赋值，失败也不阻断加载。
+    let audio_handler = AddScriptToExecuteOnDocumentCreatedCompletedHandler::create(Box::new(
+        |_error_code: windows::core::Result<()>, _id: String| -> windows::core::Result<()> {
+            Ok(())
+        },
+    ));
+    unsafe {
+        if let Err(e) = webview.AddScriptToExecuteOnDocumentCreated(
+            &HSTRING::from(INJECT_AUDIO_RESTORE_SCRIPT),
+            &audio_handler,
+        ) {
+            tracing::warn!(error = %e, "注入音量/静音恢复脚本失败");
         }
     }
 }

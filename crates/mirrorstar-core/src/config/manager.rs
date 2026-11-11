@@ -570,7 +570,8 @@ impl ConfigManager {
     /// 创建池
     ///
     /// `member_ids` 写入前就地去除重复 id（DR-24，保留首次出现顺序）。
-    /// `name` 为空时默认生成"池 N"。写后立即触发库保存（原子写）。
+    /// `name` 为空时默认生成"池 N"。显式 `name` 与现有池重名（trim 后比较）时返回
+    /// [`MirrorStarError::InvalidArgument`] 且不落盘。写后立即触发库保存（原子写）。
     pub fn create_pool(
         &self,
         name: Option<String>,
@@ -581,6 +582,13 @@ impl ConfigManager {
                 .wallpaper_library
                 .read()
                 .unwrap_or_else(|e| e.into_inner());
+            if let Some(n) = name.as_deref() {
+                if lib.pools.iter().any(|p| p.name.trim() == n.trim()) {
+                    return Err(MirrorStarError::InvalidArgument {
+                        reason: format!("创建池失败：名称「{}」已存在", n.trim()),
+                    });
+                }
+            }
             lib.pools.len() + 1
         };
         let mut pool = Pool {
@@ -604,7 +612,8 @@ impl ConfigManager {
     /// 更新池名称与/或成员列表
     ///
     /// 仅更新传入的非空字段（`name` / `member_ids`）；`member_ids` 写入前去重（DR-24）。
-    /// 未找到池时返回 `Ok(None)` 且不落盘。写后立即触发库保存（原子写）。
+    /// 未找到池时返回 `Ok(None)` 且不落盘。`name` 与其他池重名（trim 后比较，排除自身）
+    /// 时返回 [`MirrorStarError::InvalidArgument`] 且不落盘。写后立即触发库保存（原子写）。
     pub fn update_pool(
         &self,
         id: &str,
@@ -616,10 +625,25 @@ impl ConfigManager {
                 .wallpaper_library
                 .write()
                 .unwrap_or_else(|e| e.into_inner());
-            let pool = match lib.pools.iter_mut().find(|p| p.id == id) {
-                Some(p) => p,
-                None => return Ok(None),
-            };
+            if !lib.pools.iter().any(|p| p.id == id) {
+                return Ok(None);
+            }
+            if let Some(n) = name {
+                if lib
+                    .pools
+                    .iter()
+                    .any(|p| p.id != id && p.name.trim() == n.trim())
+                {
+                    return Err(MirrorStarError::InvalidArgument {
+                        reason: format!("重命名池失败：名称「{}」已存在", n.trim()),
+                    });
+                }
+            }
+            let pool = lib
+                .pools
+                .iter_mut()
+                .find(|p| p.id == id)
+                .expect("存在性已在校验分支确认");
             if let Some(n) = name {
                 pool.name = n.to_string();
             }
@@ -1775,6 +1799,67 @@ added_at = "1"
             .update_pool("no-such-pool", Some("x"), None)
             .unwrap()
             .is_none());
+    }
+
+    // ── 池名称唯一性（create_pool / update_pool 重名拒绝，trim 后比较） ────────
+
+    #[test]
+    fn create_pool_rejects_duplicate_name() {
+        let cm = make_temp_config_manager();
+        cm.create_pool(Some("壁纸池 1".to_string()), vec![])
+            .expect("create pool");
+
+        // 完全重名 → InvalidArgument，且不落新池
+        let err = cm
+            .create_pool(Some("壁纸池 1".to_string()), vec![])
+            .expect_err("重名应被拒绝");
+        assert!(
+            matches!(err, MirrorStarError::InvalidArgument { .. }),
+            "重名应返回 InvalidArgument，实际: {err:?}"
+        );
+        // 首尾空白 trim 后重名 → 同样拒绝
+        let err = cm
+            .create_pool(Some("  壁纸池 1  ".to_string()), vec![])
+            .expect_err("trim 后重名应被拒绝");
+        assert!(matches!(err, MirrorStarError::InvalidArgument { .. }));
+        assert_eq!(cm.list_pools().len(), 1, "拒绝重名后不应新增池");
+
+        // 不同名 → 通过
+        cm.create_pool(Some("壁纸池 2".to_string()), vec![])
+            .expect("不同名应创建成功");
+        assert_eq!(cm.list_pools().len(), 2);
+    }
+
+    #[test]
+    fn update_pool_rename_rejects_duplicate_name() {
+        let cm = make_temp_config_manager();
+        let p1 = cm
+            .create_pool(Some("壁纸池 1".to_string()), vec![])
+            .expect("create pool 1");
+        let p2 = cm
+            .create_pool(Some("壁纸池 2".to_string()), vec![])
+            .expect("create pool 2");
+
+        // 改为其他池的名称（trim 后命中）→ InvalidArgument，原名保留
+        let err = cm
+            .update_pool(&p2.id, Some(" 壁纸池 1 "), None)
+            .expect_err("重名重命名应被拒绝");
+        assert!(
+            matches!(err, MirrorStarError::InvalidArgument { .. }),
+            "重名应返回 InvalidArgument，实际: {err:?}"
+        );
+        assert_eq!(cm.get_pool(&p2.id).unwrap().name, "壁纸池 2");
+
+        // 改为自身当前名称（排除自身 id）→ 通过
+        cm.update_pool(&p1.id, Some("壁纸池 1"), None)
+            .expect("同名自身应通过");
+
+        // 改为未占用名称 → 通过
+        let updated = cm
+            .update_pool(&p2.id, Some("壁纸池 3"), None)
+            .expect("不同名应通过")
+            .unwrap();
+        assert_eq!(updated.name, "壁纸池 3");
     }
 
     // ── reorder_pools / reorder_wallpapers（完全重排校验 + 落盘） ────────────

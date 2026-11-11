@@ -351,6 +351,17 @@ pub struct RendererState {
     pub pre_mute_volume: Option<f32>,
 }
 
+impl RendererState {
+    /// 以新建渲染器的初始播放设定初始化共享状态。
+    ///
+    /// 静音时把意图音量记入 `pre_mute_volume`（与 `toggle_mute_atomic` 语义一致，
+    /// `volume` 保持原值），使 UI 静音图标与实际音频一致。
+    pub fn seed_playback(&mut self, volume: f32, muted: bool) {
+        self.volume = volume;
+        self.pre_mute_volume = muted.then_some(volume);
+    }
+}
+
 impl Default for RendererState {
     fn default() -> Self {
         Self {
@@ -474,12 +485,17 @@ impl PauseSender {
         self.state_version.load(Ordering::SeqCst)
     }
 
-    /// 更新共享状态中的音量
+    /// 更新共享状态中的音量。
+    ///
+    /// 音量 > 0 视为取消静音（清除 `pre_mute_volume`），与渲染器 `SetVolume`
+    /// 处理（video 清空内部 `pre_mute_volume`、web 的 `SetVolume` 脚本显式解除
+    /// `muted`）保持一致，避免「已出声但 UI 仍显示静音、下次点击方向相反」。
     pub fn set_volume(&self, volume: f32) {
-        self.shared_state
-            .write()
-            .unwrap_or_else(|e| e.into_inner())
-            .volume = volume;
+        let mut state = self.shared_state.write().unwrap_or_else(|e| e.into_inner());
+        state.volume = volume;
+        if volume > 0.0 {
+            state.pre_mute_volume = None;
+        }
     }
 
     /// 读取当前是否静音（修复）
@@ -522,6 +538,25 @@ impl PauseSender {
             state.pre_mute_volume = Some(state.volume);
             Ok(true)
         }
+    }
+
+    /// 幂等设置静音状态（显式目标值，而非切换）。
+    ///
+    /// 与 [`Self::toggle_mute_atomic`] 的区别：调用方给出期望的最终状态，
+    /// 已是目标态时不发送命令、直接返回，避免「多次点击 / 界面与引擎短暂不一致」
+    /// 导致的翻转方向错误。返回值恒为 `muted`（目标值）。
+    pub fn set_muted_atomic(&self, muted: bool) -> Result<bool, crate::MirrorStarError> {
+        let mut state = self.shared_state.write().unwrap_or_else(|e| e.into_inner());
+        if state.pre_mute_volume.is_some() == muted {
+            return Ok(muted);
+        }
+        self.send(PauseCommand::ToggleMute)?;
+        if muted {
+            state.pre_mute_volume = Some(state.volume);
+        } else {
+            state.pre_mute_volume = None;
+        }
+        Ok(muted)
     }
 }
 
@@ -1270,6 +1305,36 @@ mod tests {
         sender.send(PauseCommand::ToggleMute).unwrap();
         let cmd = rx.blocking_recv();
         assert!(matches!(cmd, Some(PauseCommand::ToggleMute)));
+    }
+
+    #[test]
+    fn set_volume_clears_mute_marker() {
+        let (sender, _rx, _shared_state) = create_pause_channel();
+
+        // 先进入静音态（真实 API：发送 ToggleMute 并记录 pre_mute_volume）
+        let muted = sender.toggle_mute_atomic().unwrap();
+        assert!(muted);
+        assert!(sender.is_muted());
+
+        // 音量 > 0 视为取消静音：清除 pre_mute_volume 并更新音量
+        sender.set_volume(0.5);
+        assert!(!sender.is_muted());
+        assert!((sender.volume() - 0.5).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn seed_playback_marks_muted() {
+        let mut s = RendererState::default();
+
+        // 静音：意图音量记入 pre_mute_volume，volume 保持原值
+        s.seed_playback(0.4, true);
+        assert_eq!(s.volume, 0.4);
+        assert_eq!(s.pre_mute_volume, Some(0.4));
+
+        // 非静音：清除静音标记
+        s.seed_playback(0.6, false);
+        assert_eq!(s.volume, 0.6);
+        assert_eq!(s.pre_mute_volume, None);
     }
 
     #[test]

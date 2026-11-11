@@ -129,6 +129,18 @@ struct GridUiState {
     settings_book_revision: u64,
     /// 上次已写回的编辑池 id（仅在其变化时重置名称输入框，避免打断输入）。
     settings_editing_pool: Option<String>,
+    // ── 投影寄存器（B1）：记录上一次写入 Slint 的易被打断字段 ──
+    //
+    // `refresh_settings` 的触发源（设置版本 / 库版本 / 编辑池）粒度大于下列字段的
+    // 实际变化范围；若每次触发都无条件重写，会在用户拖拽滑块或输入文本期间把
+    // 控件值拉回旧值。寄存器让「值未变则不写」。
+    last_volume_pos: Option<f32>,
+    last_speed_pos: Option<f32>,
+    last_interval_text: Option<String>,
+    last_editing_pool_name: Option<String>,
+    /// 上次写入的单元 key 列表：用于在单元集合变化时关闭展开中的下拉
+    /// （下拉选项按打开时的行下标定位，行集合变化后可能越界/指向别的单元）。
+    last_unit_keys: Option<Vec<String>>,
     /// 写回串行队列（config / rotation / 池 等；避免并发 read-modify-write 互相覆盖）。
     mutations: PatchQueue<Mutation>,
     // ── Task 9.7.6 视频首帧缩略图 ──
@@ -155,6 +167,11 @@ impl GridUiState {
             settings_revision: u64::MAX,
             settings_book_revision: u64::MAX,
             settings_editing_pool: None,
+            last_volume_pos: None,
+            last_speed_pos: None,
+            last_interval_text: None,
+            last_editing_pool_name: None,
+            last_unit_keys: None,
             mutations: PatchQueue::default(),
             thumbs: Arc::new(videothumb::ThumbStore::new()),
             thumb_revision: 0,
@@ -185,6 +202,8 @@ enum Revert {
     /// 无需回滚（配置类命令失败后靠全量重拉恢复真相）。
     None,
     Volume(f32),
+    /// 音量 + 静音态回滚（拖动音量自动取消静音后，命令失败需一并还原静音态）。
+    VolumeAndMute { volume: f32, muted: bool },
     Mute(bool),
     Speed(f32),
     AutoStart(bool),
@@ -1595,14 +1614,60 @@ fn refresh_settings(
     ui.set_pool_rows(pool_model(pool_rows));
     ui.set_member_rows(member_model(member_rows));
     ui.set_available_rows(member_model(available_rows));
+    // 单元集合变化时关闭展开中的下拉：选项按打开时的行下标派发，集合变化后
+    // 可能越界或指向别的单元。key 列表相同（仅顺序/状态变化）则不关闭。
+    let unit_keys: Vec<String> = unit_rows.iter().map(|u| u.key.clone()).collect();
+    let unit_rows_changed = {
+        let mut g = lock_state(gstate);
+        let changed = g.last_unit_keys.as_ref() != Some(&unit_keys);
+        if changed {
+            g.last_unit_keys = Some(unit_keys);
+        }
+        changed
+    };
+    if unit_rows_changed {
+        ui.set_dd_open(false);
+    }
     ui.set_unit_rows(unit_model(unit_rows));
     ui.set_has_editing_pool(editing_pool.is_some());
     ui.set_editing_pool_id(SharedString::from(editing_pool.unwrap_or_default()));
-    ui.set_editing_pool_name(SharedString::from(editing_pool_name));
-    ui.set_volume_pos(volume_pos);
-    ui.set_speed_pos(speed_pos);
-    ui.set_speed_text(SharedString::from(speed_text));
-    ui.set_rotation_interval_text(SharedString::from(rotation_interval_text));
+
+    // 投影寄存器：仅当目标值与上次写入值不同才写 Slint。否则用户拖拽滑块
+    // 或输入文本期间，任何一次设置/库/编辑池刷新都会把控件值拉回旧值。
+    let (write_volume, write_speed, write_interval, write_pool_name) = {
+        let mut g = lock_state(gstate);
+        let write_volume = g.last_volume_pos != Some(volume_pos);
+        if write_volume {
+            g.last_volume_pos = Some(volume_pos);
+        }
+        let write_speed = g.last_speed_pos != Some(speed_pos);
+        if write_speed {
+            g.last_speed_pos = Some(speed_pos);
+        }
+        let write_interval = g.last_interval_text.as_deref() != Some(rotation_interval_text.as_str());
+        if write_interval {
+            g.last_interval_text = Some(rotation_interval_text.clone());
+        }
+        let write_pool_name =
+            g.last_editing_pool_name.as_deref() != Some(editing_pool_name.as_str());
+        if write_pool_name {
+            g.last_editing_pool_name = Some(editing_pool_name.clone());
+        }
+        (write_volume, write_speed, write_interval, write_pool_name)
+    };
+    if write_pool_name {
+        ui.set_editing_pool_name(SharedString::from(editing_pool_name));
+    }
+    if write_volume {
+        ui.set_volume_pos(volume_pos);
+    }
+    if write_speed {
+        ui.set_speed_pos(speed_pos);
+        ui.set_speed_text(SharedString::from(speed_text));
+    }
+    if write_interval {
+        ui.set_rotation_interval_text(SharedString::from(rotation_interval_text));
+    }
 }
 
 /// `OptionItemData` → Slint `OptionItem` 模型。
@@ -2312,6 +2377,10 @@ fn apply_revert(store: &Arc<Mutex<AppStore>>, revert: Revert) {
     match revert {
         Revert::None => {}
         Revert::Volume(v) => guard.set_volume(v),
+        Revert::VolumeAndMute { volume, muted } => {
+            guard.set_volume(volume);
+            guard.set_muted(muted);
+        }
         Revert::Mute(v) => guard.set_muted(v),
         Revert::Speed(v) => guard.set_speed(v),
         Revert::AutoStart(v) => guard.apply_auto_start(v),
@@ -2325,15 +2394,6 @@ fn display_id_param(store: &AppStore) -> Value {
     match store.selected_display() {
         Some(id) => Value::String(id.to_string()),
         None => Value::Null,
-    }
-}
-
-/// 缩放命令的 `display_id` 参数：`per_monitor` 传具体选中显示器（无选择传 `null`，保持既有
-/// `display_id_param` 语义）；其余排列传 `"all"`（壳侧广播到全部活跃显示器）。
-fn scaling_display_id_param(store: &AppStore) -> Value {
-    match store.arrangement() {
-        Arrangement::PerMonitor => display_id_param(store),
-        Arrangement::AllSame | Arrangement::Span => Value::String("all".to_string()),
     }
 }
 
@@ -2352,38 +2412,8 @@ fn show_toast(ui: &MainWindow, level: i32, text: impl Into<SharedString>) {
     ui.set_toast_text(text.into());
 }
 
-/// 把一条配置补丁经 `update_config` 落盘。
-///
-/// 音量 / 静音 / 速度的运行时命令（`set_volume` / `toggle_mute` / `set_speed`）只作用于
-/// 正在运行的 mpv，**不回写 `config.toml`**；若不额外落盘，重开主窗口时会从配置重新
-/// 种子化回默认值。补丁先经 `merge_config_patch` 合并为完整配置（乐观写内存），再提交。
-fn persist_config_patch(
-    ui_weak: &slint::Weak<MainWindow>,
-    client: &Arc<UiClient>,
-    store: &Arc<Mutex<AppStore>>,
-    gstate: &Arc<Mutex<GridUiState>>,
-    patch: Value,
-    error_label: &'static str,
-) {
-    let Some(config) = lock(store).merge_config_patch(&patch) else {
-        return;
-    };
-    enqueue_mutation(
-        ui_weak,
-        client,
-        store,
-        gstate,
-        Mutation {
-            command: "update_config",
-            args: json!({ "config": config }),
-            after: AfterMutation::None,
-            revert: Revert::None,
-            error_label,
-        },
-    );
-}
-
-/// 提交播放速度：乐观写内存 → 落盘 `video.speed` → 下发引擎，三处一致。
+/// 提交播放速度：乐观写内存 → 单发 `apply_playback_setting`（壳侧原子完成
+/// 校验 → 落盘 `video.speed` → 广播运行态，失败回写旧配置）。
 ///
 /// `speed` 为速度本身（非滑块归一化值），调用方需已 sanitize。
 fn apply_speed(
@@ -2399,31 +2429,19 @@ fn apply_speed(
         guard.set_speed(speed);
         previous
     };
-    let display_id = {
-        let guard = lock(store);
-        display_id_param(&guard)
-    };
     if let Some(ui) = ui_weak.upgrade() {
         after_store_change(&ui, store, gstate);
     }
-    persist_config_patch(
-        ui_weak,
-        client,
-        store,
-        gstate,
-        json!({ "video": { "speed": speed } }),
-        "保存播放速度",
-    );
     enqueue_mutation(
         ui_weak,
         client,
         store,
         gstate,
         Mutation {
-            command: "set_speed",
-            args: json!({ "display_id": display_id, "speed": speed }),
-            // 内存态已乐观更新；−/+ 连点时不额外拉配置，避免每次点击都触发设置面板重投影。
-            after: AfterMutation::None,
+            command: "apply_playback_setting",
+            args: json!({ "speed": speed }),
+            // 失败也会补拉快照自愈。
+            after: AfterMutation::Settings,
             revert: Revert::Speed(previous),
             error_label: "设置播放速度",
         },
@@ -2486,14 +2504,7 @@ fn send_mutation(
     let revert_cb = revert.clone();
     let outcome = client.request(command, args, move |result| {
         match result {
-            // `toggle_mute` 返回新的静音态，据实回填（其余命令无返回语义）。
-            Ok(value) => {
-                if command == "toggle_mute" {
-                    if let Some(muted) = value.as_bool() {
-                        lock(&store_cb).set_muted(muted);
-                    }
-                }
-            }
+            Ok(_) => {}
             Err(error) => {
                 apply_revert(&store_cb, revert_cb);
                 lock(&store_cb).record_error(format!("{command} 失败：{}", error.message));
@@ -2740,15 +2751,16 @@ fn install_settings_handlers(
         let store = Arc::clone(store);
         let gstate = Arc::clone(gstate);
         let ui_weak = ui.as_weak();
-        ui.on_display_selected(move |index: i32| {
+        ui.on_display_selected(move |value: SharedString| {
             {
                 let mut guard = lock(&store);
-                let value = guard
-                    .display_options()
-                    .get(index.max(0) as usize)
-                    .map(|o| o.value.clone())
-                    .unwrap_or_default();
-                guard.select_display(if value.is_empty() { None } else { Some(value) });
+                // 入参即打开时快照的显示器 id（空串 = 无选择）；store 侧校验
+                // 未知 id（热插拔竞态）收敛为 None。
+                guard.select_display(if value.is_empty() {
+                    None
+                } else {
+                    Some(value.to_string())
+                });
             }
             if let Some(ui) = ui_weak.upgrade() {
                 after_store_change(&ui, &store, &gstate);
@@ -2785,44 +2797,20 @@ fn install_settings_handlers(
             let Some(modes) = modes else {
                 return;
             };
-            // 落盘：发送**完整** modes 映射（而非单条），避免浅合并把其它显示器的记忆项冲掉。
-            let patch = json!({ "scaling": { "modes": modes } });
-            let Some(config) = lock(&store).merge_config_patch(&patch) else {
-                if let Some(ui) = ui_weak.upgrade() {
-                    show_toast(&ui, settings::TOAST_ERROR, "设置失败：配置尚未加载");
-                }
-                return;
-            };
-            let display_id = {
-                let guard = lock(&store);
-                scaling_display_id_param(&guard)
-            };
             if let Some(ui) = ui_weak.upgrade() {
                 after_store_change(&ui, &store, &gstate);
             }
-            // 先经 `update_config` 持久化 `scaling.modes`（壳侧不落该运行时命令），
-            // 再经 `set_scaling_mode` 应用到引擎；失败时按 key 回滚内存值。
+            // 单发 `apply_scaling_mode`：壳侧先落盘**完整** `scaling.modes` 映射（而非单条，
+            // 避免浅合并冲掉其它显示器的记忆项）再应用运行态，应用失败回写旧映射；
+            // `display_id` 与 scaling key 同语义（per-monitor 为显示器 id，其余为 `"all"`）。
             enqueue_mutation(
                 &ui_weak,
                 &client,
                 &store,
                 &gstate,
                 Mutation {
-                    command: "update_config",
-                    args: json!({ "config": config }),
-                    after: AfterMutation::None,
-                    revert: Revert::None,
-                    error_label: "设置缩放模式",
-                },
-            );
-            enqueue_mutation(
-                &ui_weak,
-                &client,
-                &store,
-                &gstate,
-                Mutation {
-                    command: "set_scaling_mode",
-                    args: json!({ "display_id": display_id, "mode": mode }),
+                    command: "apply_scaling_mode",
+                    args: json!({ "display_id": key.clone(), "mode": mode, "modes": modes }),
                     after: AfterMutation::Settings,
                     revert: Revert::Scaling {
                         key,
@@ -2979,47 +2967,50 @@ fn install_settings_handlers(
         let gstate = Arc::clone(gstate);
         let ui_weak = ui.as_weak();
         ui.on_volume_committed(move |value: f32| {
-            let previous = {
+            let (previous, was_muted) = {
                 let mut guard = lock(&store);
                 let previous = guard.volume();
+                let was_muted = guard.muted();
                 guard.set_volume(value);
-                previous
-            };
-            let display_id = {
-                let guard = lock(&store);
-                display_id_param(&guard)
+                // 音量 > 0 视为取消静音：与音频层 SetVolume 行为一致
+                // （web 的 SetVolume 脚本会显式解除 muted，video 会清空内部 pre_mute_volume），
+                // 否则图标显示静音而实际已出声，下次点击方向也会相反。
+                if value > 0.0 && was_muted {
+                    guard.set_muted(false);
+                }
+                (previous, was_muted)
             };
             if let Some(ui) = ui_weak.upgrade() {
                 after_store_change(&ui, &store, &gstate);
             }
-            // 落盘 `audio.volume`：`set_volume` 只作用于运行中的 mpv，不回写配置。
-            persist_config_patch(
-                &ui_weak,
-                &client,
-                &store,
-                &gstate,
-                json!({ "audio": { "volume": value } }),
-                "保存音量",
-            );
+            // 单发 `apply_playback_setting`（壳侧原子落盘 + 广播）；拖音量取消静音时
+            // 一次性携带音量与静音态，避免中间态。
+            let args = if value > 0.0 && was_muted {
+                json!({ "volume": value, "muted": false })
+            } else {
+                json!({ "volume": value })
+            };
             enqueue_mutation(
                 &ui_weak,
                 &client,
                 &store,
                 &gstate,
                 Mutation {
-                    command: "set_volume",
-                    args: json!({ "display_id": display_id, "volume": value }),
-                    // 内存态已乐观更新，无需再拉配置；`update_config` 的 `config-changed`
-                    // 回显也不会覆盖运行时值（`audio_initialized` 门控）。
-                    after: AfterMutation::None,
-                    revert: Revert::Volume(previous),
+                    command: "apply_playback_setting",
+                    args,
+                    after: AfterMutation::Settings,
+                    revert: if value > 0.0 && was_muted {
+                        Revert::VolumeAndMute { volume: previous, muted: true }
+                    } else {
+                        Revert::Volume(previous)
+                    },
                     error_label: "设置音量",
                 },
             );
         });
     }
 
-    // ── 播放：静音（`toggle_mute` 返回新态，据实回填）──
+    // ── 播放：静音 ──
     {
         let client = Arc::clone(client);
         let store = Arc::clone(store);
@@ -3032,34 +3023,21 @@ fn install_settings_handlers(
                 guard.set_muted(value);
                 previous
             };
-            let display_id = {
-                let guard = lock(&store);
-                display_id_param(&guard)
-            };
             if let Some(ui) = ui_weak.upgrade() {
                 after_store_change(&ui, &store, &gstate);
             }
-            // 落盘 `audio.muted`：`toggle_mute` 只作用于运行中的 mpv，不回写配置。
-            persist_config_patch(
-                &ui_weak,
-                &client,
-                &store,
-                &gstate,
-                json!({ "audio": { "muted": value } }),
-                "保存静音",
-            );
             enqueue_mutation(
                 &ui_weak,
                 &client,
                 &store,
                 &gstate,
                 Mutation {
-                    command: "toggle_mute",
-                    args: json!({ "display_id": display_id }),
-                    // 新静音态由命令返回值据实回填，无需再拉配置。
-                    after: AfterMutation::None,
+                    // 显式目标值（幂等）；壳侧单命令原子完成落盘与广播。
+                    command: "apply_playback_setting",
+                    args: json!({ "muted": value }),
+                    after: AfterMutation::Settings,
                     revert: Revert::Mute(previous),
-                    error_label: "切换静音",
+                    error_label: "设置静音",
                 },
             );
         });
@@ -3084,10 +3062,10 @@ fn install_settings_handlers(
         let gstate = Arc::clone(gstate);
         let ui_weak = ui.as_weak();
         ui.on_speed_stepped(move |delta: f32| {
-            // 先量化到 0.01 再 clamp，避免连续累加产生浮点漂移（显示保留两位小数）。
+            // 先量化/吸附到 0.05（显示保留两位小数）再 clamp，避免连续累加产生浮点漂移。
             let speed = {
                 let guard = lock(&store);
-                settings::sanitize_speed(((guard.speed() + delta) * 100.0).round() / 100.0)
+                settings::snap_speed(guard.speed() + delta)
             };
             apply_speed(&ui_weak, &client, &store, &gstate, speed);
         });
@@ -3224,7 +3202,11 @@ fn install_settings_handlers(
         let store_for_step = Arc::clone(&store);
         let gstate = Arc::clone(gstate);
         let ui_weak = ui.as_weak();
-        // ±1 步进与回车提交共用一条通路（文本非法时 sanitize 兜底）。
+        // 提交回调的非法输入分支需要独立句柄（`ui_weak` 已被 `apply_interval` 捕获）。
+        let store_for_submit = Arc::clone(&store);
+        let gstate_for_submit = Arc::clone(&gstate);
+        let ui_weak_for_submit = ui.as_weak();
+        // ±1 步进与回车提交共用一条通路（文本非法时在提交处拦截）。
         let apply_interval = move |value: i32| {
             let next = {
                 let mut guard = lock(&store);
@@ -3253,8 +3235,27 @@ fn install_settings_handlers(
             });
         }
         ui.on_rotation_interval_submitted(move |text: SharedString| {
-            let parsed = text.trim().parse::<i32>().unwrap_or(30);
-            apply_interval(parsed);
+            match text.trim().parse::<i32>() {
+                Ok(value) => apply_interval(value),
+                // 非法输入不再静默写成 30（会把用户设置意外改掉）：
+                // 保持原值、提示原因，并强制重投影一次以还原输入框文本。
+                Err(_) => {
+                    if let Some(ui) = ui_weak_for_submit.upgrade() {
+                        // 清空寄存器，确保 refresh_settings 会重写 interval 文本。
+                        lock_state(&gstate_for_submit).last_interval_text = None;
+                        show_toast(
+                            &ui,
+                            settings::TOAST_WARNING,
+                            format!(
+                                "轮换间隔需为 {}–{} 的整数（已保留原值）",
+                                settings::INTERVAL_MIN,
+                                settings::INTERVAL_MAX
+                            ),
+                        );
+                        after_store_change(&ui, &store_for_submit, &gstate_for_submit);
+                    }
+                }
+            }
         });
     }
     {
@@ -3294,7 +3295,16 @@ fn install_settings_handlers(
         ui.on_pool_create_requested(move || {
             let name = {
                 let guard = lock(&store);
-                format!("壁纸池 {}", guard.pools().len() + 1)
+                // 递增取未被占用的最小「壁纸池 N」，避免删除中间池后新建重名。
+                let mut n = 1usize;
+                while guard
+                    .pools()
+                    .iter()
+                    .any(|p| p.name == format!("壁纸池 {n}"))
+                {
+                    n += 1;
+                }
+                format!("壁纸池 {n}")
             };
             enqueue_mutation(
                 &ui_weak,
@@ -3413,6 +3423,24 @@ fn install_settings_handlers(
             let Some(pool_id) = ({ lock(&store).editing_pool().map(str::to_string) }) else {
                 return;
             };
+            // 预检重名（trim 后比较，排除自身）：冲突直接 Toast，不发命令。
+            let conflict = {
+                let guard = lock(&store);
+                guard
+                    .pools()
+                    .iter()
+                    .any(|p| p.id != pool_id && p.name.trim() == name.as_str())
+            };
+            if conflict {
+                if let Some(ui) = ui_weak.upgrade() {
+                    show_toast(
+                        &ui,
+                        settings::TOAST_ERROR,
+                        format!("重命名失败：名称「{name}」已存在"),
+                    );
+                }
+                return;
+            }
             if !lock(&store).rename_pool(&pool_id, name) {
                 return;
             }
@@ -3505,22 +3533,17 @@ fn install_settings_handlers(
         let store = Arc::clone(store);
         let gstate = Arc::clone(gstate);
         let ui_weak = ui.as_weak();
-        ui.on_unit_pool_selected(move |key: SharedString, index: i32| {
+        ui.on_unit_pool_selected(move |key: SharedString, pool_id: SharedString| {
             let key = key.to_string();
-            let value = {
-                let guard = lock(&store);
-                guard
-                    .pool_options()
-                    .get(index.max(0) as usize)
-                    .map(|o| o.value.clone())
-                    .unwrap_or_default()
-            };
-            let pool_id = if value.is_empty() {
+            // pool_id 来自下拉打开时的选项快照，不再按实时下标回查 `pool_options()`，
+            // 避免下拉打开期间池列表刷新导致「选 A 池却落到 B 池」。
+            let value = pool_id.to_string();
+            let pool_param = if value.is_empty() {
                 None
             } else {
                 Some(value.clone())
             };
-            lock(&store).set_unit_active_pool(&key, pool_id);
+            lock(&store).set_unit_active_pool(&key, pool_param);
             if let Some(ui) = ui_weak.upgrade() {
                 after_store_change(&ui, &store, &gstate);
             }

@@ -293,35 +293,84 @@ pub(crate) fn build_post_message_failed_response(request_id: u64) -> String {
     )
 }
 
+/// 生成把音量/静音写入 sessionStorage 的 JS 片段（合并已有键值，含 try/catch）。
+///
+/// `sessionStorage` 的生命周期与文档（tab）一致：页面自身 `location.reload()` 与
+/// 渲染进程崩溃后的 `Reload()` 自愈都会保留同一会话的 sessionStorage，因此它适合承载
+/// 「应用设定的音量/静音」这类需要在重建媒体元素后重放的状态。写入采用「读-合并-写」，
+/// 使 volume 与 mute 的两次更新互不覆盖。
+fn build_audio_persist_script(volume: Option<f32>, muted: Option<bool>) -> String {
+    let mut assignments = String::new();
+    if let Some(v) = volume {
+        assignments.push_str(&format!("st.v = {}; ", v.clamp(0.0, 1.0)));
+    }
+    if let Some(m) = muted {
+        assignments.push_str(&format!("st.m = {}; ", m));
+    }
+    format!(
+        "try {{ var _k = '{}'; var st = {{}}; try {{ st = JSON.parse(window.sessionStorage.getItem(_k) || '{{}}') || {{}}; }} catch (e) {{ st = {{}}; }} {} window.sessionStorage.setItem(_k, JSON.stringify(st)); }} catch (e) {{}}",
+        AUDIO_STATE_KEY, assignments
+    )
+}
+
 /// 构建设置音量的 JS 脚本（SetVolume 分支用）。
 ///
 /// 将音量钳制到 0.0 ~ 1.0（HTMLMediaElement.volume 合法域），设置所有 `video`/`audio`
 /// 元素的 volume，同时解除 muted 并同步静音态 dataset，供 ToggleMute 保持一致。
 /// M3: 额外写入 `dataset._lastVolume`，供 Resume 脚本重放音量（页面侧音量持久化）。
+///
+/// 末尾追加 sessionStorage 持久化（音量 + 显式解除静音），供页面重载后的
+/// `INJECT_AUDIO_RESTORE_SCRIPT` 恢复——重载不经过父进程的 SetVolume 命令。
 fn build_set_volume_script(volume: f32) -> String {
     let clamped = volume.clamp(0.0, 1.0);
-    format!(
+    let mut script = format!(
         r#"document.querySelectorAll('video, audio').forEach(m => {{ m.volume = {}; m.muted = false; m.dataset._muted = 'false'; m.dataset._lastVolume = {}; }});"#,
         clamped, clamped
-    )
+    );
+    script.push_str(&build_audio_persist_script(Some(clamped), Some(false)));
+    script
 }
 
-/// 构建 Resume 的 JS 脚本（M3）：播放已暂停的媒体元素，并重放当前音量。
+/// 构建显式设置静音态的 JS 脚本（ToggleMute 分支用）。
+///
+/// 直接写入目标静音态（而非在页面侧取反）：页面重载/渲染进程崩溃后 `dataset._muted`
+/// 会丢失，若以页面 dataset 作为唯一真相，翻转方向会错乱。故由调用方（进程侧 LAST_MUTE）
+/// 算出目标态后显式下发。末尾追加 sessionStorage 持久化，供重载后恢复。
+fn build_set_mute_script(volume: Option<f32>, muted: bool) -> String {
+    let mut script = format!(
+        r#"document.querySelectorAll('video, audio').forEach(m => {{ m.muted = {}; m.dataset._muted = '{}'; }});"#,
+        muted, muted
+    );
+    script.push_str(&build_audio_persist_script(volume, Some(muted)));
+    script
+}
+
+/// 构建 Resume 的 JS 脚本（M3）：播放已暂停的媒体元素，并重放当前音量与静音态。
 ///
 /// 音量恢复双保险：
 /// 1. 页面 `dataset._lastVolume`（由 build_set_volume_script 写入）优先；
 /// 2. `fallback_volume`（进程侧 LAST_SET_VOLUME）兜底——覆盖页面重载
 ///    （如 H2 Reload）后 dataset 丢失的场景。
-fn build_resume_script(fallback_volume: Option<f32>) -> String {
+///
+/// 静音恢复：`muted` 为 `Some` 时显式写入静音态（进程侧 LAST_MUTE 已知），并同步
+/// dataset；`None`（从未设置）时不写任何静音语句，避免覆盖页面自身的静音选择。
+/// 末尾追加 sessionStorage 持久化，供后续重载场景由注入脚本恢复。
+fn build_resume_script(fallback_volume: Option<f32>, muted: Option<bool>) -> String {
     let fallback = match fallback_volume {
         Some(v) => v.clamp(0.0, 1.0),
         // 无已知音量时回退到 1.0（HTMLMediaElement.volume 默认值）
         None => 1.0,
     };
-    format!(
-        r#"document.querySelectorAll('video, audio').forEach(m => {{ if (m.dataset._paused) m.play(); delete m.dataset._paused; m.volume = (m.dataset._lastVolume !== undefined) ? m.dataset._lastVolume : {}; }});"#,
-        fallback
-    )
+    let mute_js = match muted {
+        Some(m) => format!(" m.muted = {}; m.dataset._muted = '{}';", m, m),
+        None => String::new(),
+    };
+    let mut script = format!(
+        r#"document.querySelectorAll('video, audio').forEach(m => {{ if (m.dataset._paused) m.play(); delete m.dataset._paused; m.volume = (m.dataset._lastVolume !== undefined) ? m.dataset._lastVolume : {};{} }});"#,
+        fallback, mute_js
+    );
+    script.push_str(&build_audio_persist_script(fallback_volume, muted));
+    script
 }
 
 // ── M2/M3: 控制命令可靠执行（导航完成后执行 / 排队 / 串行化）────────────────
@@ -374,6 +423,18 @@ static PENDING_CONTROL_COMMANDS: Mutex<VecDeque<PendingControlCommand>> =
 /// Resume 时从该值重建音量恢复脚本兜底，覆盖页面重载（dataset 丢失）场景。
 static LAST_SET_VOLUME: Mutex<Option<f32>> = Mutex::new(None);
 
+/// 网页壁纸音量/静音的页内持久化键（sessionStorage）。
+///
+/// 页面重载（含渲染进程崩溃后的 `Reload()` 自愈）不会经过父进程的 SetVolume/Resume，
+/// 由 `webview.rs::INJECT_AUDIO_RESTORE_SCRIPT` 在文档创建时读取本键恢复。
+pub(crate) const AUDIO_STATE_KEY: &str = "__mirrorstar_audio";
+
+/// 进程侧最近一次静音态（None = 从未设置）。
+///
+/// ToggleMute 以此为唯一真相翻转：页面 `dataset._muted` 在重载后会丢失，
+/// 若以页面侧取反则翻转方向会错乱。
+static LAST_MUTE: Mutex<Option<bool>> = Mutex::new(None);
+
 /// 执行控制类命令（M2）：导航进行中先入队并立即返回 Ok；导航完成后立即执行。
 ///
 /// 排队路径立即返回 Ok：命令未丢，只是延迟到导航完成后统一执行，父进程无需感知延迟。
@@ -409,19 +470,29 @@ fn execute_control_command(
         PendingControlCommand::Resume => {
             // M3: resume 时重放当前音量（页面 dataset._lastVolume 优先，进程侧
             // LAST_SET_VOLUME 兜底），避免暂停期间音量状态丢失。
+            // 同时按进程侧 LAST_MUTE 恢复静音态（未知时不写静音语句）。
             let fallback = *LAST_SET_VOLUME.lock().unwrap_or_else(|e| e.into_inner());
-            (build_resume_script(fallback), "Resume")
+            let mute = *LAST_MUTE.lock().unwrap_or_else(|e| e.into_inner());
+            (build_resume_script(fallback, mute), "Resume")
         }
         PendingControlCommand::SetVolume(volume) => {
             // M3: 记录进程侧最近音量，供后续 Resume 兜底恢复。
             *LAST_SET_VOLUME.lock().unwrap_or_else(|e| e.into_inner()) = Some(volume);
+            // SetVolume 脚本会显式解除静音，进程侧静音态同步为 false。
+            *LAST_MUTE.lock().unwrap_or_else(|e| e.into_inner()) = Some(false);
             (build_set_volume_script(volume), "SetVolume")
         }
-        PendingControlCommand::ToggleMute => (
-            r#"document.querySelectorAll('video, audio').forEach(m => { m.muted = !(m.dataset._muted === 'true'); m.dataset._muted = m.muted ? 'true' : 'false'; });"#
-                .to_string(),
-            "ToggleMute",
-        ),
+        PendingControlCommand::ToggleMute => {
+            // 以进程侧 LAST_MUTE 为准翻转（页面 dataset 在重载后会丢失，不可作为唯一真相）。
+            let target = {
+                let mut last = LAST_MUTE.lock().unwrap_or_else(|e| e.into_inner());
+                let next = !last.unwrap_or(false);
+                *last = Some(next);
+                next
+            };
+            let volume = *LAST_SET_VOLUME.lock().unwrap_or_else(|e| e.into_inner());
+            (build_set_mute_script(volume, target), "ToggleMute")
+        }
     };
     execute_script_and_report(controller, &script, op_name, request_id)
 }
@@ -1474,7 +1545,7 @@ mod tests {
     #[test]
     fn m3_resume_script_replays_volume() {
         // 有兜底音量：脚本应嵌入兜底值并优先读取 dataset._lastVolume
-        let script = build_resume_script(Some(0.7));
+        let script = build_resume_script(Some(0.7), None);
         assert!(
             script.contains("_lastVolume"),
             "Resume 脚本应读取 dataset._lastVolume"
@@ -1484,8 +1555,104 @@ mod tests {
         assert!(script.contains("if (m.dataset._paused) m.play()"));
 
         // 无兜底音量：回退到 1.0（HTMLMediaElement.volume 默认值）
-        let no_fallback = build_resume_script(None);
+        let no_fallback = build_resume_script(None, None);
         assert!(no_fallback.contains(": 1"), "无兜底音量时应回退到 1.0");
+    }
+
+    #[test]
+    fn set_volume_script_persists_audio_state() {
+        // SetVolume 脚本除设置 media 元素外，还应把音量/解除静音写入 sessionStorage，
+        // 供页面重载后的注入脚本恢复。
+        let script = build_set_volume_script(0.75);
+        assert!(
+            script.contains("sessionStorage"),
+            "SetVolume 脚本应写入 sessionStorage，实际: {}",
+            script
+        );
+        assert!(
+            script.contains(AUDIO_STATE_KEY),
+            "SetVolume 脚本应使用统一持久化键"
+        );
+        assert!(
+            script.contains("st.v = 0.75"),
+            "应持久化音量 0.75，实际: {}",
+            script
+        );
+        assert!(
+            script.contains("st.m = false"),
+            "应持久化解除静音，实际: {}",
+            script
+        );
+    }
+
+    #[test]
+    fn set_mute_script_sets_explicit_state() {
+        // ToggleMute 显式写入目标静音态（不依赖页面 dataset 取反），并持久化。
+        let script = build_set_mute_script(Some(0.6), true);
+        assert!(
+            script.contains("m.muted = true"),
+            "应显式设置静音，实际: {}",
+            script
+        );
+        assert!(
+            script.contains("_muted = 'true'"),
+            "应同步 dataset 静音态，实际: {}",
+            script
+        );
+        assert!(
+            script.contains("st.m = true"),
+            "应持久化静音态，实际: {}",
+            script
+        );
+        assert!(
+            script.contains("st.v = 0.6"),
+            "应持久化当前音量，实际: {}",
+            script
+        );
+    }
+
+    #[test]
+    fn resume_script_restores_mute_when_known() {
+        // 进程侧已知静音态时，Resume 应显式恢复静音。
+        let known = build_resume_script(Some(0.7), Some(true));
+        assert!(
+            known.contains("m.muted = true"),
+            "已知静音态时应恢复静音，实际: {}",
+            known
+        );
+        // 未知静音态时不写任何静音语句（避免覆盖页面自身选择）。
+        let unknown = build_resume_script(Some(0.7), None);
+        assert!(
+            !unknown.contains("m.muted"),
+            "未知静音态时不应写静音语句，实际: {}",
+            unknown
+        );
+    }
+
+    #[test]
+    fn restore_script_is_injected() {
+        // 恢复脚本必须在每个文档创建时注入一次（与 CSP 注入并列）。
+        let source = include_str!("webview.rs");
+        assert!(
+            source.contains("INJECT_AUDIO_RESTORE_SCRIPT"),
+            "webview.rs 应定义并引用音量/静音恢复脚本常量"
+        );
+        assert_eq!(
+            source.matches(".AddScriptToExecuteOnDocumentCreated(").count(),
+            2,
+            "应注入 CSP 与音量/静音恢复两个文档创建脚本"
+        );
+        // 脚本常量与 command.rs 的持久化键必须一致，且监听 play 事件覆盖后创建的媒体元素。
+        let key = super::AUDIO_STATE_KEY;
+        assert!(
+            source.contains(&format!("'{}'", key)),
+            "恢复脚本应使用与命令侧一致的 sessionStorage 键，实际键: {}",
+            key
+        );
+        assert!(
+            source.contains("addEventListener('play'"),
+            "恢复脚本应监听 play 事件以覆盖后创建的媒体元素"
+        );
     }
 
     // ── M1/M2/M3: 源码静态检查（真实 WebView2 路径需集成测试）─────────────

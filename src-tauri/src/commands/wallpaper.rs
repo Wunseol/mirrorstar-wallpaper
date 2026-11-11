@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 use mirrorstar_core::layout::ALL_UNIT_KEY;
 use mirrorstar_core::{Arrangement, ConfigManager, ScalingMode, WallpaperSource};
@@ -1033,6 +1033,10 @@ async fn set_wallpaper_inner(
         let renderer_config = {
             let mut engine = engine.lock().await;
             engine.prepare_for_wallpaper(&display, wp_type)?;
+            // 配置为播放设置的真相源：新建渲染器前同步一次，消除本命令（直连）
+            // 与 UI 音量/静音写入（异步 mutation 队列）之间的竞态。
+            let cfg = state.config_manager.get_config();
+            engine.set_playback_settings(cfg.audio.volume, cfg.audio.muted, cfg.video.speed);
             engine.renderer_config()
         };
 
@@ -1246,6 +1250,25 @@ pub async fn toggle_mute(
     Ok(result.unwrap_or(false))
 }
 
+/// 幂等设置静音状态（显式目标值），返回设置后的目标值。
+///
+/// 与 `toggle_mute` 的区别：调用方给出期望的最终状态，命令层不再做取反，
+/// 因此「无活跃壁纸」「重复点击」「界面与引擎短暂不一致」都不会翻转方向错误，
+/// 也从不会返回与目标相反的值（无 sender 时仍返回 `muted`，配置继续生效）。
+#[tauri::command]
+pub async fn set_mute(
+    state: State<'_, AppState>,
+    display_id: Option<String>,
+    muted: bool,
+) -> Result<bool, mirrorstar_core::MirrorStarError> {
+    let engine = state.wallpaper_engine.lock().await;
+    if display_id.as_deref() == Some("all") {
+        return engine.broadcast_set_mute_fast(muted);
+    }
+    let display = resolve_display_id(display_id, &engine);
+    engine.set_mute_fast(&display, muted)
+}
+
 #[tauri::command]
 pub async fn get_wallpaper_state(
     state: State<'_, AppState>,
@@ -1301,9 +1324,180 @@ pub async fn set_speed(
     // 一致，同步阻塞窗口可接受。原 fire-and-forget 优化的"避免串行瓶颈"在
     // 实际场景中收益有限（set_speed 调用频率低，IPC 写入快）。
     let mut engine = state.wallpaper_engine.lock().await;
+    // 特殊键 "all"：对全部活跃显示器逐个设置速度（广播语义）。
+    // 与 `set_volume` 保持一致——速度是全局配置，缺少本分支会导致全局排列下
+    // 命令静默落在不存在的 `"all"` 键上（界面已更新但画面不变）。
+    if display_id.as_deref() == Some("all") {
+        return engine.set_speed_for_all(speed).await;
+    }
     // FE-001: display_id 为 None 或空串时回退到第一个活跃壁纸的 display_id
     let display = resolve_display_id(display_id, &engine);
     engine.set_speed(&display, speed).await
+}
+
+// ── 第二轮审查 N1/N2：落盘与运行态下发原子化 ─────────────────────────────────
+//
+// 背景：设置面板的音量/静音/速度/缩放原为「UI 发两条独立命令：先 update_config
+// 落盘、再运行态命令」，两条之间无事务，任一失败即磁盘/运行态/界面三方分叉且
+// 永不自愈。以下两个原子命令在单命令内完成：
+//   校验 → 旧值快照 → update_config 落盘 → 广播运行态 → 失败回写旧配置。
+
+/// `apply_playback_setting` 参数校验（纯函数，便于单元测试）。
+///
+/// - 三者至少提供一个，否则 InvalidArgument；
+/// - volume / speed 范围与 `set_volume` / `set_speed` 完全一致（复用同一校验函数）。
+fn validate_playback_setting_args(
+    volume: Option<f32>,
+    muted: Option<bool>,
+    speed: Option<f32>,
+) -> Result<(), mirrorstar_core::MirrorStarError> {
+    if volume.is_none() && muted.is_none() && speed.is_none() {
+        return Err(mirrorstar_core::MirrorStarError::InvalidArgument {
+            reason: "apply_playback_setting 至少需提供 volume / muted / speed 之一".to_string(),
+        });
+    }
+    if let Some(v) = volume {
+        validate_volume(v)?;
+    }
+    if let Some(s) = speed {
+        validate_speed(s)?;
+    }
+    Ok(())
+}
+
+/// N1 原子命令：音量/静音/速度「落盘 + 广播运行态」单命令完成。
+///
+/// 顺序：校验入参 → 旧值快照（audio.volume / audio.muted / video.speed）→
+/// 合并新值进完整 AppConfig 并 `update_config` 落盘（失败直接返回，运行态未动，
+/// 无分叉）→ 对提供的每个字段广播运行态（volume → `broadcast_set_volume_fast`，
+/// muted → `broadcast_set_mute_fast`，speed → `set_speed_for_all`）→
+/// 任一失败：用旧值快照回写配置后返回 Err（回写本身失败记 error 日志并仍返回原错误）。
+#[tauri::command]
+pub async fn apply_playback_setting(
+    state: State<'_, AppState>,
+    volume: Option<f32>,
+    muted: Option<bool>,
+    speed: Option<f32>,
+) -> Result<(), mirrorstar_core::MirrorStarError> {
+    validate_playback_setting_args(volume, muted, speed)?;
+
+    // 旧值快照：运行态下发失败时回写，消除「磁盘已新值、引擎仍旧值」的分叉。
+    let old_config = state.config_manager.get_config();
+    let mut new_config = old_config.clone();
+    if let Some(v) = volume {
+        new_config.audio.volume = v;
+    }
+    if let Some(m) = muted {
+        new_config.audio.muted = m;
+    }
+    if let Some(s) = speed {
+        new_config.video.speed = s;
+    }
+
+    // 落盘失败直接返回：运行态未动，磁盘/运行态/界面仍一致（均为旧值）。
+    state.config_manager.update_config(new_config)?;
+
+    // 落盘成功后广播运行态。音量/静音/速度是全局配置，统一走广播语义
+    // （与 set_volume/set_mute/set_speed 的 "all" 分支一致）。
+    let apply_result: Result<(), mirrorstar_core::MirrorStarError> = async {
+        let mut engine = state.wallpaper_engine.lock().await;
+        if let Some(v) = volume {
+            engine.broadcast_set_volume_fast(v)?;
+        }
+        if let Some(m) = muted {
+            engine.broadcast_set_mute_fast(m)?;
+        }
+        if let Some(s) = speed {
+            engine.set_speed_for_all(s).await?;
+        }
+        Ok(())
+    }
+    .await;
+
+    if let Err(e) = apply_result {
+        // 回写旧配置；回写本身失败时磁盘与运行态分叉，记 error 日志以便排查，
+        // 但仍返回原运行态错误（调用方据此回滚界面乐观更新）。
+        if let Err(rollback_err) = state.config_manager.update_config(old_config) {
+            tracing::error!(
+                error = %rollback_err,
+                "apply_playback_setting 运行态下发失败后回写旧配置亦失败：磁盘配置可能与运行态不一致"
+            );
+        }
+        return Err(e);
+    }
+    Ok(())
+}
+
+/// 解析完整 `scaling.modes` 映射（String → ScalingMode），供落盘使用（纯函数）。
+///
+/// 映射中任一值非法即整体拒绝（InvalidArgument，附 key 便于定位），避免部分
+/// 合法部分非法的映射落盘后重启「复活」成用户未设置过的模式。
+fn parse_scaling_modes_map(
+    modes: &HashMap<String, String>,
+) -> Result<BTreeMap<String, ScalingMode>, mirrorstar_core::MirrorStarError> {
+    let mut parsed = BTreeMap::new();
+    for (key, value) in modes {
+        let mode = parse_scaling_mode(value).map_err(|e| match e {
+            mirrorstar_core::MirrorStarError::InvalidArgument { reason } => {
+                mirrorstar_core::MirrorStarError::InvalidArgument {
+                    reason: format!("scaling.modes[{}]: {}", key, reason),
+                }
+            }
+            other => other,
+        })?;
+        parsed.insert(key.clone(), mode);
+    }
+    Ok(parsed)
+}
+
+/// N2 原子命令：缩放模式「落盘完整 modes 映射 + 应用运行态」单命令完成。
+///
+/// - `display_id`：`None` 或 `"all"` 表示全局广播（沿用 `set_scaling_mode` 的
+///   `"all"` 分支语义），否则应用单屏；
+/// - `modes`：落盘用的完整 `scaling.modes` 映射（UI 传入合并后的完整映射，
+///   避免浅合并冲掉其它显示器的记忆项）；
+///
+/// 顺序：解析 mode 与 modes 映射 → 旧映射快照 → 落盘 → 应用运行态 →
+/// 应用失败回写旧映射后返回 Err（回写失败记 error 日志并仍返回原错误）。
+#[tauri::command]
+pub async fn apply_scaling_mode(
+    state: State<'_, AppState>,
+    display_id: Option<String>,
+    mode: String,
+    modes: HashMap<String, String>,
+) -> Result<(), mirrorstar_core::MirrorStarError> {
+    let parsed_mode = parse_scaling_mode(&mode)?;
+    let parsed_modes = parse_scaling_modes_map(&modes)?;
+
+    // 旧映射快照：运行态应用失败时回写。
+    let old_config = state.config_manager.get_config();
+    let mut new_config = old_config.clone();
+    new_config.scaling.modes = parsed_modes;
+
+    // 落盘失败直接返回：运行态未动，无分叉。
+    state.config_manager.update_config(new_config)?;
+
+    let apply_result = {
+        let mut engine = state.wallpaper_engine.lock().await;
+        if display_id.as_deref() == Some("all") || display_id.is_none() {
+            engine.set_scaling_mode_for_all(parsed_mode)
+        } else {
+            // FE-001: 空串回退到第一个活跃壁纸的 display_id
+            let display = resolve_display_id(display_id, &engine);
+            engine.set_scaling_mode(&display, parsed_mode)
+        }
+    };
+
+    if let Err(e) = apply_result {
+        if let Err(rollback_err) = state.config_manager.update_config(old_config) {
+            tracing::error!(
+                error = %rollback_err,
+                "apply_scaling_mode 运行态应用失败后回写旧映射亦失败：磁盘配置可能与运行态不一致"
+            );
+        }
+        return Err(e);
+    }
+    Ok(())
 }
 
 // ── 纯逻辑校验函数（ST-007：提取为独立函数以支持非 #[ignore] 单元测试） ──────
@@ -1902,6 +2096,88 @@ mod tests {
             }
             other => panic!("期望 InvalidArgument 变体，实际: {:?}", other),
         }
+    }
+
+    // ── 第二轮 N1/N2：apply_playback_setting / apply_scaling_mode 参数校验 ─────
+    //
+    // 命令本体依赖 State<AppState>（含真实 ConfigManager + WallpaperEngine），
+    // 单元测试难以构造，故回滚路径不在此覆盖；可测的纯校验逻辑提取为
+    // validate_playback_setting_args / parse_scaling_modes_map 后在此测试。
+
+    #[test]
+    fn n1_validate_playback_setting_args_rejects_all_none() {
+        let err = validate_playback_setting_args(None, None, None).unwrap_err();
+        match err {
+            mirrorstar_core::MirrorStarError::InvalidArgument { reason } => {
+                assert!(
+                    reason.contains("至少需提供"),
+                    "错误消息应包含「至少需提供」，实际: {}",
+                    reason
+                );
+            }
+            other => panic!("期望 InvalidArgument 变体，实际: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn n1_validate_playback_setting_args_accepts_single_field() {
+        assert!(validate_playback_setting_args(Some(0.5), None, None).is_ok());
+        assert!(validate_playback_setting_args(None, Some(true), None).is_ok());
+        assert!(validate_playback_setting_args(None, None, Some(1.0)).is_ok());
+        assert!(validate_playback_setting_args(Some(0.3), Some(false), Some(2.0)).is_ok());
+    }
+
+    #[test]
+    fn n1_validate_playback_setting_args_rejects_out_of_range() {
+        // 与 set_volume / set_speed 相同的范围校验（NaN / 越界拒绝）。
+        for bad in [f32::NAN, -0.1, 1.1] {
+            assert!(matches!(
+                validate_playback_setting_args(Some(bad), None, None).unwrap_err(),
+                mirrorstar_core::MirrorStarError::InvalidArgument { .. }
+            ));
+        }
+        for bad in [f32::NAN, 0.0, 4.1] {
+            assert!(matches!(
+                validate_playback_setting_args(None, None, Some(bad)).unwrap_err(),
+                mirrorstar_core::MirrorStarError::InvalidArgument { .. }
+            ));
+        }
+    }
+
+    #[test]
+    fn n2_parse_scaling_modes_map_accepts_valid_entries() {
+        let mut modes = HashMap::new();
+        modes.insert("all".to_string(), "fill".to_string());
+        modes.insert("DISPLAY1".to_string(), "fit".to_string());
+        let parsed = parse_scaling_modes_map(&modes).expect("合法映射应解析成功");
+        assert_eq!(parsed.get("all"), Some(&ScalingMode::Fill));
+        assert_eq!(parsed.get("DISPLAY1"), Some(&ScalingMode::Fit));
+    }
+
+    #[test]
+    fn n2_parse_scaling_modes_map_rejects_invalid_value_with_key() {
+        let mut modes = HashMap::new();
+        modes.insert("all".to_string(), "fill".to_string());
+        modes.insert("DISPLAY2".to_string(), "bogus".to_string());
+        let err = parse_scaling_modes_map(&modes).unwrap_err();
+        match err {
+            mirrorstar_core::MirrorStarError::InvalidArgument { reason } => {
+                // 错误消息应附 key 便于定位是哪一个显示器的映射非法。
+                assert!(
+                    reason.contains("DISPLAY2") && reason.contains("未知的缩放模式"),
+                    "错误消息应含非法项 key 与原因，实际: {}",
+                    reason
+                );
+            }
+            other => panic!("期望 InvalidArgument 变体，实际: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn n2_parse_scaling_modes_map_empty_is_allowed() {
+        // 空映射视为「清空全部记忆」，合法（UI 不会下发，但壳侧不额外限制）。
+        let parsed = parse_scaling_modes_map(&HashMap::new()).expect("空映射应解析成功");
+        assert!(parsed.is_empty());
     }
 
     // ── ST-007：Junction Points（IO_REPARSE_TAG_MOUNT_POINT）绕过防护测试 ──────

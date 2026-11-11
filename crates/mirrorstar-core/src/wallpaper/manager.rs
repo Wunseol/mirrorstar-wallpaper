@@ -7,7 +7,7 @@ use windows::Win32::UI::WindowsAndMessaging::IsWindow;
 
 use crate::audio::volume::VolumeControl;
 use crate::config::normalize_path_key;
-use crate::config::settings::Arrangement;
+use crate::config::settings::{Arrangement, AudioConfig, VideoConfig};
 use crate::desktop::native_wallpaper;
 use crate::desktop::DesktopIntegrator;
 use crate::wallpaper::gif::GifRenderer;
@@ -35,6 +35,12 @@ pub struct RendererConfig {
     pub gif_balanced_keep_frames: usize,
     /// v41-W-012: GIF 帧像素内存预算上限（MB），由配置传入
     pub gif_max_memory_mb: usize,
+    /// 新建渲染器的初始音量 (0.0~1.0)
+    pub audio_volume: f32,
+    /// 新建渲染器的初始静音状态
+    pub audio_muted: bool,
+    /// 新建渲染器的初始播放速度（1.0 = 常速）
+    pub video_speed: f32,
 }
 
 /// GIF 内存管理配置（内部加锁，允许 `&self` 更新）
@@ -271,6 +277,12 @@ pub struct WallpaperEngine {
     pub(crate) wallpaper_sources: HashMap<String, (WallpaperSource, WallpaperType)>,
     /// GIF 内存管理配置（内部 Mutex 加锁，`set_gif_memory_strategy` 改为 `&self`）
     pub(crate) gif_config: std::sync::Mutex<GifMemoryConfig>,
+    /// 新建渲染器的初始音量（配置为唯一真相源，由 `set_playback_settings` 从 AppConfig 种入）
+    pub(crate) audio_volume: f32,
+    /// 新建渲染器的初始静音状态（配置为唯一真相源，由 `set_playback_settings` 从 AppConfig 种入）
+    pub(crate) audio_muted: bool,
+    /// 新建渲染器的初始播放速度（配置为唯一真相源，由 `set_playback_settings` 从 AppConfig 种入）
+    pub(crate) video_speed: f32,
     /// 快速控制发送端映射：显示器ID -> PauseSender
     ///
     /// # v41-W-004 调用方契约（重要）
@@ -414,6 +426,10 @@ impl WallpaperEngine {
         // 全局状态变更通道：容量 64，所有渲染器的 notify_state_changed
         // 通过转发任务汇聚到此通道，Tauri 层只订阅一次。
         let (global_state_changed, _) = tokio::sync::broadcast::channel::<String>(64);
+        // 新建渲染器的初始播放设置取配置默认值（0.8 / false / 1.0），
+        // 启动后由 `set_playback_settings` 从 AppConfig 覆盖。
+        let audio = AudioConfig::default();
+        let video = VideoConfig::default();
         Self {
             wallpapers: HashMap::new(),
             desktop,
@@ -427,6 +443,9 @@ impl WallpaperEngine {
                 keep_frames: DEFAULT_BALANCED_KEEP_FRAMES,
                 max_memory_mb: crate::wallpaper::gif_decode::DEFAULT_MAX_GIF_MEMORY_MB,
             }),
+            audio_volume: audio.volume,
+            audio_muted: audio.muted,
+            video_speed: video.speed,
             pause_senders: HashMap::new(),
             pause_reasons: std::sync::Mutex::new(PauseReason(0)),
             global_state_changed,
@@ -463,6 +482,29 @@ impl WallpaperEngine {
             max_memory_mb,
             "已更新 GIF 内存管理策略"
         );
+    }
+
+    /// 种入新建渲染器的初始播放设置（音量 / 静音 / 速度）。
+    ///
+    /// 配置为唯一真相源：所有新建渲染器路径（手动设壁纸、轮换、开机恢复、
+    /// 纯净模式临时视频覆盖窗）都通过 [`Self::renderer_config`] 读取本字段快照。
+    /// 非法速度回退 1.0（与 `VideoConfig::validate` 一致）。
+    /// 非有限音量回退默认值（NaN/Inf 会污染 WASAPI 调用）。
+    pub fn set_playback_settings(&mut self, volume: f32, muted: bool, speed: f32) {
+        // 非有限音量回退默认值：clamp 对 NaN 无收敛作用，NaN 会一路传到 WASAPI。
+        let volume = if volume.is_finite() {
+            volume
+        } else {
+            AudioConfig::default().volume
+        };
+        self.audio_volume = volume.clamp(0.0, 1.0);
+        self.audio_muted = muted;
+        // 非法速度回退 1.0（与 VideoConfig::validate 一致）。
+        self.video_speed = if crate::config::validation::validate_speed(speed).is_ok() {
+            speed
+        } else {
+            1.0
+        };
     }
 
     /// 获取 GIF 内存管理策略（读取内部 Mutex 保护的字段）
@@ -677,6 +719,35 @@ impl WallpaperEngine {
         Ok(())
     }
 
+    /// 对全部活跃显示器应用播放速度（`display_id = "all"` 广播语义）。
+    ///
+    /// 与 [`Self::set_scaling_mode_for_all`] 一致：单个显示器失败仅记录 warn 并继续
+    /// 处理其余显示器，最终返回首个错误；无活跃显示器时为 no-op 返回 `Ok`。
+    ///
+    /// 同时同步引擎级 `video_speed`，保证此后新建的渲染器继承同一速度（与
+    /// `set_playback_settings` 的语义保持单一真相源）。
+    pub async fn set_speed_for_all(&mut self, speed: f32) -> Result<(), MirrorStarError> {
+        self.video_speed = speed;
+        let ids = self.active_display_ids();
+        let mut first_err: Option<MirrorStarError> = None;
+        for id in ids {
+            if let Err(e) = self.set_speed(&id, speed).await {
+                tracing::warn!(
+                    display_id = %id,
+                    error = %e,
+                    "广播播放速度对单个显示器失败，继续处理其余显示器"
+                );
+                if first_err.is_none() {
+                    first_err = Some(e);
+                }
+            }
+        }
+        match first_err {
+            Some(e) => Err(e),
+            None => Ok(()),
+        }
+    }
+
     /// 设置交互模式
     pub fn set_interaction_mode(&mut self, enabled: bool) -> Result<(), MirrorStarError> {
         self.interaction_mode = enabled;
@@ -770,6 +841,9 @@ impl WallpaperEngine {
             gif_memory_strategy: gif.strategy,
             gif_balanced_keep_frames: gif.keep_frames,
             gif_max_memory_mb: gif.max_memory_mb,
+            audio_volume: self.audio_volume,
+            audio_muted: self.audio_muted,
+            video_speed: self.video_speed,
         }
     }
 
@@ -2500,6 +2574,9 @@ pub fn construct_renderer(
                     path.clone(),
                     scaling_mode,
                     Some(config.volume_control.clone()),
+                    config.audio_volume,
+                    config.audio_muted,
+                    config.video_speed,
                 );
                 renderer.play()?;
                 Ok(Box::new(renderer))
@@ -2524,6 +2601,8 @@ pub fn construct_renderer(
                     config.gif_balanced_keep_frames,
                     config.gif_max_memory_mb,
                 );
+                // GIF 未播放时 set_speed 仅赋值字段，play 内定时器按该速度生效
+                renderer.set_speed(config.video_speed);
                 renderer.play()?;
                 Ok(Box::new(renderer))
             } else {
@@ -2545,7 +2624,12 @@ pub fn construct_renderer(
             ensure_desktop_ready(&config.desktop)?;
 
             // 冷启动路径：启动 wp-proc 子进程 + WebView2 初始化（典型 5-15s）
-            let mut renderer = WebRenderer::new(source_str, scaling_mode);
+            let mut renderer = WebRenderer::new(
+                source_str,
+                scaling_mode,
+                config.audio_volume,
+                config.audio_muted,
+            );
             renderer.play()?;
             Ok(Box::new(renderer))
         }
@@ -3187,6 +3271,30 @@ mod tests {
         );
     }
 
+    // ========== set_playback_settings 测试 ==========
+
+    #[test]
+    fn set_playback_settings_sanitizes_inputs() {
+        let mut engine = create_test_engine();
+
+        // NaN 音量回退默认值；超界音量被 clamp；非法速度回退 1.0
+        engine.set_playback_settings(f32::NAN, true, 2.0);
+        assert!((engine.audio_volume - AudioConfig::default().volume).abs() < 1e-6);
+        assert!(engine.audio_muted);
+        assert_eq!(engine.video_speed, 2.0);
+
+        engine.set_playback_settings(1.5, false, -1.0);
+        assert_eq!(engine.audio_volume, 1.0);
+        assert_eq!(engine.video_speed, 1.0);
+
+        // 快照应反映合法输入
+        engine.set_playback_settings(0.3, false, 1.5);
+        let cfg = engine.renderer_config();
+        assert!((cfg.audio_volume - 0.3).abs() < 1e-6);
+        assert!(!cfg.audio_muted);
+        assert_eq!(cfg.video_speed, 1.5);
+    }
+
     // ========== set_scaling_mode 测试 ==========
 
     #[test]
@@ -3399,6 +3507,35 @@ mod tests {
         let mut engine = create_test_engine();
         let result = engine.set_speed("nonexistent", 2.0).await;
         assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn set_speed_for_all_no_active_displays_returns_ok() {
+        // 无活跃显示器时为 no-op，但仍同步引擎级速度（供后续新建渲染器继承）
+        let mut engine = create_test_engine();
+        assert!(engine.set_speed_for_all(2.0).await.is_ok());
+        assert_eq!(engine.video_speed, 2.0);
+    }
+
+    #[tokio::test]
+    async fn set_speed_for_all_applies_to_every_active_display() {
+        // "all" 广播必须覆盖所有活跃显示器，而不是只改第一个/静默 no-op
+        let mut engine = create_test_engine();
+        let source = WallpaperSource::File("/test.mp4".to_string());
+        let (r0, s0) = MockRenderer::new();
+        engine
+            .embed_and_register_renderer(Box::new(r0), "monitor_0", &source, WallpaperType::Video)
+            .unwrap();
+        let (r1, s1) = MockRenderer::new();
+        engine
+            .embed_and_register_renderer(Box::new(r1), "monitor_1", &source, WallpaperType::Video)
+            .unwrap();
+
+        engine.set_speed_for_all(1.25).await.unwrap();
+
+        assert_eq!(s0.lock().unwrap().speed_calls, vec![1.25]);
+        assert_eq!(s1.lock().unwrap().speed_calls, vec![1.25]);
+        assert_eq!(engine.video_speed, 1.25);
     }
 
     // ========== set_interaction_mode 测试 ==========

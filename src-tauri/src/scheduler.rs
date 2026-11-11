@@ -98,6 +98,12 @@ pub struct SchedulerHandle {
     pub store: PlaybackStore,
     /// 手动"下一张"请求通道（`Option<String>` = 目标单元 key，`None` = 主/唯一单元）。
     pub manual_tx: UnboundedSender<Option<String>>,
+    /// 活跃池切换后的"立即换图"请求通道（`String` = 目标单元 key）。
+    ///
+    /// 与 `manual_tx` 分开：切池要求「按新池立即生效」，而池内仅 1 张时
+    /// `sample_next` 会返回 `None`（池 <2 不参与轮换），无法复用"下一张"路径。
+    /// 通道有缓冲，避免 `Notify` 在主循环忙碌时丢失请求。
+    pub pool_apply_tx: UnboundedSender<String>,
     /// 唤醒信号：config / 暂停 / 池成员 / 编排变化 → `notify_waiters()`。
     pub wake: Arc<Notify>,
 
@@ -106,6 +112,8 @@ pub struct SchedulerHandle {
     desktop: Arc<Mutex<DesktopIntegrator>>,
     /// 手动请求接收端，由 `start()` 取出交给主循环任务。
     manual_rx: Mutex<Option<UnboundedReceiver<Option<String>>>>,
+    /// 活跃池"立即换图"接收端，由 `start()` 取出交给主循环任务。
+    pool_apply_rx: Mutex<Option<UnboundedReceiver<String>>>,
 }
 
 impl SchedulerHandle {
@@ -118,15 +126,18 @@ impl SchedulerHandle {
         let store = PlaybackStore::new();
         let playback = Arc::new(Mutex::new(store.load()));
         let (manual_tx, manual_rx) = mpsc::unbounded_channel();
+        let (pool_apply_tx, pool_apply_rx) = mpsc::unbounded_channel();
         Arc::new(Self {
             playback,
             store,
             manual_tx,
+            pool_apply_tx,
             wake: Arc::new(Notify::new()),
             config_manager,
             engine,
             desktop,
             manual_rx: Mutex::new(Some(manual_rx)),
+            pool_apply_rx: Mutex::new(Some(pool_apply_rx)),
         })
     }
 
@@ -145,7 +156,14 @@ impl SchedulerHandle {
                     return;
                 }
             };
-            run_loop(handle, app, manual_rx).await;
+            let pool_apply_rx = match handle.pool_apply_rx.lock().map(|mut r| r.take()) {
+                Ok(Some(rx)) => rx,
+                _ => {
+                    tracing::error!("调度器：活跃池通道接收端已被取走或锁中毒，跳过主循环");
+                    return;
+                }
+            };
+            run_loop(handle, app, manual_rx, pool_apply_rx).await;
         });
     }
 
@@ -154,7 +172,9 @@ impl SchedulerHandle {
     /// 设置单元生效池（DR-35）。`pool_id = None` → 回退隐式"全部"池。
     /// 命令层已校验 key 合法（孤儿单元拒绝）；此处仅校验池存在。
     ///
-    /// 写后立即落盘 + `wake` 唤醒调度器重算 deadline / 失效重建采样器（DR-23）。
+    /// 写后立即落盘 + 请求主循环「按新池立即换图」+ `wake` 唤醒重算 deadline /
+    /// 失效重建采样器（DR-23）。立即换图走独立通道而非 `Notify`：主循环忙碌时
+    /// `notify_waiters` 会丢失唤醒，通道有缓冲可保证请求最终被处理。
     pub fn set_unit_active_pool(
         &self,
         key: &str,
@@ -171,8 +191,18 @@ impl SchedulerHandle {
             let mut play = self.playback.lock().unwrap_or_else(|e| e.into_inner());
             let unit = play.ensure_unit(key.to_string());
             unit.active_pool = pool_id;
+            // 切池即失效本单元采样器（DR-23）：旧池的游标 / 洗牌袋对本池无意义。
+            // 立即清理可避免「等待下一轮 wake 才重置」期间的跨池残留采样。
+            let mut sampler = SamplerState {
+                order_cursor: unit.order_cursor.clone(),
+                bag_remaining: unit.bag_remaining.clone(),
+            };
+            invalidate_sampler(&mut sampler, unit.current_wallpaper_id.as_deref());
+            unit.order_cursor = sampler.order_cursor;
+            unit.bag_remaining = sampler.bag_remaining;
         }
         self.flush_playback();
+        let _ = self.pool_apply_tx.send(key.to_string());
         self.wake.notify_waiters();
         Ok(())
     }
@@ -391,6 +421,7 @@ async fn run_loop(
     handle: Arc<SchedulerHandle>,
     app: tauri::AppHandle,
     mut manual_rx: UnboundedReceiver<Option<String>>,
+    mut pool_apply_rx: UnboundedReceiver<String>,
 ) {
     // 启动阶段：读配置 + 对账 + 对齐单元 + 开机解析一次（设计 §16）。
     let cfg = handle.config_manager.get_config();
@@ -464,6 +495,8 @@ async fn run_loop(
         tokio::pin!(notified);
         let manual_fut = manual_rx.recv();
         tokio::pin!(manual_fut);
+        let pool_apply_fut = pool_apply_rx.recv();
+        tokio::pin!(pool_apply_fut);
 
         let mut sleep: Pin<Box<dyn Future<Output = ()> + Send>> = match desired {
             Some(t) => {
@@ -477,6 +510,7 @@ async fn run_loop(
             Timed,
             Wake,
             Manual(Option<Option<String>>),
+            PoolApply(Option<String>),
             DisplayCheck,
         }
 
@@ -484,6 +518,7 @@ async fn run_loop(
             _ = &mut sleep => Why::Timed,
             _ = &mut notified => Why::Wake,
             m = &mut manual_fut => Why::Manual(m),
+            k = &mut pool_apply_fut => Why::PoolApply(k),
             _ = display_check.tick() => Why::DisplayCheck,
         };
 
@@ -566,6 +601,25 @@ async fn run_loop(
                         handle.flush_playback();
                     }
                 }
+            }
+            Why::PoolApply(key) => {
+                // 通道关闭（handle 全部 drop = 应用退出中）。
+                let Some(key) = key else {
+                    tracing::info!("活跃池通道关闭，调度器主循环退出");
+                    break;
+                };
+                // N3：切换活跃池后立即按新池换一张，让设置在界面上即时可见。
+                // 与手动"下一张"同门控：暂停不抑制，纯净壁纸模式内跳过
+                //（模式内画面与置顶状态不可被壁纸变更破坏）。
+                if mirrorstar_core::pure_mode::is_active() {
+                    tracing::info!(
+                        key = %key,
+                        "纯净壁纸模式运行中，跳过活跃池切换的立即换图"
+                    );
+                } else if let Some(k) = resolve_target_key(&layout, Some(key)) {
+                    apply_unit_pool_now(&handle, &layout, &k, &app).await;
+                }
+                handle.flush_playback();
             }
         }
     }
@@ -1080,6 +1134,75 @@ async fn sample_and_apply_unit(
     }
 }
 
+/// 切池"立即换图"的目标决策（纯函数，便于单测）。
+///
+/// 与 [`sample_next`] 的差异：轮换入口要求池 ≥2（DR-14），而切池是用户显式操作，
+/// 池内仅 1 张时也应立即应用该张（否则用户看不到任何变化）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum PoolApplyPlan {
+    /// 保持现图（池内无可用候选，或唯一候选就是当前壁纸）。
+    Keep,
+    /// 直接应用指定壁纸（池内仅 1 张可用候选且与当前不同）。
+    Apply(String),
+    /// 交给常规轮换采样（池 ≥2，`sample_next` 自动排除当前壁纸）。
+    Sample,
+}
+
+fn plan_pool_apply(candidates: &[PoolEntry], current_id: Option<&str>) -> PoolApplyPlan {
+    match candidates.len() {
+        0 => PoolApplyPlan::Keep,
+        1 => {
+            let only = &candidates[0].id;
+            if Some(only.as_str()) == current_id {
+                PoolApplyPlan::Keep
+            } else {
+                PoolApplyPlan::Apply(only.clone())
+            }
+        }
+        _ => PoolApplyPlan::Sample,
+    }
+}
+
+/// 切换活跃池后的立即换图（N3）：把该单元切到新池的一张可用壁纸。
+///
+/// 调用前 `unit.active_pool` 已更新且采样器已失效（见
+/// [`SchedulerHandle::set_unit_active_pool`]）；本函数只负责按新池挑一张并应用。
+/// 单屏 / 全局编排的显示器解析与 emit 复用 [`apply_wallpaper_to_unit`] 路径。
+async fn apply_unit_pool_now(
+    handle: &SchedulerHandle,
+    layout: &LayoutPlane,
+    key: &str,
+    app: &tauri::AppHandle,
+) {
+    let (active_pool, current_id) = {
+        let play = handle.playback.lock().unwrap_or_else(|e| e.into_inner());
+        let unit = play.units.get(key);
+        (
+            unit.and_then(|u| u.active_pool.clone()),
+            unit.and_then(|u| u.current_wallpaper_id.clone()),
+        )
+    };
+    let entries = build_pool_entries(&handle.config_manager, active_pool.as_deref());
+    let candidates = filter_candidates(entries.iter().collect());
+
+    match plan_pool_apply(&candidates, current_id.as_deref()) {
+        // 空池 / 唯一候选即现图：保持现图，不做无意义的重建（避免闪屏）。
+        PoolApplyPlan::Keep => {}
+        PoolApplyPlan::Apply(id) => {
+            if apply_wallpaper_to_unit(handle, layout, key, &id, /* record_history = */ true, app)
+                .await
+                == UnitApplyResult::Applied
+            {
+                emit_rotated(app, key, &id);
+            }
+        }
+        // 池 ≥2：复用轮换采样（排除当前壁纸，游标 / 洗牌袋已按新池失效重建）。
+        PoolApplyPlan::Sample => {
+            sample_and_apply_unit(handle, layout, key, app).await;
+        }
+    }
+}
+
 /// 轮换 apply 的结果
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ApplyOutcome {
@@ -1138,6 +1261,13 @@ async fn apply_wallpaper_to_unit(
     let displays = layout.unit_displays.get(key).cloned().unwrap_or_default();
     if displays.is_empty() {
         return UnitApplyResult::Failed;
+    }
+
+    // 配置为播放设置的真相源：轮换新建渲染器前同步一次，避免与异步配置写入的竞态。
+    {
+        let cfg = handle.config_manager.get_config();
+        let mut engine = handle.engine.lock().await;
+        engine.set_playback_settings(cfg.audio.volume, cfg.audio.muted, cfg.video.speed);
     }
 
     let mut any_ok = false;
@@ -1406,6 +1536,46 @@ mod tests {
     fn target_per_monitor_unknown_key_ignored() {
         let l = layout_with(Arrangement::PerMonitor, &["a", "b"], Some("a"));
         assert_eq!(resolve_target_key(&l, Some("ghost".to_string())), None);
+    }
+
+    // ── plan_pool_apply（N3 切池立即换图的目标决策）────────────────────────
+
+    fn pool_entry(id: &str) -> PoolEntry {
+        PoolEntry {
+            id: id.to_string(),
+            ty: WallpaperType::Image,
+            path: format!("C:/wallpapers/{id}.jpg"),
+        }
+    }
+
+    #[test]
+    fn pool_apply_keeps_when_no_candidates() {
+        // 空池（或全被过滤）→ 保持现图，不能把正在显示的壁纸清掉。
+        assert_eq!(plan_pool_apply(&[], Some("a")), PoolApplyPlan::Keep);
+        assert_eq!(plan_pool_apply(&[], None), PoolApplyPlan::Keep);
+    }
+
+    #[test]
+    fn pool_apply_applies_single_candidate_when_not_current() {
+        // 池内仅 1 张且非当前 → 必须直接应用（轮换入口池 <2 会返回 None，不能复用）。
+        let c = vec![pool_entry("b")];
+        assert_eq!(
+            plan_pool_apply(&c, Some("a")),
+            PoolApplyPlan::Apply("b".to_string())
+        );
+    }
+
+    #[test]
+    fn pool_apply_keeps_when_single_candidate_is_current() {
+        let c = vec![pool_entry("b")];
+        assert_eq!(plan_pool_apply(&c, Some("b")), PoolApplyPlan::Keep);
+    }
+
+    #[test]
+    fn pool_apply_samples_when_multiple_candidates() {
+        // 池 ≥2 → 走常规轮换采样（sample_next 自动排除当前壁纸）。
+        let c = vec![pool_entry("a"), pool_entry("b")];
+        assert_eq!(plan_pool_apply(&c, Some("a")), PoolApplyPlan::Sample);
     }
 
     // ── resolve_migration（DR-22 编排切换迁移）────────────────────────────
@@ -1973,8 +2143,9 @@ mod tests {
 
     // ── 纯净壁纸模式轮换抑制契约（DR-9 Layer 2）────────────────────────────
 
-    /// DR-9 Layer 2：轮换排期处、到点前复核处与手动"下一张"分支三处门控均须含
-    /// 纯模式判断，使模式运行期间既不安排、也不触达定时轮换，且手动换图亦被抑制。
+    /// DR-9 Layer 2：轮换排期处、到点前复核处、手动"下一张"分支与活跃池切换
+    /// 立即换图分支四处门控均须含纯模式判断，使模式运行期间既不安排、也不触达
+    /// 定时轮换，且手动换图 / 切池换图亦被抑制。
     #[test]
     fn rotation_gates_check_pure_mode() {
         let source = include_str!("scheduler.rs");
@@ -2006,11 +2177,11 @@ mod tests {
             "手动『下一张』分支应含门控上下文 {manual_gate}"
         );
 
-        // 数量契约：恰好三处轮换门控。
+        // 数量契约：恰好四处轮换门控（排期 / 到点复核 / 手动下一张 / 切池立即换图）。
         let count = source.matches(&needle).count();
         assert_eq!(
-            count, 3,
-            "排期处、到点前复核处与手动『下一张』分支三处轮换门控均应含 {needle}，实际出现 {count} 次"
+            count, 4,
+            "排期处、到点前复核处、手动『下一张』与活跃池切换换图四处轮换门控均应含 {needle}，实际出现 {count} 次"
         );
     }
 

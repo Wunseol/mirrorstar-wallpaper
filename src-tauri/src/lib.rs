@@ -721,6 +721,9 @@ pub fn run() {
         // 锁顺序：此处仅持有 engine 锁（不获取 desktop 锁），符合 state.rs
         // 顶部「engine → desktop」的锁顺序约定。
         engine.seed_scaling_modes(&config.scaling.modes);
+        // 种入新建渲染器的初始播放设置（音量 / 静音 / 速度），
+        // 使手动设壁纸、轮换、开机恢复等所有路径重建渲染器时沿用配置值。
+        engine.set_playback_settings(config.audio.volume, config.audio.muted, config.video.speed);
     }
 
     // 启动配置文件监视（热重载）
@@ -929,6 +932,14 @@ pub fn run() {
                         // 手工编辑 config.toml 的缩放变更须即时进入引擎，而非等重启。
                         // 仅持 engine 锁，符合 state.rs「engine → desktop」锁顺序约定。
                         engine.seed_scaling_modes(&cm.get_config().scaling.modes);
+                        // 配置热重载后同步播放设置（音量 / 静音 / 速度），
+                        // 使后续新建渲染器沿用最新配置值。
+                        let cfg = cm.get_config();
+                        engine.set_playback_settings(
+                            cfg.audio.volume,
+                            cfg.audio.muted,
+                            cfg.video.speed,
+                        );
                     });
                 }));
             }
@@ -1306,6 +1317,9 @@ pub fn run() {
             update_arrangement,
             set_volume,
             toggle_mute,
+            set_mute,
+            apply_playback_setting,
+            apply_scaling_mode,
             set_interaction_mode,
             get_displays,
             get_memory_report,

@@ -864,6 +864,10 @@ export component MainWindow inherits Window {
     in-out property <length> dd-w: 0px;
     in-out property <int> dd-index: 0;
     in-out property <[OptionItem]> dd-options: [];
+    // 单元池下拉在「打开瞬间」固化的单元 key。
+    // 不能用 `unit-rows[dd-id - 100]` 在点击时再取：打开期间显示器热插拔/排列切换/池
+    // 刷新会整体替换 `unit-rows`，此时下标会指向另一个单元甚至越界。
+    in-out property <string> dd-unit-key: "";
 
     // ── 预览弹窗投影（Task 8，全部由 Rust 写回）─────────────────────────────
     // `preview-id` 非空即显示覆盖层；kind 与 `preview::KIND_*` 一一对应。
@@ -984,7 +988,7 @@ export component MainWindow inherits Window {
 
     // ── 设置面板回调（Task 6 / Task 7，由 Rust 实现）─────────────────────────
     callback settings-toggled();
-    callback display-selected(int);
+    callback display-selected(string);
     callback scaling-selected(int);
     callback arrangement-selected(int);
     callback fullscreen-selected(int);
@@ -1014,7 +1018,7 @@ export component MainWindow inherits Window {
     callback pool-member-move(string, int);
     callback pool-member-remove(string);
     callback pool-member-add(string);
-    callback unit-pool-selected(string, int);
+    callback unit-pool-selected(string, string);
     callback unit-enabled-toggled(string, bool);
     // 关于面板：在默认浏览器打开项目仓库。
     callback open-repo();
@@ -1041,7 +1045,14 @@ export component MainWindow inherits Window {
             if (id == 3) { root.dd-options = root.arrangement-options; }
             if (id == 4) { root.dd-options = root.fullscreen-options; }
             if (id == 5) { root.dd-options = root.order-options; }
-            if (id >= 100) { root.dd-options = root.pool-options; }
+            if (id >= 100) {
+                root.dd-options = root.pool-options;
+                // 固化打开时的单元 key，避免点击时按下标重新取（模型可能已替换）。
+                root.dd-unit-key = "";
+                if (id - 100 >= 0 && id - 100 < root.unit-rows.length) {
+                    root.dd-unit-key = root.unit-rows[id - 100].key;
+                }
+            }
             root.dd-open = true;
         }
     }
@@ -1049,12 +1060,24 @@ export component MainWindow inherits Window {
     dd-choose(id, index) => {
         // 选择即收起，再按身份回派到既有 `selected` 回调（Rust 写回链路不变）。
         root.dd-open = false;
-        if (id == 1) { root.display-selected(index); }
+        // 显示器 id 取自 `dd-options` 打开时快照的 value，避免热插拔后按点击时下标
+        // 回查实时列表作用到别的显示器；越界/空丢弃本次点击。
+        if (id == 1) {
+            if (index >= 0 && index < root.dd-options.length) {
+                root.display-selected(root.dd-options[index].value);
+            }
+        }
         if (id == 2) { root.scaling-selected(index); }
         if (id == 3) { root.arrangement-selected(index); }
         if (id == 4) { root.fullscreen-selected(index); }
         if (id == 5) { root.order-selected(index); }
-        if (id >= 100) { root.unit-pool-selected(root.unit-rows[id - 100].key, index); }
+        if (id >= 100) {
+            // 用打开瞬间固化的 key 与选项值派发；空 key / 下标失效时丢弃本次点击。
+            // 池 id 取自 `dd-options` 快照，避免池列表刷新后按实时下标取到别的池。
+            if (root.dd-unit-key != "" && index >= 0 && index < root.dd-options.length) {
+                root.unit-pool-selected(root.dd-unit-key, root.dd-options[index].value);
+            }
+        }
     }
 
     // 防抖到期（合并窗口见下方 Timer 注释）。

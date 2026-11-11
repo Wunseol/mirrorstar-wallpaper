@@ -121,6 +121,27 @@ impl WallpaperEngine {
         }
     }
 
+    /// 幂等设置指定显示器壁纸的静音状态（显式目标值），返回目标值。
+    ///
+    /// 与 [`Self::toggle_mute_fast`] 的 `None` 语义不同：无 pause_sender 时仍返回
+    /// `Ok(muted)`——静音是全局配置，调用方据此落盘并在下次创建渲染器时注入，
+    /// 不应因「当前没有活跃壁纸」而让界面状态与配置分叉。
+    ///
+    /// # v41-W-004 契约
+    ///
+    /// 调用方必须持有 `WallpaperEngine` 锁（`&self` 借用已保证）。
+    pub fn set_mute_fast(&self, display_id: &str, muted: bool) -> Result<bool, MirrorStarError> {
+        if let Some(sender) = self.pause_senders.get(display_id) {
+            sender.set_muted_atomic(muted)
+        } else {
+            tracing::warn!(
+                display_id,
+                "set_mute_fast: 无对应 pause_sender，仅记录目标状态"
+            );
+            Ok(muted)
+        }
+    }
+
     // ── `display_id = "all"` 广播（对全部活跃显示器逐个生效）────────────────────
     //
     // 命令层在 `display_id == Some("all")` 时调用以下方法。目标集合取
@@ -225,6 +246,31 @@ impl WallpaperEngine {
         match first_err {
             Some(e) => Err(e),
             None => Ok(result),
+        }
+    }
+
+    /// 广播「显式静音目标值」到全部活跃显示器（`display_id = "all"`）。
+    ///
+    /// 与 [`Self::broadcast_toggle_mute_fast`] 的区别是幂等：每台显示器都收敛到
+    /// `muted`，不依赖各自的当前状态。无活跃显示器时返回 `Ok(muted)`（全局配置
+    /// 仍然有效，供下次创建渲染器时注入）。
+    pub fn broadcast_set_mute_fast(&self, muted: bool) -> Result<bool, MirrorStarError> {
+        let mut first_err: Option<MirrorStarError> = None;
+        for id in self.active_display_ids() {
+            if let Err(e) = self.set_mute_fast(&id, muted) {
+                tracing::warn!(
+                    display_id = %id,
+                    error = %e,
+                    "广播静音设置对单个显示器失败，继续处理其余显示器"
+                );
+                if first_err.is_none() {
+                    first_err = Some(e);
+                }
+            }
+        }
+        match first_err {
+            Some(e) => Err(e),
+            None => Ok(muted),
         }
     }
 
@@ -839,6 +885,48 @@ mod tests {
         assert!(engine.broadcast_resume_fast().unwrap().is_empty());
         assert!(engine.broadcast_set_volume_fast(0.3).is_ok());
         assert_eq!(engine.broadcast_toggle_mute_fast().unwrap(), None);
+    }
+
+    #[test]
+    fn broadcast_set_mute_fast_is_idempotent_and_covers_all_displays() {
+        use crate::wallpaper::manager::WallpaperMode;
+
+        let mut engine = create_test_engine_no_com();
+        let (s0, mut rx0, sh0) = create_pause_channel();
+        let (s1, mut rx1, _sh1) = create_pause_channel();
+        engine.pause_senders.insert("monitor_0".to_string(), s0);
+        engine.pause_senders.insert("monitor_1".to_string(), s1);
+        engine
+            .wallpaper_mode
+            .insert("monitor_0".to_string(), WallpaperMode::WorkerW);
+        engine
+            .wallpaper_mode
+            .insert("monitor_1".to_string(), WallpaperMode::WorkerW);
+
+        // 显式静音：两台都下发一次，共享状态标记为已静音。
+        assert!(engine.broadcast_set_mute_fast(true).unwrap());
+        assert!(matches!(rx0.try_recv(), Ok(PauseCommand::ToggleMute)));
+        assert!(matches!(rx1.try_recv(), Ok(PauseCommand::ToggleMute)));
+        assert!(sh0.read().unwrap().pre_mute_volume.is_some());
+
+        // 幂等：已经是目标态时不再发送命令（避免二次点击翻转方向错误）。
+        assert!(engine.broadcast_set_mute_fast(true).unwrap());
+        assert!(rx0.try_recv().is_err());
+        assert!(rx1.try_recv().is_err());
+
+        // 取消静音：下发并清空标记。
+        assert!(!engine.broadcast_set_mute_fast(false).unwrap());
+        assert!(matches!(rx0.try_recv(), Ok(PauseCommand::ToggleMute)));
+        assert!(sh0.read().unwrap().pre_mute_volume.is_none());
+    }
+
+    #[test]
+    fn set_mute_fast_without_sender_returns_target() {
+        // 无 pause_sender 时返回目标值而不是 None/false——
+        // 静音是全局配置，界面/配置不应因「当前无壁纸」而与目标态分叉。
+        let engine = create_test_engine_no_com();
+        assert!(engine.set_mute_fast("monitor_0", true).unwrap());
+        assert!(!engine.set_mute_fast("monitor_0", false).unwrap());
     }
 
     #[test]

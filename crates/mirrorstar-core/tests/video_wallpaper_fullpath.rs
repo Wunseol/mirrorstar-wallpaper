@@ -44,7 +44,14 @@ fn video_wallpaper_fullpath_diagnostic() {
         }
     };
 
-    let mut renderer = VideoRenderer::new(video_path.to_string(), ScalingMode::Fit, volume_control);
+    let mut renderer = VideoRenderer::new(
+        video_path.to_string(),
+        ScalingMode::Fit,
+        volume_control,
+        0.8,
+        false,
+        1.0,
+    );
 
     // Step 1: play() —— 创建隐藏视频宿主 + mpv --wid 启动 + IPC 连接 + 找宿主子窗口
     println!("== Step 1: play() ==");

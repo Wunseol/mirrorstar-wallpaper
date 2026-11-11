@@ -60,23 +60,40 @@ pub struct VolumeControl {
     device_changed: Arc<AtomicBool>,
     /// A-001：工作线程退出标志。
     shutdown: Arc<AtomicBool>,
-    /// A-001：最近一次用户设定的音量/静音态（跨线程共享，供设备变更后重下发）。
-    cached_setting: Arc<Mutex<CachedUserSetting>>,
+    /// A-001：pid -> 用户设定，供默认设备变更后逐个重下发
+    /// （跨线程共享；多屏各放一个视频壁纸时每块屏的进程都需恢复）。
+    cached_setting: Arc<Mutex<HashMap<u32, CachedUserSetting>>>,
 }
 
-/// A-001：最近一次用户设定的音量与静音态。
+/// A-001：最近一次用户设定的音量与静音态（按进程记录）。
 ///
 /// 在 `set_process_volume` / `set_process_mute` **成功**后更新（失败不更新以避免脏值）。
-/// 设备变更后由工作线程据此向目标进程的新会话重下发（Windows 新建会话默认回到系统音量，
+/// 设备变更后由工作线程据此向各进程的新会话重下发（Windows 新建会话默认回到系统音量，
 /// 仅重建会话管理器不足以恢复用户设定）。
 #[derive(Clone, Copy, Default)]
 struct CachedUserSetting {
-    /// 最近一次被操作的目标进程 PID。
-    pid: Option<u32>,
     /// 最近一次成功下发的音量。
     volume: Option<f32>,
     /// 最近一次成功下发的静音态。
     mute: Option<bool>,
+}
+
+/// 缓存条目上限：超过后清理已退出进程，避免长期累积。
+const MAX_CACHED_AUDIO_SETTINGS: usize = 32;
+
+/// 记录某进程最近一次音量设定。
+fn record_volume(map: &mut HashMap<u32, CachedUserSetting>, pid: u32, volume: f32) {
+    map.entry(pid).or_default().volume = Some(volume);
+}
+
+/// 记录某进程最近一次静音设定。
+fn record_mute(map: &mut HashMap<u32, CachedUserSetting>, pid: u32, mute: bool) {
+    map.entry(pid).or_default().mute = Some(mute);
+}
+
+/// 清理已退出进程的缓存条目（A-003 同源策略：保守保留「无法判定」的进程）。
+fn prune_dead_settings(map: &mut HashMap<u32, CachedUserSetting>) {
+    map.retain(|pid, _| is_pid_running(*pid));
 }
 
 // SAFETY (Task 9.1.3 soundness 论证):
@@ -167,7 +184,7 @@ impl VolumeControl {
                 watcher: None,
                 device_changed: Arc::new(AtomicBool::new(false)),
                 shutdown: Arc::new(AtomicBool::new(false)),
-                cached_setting: Arc::new(Mutex::new(CachedUserSetting::default())),
+                cached_setting: Arc::new(Mutex::new(HashMap::new())),
             }
         };
         // A-001：启动主动监听（失败仅降级为「无监听 + 惰性自愈」，不阻断构造）。
@@ -197,7 +214,7 @@ impl VolumeControl {
             watcher: None,
             device_changed: Arc::new(AtomicBool::new(false)),
             shutdown: Arc::new(AtomicBool::new(false)),
-            cached_setting: Arc::new(Mutex::new(CachedUserSetting::default())),
+            cached_setting: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -524,14 +541,16 @@ impl VolumeControl {
             })
         };
         // A-001：仅在成功下发后更新缓存（失败不更新以避免脏值），
-        // 供设备变更后向新端点上的会话重下发用户设定。
+        // 按 pid 记录，供设备变更后向该进程新端点上的会话重下发用户设定。
         if result.is_ok() {
             let mut cached = self
                 .cached_setting
                 .lock()
                 .unwrap_or_else(|e| e.into_inner());
-            cached.pid = Some(pid);
-            cached.volume = Some(volume);
+            record_volume(&mut cached, pid, volume);
+            if cached.len() > MAX_CACHED_AUDIO_SETTINGS {
+                prune_dead_settings(&mut cached);
+            }
         }
         result
     }
@@ -551,14 +570,16 @@ impl VolumeControl {
                 Ok(())
             })
         };
-        // A-001：仅在成功下发后更新缓存（失败不更新以避免脏值）。
+        // A-001：仅在成功下发后更新缓存（失败不更新以避免脏值），按 pid 记录。
         if result.is_ok() {
             let mut cached = self
                 .cached_setting
                 .lock()
                 .unwrap_or_else(|e| e.into_inner());
-            cached.pid = Some(pid);
-            cached.mute = Some(mute);
+            record_mute(&mut cached, pid, mute);
+            if cached.len() > MAX_CACHED_AUDIO_SETTINGS {
+                prune_dead_settings(&mut cached);
+            }
         }
         result
     }
@@ -666,7 +687,7 @@ impl IMMNotificationClient_Impl for DeviceNotificationClient_Impl {
 /// 避免在 `VolumeControl` 释放后残留。
 fn device_watch_loop(
     wake_rx: Receiver<()>,
-    cached: Arc<Mutex<CachedUserSetting>>,
+    cached: Arc<Mutex<HashMap<u32, CachedUserSetting>>>,
     shutdown: Arc<AtomicBool>,
 ) {
     // 工作线程自行初始化 COM（MTA）；失败时仍继续等待，仅在实际重下发时告警。
@@ -693,17 +714,26 @@ fn device_watch_loop(
     tracing::debug!("音频设备变更监听线程退出");
 }
 
-/// A-001：默认渲染端点变更后，向目标进程会话重下发缓存的用户音量/静音设定。
+/// A-001：默认渲染端点变更后，向各目标进程会话逐个重下发缓存的用户音量/静音设定。
 ///
 /// 在专用工作线程（已初始化 COM）内执行，**不**依赖 `VolumeControl` 的内部状态
 /// （`session_manager` 的惰性刷新由 `with_session` 另行完成），从而避免跨线程共享
-/// 非 `Sync` 的可变状态。会话不存在（mpv 尚未创建音频会话）时放弃本次重下发但不报错。
-fn redispatch_after_device_change(cached: &Mutex<CachedUserSetting>) {
-    let setting = *cached.lock().unwrap_or_else(|e| e.into_inner());
-    let Some(pid) = setting.pid else {
-        return;
+/// 非 `Sync` 的可变状态。会话不存在（mpv 尚未创建音频会话）时放弃该进程的重下发但不报错。
+///
+/// 多显示器场景下每个视频壁纸进程各有条目，故需逐 pid 重下发；
+/// 快照在锁内完成，WASAPI/COM 调用在锁外进行，避免持锁阻塞其它线程的缓存写入。
+fn redispatch_after_device_change(cached: &Mutex<HashMap<u32, CachedUserSetting>>) {
+    let snapshot: Vec<(u32, CachedUserSetting)> = {
+        let map = cached.lock().unwrap_or_else(|e| e.into_inner());
+        map.iter().map(|(pid, s)| (*pid, *s)).collect()
     };
-    if setting.volume.is_none() && setting.mute.is_none() {
+    let snapshot: Vec<(u32, CachedUserSetting)> = snapshot
+        .into_iter()
+        .filter(|(pid, s)| (s.volume.is_some() || s.mute.is_some()) && is_pid_running(*pid))
+        .collect();
+    if snapshot.is_empty() {
+        // 无有效目标：顺手清理已退出进程，避免缓存长期累积。
+        prune_dead_settings(&mut cached.lock().unwrap_or_else(|e| e.into_inner()));
         return;
     }
 
@@ -732,40 +762,45 @@ fn redispatch_after_device_change(cached: &Mutex<CachedUserSetting>) {
         }
     };
 
-    let mut attempted = 0usize;
-    let control = match find_session_control(&manager, pid, &mut attempted) {
-        Ok(Some(control)) => control,
-        Ok(None) => {
-            // 设备刚切换时 mpv 的新会话可能尚未注册：放弃本次重下发，但不报错。
-            tracing::debug!(
-                pid,
-                "设备变更重下发：目标进程音频会话尚不存在，跳过本次重下发"
-            );
-            return;
-        }
-        Err(error) => {
-            tracing::warn!(error = %error, pid, "设备变更重下发：枚举会话失败");
-            return;
-        }
-    };
-
-    unsafe {
-        let Ok(simple_volume) = control.cast::<ISimpleAudioVolume>() else {
-            tracing::warn!(pid, "设备变更重下发：会话不支持 ISimpleAudioVolume");
-            return;
+    for (pid, setting) in snapshot {
+        let mut attempted = 0usize;
+        let control = match find_session_control(&manager, pid, &mut attempted) {
+            Ok(Some(control)) => control,
+            Ok(None) => {
+                // 设备刚切换时 mpv 的新会话可能尚未注册：跳过该进程，但不报错。
+                tracing::debug!(
+                    pid,
+                    "设备变更重下发：目标进程音频会话尚不存在，跳过本次重下发"
+                );
+                continue;
+            }
+            Err(error) => {
+                tracing::warn!(error = %error, pid, "设备变更重下发：枚举会话失败");
+                continue;
+            }
         };
-        if let Some(volume) = setting.volume {
-            if let Err(error) = simple_volume.SetMasterVolume(volume, std::ptr::null()) {
-                tracing::warn!(pid, error = %error, "设备变更重下发音量失败");
+
+        unsafe {
+            let Ok(simple_volume) = control.cast::<ISimpleAudioVolume>() else {
+                tracing::warn!(pid, "设备变更重下发：会话不支持 ISimpleAudioVolume");
+                continue;
+            };
+            if let Some(volume) = setting.volume {
+                if let Err(error) = simple_volume.SetMasterVolume(volume, std::ptr::null()) {
+                    tracing::warn!(pid, error = %error, "设备变更重下发音量失败");
+                }
+            }
+            if let Some(mute) = setting.mute {
+                if let Err(error) = simple_volume.SetMute(mute, std::ptr::null()) {
+                    tracing::warn!(pid, error = %error, "设备变更重下发静音态失败");
+                }
             }
         }
-        if let Some(mute) = setting.mute {
-            if let Err(error) = simple_volume.SetMute(mute, std::ptr::null()) {
-                tracing::warn!(pid, error = %error, "设备变更重下发静音态失败");
-            }
-        }
+        tracing::info!(pid, "默认音频端点变更后已重下发该进程的音量/静音设定");
     }
-    tracing::info!(pid, "默认音频端点变更后已重下发用户音量/静音设定");
+
+    // A-003：重下发结束后清理已退出进程，限制缓存规模。
+    prune_dead_settings(&mut cached.lock().unwrap_or_else(|e| e.into_inner()));
 }
 
 /// A-001：在给定会话管理器中查找指定 PID 的音频会话。
@@ -1524,5 +1559,36 @@ mod tests {
             .filter(|(flow, role)| should_redispatch_on_default_change(*flow, *role))
             .count();
         assert_eq!(hits, 1, "单次默认设备切换应只触发一次重下发（原为三次）");
+    }
+
+    // ── A-001：按 pid 记录用户设定，多屏各自恢复 ─────────────────────────────
+
+    #[test]
+    fn cached_settings_are_per_pid() {
+        // 每个进程独立保存音量/静音，互不覆盖（多显示器各一块视频壁纸的场景）。
+        let mut map = HashMap::new();
+        record_volume(&mut map, 100, 0.3);
+        record_mute(&mut map, 100, true);
+        record_volume(&mut map, 200, 0.0);
+        assert_eq!(map[&100].volume, Some(0.3));
+        assert_eq!(map[&100].mute, Some(true));
+        assert_eq!(map[&200].volume, Some(0.0));
+        assert_eq!(map[&200].mute, None);
+    }
+
+    #[test]
+    fn redispatch_empty_cache_is_noop() {
+        // 空缓存应直接返回：不创建 COM 对象、不 panic（无音频设备环境亦可运行）。
+        let cached = Mutex::new(HashMap::new());
+        redispatch_after_device_change(&cached);
+    }
+
+    #[test]
+    fn prune_dead_settings_keeps_running_pid() {
+        // 清理只移除已退出进程，当前进程（运行中）的设定应保留。
+        let mut map = HashMap::new();
+        record_volume(&mut map, std::process::id(), 0.5);
+        prune_dead_settings(&mut map);
+        assert!(map.contains_key(&std::process::id()));
     }
 }

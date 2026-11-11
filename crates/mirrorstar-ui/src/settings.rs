@@ -402,6 +402,9 @@ pub const SPEED_MIN: f32 = mirrorstar_core::ipc::mpv_protocol::SPEED_MIN;
 /// 播放速度滑块量程上限。
 pub const SPEED_MAX: f32 = mirrorstar_core::ipc::mpv_protocol::SPEED_MAX;
 
+/// 设置面板播放速度的步长（−/+ 微调与滑块提交吸附网格）。
+pub const SPEED_STEP: f32 = 0.05;
+
 /// 播放速度 sanitize：NaN → 1.0，越界 clamp 到 `[SPEED_MIN, SPEED_MAX]`（滑块量程）。
 pub fn sanitize_speed(speed: f32) -> f32 {
     if speed.is_nan() {
@@ -410,19 +413,31 @@ pub fn sanitize_speed(speed: f32) -> f32 {
     speed.clamp(SPEED_MIN, SPEED_MAX)
 }
 
+/// 把速度吸附到最近的 `SPEED_STEP` 网格（仍保证量程与 NaN 语义，与 `sanitize_speed` 一致）。
+pub fn snap_speed(speed: f32) -> f32 {
+    sanitize_speed((speed / SPEED_STEP).round() * SPEED_STEP)
+}
+
 /// 速度 → 滑块归一化位置 `[0,1]`（把配置速度投影到滑块）。
 pub fn speed_to_slider(speed: f32) -> f32 {
     (sanitize_speed(speed) - SPEED_MIN) / (SPEED_MAX - SPEED_MIN)
 }
 
-/// 滑块归一化位置 `[0,1]` → 速度（把滑块值提交为配置速度）。
+/// 滑块归一化位置 `[0,1]` → 速度（把滑块值提交为配置速度，吸附到 `SPEED_STEP`（0.05）档位）。
 pub fn slider_to_speed(slider: f32) -> f32 {
-    sanitize_speed(SPEED_MIN + slider.clamp(0.0, 1.0) * (SPEED_MAX - SPEED_MIN))
+    snap_speed(SPEED_MIN + slider.clamp(0.0, 1.0) * (SPEED_MAX - SPEED_MIN))
 }
 
-/// 轮换间隔 sanitize：`< 1` 一律修正为 1（DR-16 下限）。
+/// 轮换间隔下限（分钟）。
+pub const INTERVAL_MIN: i32 = 1;
+
+/// 轮换间隔上限（分钟）：与 `ui/main.slint` 的 `NumberStepper.max-value` 同源，
+/// 避免「界面 + 变灰但后端接受更大值」的不一致。
+pub const INTERVAL_MAX: i32 = 1440;
+
+/// 轮换间隔 sanitize：收敛到 `[INTERVAL_MIN, INTERVAL_MAX]`。
 pub fn sanitize_interval(minutes: i32) -> i32 {
-    minutes.max(1)
+    minutes.clamp(INTERVAL_MIN, INTERVAL_MAX)
 }
 
 // ── 事件 → Toast 文案（Task 6.3 / 7.4）────────────────────────────────────────
@@ -737,6 +752,21 @@ mod tests {
         assert_eq!(sanitize_interval(0), 1);
         assert_eq!(sanitize_interval(-3), 1);
         assert_eq!(sanitize_interval(30), 30);
+        assert_eq!(sanitize_interval(INTERVAL_MAX), INTERVAL_MAX);
+        assert_eq!(sanitize_interval(INTERVAL_MAX + 1), INTERVAL_MAX);
+        assert_eq!(sanitize_interval(i32::MAX), INTERVAL_MAX);
+
+        // 速度吸附到 0.05 网格
+        assert!((snap_speed(1.02) - 1.00).abs() < 1e-4);
+        assert!((snap_speed(1.03) - 1.05).abs() < 1e-4);
+        assert_eq!(snap_speed(0.01), SPEED_MIN);
+        assert_eq!(snap_speed(99.0), SPEED_MAX);
+        assert_eq!(snap_speed(f32::NAN), 1.0);
+
+        // 滑块提交值落在 0.05 网格且不超出量程
+        let v = slider_to_speed(0.5);
+        assert!(((v / SPEED_STEP).round() * SPEED_STEP - v).abs() < 1e-4);
+        assert!((SPEED_MIN..=SPEED_MAX).contains(&v));
     }
 
     #[test]

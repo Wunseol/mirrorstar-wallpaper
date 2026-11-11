@@ -14,7 +14,7 @@
 //! 单元 key 校验（DR-40）：`AllSame` / `Span` 仅允许全局单元 `"all"`；`PerMonitor`
 //! 依显示器枚举校验 key 命中，缺省回退主显示器（DR-36）。孤儿单元一律拒绝。
 
-use mirrorstar_core::config::settings::{RotationConfig, MIN_INTERVAL_MINUTES};
+use mirrorstar_core::config::settings::{RotationConfig, MAX_INTERVAL_MINUTES, MIN_INTERVAL_MINUTES};
 use mirrorstar_core::config::Pool;
 use mirrorstar_core::layout::{self, LayoutMonitor};
 use mirrorstar_core::ui_proto::UnitStateDto;
@@ -30,16 +30,27 @@ pub fn get_rotation_config(state: State<'_, AppState>) -> Result<RotationConfig,
     Ok(state.config_manager.get_config().rotation)
 }
 
-/// DR-16 硬校验：`interval_minutes` 下限为 core `MIN_INTERVAL_MINUTES`（1 分钟）。
+/// DR-16 硬校验：`interval_minutes` 限定在 `[MIN_INTERVAL_MINUTES, MAX_INTERVAL_MINUTES]`
+/// （1–1440 分钟），与设置面板 `NumberStepper.max-value` 同源。
 ///
-/// 低于下限时 core `RotationConfig::validate` 会静默 clamp 到 1（前端收到 Ok 但实际
-/// 值被改），故命令层以同一下限做硬校验，返回 `InvalidConfig` 让前端回滚乐观更新。
+/// 越界时 core `RotationConfig::validate` 会静默 clamp（前端收到 Ok 但实际值被改），
+/// 故命令层以同一范围做硬校验，返回 `InvalidConfig` 让前端回滚乐观更新。
 fn validate_rotation_config(config: &RotationConfig) -> Result<(), MirrorStarError> {
     if config.interval_minutes < MIN_INTERVAL_MINUTES {
         return Err(MirrorStarError::InvalidConfig {
             reason: format!(
                 "轮换间隔过短（下限 {} 分钟）: {}",
                 MIN_INTERVAL_MINUTES, config.interval_minutes
+            ),
+        });
+    }
+    // 上限与设置面板 `NumberStepper.max-value`（1440）同源：超出时明确报错，
+    // 避免 core 静默 clamp 后界面仍显示大值（用户以为设置成功）。
+    if config.interval_minutes > MAX_INTERVAL_MINUTES {
+        return Err(MirrorStarError::InvalidConfig {
+            reason: format!(
+                "轮换间隔过长（上限 {} 分钟）: {}",
+                MAX_INTERVAL_MINUTES, config.interval_minutes
             ),
         });
     }
@@ -253,6 +264,35 @@ mod tests {
         // 下限处（1 分钟）的值应通过校验
         let config = RotationConfig {
             interval_minutes: MIN_INTERVAL_MINUTES,
+            ..Default::default()
+        };
+        assert!(validate_rotation_config(&config).is_ok());
+    }
+
+    #[test]
+    fn validate_rotation_config_rejects_interval_above_maximum() {
+        // 上限之外的值必须显式报错，而不是被 core 静默 clamp 后界面仍显示大值。
+        let config = RotationConfig {
+            interval_minutes: MAX_INTERVAL_MINUTES + 1,
+            ..Default::default()
+        };
+        let err = validate_rotation_config(&config).unwrap_err();
+        match err {
+            MirrorStarError::InvalidConfig { reason } => {
+                assert!(
+                    reason.contains("轮换间隔过长"),
+                    "reason 应包含「轮换间隔过长」，实际: {}",
+                    reason
+                );
+            }
+            other => panic!("期望 InvalidConfig 变体，实际: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn validate_rotation_config_accepts_interval_at_maximum() {
+        let config = RotationConfig {
+            interval_minutes: MAX_INTERVAL_MINUTES,
             ..Default::default()
         };
         assert!(validate_rotation_config(&config).is_ok());

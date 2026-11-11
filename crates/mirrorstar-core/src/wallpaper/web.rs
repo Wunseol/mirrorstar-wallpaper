@@ -70,6 +70,10 @@ pub struct WebRenderer {
     ipc: Arc<Mutex<Option<WpProcIpcClient>>>,
     /// 窗口标题（用于 FindWindowW 查找）
     title: String,
+    /// 初始音量 (0.0~1.0)，play 时下发并用于 PauseSender 共享状态初始化
+    volume: f32,
+    /// 初始静音状态，play 时下发并用于 PauseSender 共享状态初始化
+    muted: bool,
 }
 
 // SAFETY: WebRenderer 的 HWND 仅作为值存储，用于 Win32 API 调用。
@@ -78,7 +82,7 @@ unsafe impl Send for WebRenderer {}
 
 impl WebRenderer {
     /// 创建新的网页渲染器
-    pub fn new(source: String, scaling_mode: ScalingMode) -> Self {
+    pub fn new(source: String, scaling_mode: ScalingMode, volume: f32, muted: bool) -> Self {
         let pipe_name = format!("mirrorstar-wp-{}", uuid::Uuid::new_v4());
         let title = format!("MirrorStarWebWallpaper_{}", uuid::Uuid::new_v4().simple());
         let wp_proc_path = Self::find_wp_proc();
@@ -88,6 +92,8 @@ impl WebRenderer {
             source,
             ipc: Arc::new(Mutex::new(None)),
             title,
+            volume,
+            muted,
         }
     }
 
@@ -152,6 +158,13 @@ impl WebRenderer {
 
 impl WallpaperRenderer for WebRenderer {
     fn play(&mut self) -> Result<(), crate::MirrorStarError> {
+        // revive 时沿用运行时设定：进程重建前先同步 PauseSender 中用户实时调整后的
+        // 音量/静音，避免回到配置初始值（配置仅在新建时种入）。
+        if let Some(sender) = &self.base.pause_sender {
+            self.volume = sender.volume();
+            self.muted = sender.is_muted();
+        }
+
         // 1. 构建并启动 wp-proc 进程
         let args = self.build_wp_proc_args();
         let pid = self.base.start_process(args)?;
@@ -169,6 +182,15 @@ impl WallpaperRenderer for WebRenderer {
             let mut ipc_guard = self.ipc.lock().unwrap_or_else(|e| e.into_inner());
             if let Some(ref mut ipc) = *ipc_guard {
                 ipc.play(&self.source)?;
+                // best-effort 下发初始音量/静音（失败仅告警，不阻断 play）
+                if let Err(e) = ipc.set_volume(self.volume) {
+                    tracing::warn!(error = %e, volume = self.volume, "网页壁纸下发初始音量失败（已跳过）");
+                }
+                if self.muted {
+                    if let Err(e) = ipc.toggle_mute() {
+                        tracing::warn!(error = %e, "网页壁纸下发初始静音失败（已跳过）");
+                    }
+                }
             }
         }
 
@@ -309,11 +331,21 @@ impl WallpaperRenderer for WebRenderer {
     }
 
     fn create_pause_sender(&mut self, display_id: &str) -> Option<crate::wallpaper::PauseSender> {
+        // 重建 PauseSender（桌面自愈 / 重新嵌入）时继承旧 sender 的运行时音量与静音，
+        // 避免回落到创建时的配置值导致静音/音量跳变。
+        if let Some(sender) = &self.base.pause_sender {
+            self.volume = sender.volume();
+            self.muted = sender.is_muted();
+        }
+
         let (sender, mut rx, shared_state) = create_pause_channel();
 
         {
             let mut s = shared_state.write().unwrap_or_else(|e| e.into_inner());
             s.state = self.base.state();
+            // 以新建时的初始音量/静音初始化共享状态（已静音时 volume 保持原值，
+            // pre_mute_volume 记录静音前音量，与 toggle_mute_atomic 语义一致）。
+            s.seed_playback(self.volume, self.muted);
         }
 
         let ipc = self.ipc.clone();
@@ -652,6 +684,8 @@ mod tests {
             source: source.to_string(),
             ipc: Arc::new(Mutex::new(None)),
             title: "TestTitle".to_string(),
+            volume: 1.0,
+            muted: false,
         }
     }
 

@@ -208,7 +208,11 @@ pub async fn update_config(
     // 仅持 engine 锁，符合 state.rs「engine → desktop」的锁顺序约定。
     {
         let mut engine = state.wallpaper_engine.lock().await;
-        engine.seed_scaling_modes(&state.config_manager.get_config().scaling.modes);
+        // 配置为播放设置的持久化真相源：读取更新后的最新配置并种入引擎，
+        // 使后续新建渲染器沿用新音量 / 静音 / 速度。
+        let cfg = state.config_manager.get_config();
+        engine.seed_scaling_modes(&cfg.scaling.modes);
+        engine.set_playback_settings(cfg.audio.volume, cfg.audio.muted, cfg.video.speed);
     }
     if arrangement_changed {
         sync_arrangement_to_engine(&state, state.config_manager.get_config().arrangement).await;

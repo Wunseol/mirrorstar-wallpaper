@@ -204,6 +204,34 @@ async fn dispatch(
         "toggle_mute" => crate::commands::toggle_mute(state!(), p.get("display_id")?)
             .await
             .and_then(to_json),
+        // 幂等静音（显式目标值）：设置面板使用此命令，避免 toggle 语义在
+        // 「无活跃壁纸 / 界面与引擎短暂不一致」时翻转方向错误。
+        "set_mute" => crate::commands::set_mute(
+            state!(),
+            p.get("display_id")?,
+            p.require("muted")?,
+        )
+        .await
+        .and_then(to_json),
+        // N1 原子命令：音量/静音/速度「落盘 + 广播运行态」单命令完成。
+        // 三个参数均可选（缺省即 None），但至少一个有效值（由命令层校验）。
+        "apply_playback_setting" => crate::commands::apply_playback_setting(
+            state!(),
+            p.get("volume")?,
+            p.get("muted")?,
+            p.get("speed")?,
+        )
+        .await
+        .and_then(to_json),
+        // N2 原子命令：缩放模式「落盘完整 modes 映射 + 应用运行态」单命令完成。
+        "apply_scaling_mode" => crate::commands::apply_scaling_mode(
+            state!(),
+            p.get("display_id")?,
+            p.require("mode")?,
+            p.require("modes")?,
+        )
+        .await
+        .and_then(to_json),
         "get_wallpaper_state" => {
             crate::commands::get_wallpaper_state(state!(), p.get("display_id")?)
                 .await

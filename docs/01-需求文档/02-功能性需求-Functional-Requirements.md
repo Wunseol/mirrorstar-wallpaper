@@ -118,8 +118,8 @@
 |---------|----------|--------|------|
 | FR-023 | 配置持久化 | P0 | 用户设置（当前壁纸、音量、暂停策略等）持久化保存，重启后恢复（`config.toml` + 壁纸库 `wallpapers.toml`，TOML 格式） |
 | FR-024 | 壁纸库管理 | P0 | 维护用户添加的壁纸列表，包含壁纸路径、类型、缩略图、所属池等信息。外部文件会被复制进 `data_root/wallpapers/{id}/{filename}`，壁纸库自包含；源文件已在 data_dir 内时跳过复制 |
-| FR-025 | 音量控制 | P1 | 支持调节视频/网页壁纸的音频音量，包括全局静音（通过 Core Audio API `IAudioSessionManager2` 按子进程 pid 控制音频会话音量，`crates/mirrorstar-core/src/audio/volume.rs`） |
-| FR-026 | 播放速度 | P2 | 支持调节视频和 GIF 壁纸的播放速度。视频壁纸通过 mpv IPC `set_speed` 命令实现；GIF 壁纸通过 `GifCommand::SetSpeed` 调整定时器间隔实现。core 配置层 `VideoConfig.speed` 与命令层 `validate_speed` 均校验 `0.25×~4.0×`，越界回退默认 1.0；UI 设置滑块量程 0.25×~4.0×，预览档位见 FR-049 |
+| FR-025 | 音量控制 | P1 | 支持调节视频/网页壁纸的音频音量，包括全局静音（通过 Core Audio API `IAudioSessionManager2` 按子进程 pid 控制音频会话音量，`crates/mirrorstar-core/src/audio/volume.rs`）；新建视频/网页壁纸时以 `audio.volume` / `audio.muted` 作为初始音量与静音态下发，切换壁纸、轮换、开机恢复后不会回到 100%/未静音；静音态在界面、渲染器共享状态与系统音频会话（WASAPI 静音标志）三处保持一致，把音量调到大于 0 会自动取消静音并清除系统静音标志，保存到 `audio.muted` = false；默认音频设备变更后，全部具有音频输出的壁纸进程（多显示器各自）按最后设定恢复音量与静音；网页壁纸页面重载与渲染进程崩溃自愈后，经页面内持久化自动恢复音量与静音 |
+| FR-026 | 播放速度 | P2 | 支持调节视频和 GIF 壁纸的播放速度。视频壁纸通过 mpv IPC `set_speed` 命令实现；GIF 壁纸通过 `GifCommand::SetSpeed` 调整定时器间隔实现。core 配置层 `VideoConfig.speed` 与命令层 `validate_speed` 均校验 `0.25×~4.0×`，越界回退默认 1.0；UI 设置滑块量程 0.25×~4.0×、步长 0.05×（−/+ 微调与滑块提交均吸附到 0.05× 网格），预览档位见 FR-049；新建视频/GIF 壁纸时以 `VideoConfig.speed` 作为初始播放速度（视频在 loadfile 后经 mpv IPC 下发），切换壁纸后不再固定从 1× 起播 |
 | FR-027 | 配置文件路径 | P2 | **已修正为便携化**：用户数据（`config.toml`、`playback.toml`、`wallpapers.toml`、`wallpapers\`、`thumbnails\`、`logs\`、`webview2-cache\`）统一收束到**程序安装目录（exe 所在目录）**，而非 `%APPDATA%`；解析顺序为 `MIRRORSTAR_DATA_ROOT` 环境变量 → `current_exe().parent()` → 回退 `%APPDATA%/mirrorstar` |
 | FR-036 | 壁纸搜索 | P2 | 支持按文件名在壁纸库中实时搜索过滤壁纸，不区分大小写（`mirrorstar-ui` `dnd.rs::matches_keyword` / `filter_indices`） |
 | FR-037 | 配置热重载 | P2 | 支持配置文件的热重载（`crates/mirrorstar-core/src/config/hot_reload.rs`，基于 `notify`，监视 `config.toml` 与 `wallpapers.toml`，500ms 防抖）。用户通过外部编辑器修改配置文件后，程序自动检测变更并应用新配置（部分配置项立即生效，部分需重启） |

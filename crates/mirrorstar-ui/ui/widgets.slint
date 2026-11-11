@@ -499,7 +499,7 @@ export component VolumeRow inherits Rectangle {
 //
 // 与 `VolumeRow` 同一思路：标签自绘，−/+ 精确跟在「播放速度」右侧、尺寸与字号同级；
 // 下层 `SliderRow` 只负责数值与滑轨，`label` 置空。−/+ 经 `stepped(delta)` 回派速度
-// 增量（单位即速度本身，如 ±0.01），由 Rust 侧 clamp 到量程并写回。
+// 增量（单位即速度本身，如 ±0.05），由 Rust 侧 clamp 到量程并写回。
 export component SpeedRow inherits Rectangle {
     in property <string> label;
     in property <string> value-text;
@@ -531,7 +531,7 @@ export component SpeedRow inherits Rectangle {
         y: 0;
         minus: true;
         enabled: root.minus-enabled;
-        clicked => { root.stepped(-0.01); }
+        clicked => { root.stepped(-0.05); }
     }
 
     StepIconButton {
@@ -539,7 +539,7 @@ export component SpeedRow inherits Rectangle {
         y: 0;
         minus: false;
         enabled: root.plus-enabled;
-        clicked => { root.stepped(0.01); }
+        clicked => { root.stepped(0.05); }
     }
 
     SliderRow {
@@ -599,6 +599,18 @@ export component ToggleSwitch inherits Rectangle {
             clicked => { root.toggled(!root.checked); }
         }
     }
+
+    // 整行热区：点击文字标签等同点击开关（此前仅 40×20 的开关本体可点，
+    // 用户点标签「没反应」）。位于开关之上但不重复派发——同一次点击只会
+    // 命中一个 TouchArea（Slint 取最上层命中者）。
+    TouchArea {
+        x: 0;
+        y: 0;
+        width: parent.width - 48px;
+        height: parent.height;
+        enabled: root.enabled;
+        clicked => { root.toggled(!root.checked); }
+    }
 }
 
 // ── 数字输入（± 步进 + 回车提交）─────────────────────────────────────────────
@@ -647,6 +659,11 @@ export component NumberStepper inherits Rectangle {
             : Theme.button-bg;
 
         minus-hit := TouchArea {
+            // 扩大热区到 32px（视觉仍为 24px 按钮），覆盖按钮左侧的空白。
+            x: -4px;
+            y: -2px;
+            width: 32px;
+            height: 28px;
             enabled: root.minus-enabled;
             clicked => { root.step(-1); }
         }
@@ -699,6 +716,11 @@ export component NumberStepper inherits Rectangle {
             : Theme.button-bg;
 
         plus-hit := TouchArea {
+            // 扩大热区到 32px（视觉仍为 24px 按钮）。
+            x: -4px;
+            y: -2px;
+            width: 32px;
+            height: 28px;
             enabled: root.plus-enabled;
             clicked => { root.step(1); }
         }
