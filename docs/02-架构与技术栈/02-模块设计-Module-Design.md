@@ -104,7 +104,7 @@ MirrorStar 由 **12 个 `mirrorstar-core` 模块**（真实代码中的 `pub mod
 - 无 Web 壁纸、无主窗口时：无额外常驻渲染子进程；仅壳进程常驻（视频壁纸时另有按需的 `mpv.exe`，网页壁纸时另有按需的 `--wp-proc` 子进程）
 - WebView2 运行时仅加载在子进程中，壳进程不加载 webview2-com
 - 子进程在 Web 壁纸关闭时立即终止，释放全部内存
-- UI 子进程在窗口隐藏超时（默认 300s）后退出回收内存
+- UI 子进程在**关闭主窗口**（关闭按钮 / Alt+F4）时立即退出；**托盘隐藏**时保留进程，隐藏超时（默认 300s）后退出回收内存
 - 无独立看门狗进程（mirrorstar-watchdog 已在阶段2移除）
 
 ### 1.4 混合进程架构（早期版本示意，作历史参考）
@@ -327,7 +327,7 @@ MirrorStar 由 **12 个 `mirrorstar-core` 模块**（真实代码中的 `pub mod
 - 全屏应用检测（**SetWinEventHook(EVENT_SYSTEM_FOREGROUND) 事件驱动** + 状态去抖 + 自身窗口排除；另由 `spawn_fullscreen_review_thread` **每 2s 周期复查兜底**"无前台切换事件"的退出场景）— **全局暂停/恢复**（`pause_all_fast`），**非按显示器粒度**
 - 退出时壁纸恢复（`perform_shutdown`）
 - 配置热重载已启用
-- 主窗口按需启动原生 UI 子进程（`mirrorstar-ui.exe`），事件循环用 `run_event_loop_until_quit()` 保证窗口隐藏后进程存活（`run_event_loop()` 会在隐藏最后一个窗口时返回并结束进程），空闲超时（默认 300s）后由壳侧回收；关闭按钮/Alt+F4 走 `close_requested` 隐藏并上报 `WindowHidden`
+- 主窗口按需启动原生 UI 子进程（`mirrorstar-ui.exe`），事件循环用 `run_event_loop_until_quit()` 保证托盘隐藏后进程存活（`run_event_loop()` 会在隐藏最后一个窗口时返回并结束进程）；关闭按钮/Alt+F4 走 `close_requested`：关闭预览、上报 `WindowHidden` 后主动退出事件循环，进程立即结束并由壳侧协议泵回收；托盘隐藏保留进程，空闲超时（默认 300s）后由壳侧回收
 - PerMonitorV2 DPI 感知
 - **COM STA 初始化**：主进程显式调用 `CoInitializeEx(None, COINIT_APARTMENTTHREADED)`（STA），wp-proc 子进程同样使用 STA
 - PauseSender 快速路径（短暂持 engine 锁定位 sender，mpsc 直投渲染线程）
@@ -339,7 +339,7 @@ MirrorStar 由 **12 个 `mirrorstar-core` 模块**（真实代码中的 `pub mod
 
 **路径：** `crates/mirrorstar-ui/`
 
-**定位：** 主窗口 UI（Slint 1.18，**绑定软件渲染**），经 `ui_proto` NDJSON over stdio 与壳通信。按需启动、握手（`Hello`）、窗口隐藏超时（默认 300s）退出、单实例；不复制业务逻辑、不直接读写配置；实现原生虚拟化壁纸网格、四类预览（图片自绘 / 视频 UI 进程内 mpv 子窗口 / GIF 逐帧 / 网页临时 WebView2 子窗口）、拖拽、搜索、键盘导航。
+**定位：** 主窗口 UI（Slint 1.18，**绑定软件渲染**），经 `ui_proto` NDJSON over stdio 与壳通信。按需启动、握手（`Hello`）、关闭主窗口立即退出 / 托盘隐藏空闲超时（默认 300s）退出、单实例；不复制业务逻辑、不直接读写配置；实现原生虚拟化壁纸网格、四类预览（图片自绘 / 视频 UI 进程内 mpv 子窗口 / GIF 逐帧 / 网页临时 WebView2 子窗口）、拖拽、搜索、键盘导航。
 
 ---
 

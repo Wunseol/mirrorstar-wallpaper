@@ -357,7 +357,7 @@ GIF 帧像素预算默认 40MB（配置项 `GifConfig.max_memory_mb`，合法范
 |------|------|
 | 原生 UI 子进程 | 主窗口 UI 运行在 `mirrorstar-ui.exe`，经 `ui_proto` NDJSON（stdio）与壳通信 |
 | 软件渲染绑定 | 仅启用 Slint `renderer-software`，规避 GPU/OpenGL 后端内存开销 |
-| 按需启动 + 空闲退出 | 窗口隐藏超时（默认 300s，`MIRRORSTAR_UI_IDLE_TIMEOUT_SECS`）后整体退出 UI 子进程回收内存，再次请求重新拉起；同一时刻至多一个实例 |
+| 按需启动 + 关闭即退出 + 隐藏空闲回收 | 关闭主窗口（关闭按钮 / Alt+F4）立即退出 UI 子进程；托盘隐藏超时（默认 300s，`MIRRORSTAR_UI_IDLE_TIMEOUT_SECS`）后整体退出回收内存，再次请求重新拉起；同一时刻至多一个实例 |
 | 虚拟化网格 | 仅实例化可见区间 ±2 行缓冲，避免全量卡片实例化 |
 | 缩略图直读 | 按本地文件路径直读，不经 IPC 传字节 |
 | 用户主动唤起时置前聚焦 | 托盘 / 菜单 / 二次启动触发时 `SetForegroundWindow`（壳侧先 `AllowSetForegroundWindow`），使任务栏按钮一次点击最小化；纯净模式等非用户主动场景仍禁止抢前台 |
@@ -412,7 +412,7 @@ GIF 帧像素预算默认 40MB（配置项 `GifConfig.max_memory_mb`，合法范
 |---|---|---|---|---|---|---|---|---|---|---|---|
 | 1 | 无壁纸·仅壳（托盘常驻） | 无壁纸 | 壳进程；托盘 + 调度主循环 + 看护(5s) + 热插拔(3s) + WorkerW 检查(300s) | Main×1 | 待实测 | 待实测 | 【实】壳 10.4MB | 【实】壳 28.3MB | — | 【底】<0.1% | 【实/底】 |
 | 2 | 无壁纸 + 主窗口打开 | 无壁纸 | +`mirrorstar-ui.exe`（Slint 软件渲染，虚拟化网格） | Main×1 + UI×1 | 待实测 | 待实测 | 【底】壳+UI ≈16.8MB | 待实测 | — | 【底】idle ≈0.4% / 滚动 10.5% | 【底】(§21) |
-| 3 | 无壁纸 + 主窗口关闭（UI 空闲超时退出） | 无壁纸 | 仅壳（UI 进程在默认 300s 空闲超时后退出） | Main×1 | 待实测 | 待实测 | 【底】≈7.6MB | 待实测 | — | 待实测 | 【底】(§21) |
+| 3 | 无壁纸 + 主窗口关闭（UI 进程立即退出） | 无壁纸 | 仅壳（关闭后 UI 进程立即退出） | Main×1 | 待实测 | 待实测 | 【底】≈7.6MB | 待实测 | — | 待实测 | 【底】(§21) |
 | 4 | Native 静态图（jpg/jpeg/png/bmp/tif/tiff/dib）播放 | 播放 | **无渲染器**：`SystemParametersInfoW` + 注册表，由系统承载 | Main×1 | 壁纸侧 0 | 壁纸侧 0 | 壁纸侧 ~0 | 壁纸侧 ~0 | — | ~0 | 【导】`desktop/native_wallpaper.rs` |
 | 5 | Native 静态图 暂停 | 暂停 | 空操作（no-op，无渲染器可暂停） | Main×1 | 0 | 0 | ~0 | ~0 | — | ~0 | 【导】`mode_dispatch.rs` |
 | 6 | WorkerW 静态图（WebP）播放 | 播放 | 壳内壁纸线程 `mirrorstar-wallpaper` + GDI 双缓冲窗口（`mem_dc`/`mem_bitmap`/`image_bitmap`） | Main×1 | +1 壁纸线程 | 窗口 + GDI DC/Bitmap | 【导】像素 ~5–30MB（随分辨率） | 【导】~10–30MB | — | 低 | 【导】`wallpaper/image.rs`、`gdi_cache.rs` |
@@ -474,7 +474,7 @@ GIF 帧像素预算默认 40MB（配置项 `GifConfig.max_memory_mb`，合法范
 | 情形 | 数值 | 来源 |
 |---|---|---|
 | 主窗口打开并静置（壳 + UI 合计 private） | ≈16.8MB（验收门槛 ≤40MB） | §21 |
-| 主窗口关闭（UI 空闲超时退出）后 | ≈7.6MB | §21 |
+| 主窗口关闭（UI 进程立即退出）后 | ≈7.6MB | §21 |
 | 主窗口打开时 idle CPU | ≈0.4% | §21 |
 | 网格滚动 CPU | 10.5% | §21 |
 | 暂停态主进程（工作集） | ≈17.14MB（2026-07-24 运行时记录 17.1MB） | NFR-001 / 架构与技术栈总览 |
@@ -500,7 +500,7 @@ GIF 帧像素预算默认 40MB（配置项 `GifConfig.max_memory_mb`，合法范
 4. **多屏按显示器数线性放大**：PerMonitor/AllSame/Span 下渲染器与子进程数均 ≈ 显示器数（N 个视频屏 ⇒ 最多 N 个 `mpv.exe`；N 个网页屏 ⇒ 最多 N 套 `--wp-proc`+WebView2）；当前 Span 也是 N 个渲染器逐屏 apply（单跨屏渲染器为设计目标，尚未落地）。
 5. **纯净模式**有额外常驻（置顶窗口 + 低级输入钩子 + 存活看护线程）；Native 壁纸下还需为此**另建临时顶层呈现窗口**（打破其「零窗口」特性）。
 6. **壳侧常驻线程**：调度主循环、看护(5s)、热插拔(3s)、WorkerW 检查(300s) 均常驻，是「仅壳」情形的固定成本来源。
-7. **主窗口 UI 是独立进程且按需启停**：历史验收基线为打开 ≈16.8MB（壳+UI，§21）、关闭后 UI 空闲超时退出回落 ≈7.6MB（均待复测）——UI 不常驻。
+7. **主窗口 UI 是独立进程且按需启停**：历史验收基线为打开 ≈16.8MB（壳+UI，§21）、关闭后 UI 进程立即退出回落 ≈7.6MB（均待复测）——UI 不常驻。
 
 ### 22.7 缺口（待实测）
 
@@ -635,7 +635,7 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass `
 | 进程/线程/句柄 | 全屏监控线程 + WinEvent 钩子 | 有界 | 二次启动先 `UnhookWinEvent` + `WM_QUIT` + `join` | `platform/fullscreen.rs`；`state.rs` |
 | 进程/线程/句柄 | 全屏周期复查线程 | 有界 | `RUNNING=false` + `join` | `platform/fullscreen.rs` |
 | 进程/线程/句柄 | 纯净模式输入线程 | 有界 | 退出/超时路径 `join` | `platform/pure_mode_input.rs` |
-| 进程/线程/句柄 | UI 子进程 `mirrorstar-ui.exe` | 有界 | 空闲超时退出回收 | `ui_process/mod.rs::should_exit_idle` |
+| 进程/线程/句柄 | UI 子进程 `mirrorstar-ui.exe` | 有界 | 关闭主窗口立即退出；托盘隐藏空闲超时退出回收 | `mirrorstar-ui/src/main.rs::on_close_requested`；`ui_process/mod.rs::should_exit_idle` |
 | 进程/线程/句柄 | 命名管道句柄 | 有界 | `OwnedHandle` / `File` RAII | `mirrorstar-wp-proc/src/ipc_server.rs` |
 | 进程/线程/句柄 | 缩略图任务句柄 | 有界 | 槽上限 50 + 回收已完成 | `commands/wallpaper.rs` |
 | 内存集合/通道 | `DISPLAYS_SETTING` 去重集 | 有界 | RAII `DisplaySettingGuard::Drop` 移除 | `commands/wallpaper.rs` |
@@ -817,7 +817,7 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass `
 | **配置写入** | 原子写入(文件锁+临时文件+rename) + 300ms 防抖 |
 | **进程暂停** | 逻辑暂停（PauseSender 经 mpsc 直投渲染线程，短暂持 engine 锁） |
 | **原生壁纸 API** | SystemParametersInfoW + 注册表（零资源占用） |
-| **主窗口 UI** | 原生 UI 子进程（Slint 软件渲染，按需启动，空闲超时退出，虚拟化网格） |
+| **主窗口 UI** | 原生 UI 子进程（Slint 软件渲染，按需启动，关闭即退出 / 托盘隐藏空闲超时退出，虚拟化网格） |
 | **WebView2** | 仅网页壁纸子进程（按需启动，关闭即销毁）+ 参数裁剪（renderer 限单、V8 堆上限）；主窗口已不使用 WebView2 |
 | **mpv 限流** | 解码队列/缓存/demuxer 限流 + 解码线程数上限（`--vd-lavc-threads=4`） |
 | **内存归因** | `MEM-ATTRIB` 周期埋点（60s）+ `get_memory_report` 命令（分类别 + 总计） |

@@ -252,8 +252,10 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     apply_static_options(&ui);
 
     install_handlers(&client, &store, &gstate, &add_job, &ui_weak);
-    // 关闭按钮 / Alt+F4：保持"隐藏而非销毁"，上报 `WindowHidden` 以启动壳侧空闲回收，
-    // 并关闭预览释放 mpv / WebView2（与托盘隐藏路径一致）。
+    // 关闭按钮 / Alt+F4：**关闭即结束 UI 进程**——先关闭预览释放 mpv / WebView2，
+    // 上报 `WindowHidden` 让壳侧进入隐藏态，再主动退出事件循环；`run()` 返回后进程结束，
+    // 壳侧协议泵在 stdio EOF 后回收运行槽位。托盘左键隐藏 / 壳侧 `Hide` 不走此回调，
+    // 仍保持"隐藏不退出"以便快速再次显示，由空闲超时（默认 300s）兜底回收。
     {
         let ui_weak_for_close = ui_weak.clone();
         let client_for_close = Arc::clone(&client);
@@ -263,6 +265,10 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 preview::close(&ui);
             }
             client_for_close.report_visibility(false);
+            // 退出失败（极端环境）仅记录日志：窗口保持隐藏，壳侧空闲回收仍会兜底。
+            if let Err(e) = slint::quit_event_loop() {
+                log(format!("关闭主窗口时退出事件循环失败：{e}"));
+            }
             slint::CloseRequestResponse::HideWindow
         });
     }
@@ -395,7 +401,8 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     // 必须用 `run_event_loop_until_quit()` 而非 `run_event_loop()`：Slint 1.18 的
     // `Window::hide()` 会 `release_keepalive()`，隐藏最后一个窗口时 `run_event_loop()`
     // 会直接返回并结束进程——托盘收起主窗口后 UI 进程立即退出，下次点击只能冷启动
-    // 新进程且丢失窗口状态。进程回收统一交给壳侧空闲计时（默认 300s）或 `Exit` 指令。
+    // 新进程且丢失窗口状态。进程回收三条路径：关闭主窗口时 UI 主动退出事件循环、
+    // 托盘隐藏满空闲计时（默认 300s）由壳侧回收、壳侧 `Exit` 指令退出。
     let result = slint::run_event_loop_until_quit();
     log("事件循环已退出，UI 进程正常结束");
     result.map_err(|e| e.into())

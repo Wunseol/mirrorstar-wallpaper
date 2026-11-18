@@ -26,6 +26,11 @@
 //! 内存归零，下次打开可再次按需拉起。重复打开请求不会产生第二个实例（[`Self::ensure_running`]
 //! 的单槽位判定）。
 //!
+//! 该计时仅覆盖"托盘左键隐藏 / 壳侧 `Hide`"等**保留进程**的隐藏路径。用户点击主窗口
+//! 关闭按钮或按 Alt+F4 时，UI 侧自行退出事件循环结束进程（见 `mirrorstar-ui` 的
+//! `on_close_requested`），壳侧协议泵在 stdio EOF 后经 [`UiProcessManager::on_pump_exit`]
+//! 清理运行槽位，无需等待空闲超时。
+//!
 //! # 窗口显隐与前台策略（SubTask 2.6）
 //!
 //! 壳侧**只发送控制消息**，不直接操作窗口。UI 收到 `Show` / `Toggle` 后按可见性状态
@@ -576,7 +581,7 @@ impl UiProcessManager {
             .unwrap_or_else(|e| e.into_inner()) = None;
     }
 
-    /// 空闲检查：隐藏超时则请求并回收 UI 进程（内存归零）。
+    /// 空闲检查：托盘隐藏超时则请求并回收 UI 进程（内存归零）。
     pub fn tick_idle(&self) {
         let running = self.is_running();
         let hidden_for = self

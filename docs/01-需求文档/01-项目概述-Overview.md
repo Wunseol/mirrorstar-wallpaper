@@ -30,7 +30,7 @@ Windows 平台上的动态壁纸软件已有多种实现，但现有主流方案
 MirrorStar Wallpaper（镜星壁纸）是一款基于 Rust 开发的轻量级、高性能 Windows 动态壁纸应用程序。
 
 - **应用壳**：基于 Tauri v2（`tauri = 2.11`，启用 `tray-icon` 特性），仅承担系统托盘图标、原生对话框（tauri-plugin-dialog）、开机自启（tauri-plugin-autostart）与后端命令等壳层职责。
-- **主窗口 UI**：采用 **Slint 原生渲染**的独立子进程（`mirrorstar-ui`，软件渲染）承载，**不再使用系统 WebView 渲染主界面**；主窗口按需 spawn，窗口隐藏超时（默认 300s）后 UI 子进程退出回收内存。
+- **主窗口 UI**：采用 **Slint 原生渲染**的独立子进程（`mirrorstar-ui`，软件渲染）承载，**不再使用系统 WebView 渲染主界面**；主窗口按需 spawn；关闭主窗口（关闭按钮 / Alt+F4）时 UI 子进程立即退出，托盘隐藏时保留进程并在空闲超时（默认 300s）后退出回收内存。
 - **核心壁纸引擎**：纯 Rust + Win32 API 实现（无 GUI 框架依赖）。
 - **网页壁纸渲染**：使用 WebView2（webview2-com 0.34），由壳 exe 以 `--wp-proc` 模式启动独立子进程承载，**仅在渲染网页壁纸时存在**。
 

@@ -70,7 +70,7 @@
 | 多屏排列 | Arrangement | 多显示器布局策略枚举（core `config::settings::Arrangement`，由 `mirrorstar-core::layout` 作为唯一权威逻辑）。三态：`PerMonitor`（每屏独立，每显示器一个调度单元，key = 显示器 id）、`AllSame`（每屏同图，唯一全局单元 `all`，一张壁纸各屏顺序各 apply 一次，N 渲染器）、`Span`（跨屏合并，唯一全局单元 `all`，1 个跨屏渲染器贯通虚拟桌面、1 次 apply） |
 | 调度单元 | Unit | 多屏排列下壁纸应用的粒度：`PerMonitor` 下每显示器一个单元；`AllSame`/`Span` 下唯一全局单元 `all`（常量 `ALL_UNIT_KEY`） |
 | Slint | Slint | 用于构建 MirrorStar **主窗口**的原生 GUI 工具包。主窗口是独立的 Slint 原生 UI 子进程（`mirrorstar-ui.exe`），**非 Tauri WebView 前端**；Tauri v2 仅承担托盘/对话框/自启/后端命令等壳职责 |
-| mirrorstar-ui | mirrorstar-ui | 主窗口 UI 的独立子进程 crate（Slint 原生渲染）。由壳侧按需 spawn，窗口隐藏超时（默认 300s）后退出回收内存；同一时刻至多一个实例 |
+| mirrorstar-ui | mirrorstar-ui | 主窗口 UI 的独立子进程 crate（Slint 原生渲染）。由壳侧按需 spawn；关闭主窗口（关闭按钮 / Alt+F4）时立即退出，托盘隐藏时保留进程并在空闲超时（默认 300s）后退出回收内存；同一时刻至多一个实例 |
 | ui_proto | UI protocol | `mirrorstar-core` 中的公开模块，定义壳（`src-tauri`）与 UI 子进程（`mirrorstar-ui`）之间的 **NDJSON over stdio** 协议（命令与事件结构）。UI 侧经事件桥（`src-tauri/src/ui_process/bridge.rs` 的 `FORWARDED_EVENTS`）接收壳侧事件 |
 | 预览播放器化 | Player-ized Preview | 预览弹窗底部控制条（chrome）具备播放器级控制：播放/暂停、进度拖动、倍速、音量/静音、全屏（四角箭头）；`Esc` 在全屏时先退全屏再关闭弹窗。实现在 `crates/mirrorstar-ui/src/preview/`（视频经 mpv IPC，GIF 经 Slint 定时器；网页预览使用临时 WebView2，无控制带） |
 | 托盘溢出浮出窗 | Tray Overflow Flyout | 任务栏"隐藏栏"浮出窗（Win11 类名 `TopLevelWindowForOverflowXamlIsland`，旧版 `NotifyIconOverflowWindow`）。进入纯净壁纸模式时因不抢前台需主动关闭（`WM_CLOSE`，失败回退 `SW_HIDE`），否则会叠在置顶壁纸之上 |

@@ -37,7 +37,7 @@ MirrorStar 的架构围绕以下几项关键设计决策进行根本性重构，
 * **依赖最小化**：无 .NET Runtime 依赖，仅依赖系统自带的 WebView2 Runtime 和随程序分发的外部 mpv.exe
 * **体积控制**：目标主程序二进制 < 10MB；安装包另随附 `mirrorstar-ui.exe` 与外部 `mpv.exe`
 * **静态壁纸零资源**：JPG/JPEG/PNG/BMP/TIF/TIFF/DIB 使用 Windows 原生壁纸 API（`SystemParametersInfoW`），无需创建窗口、线程或 GDI 对象
-* **UI 子进程按需启动**：主窗口 UI 运行在独立进程 `mirrorstar-ui.exe`（Slint 原生渲染），启动时仅创建系统托盘图标；窗口隐藏超时（默认 300s）后 UI 子进程退出回收内存（壳侧≈7.6MB，历史数据/待复测），再次打开时按需拉起；同一时刻至多一个实例
+* **UI 子进程按需启动**：主窗口 UI 运行在独立进程 `mirrorstar-ui.exe`（Slint 原生渲染），启动时仅创建系统托盘图标；关闭主窗口（关闭按钮 / Alt+F4）时 UI 子进程立即退出；托盘隐藏时保留进程，空闲超时（默认 300s）后退出回收内存（壳侧≈7.6MB，历史数据/待复测），再次打开时按需拉起；同一时刻至多一个实例
 
 #### 1.2.2 高性能（High Performance）
 
