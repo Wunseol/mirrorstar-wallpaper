@@ -6,7 +6,7 @@
 
 <p align="center"><em>基于 Rust + Tauri v2 的 Windows 动态壁纸软件。</em></p>
 
-MirrorStar Wallpaper 基于 Rust + Tauri v2 打造，支持视频、GIF、静态图片与网页（本地 HTML/HTM）四类壁纸：静态图片通过系统原生壁纸 API 设置，视频 / GIF / 网页壁纸则通过 WorkerW 原生嵌入渲染到桌面图标层下方，在保持桌面正常交互的同时提供动态壁纸。
+MirrorStar Wallpaper 基于 Rust + Tauri v2 打造，支持视频、GIF、静态图片与网页（本地 HTML/HTM）四类壁纸：静态图片优先走系统原生壁纸 API（JPG/JPEG/PNG/BMP/TIF/TIFF/DIB；WebP/ICO 回退 WorkerW），视频 / GIF / 网页壁纸则通过 WorkerW 原生嵌入渲染到桌面图标层下方，在保持桌面正常交互的同时提供动态壁纸。
 
 <p align="center">
   <a href="./LICENSE"><img src="https://img.shields.io/badge/License-GPLv2%2B-orange.svg" alt="License: GPL-2.0-or-later" /></a>
@@ -17,37 +17,75 @@ MirrorStar Wallpaper 基于 Rust + Tauri v2 打造，支持视频、GIF、静态
 
 ## 简介
 
-镜星壁纸是一款面向 **Windows 桌面** 的动态壁纸方案。它尊重系统原生行为：全屏应用切换与电源状态通过系统事件（`SetWinEventHook`、`PBT_APMPOWERSTATUSCHANGE`）感知；视频与网页壁纸渲染分别运行在独立子进程（`mpv.exe` 与壳的 `--wp-proc` 模式），主窗口 UI 亦为独立子进程 `mirrorstar-ui.exe`，图片与 GIF 则在壳进程内渲染，在沉浸感与稳定性之间取得平衡。
+镜星壁纸是一款面向 **Windows 桌面** 的动态壁纸方案。它尊重系统原生行为：全屏状态通过两组 `SetWinEventHook`（系统事件 + 对象事件）事件驱动，并以 2s 周期调和兜底；电源状态通过 `WM_POWERBROADCAST` / `PBT_APMPOWERSTATUSCHANGE` 感知。视频与网页壁纸分别运行在独立子进程（`mpv.exe` 与壳的 `--wp-proc` 模式），主窗口 UI 亦为独立子进程 `mirrorstar-ui.exe`（关闭主窗口即结束该进程，托盘隐藏则保留进程并在空闲超时后回收），图片与 GIF 在壳进程内渲染，在沉浸感与稳定性之间取得平衡。
 
-- **资源占用随壁纸类型而异**：静态图片走系统原生壁纸 API（无额外常驻渲染进程）；GIF 由 `image` 在壳进程内逐帧解码（默认帧像素内存预算 40 MB，`gif.max_memory_mb`，范围 10–500 MB）；视频由独立 `mpv.exe` 子进程渲染；网页（本地 HTML/HTM）由壳的 `--wp-proc` 子进程内 WebView2 渲染。
-- **事件驱动感知为主**：全屏应用切换（`SetWinEventHook(EVENT_SYSTEM_FOREGROUND)`）与电源状态变化（`PBT_APMPOWERSTATUSCHANGE`）均为系统事件回调；另有低频周期检查用于显示器热插拔（3 秒）与渲染器存活看护（5 秒），并非高频轮询。
+- **资源占用随壁纸类型而异**：静态图片优先走系统原生壁纸 API（WebP/ICO 回退 WorkerW；无额外常驻渲染进程）；GIF 由 `image` 在壳进程内逐帧解码（默认帧像素内存预算 40 MB，`[gif] max_memory_mb`，范围 10–500 MB）；视频由独立 `mpv.exe` 子进程渲染；网页（本地 HTML/HTM）由壳的 `--wp-proc` 子进程内 WebView2 渲染。
+- **事件驱动感知为主**：全屏状态由系统事件与对象事件两组 WinEvent 回调驱动（对象事件覆盖独占全屏的 `LOCATIONCHANGE` / `STATECHANGE`），另有 2s 周期调和兜底；电源状态变化为 `PBT_APMPOWERSTATUSCHANGE` 回调；显示器热插拔（3 秒）与视频渲染器存活看护（5 秒）为低频周期检查。整体为事件驱动 + 低频兜底，并非高频轮询。
 - **子进程隔离**：视频与网页壁纸分别运行在独立 `mpv.exe` / `--wp-proc` 子进程，主窗口 UI 为按需启动的独立进程；这些子进程崩溃不会拖垮壳进程与其它类型壁纸（图片 / GIF 在壳进程内渲染，与壳同生共死）。
 - **多显示器支持**：每屏独立设置壁纸，支持三种多屏排列（每屏独立 / 每屏同图 / 跨屏合并）。
 - **四种壁纸类型**：视频 / GIF / 静态图片 / 网页（本地 HTML/HTM），覆盖主流动态壁纸需求。
 
-## 特性
+## 项目定位
+
+> **一句话定位**：MirrorStar 是“原生、轻量常驻、开源免费、本地优先”的 Windows 动态壁纸工具；适合看重常驻开销、开源性、无账号 / 本地数据与可控行为的用户。若看重 3D / 交互内容、创意工坊与成熟生态，Wallpaper Engine / Lively 更合适。
+
+### 核心优势
+
+- **轻量常驻**：托盘壳空闲 private ≈7.7 MB / WS ≈21.7 MB（2026-11-24 dev 实测，1080p 视频播放、UI 关闭；详见[性能文档 §22](./docs/02-架构与技术栈/09-性能优化-Performance.md)）；主窗口 UI 按需启动、关闭即退出；原生支持格式的静态图片走系统原生壁纸 API，无额外渲染进程。
+- **原生与隔离**：Rust + Slint 原生 UI，无 Electron / WebView 主窗口；视频与网页壁纸分别在 `mpv.exe` / `--wp-proc` 子进程，崩溃隔离。
+- **开源免费、本地优先**：GPL-2.0-or-later，无账号 / 云依赖；网页壁纸只接受本地文件，远程白名单默认空。
+- **行为可控**：全屏 `none` / `pause` / `terminate`、电池暂停、轮换池 / 算法、纯净模式、托盘常驻。
+
+### 客观短板
+
+- **内容生态**：无 Steam 创意工坊 / 百万级内容库；无 3D / 2D 场景编辑器、无脚本化鼠标交互壁纸（仅有穿透 / 交互模式切换）、无 Android 伴侣、无 RGB 联动。
+- **类型与扩展**：仅视频 / GIF / 图片 / 本地 HTML，不支持网页 URL / YouTube、Unity / Godot、GLSL 着色器、应用程序壁纸。
+- **生态与验证**：Windows-only、项目规模较小、缺少独立第三方横向评测；竞品运行时数据官方普遍未公开，且没有同条件实测，不能得出“最省内存 / 最快”的结论。
+
+### 适合 / 不适合
+
+| 适合 | 不适合 |
+|---|---|
+| 看重轻量常驻、原生实现、开源免费、本地数据与可控行为的 Windows 用户 | 需要 3D / 交互壁纸、海量创意工坊内容、网页 URL / 着色器 / Unity、跨平台或成熟生态的用户 |
+
+## 项目特性
 
 - **四种壁纸类型**
   - 视频：经 `mpv.exe` 外部子进程渲染
   - GIF：`image` crate 在壳进程内逐帧解码
   - 静态图片：优先调用原生壁纸 API（`SystemParametersInfoW`）；原生 API 不支持的格式（如 WebP、ICO）回退 WorkerW 渲染
-  - 网页：仅支持本地 `.html` / `.htm`，由 WebView2 在壳的 `--wp-proc` 子进程中渲染；远程 http/https 默认拒绝，需系统已安装 WebView2 Runtime
+  - 网页：仅支持本地 `.html` / `.htm` 文件
+    - 由 WebView2 在壳的 `--wp-proc` 子进程中渲染，需系统已安装 WebView2 Runtime
+    - 添加时要求绝对本地路径，`http/https` URL 不能作为壁纸源直接添加
+    - wp-proc 的远程域名白名单默认为空（仅放行 `localhost` / `127.0.0.1`）
 - **WorkerW 原生嵌入**：壁纸渲染在桌面图标层下方，不影响桌面交互与右键菜单
 - **多显示器支持**：每屏独立设置壁纸，支持三种多屏排列
   - `per_monitor`：每屏独立
   - `all_same`：每屏同图
   - `span`：跨屏合并
-- **全屏处置策略**：进入全屏应用时按配置执行三种策略之一——`none`（不处置）/ `pause`（暂停，退出全屏即时恢复）/ `terminate`（终止渲染子进程，退出全屏冷启动恢复），默认 `terminate`；前台切换事件驱动。电池供电时可按配置暂停（电源状态事件驱动）
-- **播放控制**：暂停 / 恢复 / 音量 / 静音 / 播放速度
+- **全屏处置策略**：按 `[pause] fullscreen_action` 执行，默认 `terminate`
+  - `none`：不处置
+  - `pause`：暂停，退出全屏即时恢复
+  - `terminate`：终止渲染子进程，退出全屏冷启动恢复
+  - 检测：系统 / 对象 WinEvent 事件驱动 + 2s 周期调和兜底
+  - 电池：`[pause] pause_on_battery`（默认关闭）可按电源状态暂停
+- **播放控制**：暂停 / 恢复 / 音量 / 静音 / 播放速度（按渲染器能力生效；GIF 支持速度调节，图片无音视频控制）
 - **子进程隔离**：视频 / 网页壁纸分别运行在独立 `mpv.exe` / `--wp-proc` 子进程，其崩溃不影响壳与其它壁纸；图片 / GIF 在壳进程内渲染
-- **壁纸轮换**：定时轮换 + 可组合候选池 + 采样算法（顺序循环 / 洗牌袋（随机不重复）/ 纯随机（随机可重复））
+- **壁纸轮换**
+  - 定时：`[rotation] interval_minutes`，默认 30，范围 1–1440 分钟
+  - 候选：可组合候选池
+  - 算法：`sequential` 顺序循环 / `shuffle_bag` 洗牌袋（随机不重复）/ `pseudo_random` 纯随机（随机可重复）
 - **纯净壁纸模式**：托盘一键进入，壁纸置顶全屏覆盖图标 / 任务栏，任意键 / 鼠标点击退出（模式内暂停轮换并跳过全屏处置）
-- **托盘驻留 + 主窗口按需启动**：应用默认驻留系统托盘；主窗口为独立原生 UI 子进程 `mirrorstar-ui.exe`，按需拉起、隐藏超时（默认 300s）后自动退出回收内存，降低驻留资源占用
+- **托盘驻留 + 主窗口按需启动**
+  - 应用默认驻留系统托盘
+  - 主窗口为独立原生 UI 子进程 `mirrorstar-ui.exe`，按需拉起
+  - 关闭主窗口（关闭按钮 / Alt+F4）立即结束 UI 子进程
+  - 托盘隐藏时保留进程以便快速重开，隐藏满 300s（`MIRRORSTAR_UI_IDLE_TIMEOUT_SECS`，30s tick）后自动回收
 - **其他**：开机自启、缩略图管理、鼠标交互模式
 
 ## 技术栈
 
-下表版本号以根 `Cargo.toml` / `src-tauri/tauri.conf.json` 为准。
+下表版本号以各 `Cargo.toml` / `src-tauri/tauri.conf.json` 为准。
 
 | 层 | 技术 | 说明 |
 |---|---|---|
@@ -65,6 +103,8 @@ MirrorStar Wallpaper 基于 Rust + Tauri v2 打造，支持视频、GIF、静态
 ## 项目结构
 
 Rust workspace 四个成员：`src-tauri` / `crates/mirrorstar-core` / `crates/mirrorstar-wp-proc` / `crates/mirrorstar-ui`。
+
+以下仅列关键项（省略 `.git`、`target/` 等构建/版本控制细节）：
 
 ```
 mirrorstar-wallpaper/
@@ -89,7 +129,7 @@ mirrorstar-wallpaper/
 
 ### 最终用户
 
-从 **Release** 页面下载 NSIS 安装包（`productName` 为 `MirrorStar Wallpaper`，identifier `com.mirrorstar.wallpaper`），双击安装即可使用，无需自行构建。
+从 [Releases](https://github.com/Wunseol/mirrorstar-wallpaper/releases) 下载 NSIS 安装包（`productName` 为 `MirrorStar Wallpaper`，identifier `com.mirrorstar.wallpaper`），双击安装即可使用，无需自行构建。
 
 ### 开发者
 
@@ -98,35 +138,37 @@ mirrorstar-wallpaper/
 - Windows 10 / 11
 - Rust 1.80+（`rust-toolchain.toml` 锁定 stable 通道）
 - MSVC Build Tools（Visual Studio 2022，"Desktop development with C++" 工作负载，含 Windows SDK）
-- Tauri CLI 2.11（`cargo install tauri-cli --version "^2.11" --locked`）
+- Tauri CLI 2.11+（`cargo install tauri-cli --version "^2.11" --locked`；当前验证 2.12.1）
 
 > **不再需要 Node.js / npm**：项目已无前端构建产物；主窗口为原生 Slint UI 子进程。
 
 #### 构建与运行
 
 ```bash
-# 克隆仓库（将 <repo-url> 替换为实际仓库地址）
-git clone <repo-url>
+# 克隆仓库
+git clone https://github.com/Wunseol/mirrorstar-wallpaper.git
 cd mirrorstar-wallpaper
 
 # 开发模式：src-tauri/build.rs 会以隔离的 CARGO_TARGET_DIR
 # 单独执行 `cargo build -p mirrorstar-ui --release`，并把产物复制到
 # target/<PROFILE>/ 与 target/release/（wp-proc 已并入壳，无需单独构建）
-# --additional-watch-folders 让主窗口 UI crate（crates/mirrorstar-ui）
-# 的改动也被监听并触发重启
-cargo tauri dev --additional-watch-folders crates/mirrorstar-ui
+# --additional-watch-folders 的路径相对于 src-tauri，因此使用 ../crates/mirrorstar-ui；
+# 让主窗口 UI crate 的改动也被监听并触发重启
+cargo tauri dev --additional-watch-folders ../crates/mirrorstar-ui
 ```
+
+> **dev 构建排障**：若 `cargo tauri dev` 报 `cargo build -p mirrorstar-ui --release failed`，通常是隔离构建目录 `%TEMP%\mirrorstar-ui-cargo-target` 残留损坏；删除该目录后重试。若 rustc 报 `unexpectedly panicked` / ICE，删除 `target\debug\incremental` 后重试。两者均为构建缓存，可安全删除。
 
 #### mpv 运行时获取
 
-视频壁纸依赖 `mpv.exe`（体积大，约 120 MB，已被 `.gitignore` 忽略、不入库）。请手动下载官方 release `20260903`（`mpv-x86_64-v3-20260903-git-69e63f425a.7z`），将解压得到的 `mpv.exe` 放入仓库根 `mpv/` 目录；`tauri_build` 在编译期会校验该文件存在。`mpv/license` 为随源码入库的许可文本，无需另行获取。
+视频壁纸依赖 `mpv.exe`（体积大，约 120 MB，已被 `.gitignore` 忽略、不入库）。请手动下载官方 release `20260903`（x86_64-v3 构建，资产名形如 `mpv-x86_64-v3-20260903-git-69e63f425a.7z`，以官方 Release 页面为准），将解压得到的 `mpv.exe` 放入仓库根 `mpv/` 目录；`tauri_build` 在编译期会校验该文件存在。`mpv/license` 为随源码入库的许可文本，无需另行获取。
 
 #### 常用命令
 
 | 用途 | 命令 |
 |---|---|
 | 编译全部成员 | `cargo build --workspace` |
-| 应用开发模式 | `cargo tauri dev --additional-watch-folders crates/mirrorstar-ui` |
+| 应用开发模式 | `cargo tauri dev --additional-watch-folders ../crates/mirrorstar-ui` |
 | 打包（NSIS 安装包） | `cargo tauri build` |
 | Rust 测试 | `cargo test --workspace` |
 | Lint（零警告） | `cargo clippy --workspace --all-targets -- -D warnings` |
@@ -145,16 +187,21 @@ cargo clean   # 删除整个 target/，下次构建自动复现
 
 ### 数据存放位置（便携版）
 
-全部用户数据（配置、壁纸库、壁纸资源、缩略图、日志）统一存储在数据根目录，由 `resolve_data_root()` 按三级优先级解析：环境变量 `MIRRORSTAR_DATA_ROOT` → exe 所在目录（始终采用）→ `%APPDATA%\mirrorstar`（仅作兜底）。安装版数据落在安装目录（即 exe 所在目录），删除整个安装目录即可一键全量清理；开发时经 `cargo run` / `cargo tauri dev` 运行的程序（exe 位于 `target\<profile>` 下）数据随之落在 `target\<debug|release>\`，会随 `cargo clean` 一并清除——这一行为是**刻意设计**（dev 数据视为可再生的临时产物），并非便携性缺陷；详细优先级见 [docs/04-优化文档/02-config模块.md](./docs/04-优化文档/02-config模块.md) 的「1.4 数据根目录」。
+全部用户数据（配置、壁纸库、播放状态、壁纸资源、缩略图、日志与 WebView2 缓存）统一存储在数据根目录。
+
+- **解析顺序**：`MIRRORSTAR_DATA_ROOT`（存在即采用）→ 可执行文件所在目录（正常安装 / dev 均如此）→ `%APPDATA%\mirrorstar`（仅当无法取得 exe 路径时兜底）。
+- **安装版**：数据落在安装目录（即 exe 所在目录），删除整个安装目录即可一键全量清理。
+- **开发版**：经 `cargo tauri dev`（或 `cargo run -p mirrorstar-wallpaper`）运行的程序，exe 位于 `target\<profile>`，数据落在 `target\<debug|release>\`，会随 `cargo clean` 一并清除。这是**刻意设计**（dev 数据视为可再生的临时产物），并非便携性缺陷。
+- **详细说明**：见 [docs/04-优化文档/02-config模块.md](./docs/04-优化文档/02-config模块.md) 的「1.4 数据根目录」。
 
 ## 使用说明
 
 - **添加壁纸**：将视频 / GIF / 图片 / 网页（本地 HTML/HTM）资源加入轮换池，即可作为动态壁纸。
 - **切换类型**：视频 / GIF / 图片 / 网页四种类型可按需自由切换。
-- **全屏处置**：进入全屏应用窗口时按 `pause.fullscreen_action` 执行 `none` / `pause` / `terminate`（默认 `terminate`，退出全屏后冷启动恢复；选 `pause` 则即时恢复）；电池供电时也可选择暂停以避免额外耗电。
-- **播放控制**：支持暂停 / 恢复 / 音量 / 静音 / 播放速度等控制。
+- **全屏处置**：进入全屏应用窗口时按 `[pause] fullscreen_action` 执行 `none` / `pause` / `terminate`（默认 `terminate`，退出全屏后冷启动恢复；选 `pause` 则即时恢复）；电池供电时也可选择暂停以避免额外耗电。
+- **播放控制**：支持暂停 / 恢复 / 音量 / 静音 / 播放速度等控制（按壁纸类型能力生效）。
 - **壁纸轮换**：可配置多个候选池与采样算法（顺序循环 / 洗牌袋 / 纯随机），并设定轮换间隔。
-- **托盘驻留**：应用默认驻留系统托盘；主窗口由独立 UI 子进程按需启动，窗口隐藏超时（默认 300s）后自动退出以释放内存，再次打开时重新拉起。
+- **托盘驻留**：应用默认驻留系统托盘；主窗口由独立 UI 子进程按需启动。关闭主窗口会立即结束该 UI 子进程；通过托盘隐藏时保留进程并在 300s 空闲后回收，再次打开时重新拉起。
 
 ## 文档入口
 
@@ -169,7 +216,7 @@ cargo clean   # 删除整个 target/，下次构建自动复现
 
 ## 项目状态
 
-- **当前版本**：0.1.5（开发中）
+- **当前版本**：0.1.6（开发中）
 - **目标平台**：Windows 10 / 11
 - **项目状态**：积极开发中，API 与功能可能调整
 

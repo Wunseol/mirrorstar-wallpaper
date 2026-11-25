@@ -38,8 +38,9 @@ slint::include_modules!();
 use std::cell::RefCell;
 use std::collections::VecDeque;
 use std::io::BufReader;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use slint::{ComponentHandle, DataTransfer, Image, ModelRc, SharedString, VecModel};
 
@@ -65,6 +66,8 @@ mod store;
 mod thumbs;
 mod videothumb;
 #[cfg(windows)]
+mod window_effects;
+#[cfg(windows)]
 mod window_icon;
 mod window_pos;
 
@@ -87,6 +90,67 @@ const DRAG_GHOST_OPACITY: f32 = 0.85;
 
 /// 项目仓库地址：关于面板「项目仓库」链接的唯一来源。
 const REPO_URL: &str = "https://github.com/Wunseol/mirrorstar-wallpaper";
+
+/// 启动快照数量：必须与 run() 中 fetch_startup_snapshot 调用数一致。
+const STARTUP_SNAPSHOT_COUNT: usize = 9;
+
+/// 首次可见性门：启动快照全部完成前不显示窗口，避免半成品首帧。
+struct StartupGate {
+    remaining: AtomicUsize,
+    ready: AtomicBool,
+    pending_show: AtomicBool,
+}
+
+impl StartupGate {
+    fn new(count: usize) -> Self {
+        Self {
+            remaining: AtomicUsize::new(count),
+            ready: AtomicBool::new(false),
+            pending_show: AtomicBool::new(false),
+        }
+    }
+
+    fn is_ready(&self) -> bool {
+        self.ready.load(Ordering::Acquire)
+    }
+
+    /// 就绪则允许立即显示；未就绪则记录 pending 并返回 false。
+    fn request_show(&self) -> bool {
+        if self.is_ready() {
+            true
+        } else {
+            self.pending_show.store(true, Ordering::Release);
+            false
+        }
+    }
+
+    /// Hide/Exit 取消尚未执行的首次显示。
+    fn cancel_pending(&self) {
+        self.pending_show.store(false, Ordering::Release);
+    }
+
+    /// 一条启动快照最终完成（成功或最终失败）时调用；返回 true 表示“刚就绪且有 pending show”。
+    fn complete_one(&self) -> bool {
+        let remaining = self.remaining.load(Ordering::Acquire);
+        if remaining == 0 {
+            return false;
+        }
+        self.remaining.store(remaining - 1, Ordering::Release);
+        if remaining == 1 {
+            self.ready.store(true, Ordering::Release);
+            return self.pending_show.swap(false, Ordering::AcqRel);
+        }
+        false
+    }
+
+    /// 启动快照超时兜底：强制就绪，返回是否有待显示的窗口。
+    /// 防止单条快照响应丢失时主窗口永久隐藏。
+    fn force_ready(&self) -> bool {
+        self.remaining.store(0, Ordering::Release);
+        self.ready.store(true, Ordering::Release);
+        self.pending_show.swap(false, Ordering::AcqRel)
+    }
+}
 
 /// 在系统默认浏览器中打开 `url`（best-effort：失败仅记日志，不 panic）。
 #[cfg(windows)]
@@ -242,6 +306,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     // 批量添加作业（原生拖入 / 文件对话框共用一条串行流水线）。
     let add_job = Arc::new(Mutex::new(AddJob::default()));
     let client = UiClient::new(slint_dispatch());
+    let gate = Arc::new(StartupGate::new(STARTUP_SNAPSHOT_COUNT));
 
     // 网格几何由 Rust 单点写入 Slint，避免两处常量漂移。
     {
@@ -251,7 +316,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     // 枚举下拉的选项表是编译期常量，只需写一次。
     apply_static_options(&ui);
 
-    install_handlers(&client, &store, &gstate, &add_job, &ui_weak);
+    install_handlers(&client, &store, &gstate, &add_job, &ui_weak, &gate);
     // 关闭按钮 / Alt+F4：**关闭即结束 UI 进程**——先关闭预览释放 mpv / WebView2，
     // 上报 `WindowHidden` 让壳侧进入隐藏态，再主动退出事件循环；`run()` 返回后进程结束，
     // 壳侧协议泵在 stdio EOF 后回收运行槽位。托盘左键隐藏 / 壳侧 `Hide` 不走此回调，
@@ -313,6 +378,38 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
 
     // ── 全量快照 ────────────────────────────────────────────────────────────
     // 启动批次：均为一次性重试（偶发时序失败不致命）；关键数据最终失败会提示重开窗口。
+    // 全部完成的最后一条会打开首次显示门：期间壳侧 Show/Toggle 只排队，避免半成品首帧。
+    let show_pending_window: Arc<dyn Fn() + Send + Sync> = {
+        let ui_weak = ui_weak.clone();
+        let client = Arc::clone(&client);
+        let store = Arc::clone(&store);
+        let gstate = Arc::clone(&gstate);
+        let add_job = Arc::clone(&add_job);
+        Arc::new(move || {
+            if let Some(ui) = ui_weak.upgrade() {
+                log("启动数据就绪，显示排队的首次窗口");
+                // 窗口初始隐藏；用 Show 路径居中、显示、聚焦、刷新并 request_redraw。
+                apply_window_action(
+                    &ui,
+                    focus::WindowAction::Show,
+                    &client,
+                    &store,
+                    &gstate,
+                    &add_job,
+                );
+                client.report_visibility(true);
+            }
+        })
+    };
+    let startup_done: Arc<dyn Fn() + Send + Sync> = {
+        let gate = Arc::clone(&gate);
+        let show_pending_window = Arc::clone(&show_pending_window);
+        Arc::new(move || {
+            if gate.complete_one() {
+                show_pending_window();
+            }
+        })
+    };
     fetch_startup_snapshot(
         &client,
         "get_config",
@@ -321,6 +418,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         &ui_weak,
         apply_config_value,
         Some("配置"),
+        Arc::clone(&startup_done),
     );
     fetch_startup_snapshot(
         &client,
@@ -330,6 +428,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         &ui_weak,
         apply_wallpapers_value,
         Some("壁纸库"),
+        Arc::clone(&startup_done),
     );
     fetch_startup_snapshot(
         &client,
@@ -339,6 +438,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         &ui_weak,
         apply_displays_value,
         None,
+        Arc::clone(&startup_done),
     );
     fetch_startup_snapshot(
         &client,
@@ -348,6 +448,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         &ui_weak,
         apply_arrangement_value,
         None,
+        Arc::clone(&startup_done),
     );
     fetch_startup_snapshot(
         &client,
@@ -357,6 +458,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         &ui_weak,
         apply_rotation_value,
         None,
+        Arc::clone(&startup_done),
     );
     fetch_startup_snapshot(
         &client,
@@ -366,6 +468,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         &ui_weak,
         apply_pools_value,
         None,
+        Arc::clone(&startup_done),
     );
     fetch_startup_snapshot(
         &client,
@@ -375,6 +478,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         &ui_weak,
         apply_units_value,
         None,
+        Arc::clone(&startup_done),
     );
     fetch_startup_snapshot(
         &client,
@@ -384,6 +488,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         &ui_weak,
         apply_auto_start_value,
         None,
+        Arc::clone(&startup_done),
     );
     // 播放按钮初值：无活跃壁纸时壳侧返回 `null`。
     fetch_startup_snapshot(
@@ -394,7 +499,20 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         &ui_weak,
         apply_playback_value,
         None,
+        Arc::clone(&startup_done),
     );
+
+    // 启动快照响应丢失时不能永久隐藏主窗口：2s 后强制打开就绪门。
+    {
+        let gate = Arc::clone(&gate);
+        let show_pending_window = Arc::clone(&show_pending_window);
+        slint::Timer::single_shot(Duration::from_secs(2), move || {
+            if gate.force_ready() {
+                log("启动快照 2s 未全部完成，强制显示主窗口");
+                show_pending_window();
+            }
+        });
+    }
 
     // 窗口初始保持隐藏：由壳侧 `Show` 控制指令驱动显示（窗口显隐权归壳，Task 2.6）。
     //
@@ -415,6 +533,7 @@ fn install_handlers(
     gstate: &Arc<Mutex<GridUiState>>,
     add_job: &Arc<Mutex<AddJob>>,
     ui_weak: &slint::Weak<MainWindow>,
+    gate: &Arc<StartupGate>,
 ) {
     // 推送事件：增量更新状态仓后刷新视图与网格（Task 6.3 / 7.4 的事件回填在此接线）。
     //
@@ -484,52 +603,29 @@ fn install_handlers(
         // 回调内需回报可见性，故单独克隆一份句柄，避免与被调用的接收者 `client` 争用。
         let client_for_control = Arc::clone(client);
         let client_for_drop = Arc::clone(client);
+        let gate_for_control = Arc::clone(gate);
         client.set_control_handler(Arc::new(move |action: ControlAction| match action {
             ControlAction::Show => {
-                #[cfg(windows)]
-                if let Some(ui) = ui_weak.upgrade() {
-                    let (visible, minimized) = window_state(&ui);
-                    apply_window_action(
-                        &ui,
-                        focus::decide_show_action(visible, minimized),
-                        &client_for_drop,
-                        &store,
-                        &gstate,
-                        &add_job,
-                    );
-                }
-                #[cfg(not(windows))]
-                if let Some(ui) = ui_weak.upgrade() {
-                    if let Err(e) = ui.show() {
-                        log(format!("显示窗口失败：{e}"));
+                if !gate_for_control.request_show() {
+                    log("启动数据未就绪，Show 已排队");
+                } else {
+                    #[cfg(windows)]
+                    if let Some(ui) = ui_weak.upgrade() {
+                        let (visible, minimized) = window_state(&ui);
+                        apply_window_action(
+                            &ui,
+                            focus::decide_show_action(visible, minimized),
+                            &client_for_drop,
+                            &store,
+                            &gstate,
+                            &add_job,
+                        );
                     }
-                    install_native_drop_target(&ui, &client_for_drop, &store, &gstate, &add_job);
-                    after_store_change(&ui, &store, &gstate);
-                }
-                client_for_control.report_visibility(true);
-            }
-            ControlAction::Toggle => {
-                // 托盘左键：纯可见性切换（最小化→还原；隐藏→显示；可见→隐藏）。
-                // 不查询系统前台：点击托盘会改变前台，且显示路径不抢焦点，跨进程前台
-                // 判定必然失真，曾导致"可见窗口点托盘只置前、要点两次才收起"。
-                #[cfg(windows)]
-                if let Some(ui) = ui_weak.upgrade() {
-                    let (visible, minimized) = window_state(&ui);
-                    let next = focus::decide_toggle_action(visible, minimized);
-                    log(format!(
-                        "托盘切换窗口：visible={visible} minimized={minimized} action={next:?}"
-                    ));
-                    apply_window_action(&ui, next, &client_for_drop, &store, &gstate, &add_job);
-                    client_for_control.report_visibility(next != focus::WindowAction::Hide);
-                }
-                #[cfg(not(windows))]
-                if let Some(ui) = ui_weak.upgrade() {
-                    let visible = ui.window().is_visible();
-                    let result = if visible { ui.hide() } else { ui.show() };
-                    if let Err(e) = result {
-                        log(format!("切换窗口失败：{e}"));
-                    }
-                    if !visible {
+                    #[cfg(not(windows))]
+                    if let Some(ui) = ui_weak.upgrade() {
+                        if let Err(e) = ui.show() {
+                            log(format!("显示窗口失败：{e}"));
+                        }
                         install_native_drop_target(
                             &ui,
                             &client_for_drop,
@@ -539,10 +635,56 @@ fn install_handlers(
                         );
                         after_store_change(&ui, &store, &gstate);
                     }
-                    client_for_control.report_visibility(!visible);
+                    client_for_control.report_visibility(true);
+                }
+            }
+            ControlAction::Toggle => {
+                // 托盘左键：纯可见性切换（最小化→还原；隐藏→显示；可见→隐藏）。
+                // 不查询系统前台：点击托盘会改变前台，且显示路径不抢焦点，跨进程前台
+                // 判定必然失真，曾导致"可见窗口点托盘只置前、要点两次才收起"。
+                if !gate_for_control.request_show() {
+                    log("启动数据未就绪，Toggle 已排队为 Show");
+                } else {
+                    #[cfg(windows)]
+                    if let Some(ui) = ui_weak.upgrade() {
+                        let (visible, minimized) = window_state(&ui);
+                        let next = focus::decide_toggle_action(visible, minimized);
+                        log(format!(
+                            "托盘切换窗口：visible={visible} minimized={minimized} action={next:?}"
+                        ));
+                        apply_window_action(
+                            &ui,
+                            next,
+                            &client_for_drop,
+                            &store,
+                            &gstate,
+                            &add_job,
+                        );
+                        client_for_control.report_visibility(next != focus::WindowAction::Hide);
+                    }
+                    #[cfg(not(windows))]
+                    if let Some(ui) = ui_weak.upgrade() {
+                        let visible = ui.window().is_visible();
+                        let result = if visible { ui.hide() } else { ui.show() };
+                        if let Err(e) = result {
+                            log(format!("切换窗口失败：{e}"));
+                        }
+                        if !visible {
+                            install_native_drop_target(
+                                &ui,
+                                &client_for_drop,
+                                &store,
+                                &gstate,
+                                &add_job,
+                            );
+                            after_store_change(&ui, &store, &gstate);
+                        }
+                        client_for_control.report_visibility(!visible);
+                    }
                 }
             }
             ControlAction::Hide => {
+                gate_for_control.cancel_pending();
                 if let Some(ui) = ui_weak.upgrade() {
                     // 隐藏前先关闭预览：释放 mpv / WebView2 与宿主子窗口，杜绝后台残留。
                     #[cfg(windows)]
@@ -560,6 +702,7 @@ fn install_handlers(
                 client_for_control.report_visibility(false);
             }
             ControlAction::Exit => {
+                gate_for_control.cancel_pending();
                 log("收到壳侧退出指令");
                 if let Some(ui) = ui_weak.upgrade() {
                     #[cfg(windows)]
@@ -623,6 +766,8 @@ fn apply_window_action(
         focus::WindowAction::Show => {
             // 显示前把窗口居中到鼠标所在显示器的工作区（best-effort）。
             window_pos::center_on_cursor_monitor(ui.window());
+            // 主窗口全不透明：关闭 DWM 过渡与 blur-behind，避免首帧透出桌面。
+            window_effects::prepare_show(ui.window());
             if let Err(e) = ui.show() {
                 log(format!("显示窗口失败：{e}"));
             }
@@ -634,12 +779,15 @@ fn apply_window_action(
             window_icon::apply(ui.window());
             install_native_drop_target(ui, client, store, gstate, add_job);
             after_store_change(ui, store, gstate);
+            ui.window().request_redraw();
+            log("显示后请求全量重绘");
         }
         focus::WindowAction::Restore => {
             // `SW_RESTORE` 还原到最小化前的尺寸/位置并激活；**禁止居中**。
             if let Some(hwnd) = drop_target::hwnd_of(ui.window()) {
                 focus::restore_window(hwnd);
             }
+            window_effects::prepare_show(ui.window());
             if let Err(e) = ui.show() {
                 log(format!("还原窗口失败：{e}"));
             }
@@ -650,6 +798,8 @@ fn apply_window_action(
             window_icon::apply(ui.window());
             install_native_drop_target(ui, client, store, gstate, add_job);
             after_store_change(ui, store, gstate);
+            ui.window().request_redraw();
+            log("显示后请求全量重绘");
         }
         focus::WindowAction::Raise => {
             // 不居中、不改尺寸/位置，也不重建内容（几何未变，重建无意义）。
@@ -979,10 +1129,12 @@ fn fetch_snapshot(
         apply,
         0,
         None,
+        None,
     );
 }
 
 /// 发起一条启动快照请求（薄封装）：失败时重试一次，最终仍失败则按 `error_label` 提示。
+#[allow(clippy::too_many_arguments)] // 快照请求的依赖项天然较多，拆结构体得不偿失。
 fn fetch_startup_snapshot(
     client: &Arc<UiClient>,
     command: &'static str,
@@ -991,6 +1143,7 @@ fn fetch_startup_snapshot(
     ui_weak: &slint::Weak<MainWindow>,
     apply: fn(&mut AppStore, Value) -> Result<(), String>,
     error_label: Option<&'static str>,
+    completion: Arc<dyn Fn() + Send + Sync>,
 ) {
     fetch_snapshot_inner(
         client,
@@ -1002,6 +1155,7 @@ fn fetch_startup_snapshot(
         apply,
         1,
         error_label,
+        Some(completion),
     );
 }
 
@@ -1026,6 +1180,7 @@ fn fetch_playback_state(
         apply_playback_value,
         0,
         None,
+        None,
     );
 }
 
@@ -1045,12 +1200,16 @@ fn fetch_snapshot_inner(
     apply: fn(&mut AppStore, Value) -> Result<(), String>,
     retries_left: u8,
     error_label: Option<&'static str>,
+    completion: Option<Arc<dyn Fn() + Send + Sync>>,
 ) {
     let client_for_cb = Arc::clone(client);
     let store_for_cb = Arc::clone(store);
     let gstate_for_cb = Arc::clone(gstate);
     let ui_weak_for_cb = ui_weak.clone();
+    let completion_for_cb = completion.clone();
     let outcome = client.request(command, args.clone(), move |result| {
+        // 每条启动快照最终只触发一次 completion：成功 / 重试耗尽后 / 发送失败各一次。
+        let mut completed = true;
         {
             let mut guard = lock(&store_for_cb);
             match result {
@@ -1065,6 +1224,8 @@ fn fetch_snapshot_inner(
                     drop(guard);
                     if let Some(next) = next_retries(retries_left) {
                         log(format!("{command} 失败，重试一次：{}", error.message));
+                        // 本次失败不完成门计数，由重试的最终结果负责。
+                        completed = false;
                         fetch_snapshot_inner(
                             &client_for_cb,
                             command,
@@ -1075,6 +1236,7 @@ fn fetch_snapshot_inner(
                             apply,
                             next,
                             error_label,
+                            completion_for_cb.clone(),
                         );
                     } else if let Some(label) = error_label {
                         if let Some(ui) = ui_weak_for_cb.upgrade() {
@@ -1091,11 +1253,20 @@ fn fetch_snapshot_inner(
         if let Some(ui) = ui_weak_for_cb.upgrade() {
             after_store_change(&ui, &store_for_cb, &gstate_for_cb);
         }
+        if completed {
+            if let Some(done) = completion_for_cb.as_ref() {
+                done();
+            }
+        }
     });
 
     // 写失败通常意味着对端已断开（断开回调另会处理），此处仅记录以便诊断。
     if let Err(error) = outcome {
         lock(store).record_error(format!("{command} 请求发送失败：{error}"));
+        // 请求未送达，回调不会执行：立即完成门计数，避免首次显示永久排队。
+        if let Some(done) = completion.as_ref() {
+            done();
+        }
     }
 }
 
@@ -3708,6 +3879,45 @@ mod tests {
     fn next_retries_allows_single_startup_retry() {
         assert_eq!(next_retries(1), Some(0));
         assert_eq!(next_retries(0), None);
+    }
+
+    #[test]
+    fn complete_one_is_underflow_safe() {
+        let gate = StartupGate::new(1);
+        assert!(!gate.complete_one());
+        assert!(!gate.complete_one());
+        assert!(gate.request_show());
+    }
+
+    #[test]
+    fn show_before_ready_is_queued_and_only_fires_once() {
+        let gate = StartupGate::new(2);
+        assert!(!gate.request_show());
+        assert!(!gate.request_show());
+        assert!(!gate.complete_one());
+        assert!(gate.complete_one());
+        assert!(gate.is_ready());
+        assert!(gate.request_show());
+        assert!(!gate.complete_one());
+    }
+
+    #[test]
+    fn hide_cancels_pending_show() {
+        let gate = StartupGate::new(1);
+        assert!(!gate.request_show());
+        gate.cancel_pending();
+        assert!(!gate.complete_one());
+        assert!(gate.is_ready());
+    }
+
+    #[test]
+    fn force_ready_shows_pending_only_once() {
+        let gate = StartupGate::new(9);
+        assert!(!gate.request_show());
+        assert!(gate.force_ready());
+        assert!(gate.is_ready());
+        assert!(!gate.force_ready());
+        assert!(!gate.complete_one());
     }
 
     #[test]

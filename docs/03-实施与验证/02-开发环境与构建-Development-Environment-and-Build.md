@@ -6,8 +6,8 @@
 | ---- | ------------------------- |
 | 项目名称 | MirrorStar Wallpaper（镜星壁纸） |
 | 文档版本 | v1.0                      |
-| 更新日期 | 2026-10-12                |
-| 文档状态 | 已实现（基于真实代码审计，2026-10）        |
+| 更新日期 | 2026-11-24                |
+| 文档状态 | 已实现（基于真实代码审计，2026-11）        |
 
 > 本文合并原《开发环境搭建》与《构建基础设施》，统一工具链与命令，并以当前仓库真实配置为准重写构建/发布流程。
 >
@@ -68,8 +68,18 @@ cargo build --workspace
 
 # 开发运行（build.rs 会在构建时以隔离 CARGO_TARGET_DIR 单独构建
 # mirrorstar-ui 子进程；wp-proc 已并入壳的 --wp-proc 模式）
-cargo tauri dev
+cargo tauri dev --additional-watch-folders ../crates/mirrorstar-ui
 ```
+
+> `--additional-watch-folders` 的路径相对 `src-tauri`，因此写作 `../crates/mirrorstar-ui`；作用是监听 UI crate 源码改动并触发 dev 重启（该 crate 不在 Tauri 默认监听范围内）。
+
+### 数据根目录（dev）
+
+数据根解析顺序：`MIRRORSTAR_DATA_ROOT`（设置且非空即采用）→ 可执行文件所在目录 → `%APPDATA%\mirrorstar`（仅当无法取得 exe 路径时兜底）。
+
+- **dev 模式**：exe 位于 `target/<debug|release>/`，配置（`config.toml` / `playback.toml` / `wallpapers.toml`）、壁纸库（`wallpapers/`、`thumbnails/`）、日志（`logs/`）与 `webview2-cache/` 均落在该目录，随 `cargo clean` 一并清除（dev 数据视为可再生的临时产物）。
+- **安装版**：数据落在 exe 所在目录（安装目录），删除整个安装目录即完成全量清理。
+- **覆盖**：设置环境变量 `MIRRORSTAR_DATA_ROOT` 可将数据根强制指向任意目录（dev 调试与 e2e 脚本常用）。
 
 ## 4. 常用命令
 

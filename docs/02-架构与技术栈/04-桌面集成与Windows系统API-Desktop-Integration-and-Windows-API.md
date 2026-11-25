@@ -5,9 +5,9 @@
 | 项目   | 内容                        |
 | ---- | ------------------------- |
 | 项目名称 | MirrorStar Wallpaper（镜星壁纸） |
-| 文档版本 | v3.0                      |
-| 更新日期 | 2026-10-11                |
-| 文档状态 | 已实现（已按真实代码合并重组，2026-10）        |
+| 文档版本 | v3.1                      |
+| 更新日期 | 2026-11-24                |
+| 文档状态 | 已实现（2026-11-24 按当前代码审计校准）        |
 
 > 本文由原《桌面集成》与《Windows 系统 API》合并去重而成。**Native/WorkerW 渲染路径的选择与对比**统一收敛至[壁纸渲染](./05-壁纸渲染-Wallpaper-Rendering.md)，本文不再重复展开，仅保留桌面集成与系统 API 的机制细节。
 
@@ -31,12 +31,12 @@ sequenceDiagram
     participant Wp as 壁纸窗口
 
     rect rgb(230, 245, 255)
-        Note over Engine,WorkerW: 阶段1: 异步初始化桌面集成（后台线程预初始化）
-        Engine->>Desktop: new() — 不调用 find_workerw()
-        Note over Desktop: DesktopIntegrator::new() 仅初始化字段<br/>不执行 WorkerW 查找
+        Note over Engine,WorkerW: 阶段1: 桌面集成懒初始化（壳 setup 阶段后台预初始化）
+        Engine->>Desktop: DesktopIntegrator::new() — 不查找 WorkerW
+        Note over Desktop: new() 仅保存原始系统壁纸并初始化字段<br/>不执行 WorkerW 查找
 
-        par 后台线程预初始化
-            Desktop->>Desktop: std::thread::spawn → find_workerw()
+        par 壳侧后台预初始化线程
+            Desktop->>Desktop: setup 阶段 spawn "mirrorstar-workerw-init" → ensure_initialized()
             Desktop->>User32: FindWindowW("Progman", None)
             User32-->>Desktop: progman_hwnd
 
@@ -54,8 +54,9 @@ sequenceDiagram
             Desktop->>Desktop: 缓存 progman_hwnd, workerw_hwnd
         end
 
-        Engine->>Desktop: ensure_initialized() — 懒等待初始化完成
+        Engine->>Desktop: ensure_initialized() — 首次使用时同步单次查找
         Desktop-->>Engine: 初始化完成
+        Note over Desktop: 预初始化失败仅 warn；ensure_initialized 本身不做 sleep/重试，<br/>重试由调用方在释放 desktop 锁后按递增间隔执行
     end
 
     rect rgb(255, 245, 230)
@@ -89,7 +90,7 @@ sequenceDiagram
             Desktop->>User32: SetWindowPos(wp_hwnd, defview, x, y, w, h,<br/>SWP_NOACTIVATE | SWP_FRAMECHANGED)
             Note over User32,Wp: 步骤8: 插入 DefView 正下方（z 序紧贴锚点之下），<br/>这是嵌入流程中最后一次 z 序写入
 
-            Desktop->>User32: ensure_below_anchor(wp_hwnd, defview, progman)
+            Desktop->>User32: ensure_below_anchor(wp_hwnd, defview, host)
             Note over User32,Wp: 步骤9: 显示之后测量 z 序——校验 GetWindow(hwnd, GW_HWNDPREV) == defview；<br/>失败则以 SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE 重试一次；<br/>仍失败则在宿主内回退 HWND_BOTTOM 并 warn（z_anchor_ok=false）
 
             Desktop->>Desktop: window::reset_wait_cursor_after_show(wp_hwnd)
@@ -480,7 +481,7 @@ flowchart TD
     A[检测到 WorkerW 句柄失效] --> B[记录警告日志]
     B --> C[重新查找 Progman 窗口]
     C --> D{找到 Progman?}
-    D -->|否| E[延迟 1 秒后重试<br/>最多重试 3 次]
+    D -->|否| E[释放 desktop 锁后按递增间隔重试<br/>100ms 起、每次 +50ms，最多 6 次（总 1350ms）]
     E --> D
     D -->|是| F[发送 0x052C 消息]
     F --> G[重新查找 WorkerW]
@@ -614,13 +615,13 @@ FR-034 定义了五种壁纸缩放模式，各模式渲染逻辑如下：
 
 | 模式 | 说明 | 视频实现 | GIF/图片实现 | 网页实现 | 原生壁纸实现 |
 |------|------|----------|-------------|----------|-------------|
-| Fill | 填满屏幕，保持比例，裁剪溢出 | mpv --panscan=1.0 | GDI 双缓冲缩放+裁剪 | CSS object-fit: cover | 注册表 WallPaperStyle=10, TileWallpaper=0 |
-| Fit | 适配屏幕，保持比例，留黑边 | mpv --keepaspect | GDI 双缓冲缩放+居中 | CSS object-fit: contain | 注册表 WallPaperStyle=6, TileWallpaper=0 |
-| Stretch | 拉伸填满，不保持比例 | mpv --no-keepaspect | GDI 双缓冲拉伸 | CSS object-fit: fill | 注册表 WallPaperStyle=2, TileWallpaper=0 |
-| Center | 原始大小居中，超出裁剪 | mpv --no-keepaspect --panscan=0 | GDI 双缓冲居中+裁剪 | CSS object-fit: none | 注册表 WallPaperStyle=0, TileWallpaper=0 |
-| Original | 原始大小，左上角对齐 | mpv 默认 | GDI 双缓冲原始大小 | CSS 无缩放 | 注册表 WallPaperStyle=0, TileWallpaper=0 |
+| Fill | 填满屏幕，保持比例，裁剪溢出 | mpv `--video-unscaled=no --panscan=1.0` | GDI 双缓冲缩放+裁剪 | 不应用（WebView2 视口铺满屏幕，页面自行布局） | 注册表 WallPaperStyle=10, TileWallpaper=0 |
+| Fit | 适配屏幕，保持比例，留黑边 | mpv `--video-unscaled=no --panscan=0.0` | GDI 双缓冲缩放+居中 | 不应用 | 注册表 WallPaperStyle=6, TileWallpaper=0 |
+| Stretch | 拉伸填满，不保持比例 | mpv `--video-unscaled=no --keepaspect=no` | GDI 双缓冲拉伸 | 不应用 | 注册表 WallPaperStyle=2, TileWallpaper=0 |
+| Center | 原始大小居中，超出裁剪 | mpv `--video-unscaled=yes` | GDI 双缓冲居中+裁剪 | 不应用 | 注册表 WallPaperStyle=0, TileWallpaper=0 |
+| Tile | 原始大小平铺重复 | mpv `--video-unscaled=yes`（mpv 无平铺能力，回退为原始尺寸居中） | GDI 按原图尺寸网格重复绘制铺满 | 不应用 | 注册表 WallPaperStyle=0, TileWallpaper=1 |
 
-缩放模式通过 IPC `set_scaling_mode` 命令传递给子进程，子进程的 WallpaperRenderer 实现类根据模式调整渲染参数。对于原生壁纸模式（jpg/jpeg/png/bmp/tif/tiff/dib），缩放模式通过注册表 `WallPaperStyle` 和 `TileWallpaper` 值控制。
+缩放模式经命令 `set_scaling_mode` 进入引擎：原生壁纸重新调用 `set_native_wallpaper` 应用注册表值；视频壁纸重启渲染器（mpv 参数在启动时固定）；图片/GIF 直接更新渲染器参数；网页壁纸当前仅记录模式、**不作用于 WebView2 内容**（网页按视口铺满，由页面自身负责缩放）。
 
 ### 1.9 鼠标输入处理设计
 
@@ -661,68 +662,64 @@ fn set_mouse_passthrough(hwnd: HWND, enabled: bool) {
 #### 1.9.2 鼠标交互模式（FR-033）
 
 交互模式用于网页壁纸，允许用户直接与网页内容交互（如点击链接）：
-- 交互模式开启：壁纸窗口正常接收鼠标消息，WebView2 处理输入
+- 交互模式开启：壁纸窗口正常接收鼠标消息，由 `--wp-proc` 子进程内的 WebView2 处理输入
 - 交互模式关闭：同鼠标穿透模式，使用 `WS_EX_TRANSPARENT`
 
 两种模式通过 IPC `set_mouse_passthrough` 和 `set_interaction_mode` 命令控制，互为补充。
 
 ***
 
-### 1.10 WorkerW 异步初始化
+### 1.10 WorkerW 懒初始化与后台预初始化
 
-`DesktopIntegrator::new()` 不再同步调用 `find_workerw()`，而是通过后台线程预初始化，避免阻塞壳进程启动。
+`DesktopIntegrator::new()` 只做廉价工作：保存原始系统壁纸、初始化空字段，**不查找 WorkerW**。壳在 setup 阶段另起后台线程 `mirrorstar-workerw-init` 调用 `ensure_initialized()` 预热；首次使用时 `ensure_initialized()` 同步单次查找（无 sleep/重试），失败返回错误，由调用方在释放 desktop 锁后按递增间隔重试。
 
 ```rust
 impl DesktopIntegrator {
-    /// 创建 DesktopIntegrator 实例（不执行 WorkerW 查找）
+    /// 快速构造：仅保存原始系统壁纸，不查找 WorkerW
     pub fn new() -> Self {
-        let initialized = Arc::new(AtomicBool::new(false));
-        let workerw = Arc::new(Mutex::new(None));
-
-        // 后台线程预初始化
-        let init_flag = initialized.clone();
-        let workerw_handle = workerw.clone();
-        std::thread::spawn(move || {
-            if let Ok((progman, wkw)) = Self::find_workerw() {
-                *workerw_handle.lock().unwrap() = Some((progman, wkw));
-                init_flag.store(true, Ordering::Release);
-            }
-        });
-
+        let original_wallpaper = worker_w::get_system_wallpaper();
         Self {
-            progman: None,
-            workerw: None,
-            initialized,
-            workerw_handle: workerw,
+            progman_hwnd: None,
+            workerw_hwnd: None,
+            active_wallpapers: HashMap::new(),
+            original_wallpaper,
+            cached_displays: None,
         }
     }
 
-    /// 懒等待初始化完成（首次设置壁纸时调用）
-    pub fn ensure_initialized(&self) -> Result<()> {
-        if self.initialized.load(Ordering::Acquire) {
-            return Ok(());
-        }
-        // 后台线程仍在初始化中，由调用方按需重试或等待
-        Ok(())
+    /// 懒初始化：单次查找 WorkerW（无 sleep、无重试）
+    pub fn ensure_initialized(&mut self) -> Result<(), MirrorStarError> {
+        self.ensure_workerw_ready().map(|_| ())
     }
 }
+
+// 壳侧（src-tauri/src/lib.rs，setup 阶段）：后台预热，失败仅 warn
+let desktop = Arc::new(Mutex::new(DesktopIntegrator::new()));
+std::thread::Builder::new()
+    .name("mirrorstar-workerw-init".into())
+    .spawn(move || {
+        if let Ok(mut d) = desktop.lock() {
+            let _ = d.ensure_initialized();
+        }
+    });
 ```
 
 **关键变更：**
 
 | 项目 | 旧方案 | 新方案 |
 |------|--------|--------|
-| `new()` 行为 | 同步调用 `find_workerw()` | 仅初始化字段，后台线程预初始化 |
-| 初始化时机 | 构造时阻塞 | 后台线程异步，`ensure_initialized()` 懒等待 |
+| `new()` 行为 | 同步调用 `find_workerw()` | 仅保存原始系统壁纸、初始化字段，不查找 WorkerW |
+| 初始化时机 | 构造时阻塞 | 壳 setup 阶段后台线程预热；首次使用时 `ensure_initialized()` 同步单次查找 |
+| 失败重试 | 构造内 sleep 重试 | 调用方在释放 desktop 锁后重试 6 次（100ms 起、每次 +50ms，总 1350ms） |
 | `SendMessageTimeoutW` 超时 | 500ms | 1000ms（`WM_SPAWN_WORK_TIMEOUT_MS`，raised desktop 下创建较慢） |
-| 壳进程启动影响 | 阻塞直到 WorkerW 查找完成 | 不阻塞，启动更快 |
+| 壳进程启动影响 | 阻塞直到 WorkerW 查找完成 | 不阻塞；2026-11-24 Debug 实测 `setup_ready` 43ms（历史 <2s 目标已于当日收紧为 <0.5s） |
 
 ***
 
 ### 1.11 包结构规模参考
 
 - `desktop` 模块：`mod.rs` / `native_wallpaper.rs` / `window.rs` / `worker_w.rs`（行数以实测为准）
-- 全屏检测：`fullscreen.rs`，纯 `SetWinEventHook(EVENT_SYSTEM_FOREGROUND)` 事件驱动，失败仅记录并退出监控线程（无轮询回退）
+- 全屏检测：`src-tauri/src/platform/fullscreen.rs`，以系统/对象两类 `SetWinEventHook` 为事件快路径，另有 **500ms QUNS/前台根轻量探针**（`PROBE_INTERVAL`）与每 4 个 tick（≈2s）的全量兜底；系统钩子失败时监控线程退出，对象钩子失败仅 `warn`（探针与 2s 兜底仍生效）
 
 ***
 
@@ -744,6 +741,7 @@ impl DesktopIntegrator {
 ```toml
 windows = { version = "0.58", features = [
     "Win32_Foundation",                 # HWND, RECT, BOOL, LPARAM, WPARAM 等基础类型
+    "Win32_Graphics_Dwm",               # DwmGetWindowAttribute（可见边界 / Cloak 判定，全屏检测）
     "Win32_Graphics_Gdi",               # MonitorFromWindow, GetMonitorInfoW 等 GDI 查询
     "Win32_Media_Audio",                # IMMDevice, IAudioSessionManager2, ISimpleAudioVolume (WASAPI)
     "Win32_Media_Audio_Endpoints",      # 音频端点枚举
@@ -764,7 +762,10 @@ windows = { version = "0.58", features = [
     "Win32_System_Threading",           # CreateProcessW 等进程/线程管理
     "Win32_UI_Accessibility",           # SetWinEventHook (前台/窗口事件监控)
     "Win32_UI_HiDpi",                   # 高 DPI 支持
+    "Win32_UI_Shell",                   # SHQueryUserNotificationState（QUNS 全屏证据）
+    "Win32_UI_Shell_PropertiesSystem",  # PROPERTYKEY（IMMNotificationClient 依赖）
     "Win32_UI_WindowsAndMessaging",     # FindWindowW, SetParent, SetWindowPos, EnumWindows, SystemParametersInfoW 等
+    "implement",                        # #[implement] 属性宏与 COM *_Impl trait（IMMNotificationClient）
 ] }
 ```
 
@@ -784,7 +785,7 @@ windows = { version = "0.58", features = [
 
 #### 原生壁纸 API
 
-- `SystemParametersInfoW(SPI_SETDESKWALLPAPER)` — 设置桌面壁纸（需要与 `SPIF_UPDATEINIFILE | SPIF_SENDCHANGE` 配合持久化）
+- `SystemParametersInfoW(SPI_SETDESKWALLPAPER)` — 设置桌面壁纸（需要与 `SPIF_UPDATEINIFILE | SPIF_SENDWININICHANGE` 配合持久化）
 - `SystemParametersInfoW(SPI_GETDESKWALLPAPER)` — 读取当前壁纸路径
 - 用于静态图片壁纸的 Native 路径，零运行时资源占用（实现细节见[壁纸渲染](./05-壁纸渲染-Wallpaper-Rendering.md)）
 
@@ -792,17 +793,20 @@ windows = { version = "0.58", features = [
 
 - `SetParent` / `SetWindowPos` — 将壁纸窗口设为 WorkerW（旧层级）或宿主（raised desktop：`SHELLDLL_DefView` 的直接父窗口，Progman 或 Progman 直接子 WorkerW）的子窗口并控制位置、层级；`SetParent` 统一经 `set_parent_verified` 以 `GetAncestor(GA_PARENT)` 校验父链，NULL 返回不单独判失败（见 1.2.3）
 - raised desktop 下 `SetWindowPos` 以 `SHELLDLL_DefView` 为 `hWndInsertAfter`（插入 DefView 正下方），随后经 `ensure_below_anchor` 校验是否位于 DefView 之下（紧邻 `GW_HWNDPREV == defview` 优先，否则允许兄弟链中位于 DefView 之后）、必要时重试或回退宿主 `HWND_BOTTOM`；锚点插入失败先 `ShowWindow(SW_HIDE)` 再返回错误。旧层级仍直接用 `HWND_BOTTOM`
-- `SetWindowPos` 驱动 mpv / WebView2 窗口尺寸与位置同步
+- `SetWindowPos` 驱动 mpv 宿主 / mpv vo 子窗口的尺寸与位置同步；网页壁纸经 IPC `set_position` 调整 wp-proc 窗口矩形
 
 #### 事件驱动监控
 
-- `SetWinEventHook(EVENT_SYSTEM_FOREGROUND, ...)` — 全屏应用检测（替代轮询）
+- `SetWinEventHook(EVENT_SYSTEM_FOREGROUND .. EVENT_SYSTEM_MINIMIZEEND)`（`WINEVENT_OUTOFCONTEXT`）— 前台切换、最小化/还原快路径
+- `SetWinEventHook(EVENT_OBJECT_DESTROY .. EVENT_OBJECT_UNCLOAKED)`（`WINEVENT_OUTOFCONTEXT | WINEVENT_SKIPOWNPROCESS`）— 窗口销毁/隐藏/Cloak/位置与状态变化（发现独占全屏在窗口内部切换）
+- `SHQueryUserNotificationState`（QUNS）+ 前台根快照的 **500ms 轻量探针**（`PROBE_INTERVAL`），以及每 4 个 tick（≈2s）的全量兜底调和 — 覆盖不产生前台事件的独占全屏（D3D `ChangeDisplaySettings`）与无事件退出
 - `SetWinEventHook(EVENT_OBJECT_DESTROY, ...)`（`WINEVENT_OUTOFCONTEXT | WINEVENT_SKIPOWNPROCESS`）— `WorkerW` / `Progman` 销毁感知（桌面层自愈，见 1.6.4）
 - `WTSRegisterSessionNotification` / `WM_WTSSESSION_CHANGE`（`WTS_SESSION_UNLOCK`）— 会话解锁后桌面层重建感知
 
 #### 进程与作业管理
 
-- `CreateProcessW` — 启动子进程（mpv.exe / 壳进程 `--wp-proc` 模式实例）
+- `CreateProcessW` — 启动子进程：`mpv.exe`（视频）、壳 exe 自身以 `--wp-proc` 模式启动的网页子进程、以及 `mirrorstar-ui.exe`（Slint 主窗口，按需拉起）
+- `mirrorstar-ui.exe` — 独立原生 UI 子进程即唯一主窗口，壳**不再创建 WebView2 主窗口**；关闭按钮 / Alt+F4 时 UI 进程立即退出；托盘隐藏后保留进程，空闲超时（`MIRRORSTAR_UI_IDLE_TIMEOUT_SECS`，默认 **300s**）后整体退出回收内存，下次打开重新拉起
 - 作业对象（`Win32_System_JobObjects`）— 约束子进程
 - `OpenProcess` / `GetWindowThreadProcessId` — PID 校验、窗口归属校验
 
@@ -813,7 +817,7 @@ windows = { version = "0.58", features = [
 `winreg 0.55` 提供类型安全的注册表读写：
 
 - **开机自启**：写入启动项
-- **壁纸缩放模式**：`HKEY_CURRENT_USER\Control Panel\Desktop` 下的 `WallPaperStyle` / `TileWallpaper`（REG_SZ），先写注册表再调用 `SystemParametersInfoW(SPI_SETDESKWALLPAPER)` 使设置生效
+- **壁纸缩放模式**：`HKEY_CURRENT_USER\Control Panel\Desktop` 下的 `WallPaperStyle` / `TileWallpaper`（REG_SZ）；`set_native_wallpaper` 先读取旧值备份，再写新值并调用 `SystemParametersInfoW(SPI_SETDESKWALLPAPER)`，设置失败时回滚注册表（详见[壁纸渲染](./05-壁纸渲染-Wallpaper-Rendering.md) §2.1）
 
 #### Core Audio API（音量控制）
 
@@ -826,7 +830,7 @@ windows = { version = "0.58", features = [
 
 #### COM 初始化
 
-壳进程在启动阶段显式初始化 COM（单线程单元 STA，`CoInitializeEx(COINIT_APARTMENTTHREADED)`），并随 `run()` 返回时 `CoUninitialize`。WASAPI 相关线程按需在线程内完成 COM 初始化（如暂停线程使用 `COINIT_MULTITHREADED`）。WebView2 环境在 wp-proc 子进程内创建。详见[进程架构与 IPC](./03-进程架构与IPC-Process-Architecture-and-IPC.md) 的 COM 初始化策略。
+壳进程在启动阶段显式初始化 COM（单线程单元 STA，`CoInitializeEx(COINIT_APARTMENTTHREADED)`），并随 `run()` 返回时 `CoUninitialize`。WASAPI 相关线程按需在线程内完成 COM 初始化（如暂停线程使用 `COINIT_MULTITHREADED`）。WebView2 环境仅用于网页壁纸的 wp-proc 子进程与 UI 预览的临时子窗口；主窗口为 Slint 原生 UI 子进程 `mirrorstar-ui.exe`，壳不再创建 WebView2 主窗口。详见[进程架构与 IPC](./03-进程架构与IPC-Process-Architecture-and-IPC.md) 的 COM 初始化策略。
 
 ### 2.4 关键 Windows API 速查表
 
@@ -836,7 +840,10 @@ windows = { version = "0.58", features = [
 | `SendMessageTimeoutW(0x052C)`                 | 触发创建 WorkerW（wParam=0xD / lParam=0x1，超时 1000ms） | 桌面集成 |
 | `EnumWindows`                                 | 遍历查找 WorkerW    | 桌面集成 |
 | `SetParent`                                   | 嵌入壁纸窗口到 WorkerW（旧层级）或 raised desktop 的宿主（DefView 的直接父窗口：Progman 或 Progman 直接子 WorkerW）；经 `set_parent_verified` 以 `GetAncestor(GA_PARENT)` 校验父链，NULL 返回可能是合法成功，不单独判失败 | 桌面集成 |
-| `SetWinEventHook(EVENT_SYSTEM_FOREGROUND)`    | 监听前台窗口切换        | 进程监控 |
+| `SetWinEventHook(EVENT_SYSTEM_FOREGROUND .. EVENT_SYSTEM_MINIMIZEEND)` | 前台切换 / 最小化还原快路径 | 全屏检测 |
+| `SetWinEventHook(EVENT_OBJECT_DESTROY .. EVENT_OBJECT_UNCLOAKED)` | 对象销毁 / 隐藏 / Cloak / 位置与状态变化（发现独占全屏） | 全屏检测 |
+| `SHQueryUserNotificationState` | QUNS 全屏证据（500ms 探针触发 / 维持会话） | 全屏检测 |
+| `DwmGetWindowAttribute(DWMWA_EXTENDED_FRAME_BOUNDS / DWMWA_CLOAKED)` | 可见窗口边界 / Cloak 判定 | 全屏检测 |
 | `IsZoomed`                                    | 检查窗口是否最大化       | 进程监控 |
 | `MonitorFromWindow`                           | 获取窗口所在显示器       | 全屏检测 |
 | `GetSystemPowerStatus`                        | 获取电源状态（ACLineStatus） | 电池监测 |

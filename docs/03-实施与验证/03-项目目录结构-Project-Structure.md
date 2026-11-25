@@ -6,8 +6,8 @@
 | ---- | ------------------------- |
 | 项目名称 | MirrorStar Wallpaper（镜星壁纸） |
 | 文档版本 | v1.0                      |
-| 更新日期 | 2026-10-12                |
-| 文档状态 | 已实现（基于真实代码审计，2026-10）        |
+| 更新日期 | 2026-11-24                |
+| 文档状态 | 已实现（基于真实代码审计，2026-11）        |
 
 > 本文以**仓库/目录布局**为主，基于当前仓库实测，不虚构。模块职责仅作概述，详见 [模块设计](../02-架构与技术栈/02-模块设计-Module-Design.md)。
 
@@ -53,7 +53,7 @@ members = [
     "crates/mirrorstar-wp-proc",
     "crates/mirrorstar-ui",
 ]
-# [workspace.package] version = "0.1.5", edition = "2021", rust-version = "1.80"
+# [workspace.package] version = "0.1.6", edition = "2021", rust-version = "1.80"
 # 依赖在 [workspace.dependencies] 统一声明，子 crate 以 workspace = true 引用
 ```
 
@@ -93,6 +93,7 @@ members = [
 | `src/settings.rs`、`src/focus.rs`、`src/keynav.rs` | 设置面板、焦点与键盘导航 |
 | `src/dnd.rs`、`src/drop_target.rs` | 原生文件拖入（`IDropTarget`） |
 | `src/desktop.rs`、`src/window_pos.rs`、`src/window_icon.rs` | 桌面联动、窗口定位与图标 |
+| `src/window_effects.rs` | 窗口显示前 DWM 收口（关闭过渡/模糊，避免首帧透明） |
 | `src/preview/` | 四类预览：`photo.rs`（图片自绘）、`video.rs`（进程内 mpv 子窗口）、`gif.rs`（逐帧）、`web.rs`（按需临时 WebView2 子窗口）、`host_child.rs`（宿主子窗口） |
 | `ui/main.slint`、`ui/widgets.slint` | Slint 声明式界面 |
 | `build.rs`、`app.rc`、`app.manifest` | Slint 编译、图标/清单嵌入 |

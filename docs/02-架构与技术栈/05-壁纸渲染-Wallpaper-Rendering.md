@@ -5,9 +5,9 @@
 | 项目   | 内容                        |
 | ---- | ------------------------- |
 | 项目名称 | MirrorStar Wallpaper（镜星壁纸） |
-| 文档版本 | v3.0                      |
-| 更新日期 | 2026-10-11                |
-| 文档状态 | 已实现（已按真实代码合并重组，2026-10）        |
+| 文档版本 | v3.1                      |
+| 更新日期 | 2026-11-24                |
+| 文档状态 | 已实现（2026-11-24 按当前代码审计校准）        |
 
 > 本文由原《壁纸渲染》与《桌面集成》的渲染路径章节（Native / WorkerW 双路径）合并去重而成。**Native/WorkerW 渲染路径的选择与对比、原生壁纸 API 实现**统一收敛至本文，其它文档不再重复展开。WorkerW 嵌入的机制细节（SetParent / 坐标转换 / DPI / Explorer 重启等）见[桌面集成与 Windows 系统 API](./04-桌面集成与Windows系统API-Desktop-Integration-and-Windows-API.md)。
 
@@ -32,7 +32,10 @@
 ### 1.1 WallpaperMode 双路径判定
 
 ```rust
-/// 判断文件格式是否支持原生壁纸 API
+const NATIVE_SUPPORTED_EXTENSIONS: &[&str] =
+    &["jpg", "jpeg", "png", "bmp", "tif", "tiff", "dib"];
+
+/// 判断文件格式是否支持 Windows 原生壁纸 API
 pub fn is_native_supported(file_path: &str) -> bool {
     let ext = Path::new(file_path)
         .extension()
@@ -40,7 +43,7 @@ pub fn is_native_supported(file_path: &str) -> bool {
         .unwrap_or("")
         .to_lowercase();
 
-    matches!(ext.as_str(), "jpg" | "jpeg" | "png" | "bmp" | "tif" | "tiff" | "dib")
+    NATIVE_SUPPORTED_EXTENSIONS.contains(&ext.as_str())
 }
 ```
 
@@ -59,12 +62,14 @@ pub fn is_native_supported(file_path: &str) -> bool {
 | 维度 | Native 模式 | WorkerW 模式 |
 |------|-------------|--------------|
 | 窗口 | 无 | 需创建无边框窗口 |
-| 线程 | 无 | 需渲染线程 |
+| 线程 | 无 | 壳内渲染线程（图片/GIF）；视频/网页为独立子进程 |
 | GDI 对象 | 无 | GDI 双缓冲表面 |
-| 内存占用 | ~0MB | ~10-30MB |
+| 内存占用 | ~0MB | 壳进程活跃 Private 7.7–8.6MB / WS 21.7–22.8MB（2026-11-24 dev 视频播放，UI 关闭）；暂停态 Private 8.7MB / WS 22.9MB；历史估计 ~10–30MB（待复测） |
 | 暂停/恢复 | 空操作（no-op） | 需控制渲染循环 |
 | 缩放模式 | 注册表 `WallPaperStyle`/`TileWallpaper` | GDI 双缓冲缩放算法 |
 | 支持格式 | jpg/jpeg/png/bmp/tif/tiff/dib | 所有格式（含 WebP/ICO） |
+
+> **内存口径**：仅计主进程（壳），不含 mpv / WebView2 等子进程；数据为 2026-11-24 dev（Debug 0.1.5，1920×1080 视频）实测。Native 模式的 ~0MB 为设计值，未单独复测。
 
 ### 1.3 桌面嵌入路径（raised desktop / 旧层级）
 
@@ -72,12 +77,13 @@ WorkerW 路径并非只有一种嵌入方式，`desktop/worker_w.rs` 按桌面�
 
 | EmbedPath | 触发条件 | 实现 |
 |-----------|----------|------|
-| `RaisedLayered(defview)` | Windows 11 raised desktop 且 `SHELLDLL_DefView` 可用 | 壁纸窗口作为 Progman 的 **layered 子窗口**（`WS_CHILD` + `WS_EX_LAYERED`，alpha=255），插入到 DefView 正下方（z-order 锚点） |
+| `RaisedLayered(defview)` | Windows 11 raised desktop 且 `SHELLDLL_DefView` 可用 | 壁纸窗口作为**宿主**（DefView 的直接父窗口：`Progman` 或 Progman 直接子 `WorkerW`）的 **layered 子窗口**（`WS_CHILD` + `WS_EX_LAYERED`，alpha=255），插入到 DefView 正下方（z-order 锚点） |
 | `LegacyWorkerW` | 旧层级；或 raised desktop 但 DefView 缺失的降级 | `SetParent(WorkerW)` + `HWND_BOTTOM`（经典 WorkerW 嵌入） |
 
 - raised desktop 判定：Progman 带 `WS_EX_NOREDIRECTIONBITMAP`（`progman_is_raised_desktop` / `is_raised_desktop`）。
+- raised 路径的宿主不固定为 Progman：`find_defview_deep` 先查 Progman 直接子，未命中再递归 Progman 直接子窗口子树（深度 ≤ 3）；宿主 = DefView 的直接父窗口，经 `choose_wallpaper_host` 校验（宿主 == Progman，或宿主的父窗口 == Progman）。
 - raised 路径下 `SetParent` 可能返回 NULL 但父链已正确，嵌入以父链校验为准；关闭鼠标穿透时保留 `WS_EX_LAYERED` 并重设 alpha=255，避免画面冻结。
-- raised desktop 下 `clear_native_wallpaper()` 会跳过 `SPI_SETDESKWALLPAPER`，避免销毁承载动态壁纸的 WorkerW/layered 子窗口。
+- raised desktop 下 `clear_native_wallpaper()` 与 `refresh_desktop()` 都会跳过 `SPI_SETDESKWALLPAPER`，避免销毁承载动态壁纸的 WorkerW / layered 子窗口。
 - 运行期通过 `heal_desktop_layer` 复检 z 序（`ZOrderRepair`：`NotApplicable` / `Ok` / `Fixed` / `NeedsReembed` / `Failed`），必要时调用方重嵌。
 
 ---
@@ -87,58 +93,62 @@ WorkerW 路径并非只有一种嵌入方式，`desktop/worker_w.rs` 按桌面�
 ### 选择：Native API（`SystemParametersInfoW`）+ WorkerW 回退
 
 - **`is_native_supported()`**：检测扩展名是否受原生壁纸 API 支持（JPG/JPEG/PNG/BMP/TIF/TIFF/DIB 共 7 种；WebP/ICO 不受支持）
-- **`set_native_wallpaper()`**：先写入注册表缩放模式，再调用 `SystemParametersInfoW(SPI_SETDESKWALLPAPER)` 设置壁纸，约 10ms 完成、零运行时资源
+- **`set_native_wallpaper(image_path, scaling_mode, monitor_id)`**：事务式设置——先读取旧 `WallPaperStyle`/`TileWallpaper` 备份，写入新缩放模式，再调用 `SystemParametersInfoW(SPI_SETDESKWALLPAPER)`；设置失败时回滚注册表后返回原始错误。`monitor_id` 非 `None` 时直接拒绝（原生 API 只作用于整个桌面，不支持指定显示器）
 - **WebP / ICO 回退**：执行 image crate 解码 + GDI 双缓冲 + WorkerW 嵌入
+- 历史数据：旧文档标注「约 10ms 完成」，2026-11-24 未复测（原因为纯注册表 + SPI 调用，无窗口/线程），标注为历史/待复测
 
 ### 2.1 SystemParametersInfoW 方案
 
 ```rust
-/// 使用原生 API 设置静态壁纸
-fn set_native_wallpaper(file_path: &str, scaling_mode: ScalingMode) -> Result<()> {
-    // 1. 设置注册表缩放模式
-    let hkcu = RegKey::predef(HKEY_CURRENT_USER);
-    let desktop_key = hkcu.open_subkey_with_flags(
-        r"Control Panel\Desktop",
-        KEY_SET_VALUE,
-    )?;
-
-    match scaling_mode {
-        ScalingMode::Fill => {
-            desktop_key.set_value("WallPaperStyle", &"10")?;  // 填充
-            desktop_key.set_value("TileWallpaper", &"0")?;
-        }
-        ScalingMode::Stretch => {
-            desktop_key.set_value("WallPaperStyle", &"2")?;   // 拉伸
-            desktop_key.set_value("TileWallpaper", &"0")?;
-        }
-        ScalingMode::Fit => {
-            desktop_key.set_value("WallPaperStyle", &"6")?;   // 适配
-            desktop_key.set_value("TileWallpaper", &"0")?;
-        }
-        ScalingMode::Center => {
-            desktop_key.set_value("WallPaperStyle", &"0")?;   // 居中
-            desktop_key.set_value("TileWallpaper", &"0")?;
-        }
-        ScalingMode::Tile => {
-            desktop_key.set_value("WallPaperStyle", &"0")?;   // 平铺
-            desktop_key.set_value("TileWallpaper", &"1")?;
-        }
+/// 使用原生 API 设置静态壁纸（先备份、后修改、失败回滚）
+pub fn set_native_wallpaper(
+    image_path: &str,
+    scaling_mode: ScalingMode,
+    monitor_id: Option<&str>,
+) -> Result<(), MirrorStarError> {
+    // 原生模式作用于整个桌面，不支持指定显示器
+    if let Some(id) = monitor_id {
+        return Err(MirrorStarError::DesktopIntegration(format!(
+            "原生壁纸模式不支持指定显示器: {}", id
+        )));
     }
 
-    // 2. 调用 SystemParametersInfoW 设置壁纸
-    let wide_path = encode_wide(file_path);
+    // ① 事务准备：读取旧注册表值用于失败回滚（读取失败返回 None，不阻塞主流程）
+    let old_values = read_wallpaper_style();
+
+    // ② 写入新缩放模式（WallPaperStyle / TileWallpaper 均为 REG_SZ）
+    let (new_style, new_tile) = scaling_mode_to_style(scaling_mode);
+    write_wallpaper_style(new_style, new_tile)?;
+
+    // ③ 设置壁纸图片
+    if let Err(e) = set_wallpaper_image(image_path) {
+        // ④ 失败回滚注册表到调用前状态，仍返回原始错误
+        if let Some((old_style, old_tile)) = old_values {
+            if let Err(rollback_err) = write_wallpaper_style(&old_style, &old_tile) {
+                tracing::error!(error = %rollback_err, "回滚注册表失败，系统可能处于不一致状态");
+            }
+        }
+        return Err(e);
+    }
+    Ok(())
+}
+
+/// 内部：编码宽字符后调用 SPI_SETDESKWALLPAPER
+fn set_wallpaper_image(image_path: &str) -> Result<(), MirrorStarError> {
+    let wide_path = encode_wide(image_path);
     unsafe {
         SystemParametersInfoW(
             SPI_SETDESKWALLPAPER,
             0,
             Some(wide_path.as_ptr() as *mut _),
-            SPIF_UPDATEINIFILE | SPIF_SENDCHANGE,
+            SPIF_UPDATEINIFILE | SPIF_SENDWININICHANGE,
         )?;
     }
-
     Ok(())
 }
 ```
+
+> 缩放模式 → 注册表映射收敛在纯函数 `scaling_mode_to_style`（`("0","0")` Center、`("2","0")` Stretch、`("6","0")` Fit、`("10","0")` Fill、`("0","1")` Tile），由单元测试锁定。
 
 ### 2.2 缩放模式 → 注册表映射
 
@@ -166,14 +176,16 @@ fn set_native_wallpaper(file_path: &str, scaling_mode: ScalingMode) -> Result<()
 ### 集成方式
 
 ```
-VideoRenderer → 创建隐藏宿主窗口（WS_EX_TOOLWINDOW） → 启动 mpv.exe（--idle=yes + --wid=<宿主> + IPC 管道） → MpvIpcClient 通过命名管道 JSON IPC 加载视频 → 查找宿主内 mpv 子窗口（类名 "mpv" + PID 校验） → 将宿主 SetParent 嵌入桌面壁纸层
+VideoRenderer → 创建隐藏宿主窗口（WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE） → 启动 mpv.exe（--idle=yes + --wid=<宿主> + IPC 管道） → MpvIpcClient 通过命名管道 JSON IPC 加载视频 → 查找宿主内 mpv 子窗口（类名 "mpv" + PID 校验） → 将宿主 SetParent 嵌入桌面壁纸层
 ```
 
-**宿主窗口 + `--wid`**：本进程先创建隐藏的 Win32 宿主窗口，mpv 通过 `--wid=<宿主 HWND>` 只创建 `WS_CHILD` 的 vo 子窗口，**不产生任何顶层窗口**（任务栏 / Alt+Tab 不会出现 mpv）。嵌入操作只作用于宿主，避免把 `WS_EX_LAYERED` 写到 mpv D3D11 输出窗口上，也规避了 mpv 顶层窗口 `SetParent` 的 NULL 二义性。
+**宿主窗口 + `--wid`**：本进程先创建隐藏的 Win32 宿主窗口（`WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE`，无 `WS_VISIBLE`），mpv 通过 `--wid=<宿主 HWND>` 只创建 `WS_CHILD` 的 vo 子窗口，**不产生任何顶层窗口**（任务栏 / Alt+Tab 不会出现 mpv）。嵌入操作只作用于宿主，避免把 `WS_EX_LAYERED` 写到 mpv D3D11 输出窗口上，也规避了 mpv 顶层窗口 `SetParent` 的 NULL 二义性。
 
 ### 启动策略：先 idle 后 loadfile（避免黑屏竞态）
 
 mpv **不以视频路径作为命令行参数**启动，而是先 `--idle=yes` 启动空窗口，稳定嵌入 WorkerW 后通过 IPC `loadfile` 加载视频。这避免了"启动即解码 + 窗口重父化 resize"时 D3D11 纹理创建的竞态（曾导致桌面黑屏）。
+
+> **实测（2026-11-24 dev）**：视频壁纸切换（点击到开始播放并嵌入）上一张 **379ms**、下一张 **~431ms**，满足 <0.5s 目标；冷启动 `setup_ready` 43ms 见[桌面集成与 Windows 系统 API](./04-桌面集成与Windows系统API-Desktop-Integration-and-Windows-API.md) §1.10。
 
 ### mpv 启动参数（实测自 video.rs::build_mpv_args）
 
@@ -224,7 +236,7 @@ mpv.exe --idle=yes \
 - `--geometry=+32000+32000`：`--wid` 下位置由宿主决定（参数被忽略），保留作为非 `--wid` 回退路径的离屏防御
 - `--input-ipc-server`：暴露命名管道，供 `MpvIpcClient` 发送 mpv 原生 JSON 协议命令
 - `--window-dragging=no`：禁用 mpv 自带的窗口拖动；否则用户在视频区域按下并拖动会进入 Win32 模态移动循环，导致 mpv 命令处理停摆、退出延迟（纯净模式退出时临时覆盖窗仍置顶，表现为"壁纸可被拖动"）
-- **内存优化（5 个参数）**：`--cache=no`（禁用 demuxer 缓存，节省 ~75MB）、`--vd-queue-max-bytes=16777216`（视频解码队列上限 16MB）、`--ad-queue-max-bytes=4194304`（音频解码队列上限 4MB）、`--demuxer-max-back-bytes=0`（禁用后退缓冲）、`--cache-secs=0`（禁用时间缓存）
+- **内存优化（5 个参数）**：`--cache=no`（禁用 demuxer 缓存，历史口径节省 ~75MB，待复测）、`--vd-queue-max-bytes=16777216`（视频解码队列上限 16MB）、`--ad-queue-max-bytes=4194304`（音频解码队列上限 4MB）、`--demuxer-max-back-bytes=0`（禁用后退缓冲）、`--cache-secs=0`（禁用时间缓存）
   > 注意：勿加 `--demuxer-max-bytes=0`，该参数会导致 demuxer 无法缓冲而立即 EOF 退出（桌面黑屏）。
 - **进一步限流**：`--vd-lavc-threads=4`（限制软解线程数，压低参考帧缓冲上限）、`--demuxer-readahead-secs=0.5`（前向预读窗口由默认 1s 减半）
 - `--config-dir=<data_root>/mpv`：重定向 mpv 配置目录，避免写穿到 `%APPDATA%\mpv`，保持数据收束到安装目录
@@ -288,7 +300,7 @@ image crate 解码 → 帧缓冲 → GDI 双缓冲渲染到 HWND → 精确帧�
 | `Performance` | 暂停时保留所有帧 | 最高 | 最快 |
 | `Adaptive` | 根据系统可用内存 / GIF 大小自动选择 | 自适应 | 自适应 |
 
-- **帧像素内存预算**：配置 `gif.max_memory_mb` 默认 **40MB**（合法范围 `[10, 500]`），解码后帧总内存不超过该值
+- **帧像素内存预算**：配置 `gif.max_memory_mb` 默认 **40MB**（合法范围 `[10, 500]`），解码后帧总内存不超过该值；配置未注入引擎时库层回退默认 **15MB**（`gif_decode::DEFAULT_MAX_GIF_MEMORY_MB`）
 - **平衡保留帧数**：配置 `gif.balanced_keep_frames` 默认 **10**（合法范围 `[1, 1000]`）
 - **暂停按策略执行**：`Aggressive` 释放到仅当前帧；`Balanced`（默认）保留当前帧附近 10 帧；`Performance` 全部保留；`Adaptive` 按可用内存自动选择（充足则全保留，紧张则按预算保留部分帧）
 - 上述配置项由 `ConfigManager` 在启动时注入引擎（`set_gif_memory_strategy` / `gif_max_memory_mb`），并支持热重载
@@ -315,7 +327,10 @@ WebRenderer（web.rs）→ 以 `--wp-proc` 模式启动壳进程自身 → 子�
 - **来源限制**：添加入口**仅接受本地 `.html` / `.htm` 文件**；远程 http/https 默认拒绝（`ALLOWED_REMOTE_DOMAINS` 为空，仅 `localhost` / `127.0.0.1` 放行）；源字符串以 `javascript:` / `data:` / `vbscript:` / `file:` 开头一律拒绝，本地路径由程序转换为 `file://` 后交给 WebView2
 - **WebView2 依赖**：依赖系统预装的 WebView2 Runtime；程序**不提供内置引导安装 / Bootstrapper**，缺失时网页壁纸与网页预览不可用，其余壁纸类型不受影响
 - **按需创建 / 关闭即销毁**：仅启用网页壁纸时才启动 wp-proc 子进程，避免闲置时占用 WebView2 运行时资源
+- **缩放模式**：网页壁纸当前**不应用** `ScalingMode`（引擎仅记录该值）；WebView2 视口铺满屏幕区域，页面缩放/布局由网页自身负责
 - 命名管道：`\\.\pipe\mirrorstar-wp-{uuid}`；进程与 IPC 细节详见[进程架构与 IPC](./03-进程架构与IPC-Process-Architecture-and-IPC.md)
+
+> **主窗口关系**：主窗口已改为独立 Slint 原生 UI 子进程 `mirrorstar-ui.exe`，壳不再创建 WebView2 主窗口；WebView2 仅用于网页壁纸（`--wp-proc` 子进程）与 UI 预览的按需临时子窗口。
 
 ***
 

@@ -6,22 +6,29 @@
 | ---- | ------------------------- |
 | 项目名称 | MirrorStar Wallpaper（镜星壁纸） |
 | 文档版本 | v3.0                      |
-| 更新日期 | 2026-10-11                |
-| 文档状态 | 已实现（已按真实代码合并重组，2026-10）        |
+| 更新日期 | 2026-11-24                |
+| 文档状态 | 已实现（已按真实代码合并重组，2026-10；2026-11-24 按当前实现校准）        |
 
 ***
 
 ## 1. 模块依赖图
 
+当前 workspace 为四成员：`src-tauri`（壳 / 托盘 / 调度器运行时）、`crates/mirrorstar-core`（12 个 `pub mod`：audio / config / desktop / ipc / layout / log_retention / perf / process / pure_mode / scheduler / ui_proto / wallpaper）、`crates/mirrorstar-wp-proc`（网页壁纸子进程，实际由壳 exe `--wp-proc` 双入口运行）、`crates/mirrorstar-ui`（Slint 原生 UI 子进程 `mirrorstar-ui.exe`）。
+
 ```mermaid
 graph LR
     Engine["壁纸引擎<br/>WallpaperEngine"]
+    Renderer["渲染器<br/>Image / GIF / Video / Web"]
     Desktop["桌面集成<br/>DesktopIntegrator"]
     Native["原生壁纸<br/>native_wallpaper"]
     ProcMgr["进程管理<br/>ProcessManager"]
     Config["配置管理<br/>ConfigManager"]
     Audio["音频控制<br/>VolumeControl"]
+    Sched["轮换调度器<br/>scheduler.rs（单 tokio 任务）"]
+    Layout["布局域<br/>layout::plan（纯函数）"]
     Tray["系统托盘<br/>（lib.rs setup + state.rs）"]
+    UiBridge["壳↔UI 桥<br/>ui_process::bridge"]
+    UiProc["原生 UI 子进程<br/>mirrorstar-ui.exe（Slint）"]
     IPC["IPC 通信<br/>MpvIpcClient / WpProcIpcClient / ui_proto"]
 
     Engine --> Desktop : 嵌入壁纸窗口<br/>（WorkerW 模式）
@@ -29,17 +36,32 @@ graph LR
     Engine --> ProcMgr : 创建/终止子进程
     Engine --> Config : 读取壁纸配置
     Engine --> Audio : 控制音频
+    Engine --> Renderer : 创建 / 嵌入 / 暂停
+
+    Renderer --> ProcMgr : 视频 mpv / 网页 wp-proc
+    Renderer --> IPC : mpv JSON IPC /<br/>wp-proc 命名管道
+
+    Sched --> Layout : 计算单元与主屏
+    Sched --> Engine : 轮换 apply<br/>（原子交换 / 回退）
+    Sched --> Config : 读 rotation / 池；<br/>写 playback.toml
 
     Native --> winreg["winreg crate<br/>注册表操作"]
     Native --> SPI["windows::Win32::UI::<br/>WindowsAndMessaging<br/>SystemParametersInfoW"]
 
     ProcMgr --> IPC : 与子进程通信<br/>（mpv + wp-proc 命名管道）
 
-    Tray --> Engine : 暂停/恢复；下一张壁纸<br/>（经调度器 manual_tx）
+    Tray --> Sched : next_wallpaper<br/>（manual_tx）
+    Tray --> Engine : 暂停/恢复；纯模式
 
-    Config -.-> Engine : 配置热重载通知
+    Config -.-> Sched : 热重载 / 配置命令<br/>→ wake.notify_waiters()
+
+    Engine -.-> UiBridge : wallpaper-state-changed
+    Sched -.-> UiBridge : wallpaper-rotated
+    UiBridge <--> UiProc : ui_proto NDJSON over stdio
+    UiProc --> IPC : 预览自建 mpv / wp-proc
 
     style Engine fill:#81C784,stroke:#388E3C,color:#000
+    style Renderer fill:#81C784,stroke:#388E3C,color:#000
     style Desktop fill:#FFB74D,stroke:#F57C00,color:#000
     style Native fill:#FFB74D,stroke:#F57C00,color:#000
     style winreg fill:#E0E0E0,stroke:#9E9E9E,color:#000
@@ -47,7 +69,11 @@ graph LR
     style ProcMgr fill:#81C784,stroke:#388E3C,color:#000
     style Config fill:#81C784,stroke:#388E3C,color:#000
     style Audio fill:#81C784,stroke:#388E3C,color:#000
+    style Sched fill:#81C784,stroke:#388E3C,color:#000
+    style Layout fill:#E0E0E0,stroke:#9E9E9E,color:#000
     style Tray fill:#4FC3F7,stroke:#0288D1,color:#000
+    style UiBridge fill:#CE93D8,stroke:#7B1FA2,color:#000
+    style UiProc fill:#4FC3F7,stroke:#0288D1,color:#000
     style IPC fill:#CE93D8,stroke:#7B1FA2,color:#000
 ```
 
@@ -59,12 +85,19 @@ graph LR
 | 壁纸引擎 → 原生壁纸 | 单向 | 引擎调用 native_wallpaper 模块通过 Windows 原生 API 设置静态壁纸（Native 模式） |
 | 原生壁纸 → winreg | 单向 | native_wallpaper 通过 winreg crate 读写注册表（WallPaperStyle/TileWallpaper） |
 | 原生壁纸 → Windows API | 单向 | native_wallpaper 调用 SystemParametersInfoW（windows::Win32::UI::WindowsAndMessaging）设置壁纸 |
+| 壁纸引擎 → 渲染器 | 单向 | 引擎持有 `Box<dyn WallpaperRenderer>`：图片/GIF 在主进程 GDI 渲染；视频为 mpv 子进程（主进程创建视频宿主窗口 + `--wid`）；网页为壳 exe `--wp-proc` 子进程 |
 | 壁纸引擎 → 进程管理 | 单向 | 引擎通过进程管理器创建和终止壁纸子进程（视频→mpv.exe，网页→壳进程 `--wp-proc` 模式）     |
 | 壁纸引擎 → 配置管理 | 单向 | 引擎读取壁纸配置和用户设置           |
 | 壁纸引擎 → 音频控制 | 单向 | 引擎控制壁纸音频的音量和静音          |
-| 进程管理 → IPC  | 单向 | 进程管理器通过命名管道与子进程通信（mpv 原生 JSON IPC + wp-proc 自定义协议；壳↔UI 另有 `ui_proto` stdio 通道）      |
-| 系统托盘 → 壁纸引擎 | 单向 | 托盘菜单操作（内联于 lib.rs，**5 项**：open / next_wallpaper / pause_resume / pure_mode / quit）触发暂停/恢复或手动下一张（`next_wallpaper` 经 `scheduler.manual_tx`）         |
-| 配置管理 → 壁纸引擎 | 事件 | 配置热重载时通知引擎应用新配置         |
+| 渲染器 / 进程管理 → IPC  | 单向 | mpv 走命名管道 mpv 原生 JSON IPC；wp-proc 走命名管道自定义 JSON 行协议；壳↔UI 另有 `ui_proto` stdio 通道      |
+| 轮换调度器 → 布局域 | 单向 | `layout::plan` 为纯函数，产出 `LayoutPlane`（单元→显示器映射、主屏）；调度器/命令层只消费 |
+| 轮换调度器 → 壁纸引擎 | 单向 | 调度器只做决策；执行下放引擎的原子交换，Native/无旧窗回退 `set_wallpaper` 三阶段 |
+| 轮换调度器 → 配置管理 | 单向（读） | 每轮醒来重读 `AppConfig` 与池（rotation / arrangement / 壁纸库） |
+| 轮换调度器 → playback.toml | 单向（写） | `PlaybackStore` 独立原子写（temp+fsync+rename），不经 `ConfigManager` / 热重载（DR-15） |
+| 系统托盘 → 轮换调度器 | 单向 | `next_wallpaper` 经 `scheduler.manual_tx`（内联托盘 **5 项**：open / next_wallpaper / pause_resume / pure_mode / quit） |
+| 配置管理 → 轮换调度器 | 事件 | 热重载 / 配置命令成功后 `wake.notify_waiters()`，调度器重读配置并重算 deadline |
+| 壳 ↔ 原生 UI 子进程 | 双向 | `ui_proto` NDJSON over stdio：UI 发 Request（命令名与 Tauri 命令逐字一致），壳回 Response 并推送 Event |
+| 调度器 / 引擎 → 原生 UI 子进程 | 事件 | 调度器 `app.emit("wallpaper-rotated")`、引擎 `wallpaper-state-changed` 等经 `ui_process::bridge` 的 `FORWARDED_EVENTS` 转发为 UI Event |
 
 ***
 
@@ -80,10 +113,11 @@ flowchart TD
     B -->|本地 HTML/HTM| C3[创建 WebRenderer]
     B -->|图片| C4[创建 ImageRenderer]
 
-    C1 --> D1[ProcessManager 启动 mpv.exe 子进程]
-    D1 --> D1a[MpvIpcClient 命名管道 IPC<br/>mpv 原生 JSON 协议]
+    C1 --> D1b[主进程创建隐藏视频宿主窗口<br/>MirrorStarVideoHost]
+    D1b --> D1[ProcessManager 启动 mpv.exe<br/>--idle=yes --wid=宿主 HWND]
+    D1 --> D1a[MpvIpcClient 命名管道 JSON IPC<br/>loadfile / pause / get_property]
     C3 --> D2[ProcessManager 以 --wp-proc 模式启动壳进程自身]
-    D2 --> D2a[WpProcIpcClient 命名管道 IPC<br/>wp-proc 自定义协议]
+    D2 --> D2a[WpProcIpcClient 命名管道 IPC<br/>wp-proc 自定义 JSON 行协议]
     C2 --> EW2[主进程内创建窗口<br/>GDI 双缓冲渲染线程]
     C4 --> E{WallpaperMode}
 
@@ -94,9 +128,8 @@ flowchart TD
 
     E -->|WorkerW| EW[主进程内创建窗口]
 
-    D1a --> F1[mpv 子进程启动并创建窗口]
-    D2a --> F2[wp-proc 子进程启动并创建窗口]
-    F1 --> G[FindWindowW + PID 验证获取 HWND]
+    D1b --> G[宿主 HWND / wp-proc HWND<br/>作为嵌入目标]
+    D2a --> F2[FindWindowW + PID 验证<br/>获取 wp-proc HWND]
     F2 --> G
 
     EW --> I[DesktopIntegrator::embed_wallpaper]
@@ -107,40 +140,52 @@ flowchart TD
     J --> L[SetParent 嵌入 WorkerW]
     L --> M[SetWindowPos 设置相对位置]
     M --> N[壁纸显示在桌面]
+    N --> N2[视频：embed 后 IPC loadfile<br/>首帧就绪后才提交/显示]
 
-    N --> O[ConfigManager::add_wallpaper]
+    N --> O[ConfigManager::add_wallpaper<br/>（仅“添加壁纸入库”时）]
     O --> P[生成缩略图]
-    P --> Q[持久化到壁纸库]
+    P --> Q[持久化到 wallpapers.toml]
 ```
+
+> 说明：视频壁纸不再按 PID 查找 mpv 顶层窗口；主进程先创建 `MirrorStarVideoHost` 宿主窗口，mpv 以 `--wid=<宿主 HWND>` 只创建 `WS_CHILD` vo 子窗口，桌面嵌入操作作用于宿主（避免嵌入时 D3D11 纹理重建触发 `E_OUTOFMEMORY`）。网页壁纸仍由 `FindWindowW` + PID 校验获取 wp-proc 窗口。
+>
+> “设为壁纸”本身不修改 `wallpapers.toml`；`add_wallpaper` / `remove_wallpaper` 才增删库条目（见 §2.2）。
 
 ### 2.2 壁纸切换清理流程
 
-壁纸切换时，必须先清理旧壁纸再启动新壁纸，避免资源泄漏：
+当前有两条换图路径，清理策略不同：
+
+- **手动「设为壁纸」**：`set_wallpaper_inner` → `prepare_set_wallpaper`（锁内关闭旧壁纸，Native 清除延迟到新窗嵌入后）→ `construct_renderer`（锁外构建/播放）→ `complete_set_wallpaper`（锁内嵌入 + 注册 + 补清除旧 Native）。
+- **轮换 apply**：原子交换，旧壁纸在 `commit_atomic_swap` 前**不关闭、不隐藏、不暂停**，新壁纸就绪后一次换槽并 terminate 旧（见 §8.4）。
 
 ```mermaid
 flowchart TD
-    A[用户选择新壁纸] --> B{当前是否有活跃壁纸?}
+    A[用户选择新壁纸 / 调度器轮换] --> B{当前是否有活跃壁纸?}
     B -->|否| C[直接启动新壁纸]
-    B -->|是| D[IPC: 发送 terminate 命令给旧壁纸子进程]
-    D --> E[等待子进程退出<br/>超时 5 秒]
-    E --> F{子进程是否退出?}
-    F -->|是| G[关闭 IPC 管道连接]
-    F -->|否| H[强制 kill 子进程]
-    H --> G
-    G --> I[从 wallpapers.toml 移除旧条目]
-    I --> J[启动新壁纸子进程]
-    J --> K[新壁纸嵌入 WorkerW]
-    C --> K
+    B -->|是| D[acquire DisplaySettingGuard<br/>按显示器串行化]
+    D --> E[prepare_set_wallpaper 锁内关闭旧壁纸<br/>Native 清除可延迟]
+    E --> F[锁外 construct_renderer 构建并 play]
+    F --> G[complete_set_wallpaper 锁内嵌入 + 注册]
+    G --> H[补清除旧 Native / terminate 旧渲染器]
+    H --> I[新壁纸嵌入 WorkerW 显示]
+    C --> I
+
+    subgraph ATOMIC["轮换原子交换（不先关旧）"]
+      R1[prepare_atomic_swap<br/>旧壁纸保持占位] --> R2[build_new_renderer 锁外]
+      R2 --> R3[embed_atomic_into<br/>新窗 HWND_BOTTOM]
+      R3 --> R4[wait_new_ready 锁外首帧]
+      R4 --> R5[commit_atomic_swap<br/>换槽后 terminate 旧]
+    end
 ```
 
 **清理步骤详解：**
 
-1. **发送 terminate 命令**：通过 IPC 通知子进程优雅退出
-2. **等待退出**：设置 5 秒超时，等待子进程自行退出
-3. **强制终止**：超时后调用 `child.kill()` 强制终止
-4. **关闭管道**：关闭命名管道连接，释放资源
-5. **更新持久化**：从 `wallpapers.toml` 中移除旧条目
-6. **启动新壁纸**：创建新的子进程和 IPC 连接
+1. **按显示器串行化**：`DisplaySettingGuard::acquire(display_id)` 在手动 set 与调度器 apply 两条路径统一排队；acquire 失败视为该屏 Busy，调度器静默跳过。
+2. **关闭旧壁纸**：`prepare_set_wallpaper` 锁内关闭旧渲染器；若旧壁纸为 Native，可延迟清除系统壁纸，待新窗嵌入完成后补清除，避免“先黑后设”的窗口。
+3. **终止子进程**：渲染器 `terminate()` 优先经 IPC 优雅退出（mpv `quit` / wp-proc `terminate`），进程管理器等待默认 **3s** 后强杀；不同渲染器的连接/等待预算不同（例如 mpv IPC 连接 40×50ms=2s、wp-proc 连接 160×50ms=8s）。
+4. **关闭管道**：渲染器 Drop / terminate 时关闭命名管道与事件监听，释放句柄。
+5. **持久化边界**：“设为壁纸 / 轮换”**不修改** `wallpapers.toml`；只有 `remove_wallpaper` 才删除库条目并清理文件（历史文档中“切换时从 wallpapers.toml 移除旧条目”为旧口径，已废止）。
+6. **启动新壁纸**：构建新渲染器并嵌入；视频在嵌入完成后通过 IPC `loadfile` 加载，等待首帧就绪再提交显示。
 
 ### 2.3 暂停/恢复数据流
 
@@ -148,57 +193,73 @@ flowchart TD
 
 ```mermaid
 flowchart TD
-    A[SetWinEventHook 回调触发] --> B[is_foreground_fullscreen 检测]
+    A[SetWinEventHook 回调 / 500ms QUNS 探针] --> B[全屏判定<br/>QUNS + DwmGetWindowAttribute<br/>DWMWA_EXTENDED_FRAME_BOUNDS]
     B --> C{前台窗口类型?}
     C -->|桌面/任务栏/自身窗口| D[恢复壁纸]
-    C -->|普通窗口| E{窗口矩形是否完全<br/>覆盖显示器矩形?}
+    C -->|普通窗口| E{是否判定为全屏?<br/>QUNS 2/3/4 或矩形完全覆盖}
 
-    E -->|是| F[暂停壁纸]
+    E -->|是| F[置位 PauseReason::FULLSCREEN]
     E -->|否| D
 
-    F --> G[WallpaperEngine::pause_wallpaper_fast]
-    G --> H[IPC: 发送 {"command":"pause","request_id":1}]
-    H --> I[子进程暂停播放]
-    G --> J[VolumeControl::set_process_mute(pid, true)]
-    J --> K[ISimpleAudioVolume::SetMute(true)]
-    G --> L[切换托盘菜单文本为"恢复壁纸"]
+    F --> G{fullscreen_action}
+    G -->|pause| G1[WallpaperEngine::pause_all_fast]
+    G -->|terminate| G2[terminate_all_fast<br/>终止视频 / 网页子进程]
+    G -->|none| G3[不处置]
 
-    D --> M[WallpaperEngine::resume_wallpaper_fast]
-    M --> N[IPC: 发送 {"command":"resume","request_id":2}]
-    N --> O[子进程恢复播放]
+    G1 --> H[PauseSender 快速通道<br/>mpsc 直投渲染线程]
+    H --> H1[视频 mpv JSON IPC：<br/>set_property pause=yes]
+    H --> H2[网页 wp-proc JSON 行：<br/>command=pause]
+    H --> H3[图片/GIF：状态翻转 / 冻结帧]
+    G1 --> J[VolumeControl::set_process_mute(pid, true)]
+    J --> K[ISimpleAudioVolume::SetMute(true)]
+    G1 --> L[切换托盘菜单文本为"恢复壁纸"]
+
+    D --> M[WallpaperEngine::resume_all_fast]
+    M --> N[视频 mpv：set_property pause=no；<br/>网页 wp-proc：command=resume]
+    N --> O[子进程恢复播放 / terminate 路径冷启动]
     M --> P[VolumeControl::set_process_mute(pid, false)]
     P --> Q[ISimpleAudioVolume::SetMute(false)]
     M --> R[切换托盘菜单文本为"暂停壁纸"]
 ```
 
+> 说明：全屏判定以 `SHQueryUserNotificationState` 为权威（`QUNS_RUNNING_D3D_FULL_SCREEN` / `QUNS_BUSY` / `QUNS_PRESENTATION_MODE`），窗口矩形分级仅在 QUNS 不可判定时兜底；矩形取 DWM 扩展边框（不含阴影）。`pause_reasons` 位图非空同时抑制调度器定时轮换（见《10-壁纸轮换调度器》§10）。
+>
+> 实际线格式：视频为 `{"command":["set_property","pause","yes"],"request_id":N}`（恢复为 `"no"`）；网页 wp-proc 为 `{"command":"pause","request_id":N}`（恢复为 `"resume"`）。历史文档中的 `{"command":"pause"}` 统一写法只对 wp-proc 成立，不代表 mpv。
+
 ### 2.4 配置变更数据流
 
 ```mermaid
 flowchart TD
-    A[配置文件变更] --> B[notify crate 触发事件]
-    B --> C[ConfigManager 防抖处理]
-    C --> D[重新解析 TOML]
-    D --> E{解析是否成功?}
-    E -->|是| F[更新内存中的配置]
-    E -->|否| G[保留旧配置 + 记录日志]
+    A[配置文件变更 / update_config 命令] --> B[notify RecommendedWatcher<br/>500ms 防抖]
+    B --> C[重新解析 TOML + validate<br/>越界就地 clamp]
+    C --> D{解析是否成功?}
+    D -->|是| E[更新内存配置 + 标记 dirty<br/>300ms 落盘防抖 + 周期保存]
+    D -->|否| F[保留旧配置 + warn 日志]
 
-    F --> H{配置项类型}
-    H -->|音量变更| I[VolumeControl::set_process_volume]
-    H -->|暂停策略变更| J[更新全屏检测逻辑<br/>（platform/fullscreen.rs SetWinEventHook 回调）]
-    H -->|壁纸排列变更| K[WallpaperEngine::set_arrangement<br/>+ 调度器按 LayoutPlane 重建/重嵌]
-    H -->|开机自启变更| L[注册表/启动文件夹操作]
+    E --> G[on_config_changed 回调]
+    G --> G1[emit config-changed<br/>经 UI 桥转发给 mirrorstar-ui]
+    G --> G2[scheduler.wake.notify_waiters<br/>重算 deadline]
+    G --> G3[engine.set_arrangement<br/>+ seed_scaling_modes<br/>+ set_playback_settings]
 
-    I --> M[IPC: {"command":"set_volume","request_id":3,"volume":0.8}]
-    J --> N[更新 Hook 回调逻辑]
-    K --> O[重新计算所有壁纸位置]
-    L --> P[写入/删除注册表项]
+    A2[apply_playback_setting 命令] --> E2[先 update_config 落盘]
+    E2 --> H1[broadcast_set_volume_fast]
+    E2 --> H2[broadcast_set_mute_fast]
+    E2 --> H3[set_speed_for_all]
+    H1 --> R1{下发是否成功?}
+    H2 --> R1
+    H3 --> R1
+    R1 -->|失败| R2[回写旧配置快照 + 返回 Err]
+
+    A3[toggle_auto_start 命令] --> L[tauri-plugin-autostart<br/>启用/禁用自启动]
 ```
+
+> 说明：热重载回调只负责“通知 + 种入”，不会主动重建现有渲染器；音量/静音/速度的**运行态即时下发**走 `apply_playback_setting`（先落盘、再广播、失败回写）。历史文档中 `VolumeControl::set_process_volume` / 注册表手写自启动项等表述为旧实现口径，当前分别以 `broadcast_set_volume_fast` 与 `tauri-plugin-autostart` 为准。
 
 ***
 
 ## 3. 通信机制概览
 
-MirrorStar 采用三类跨进程通信通道（两套命名管道 + 一套 stdio），配合 mpsc 通道与事件钩子实现跨进程、跨线程的高效通信。
+MirrorStar 采用三类跨进程通信通道（两套命名管道 + 一套 stdio），配合 mpsc 通道与事件钩子实现跨进程、跨线程的高效通信。原生 UI 子进程的预览窗口还会自建 mpv / wp-proc 子进程，复用同一套命名管道协议。
 
 > **完整 IPC 设计（协议定义、消息类型、连接重试参数、HWND 获取）详见《03-进程架构与IPC》。**
 
@@ -206,14 +267,16 @@ MirrorStar 采用三类跨进程通信通道（两套命名管道 + 一套 stdio
 
 | 通信方式 | 说明 |
 |----------|------|
-| **壳 ↔ 原生 UI 子进程** | `ui_proto` NDJSON over stdio（壳与 `mirrorstar-ui` 共享定义） |
+| **壳 ↔ 原生 UI 子进程** | `ui_proto` NDJSON over stdio（壳与 `mirrorstar-ui` 共享定义；Request/Response + Event/Control） |
 | **主线程 → 渲染线程** | mpsc 通道 + PostMessageW |
-| **视频播放控制** | 命名管道 JSON IPC（MpvIpcClient，mpv 原生协议，`ipc/mpv_protocol.rs`） |
-| **Web 壁纸通信** | 命名管道 JSON IPC（WpProcIpcClient，wp-proc 自定义协议，`ipc/wp_proc.rs`） |
-| **全屏检测通知** | SetWinEventHook 回调 → AtomicBool 去抖 |
-| **配置变更通知** | notify crate → RwLock（500ms 防抖） |
+| **视频播放控制** | 命名管道 JSON IPC（MpvIpcClient，mpv 原生协议，`--input-ipc-server=\\.\pipe\<name>`，`ipc/mpv_protocol.rs`） |
+| **Web 壁纸通信** | 命名管道 JSON IPC（WpProcIpcClient，wp-proc 自定义 JSON 行协议，`ipc/wp_proc.rs`） |
+| **全屏检测通知** | SetWinEventHook 回调 + 500ms QUNS 轻量探针 → `PauseReason` 位图 |
+| **配置变更通知** | notify crate（500ms 防抖）→ `on_config_changed` → emit + `scheduler.wake` |
 | **暂停/恢复控制** | PauseSender 快速通道（短暂持 engine 锁定位 sender，mpsc 直投渲染线程） |
-| **崩溃恢复** | Web 子进程异常退出通过退出监听（spawn_proc_exit_monitor）识别，OS 自动回收子进程，无自动 respawn |
+| **子进程异常退出** | 退出监听（`spawn_proc_exit_monitor`）识别并通知引擎；Web 不自动 respawn |
+| **视频停滞自愈** | `platform/liveness_watchdog` 周期采样 `time-pos`，停滞时调用 `heal_stalled_renderer` 分级自愈（terminate → 重建） |
+| **UI 事件转发** | 壳侧 `FORWARDED_EVENTS`（14 个）经 `ui_process::bridge` 转 `ui_proto` Event |
 
 ### 3.2 关键设计说明
 
@@ -223,7 +286,7 @@ MirrorStar 采用三类跨进程通信通道（两套命名管道 + 一套 stdio
 
 3. **PauseSender 快速通道**：短暂持 engine 锁定位 sender 后，经 mpsc 直接投递暂停/恢复/音量命令，避免高优先级操作等待渲染器处理/IPC 往返，降低响应延迟。
 
-4. **崩溃恢复**：Web 壁纸子进程异常退出由退出监听（`spawn_proc_exit_monitor`）识别并通知引擎；主进程崩溃时操作系统自动回收子进程（父子进程关系）。无需独立看门狗进程，依赖 Rust 的线程安全和 RAII 保证资源释放。
+4. **崩溃恢复与自愈**：Web 子进程异常退出由退出监听（`spawn_proc_exit_monitor`）识别并通知引擎，**不自动 respawn**；视频播放停滞由 liveness watchdog 周期检测后分级自愈（`heal_stalled_renderer` 重建渲染器）。主进程崩溃时，UI / mpv / wp-proc 子进程由 Windows Job Object 随父进程回收，无需独立看门狗进程。
 
 ***
 
@@ -255,7 +318,9 @@ MirrorStar 采用三类跨进程通信通道（两套命名管道 + 一套 stdio
 ├── logs/              # 日志（mirrorstar.log.<日期> + mpv-*.log），受保留上限约束
 ├── webview2-cache/    # WebView2 UDF：<pid>/（网页壁纸）、ui-<pid>/（UI 预览）
 ├── mpv/               # mpv --config-dir 重定向目录（避免写穿 %APPDATA%\mpv）
-└── config.lock        # 写锁
+├── config.lock        # config.toml 写锁（fs2，atomic_write）
+├── wallpapers.lock    # wallpapers.toml 写锁
+└── playback.lock      # playback.toml 写锁
 ```
 
 ### 4.3 AppConfig 结构（实测自 settings.rs）
@@ -292,8 +357,8 @@ max_memory_mb = 40               # 帧像素内存预算（[10,500]）
 [rotation]
 enabled = false             # 轮换主开关
 on_boot = false             # 应用启动时推进下一张
-interval_minutes = 30       # 1–1440
-order = "sequential"        # sequential | shuffle_bag | pseudo_random
+interval_minutes = 30       # 1–1440；下限 1 分钟 = 60s
+order = "sequential"        # sequential | shuffle_bag | pseudo_random（默认 sequential）
 
 [scaling.modes]
 all = "fill"                # display_id → 缩放模式；"all" 为兜底
@@ -307,13 +372,17 @@ all = "fill"                # display_id → 缩放模式；"all" 为兜底
 - `VideoConfig.speed`：`0.25 ~ 4.0`（共享 `mpv_protocol::SPEED_MIN/SPEED_MAX`），非法回退 1.0
 - `GifConfig.balanced_keep_frames`：`≥ 1` 且 ≤ `MAX_BALANCED_KEEP_FRAMES`（1000）
 - `GifConfig.max_memory_mb`：`[10, 500]`
+- `RotationConfig.interval_minutes`：clamp 到 `[1, 1440]` 分钟（默认 30；下限 1 分钟 = 60s，防短间隔反复 spawn/kill 视频进程）
+
+> `AppConfig.arrangement` / `pause.fullscreen_action` / `scaling.modes` 的未知枚举值采用宽松反序列化：逐项回退默认（`per_monitor` / `terminate` / `fill`）并 warn，不使整份配置失败。
 
 ### 4.5 热重载与持久化
 
 - `ConfigManager` 管理 `config.toml` 与 `wallpapers.toml` 的读写（`mirrorstar-core/src/config/manager.rs`）
 - 使用 `notify::RecommendedWatcher` 监控，**500ms 防抖**（hot_reload.rs）
+- **落盘防抖**与监控防抖分离：`CONFIG_SAVE_DEBOUNCE_MS = 300ms`（`maybe_save_config`）+ 周期性保存线程 + 退出 `flush()` 兜底；`config` 与 `library` 使用独立的 `fs2` 文件锁（`config.lock` / `wallpapers.lock`）串行化写入
 - 配置加载失败（损坏/缺失）：记录 warn 并回退到默认配置，**保证应用可启动**；构造时的加载错误暂存 `pending_config_errors`，待 Tauri setup 后作为 `config-load-error` 事件通知
-- 写路径使用 `fs2` 锁 + 防抖落盘 + 定期保存，避免频繁写入与并发冲突
+- 热重载成功后的实际副作用：emit `config-changed` → `scheduler.wake.notify_waiters()` → 引擎 `set_arrangement` / `seed_scaling_modes` / `set_playback_settings`（音量/静音/速度）
 
 ***
 
@@ -339,6 +408,8 @@ let env_filter = EnvFilter::try_from_default_env()        // 优先 RUST_LOG
 
 tracing_subscriber::fmt()
     .with_env_filter(env_filter)
+    .with_writer(std::io::stdout.and(non_blocking))   // 控制台 + 日志文件双写
+    .with_ansi(true)
     .init();
 // guard 由 run() 持有至程序退出，early drop 会丢失日志
 ```
@@ -370,9 +441,10 @@ workspace 配置：`tokio = { version = "1.52", features = ["rt", "rt-multi-thre
 |------|------|
 | 广播通道 | WallpaperEngine 状态变更 broadcast 订阅（`sync`） |
 | 事件监听 | 全屏 / 电池事件驱动处理 |
+| 轮换调度器 | 单个后台 tokio 任务：`select!` 同时等待定时 sleep、`wake.notified()`、`manual_rx`、`pool_apply_rx` 与 3s 显示器轮询 |
 | UI 通信 | 壳与原生 UI 子进程的 `ui_proto` 消息（stdio NDJSON） |
 
-> **注意**：命名管道 IPC 使用同步 Win32 API，**不经过** tokio 异步运行时；文件监控热重载均在独立线程完成。
+> **注意**：命名管道 IPC 使用同步 Win32 API，**不经过** tokio 异步运行时；文件监控热重载均在独立线程完成；原子交换的 `build_new_renderer` / `wait_new_ready` 通过 `spawn_blocking` 执行，避免阻塞 tokio worker。
 
 ***
 

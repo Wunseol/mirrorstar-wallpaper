@@ -49,8 +49,8 @@
 | WebView2 | Microsoft Edge WebView2 | Microsoft 提供的 WebView 控件，基于 Chromium 内核。用于网页壁纸（`--wp-proc` 子进程）与预览弹窗的按需临时渲染 |
 | SHELLDLL_DefView | Shell Default View | Windows 桌面窗口层次结构中管理桌面图标显示的窗口 |
 | 硬件加速解码 | Hardware-accelerated decoding | 利用 GPU 进行视频解码（mpv `--hwdec=auto`），降低 CPU 占用 |
-| 事件驱动 | Event-driven | 壁纸状态变更（全屏、电源、Explorer 重启）通过 Windows 消息 / WinEvent 回调触发，而非轮询；实现暂停态近似零 CPU 占用 |
-| PauseSender | PauseSender | 暂停/恢复快速通道：绕过引擎 Mutex，直接向渲染线程发送暂停命令，实现 < 10ms 的快速响应 |
+| 事件驱动 | Event-driven | 壁纸状态变更（全屏、电源、Explorer 重启）通过 Windows 消息 / WinEvent 回调触发，辅以 500ms QUNS/前台根轻量探针与每 2s 全量兜底；不是纯轮询，也不是完全无轮询。空闲/暂停态 CPU 目标接近 0；2026-11-24 dev 暂停态实测 0.00%（10s 采样） |
+| PauseSender | PauseSender | 暂停/恢复快速通道：绕过引擎 Mutex，直接向渲染线程发送暂停命令；设计目标 GIF/图片 <10ms、视频 <50ms（含 mpv IPC）。2026-11-24 dev 视频实测：暂停 1.7–10.9ms、恢复 1.9–4.3ms（鼠标释放→mpv `pause` 属性事件）；GIF/图片未测 |
 | 工作集内存 | Working Set Memory | 进程当前驻留在物理内存中的页面集合，反映实际物理内存占用 |
 | 壁纸库 | Wallpaper Library | 用户添加的壁纸集合，包含壁纸的元信息和缩略图；外部文件复制进托管目录 `data_root/wallpapers/{id}/`；库内顺序可拖拽调整，影响隐式「全部壁纸池」的 Sequential 采样顺序 |
 | playback.toml | playback.toml | `data_root()` 下的播放状态持久化文件，记录单元激活池、顺序游标、历史栈、洗牌袋等状态；文件损坏或版本不符时回退为默认空状态 |
@@ -62,12 +62,12 @@
 | 日志留存 | Log Retention | 应用日志保留 7 个按日轮转文件、mpv 日志剪枝、`crash.log` 超过 1MB 时轮转 |
 | 内存归因 | Memory Report | `get_memory_report` 按进程树归类内存占用：主进程 / mpv / wp-proc / msedgewebview2 / other |
 | 托盘图标 | System Tray Icon | Windows 任务栏通知区域（系统托盘）中的图标 |
-| 全屏检测 | Fullscreen Detection | 检测系统中是否有应用程序以全屏模式运行的技术（`SetWinEventHook` / `EVENT_SYSTEM_FOREGROUND`） |
+| 全屏检测 | Fullscreen Detection | 检测系统中是否有应用程序以全屏模式运行的技术：系统/对象两类 `SetWinEventHook` + 500ms QUNS/前台根轻量探针 + 每 2s 全量兜底；QUNS 仅作触发/维持/确认，全屏身份由可信且 100% 覆盖的前台窗口/会话决定 |
 | 冷启动 | Cold Start | 程序从完全关闭状态启动的过程 |
-| 热启动 | Warm Start | 程序从最小化/后台状态恢复到前台的过程，窗口从零创建（非从隐藏状态恢复） |
+| 热启动 | Warm Start | 壳已运行，用户再次打开主窗口的过程：按需 spawn UI 子进程；托盘隐藏未超时时复用已驻留进程，超时后重新 spawn。关闭主窗口（X/Alt+F4）立即退出；首次打开（应用刚启动后）441ms、后续热打开 133–164ms（Debug，2026-11-24；修复前 206ms 为历史） |
 | 鼠标穿透 | Click-through | 壁纸窗口不拦截鼠标事件，使鼠标操作直接传递到下层窗口 |
 | 纯净壁纸模式 | Pure Mode | 由托盘"纯净壁纸"勾选项进入的沉浸模式（core `pure_mode` + `src-tauri/src/platform/pure_mode*.rs`）：将壁纸窗口从桌面层（WorkerW / raised desktop 的 Progman 层）摘出并以 `HWND_TOPMOST` 置顶全屏、安装输入捕获钩子且**刻意不抢前台**（`WS_EX_NOACTIVATE`），按任意键/点击鼠标/再次点击托盘即退出。退出编排保证"先恢复桌面再卸载钩子"，并做视频渲染器存活校验与自愈 |
-| 多屏排列 | Arrangement | 多显示器布局策略枚举（core `config::settings::Arrangement`，由 `mirrorstar-core::layout` 作为唯一权威逻辑）。三态：`PerMonitor`（每屏独立，每显示器一个调度单元，key = 显示器 id）、`AllSame`（每屏同图，唯一全局单元 `all`，一张壁纸各屏顺序各 apply 一次，N 渲染器）、`Span`（跨屏合并，唯一全局单元 `all`，1 个跨屏渲染器贯通虚拟桌面、1 次 apply） |
+| 多屏排列 | Arrangement | 多显示器布局策略枚举（core `config::settings::Arrangement`，由 `mirrorstar-core::layout` 作为唯一权威逻辑）。三态：`PerMonitor`（每屏独立，每显示器一个调度单元，key = 显示器 id）、`AllSame`（每屏同图，唯一全局单元 `all`，一张壁纸各屏顺序各 apply 一次，N 渲染器）、`Span`（跨屏合并，唯一全局单元 `all`；当前同一壁纸逐屏串行 apply，N 渲染器；单个跨屏渲染器 / 1 次 apply 为设计目标，尚未实现） |
 | 调度单元 | Unit | 多屏排列下壁纸应用的粒度：`PerMonitor` 下每显示器一个单元；`AllSame`/`Span` 下唯一全局单元 `all`（常量 `ALL_UNIT_KEY`） |
 | Slint | Slint | 用于构建 MirrorStar **主窗口**的原生 GUI 工具包。主窗口是独立的 Slint 原生 UI 子进程（`mirrorstar-ui.exe`），**非 Tauri WebView 前端**；Tauri v2 仅承担托盘/对话框/自启/后端命令等壳职责 |
 | mirrorstar-ui | mirrorstar-ui | 主窗口 UI 的独立子进程 crate（Slint 原生渲染）。由壳侧按需 spawn；关闭主窗口（关闭按钮 / Alt+F4）时立即退出，托盘隐藏时保留进程并在空闲超时（默认 300s）后退出回收内存；同一时刻至多一个实例 |

@@ -22,7 +22,7 @@
 | `crates/mirrorstar-core/src/audio/mod.rs` | 1 | 仅 `pub mod volume;` |
 | `crates/mirrorstar-core/src/audio/volume.rs` | 1418 | `VolumeControl` 实现 + `is_pid_running` / `collect_stale_pids` 辅助 + 26 个测试（含 1 个 `#[ignore]`） |
 
-> **2026-11-04 复核**：`volume.rs` 实测 **1418** 行、**26** 个 `#[test]`（其中 **1** 个 `#[ignore]`）；原文档的 1131 行 / 24 个测试为 2026-10-11 历史快照。表中 ipc / process 的行数与测试数沿用 2026-10-11 快照，未在本次校正中改写。
+> **2026-11-04 复核**：`volume.rs` 实测 **1418** 行、**26** 个 `#[test]`（其中 **1** 个 `#[ignore]`）；原文档的 1131 行 / 24 个测试为 2026-10-11 历史快照。表中 ipc / process 的行数与测试数沿用 2026-10-11 快照，未在本次校正中改写。（2026-11-24 复核：本节数值口径不变，本轮未重新统计。）
 
 #### ipc 子模块
 
@@ -51,6 +51,19 @@
 - **audio**：26 个单元测试（2026-11-04 复核实测；24 为历史快照），覆盖 `new_disabled` 降级路径、`set_process_volume` clamp、`is_pid_running` / `collect_stale_pids` 辅助函数、v41-A-001 COM 恢复路径。**核心 WASAPI 交互路径（`with_session` cache hit/miss + 真实会话枚举）仅在 `#[ignore]` 真机测试中覆盖**（`v41_a003_real_com_cache_hit_miss_e2e`），CI 中无端到端验证。
 - **ipc**：63 个单元测试（`client.rs` 41 + `mpv_protocol.rs` 10 + `wp_proc.rs` 12，2026-11-04 实测），覆盖 `Backoff` 序列、`read_line_with_limit` OOM 防护与 I-001 / v41-I-001 UTF-8 截断处理；3 个集成测试（`tests/ipc_timeout.rs`）通过真实命名管道验证 I01/I03 总体超时；`wp_proc.rs` 内嵌 2 个 I04 真实管道超时测试。覆盖较完整。
 - **process**：29 个测试覆盖 `escape_windows_arg`（含 N-009/P-005 拒绝换行/NUL）、P01 STILL_ACTIVE 误判修复、P03 pid() 退出后返回 None、P-001 句柄泄漏量化测试。**仅 1 个测试标 `#[ignore]`（`start_after_stop_immediate_does_not_reuse_pid`，PID 复用属 OS 行为，防 CI flaky）；句柄泄漏量化测试已重命名为 `start_after_exit_does_not_leak_handles`（10 轮/阈值 8）且 CI 可执行**。
+
+### 1.4 2026-11-24 暂停/IPC 实测补充
+
+> 来源：2026-11-24 Debug 0.1.5 单机实测。完整口径与采集环境见 [`docs/02-架构与技术栈/09-性能优化-Performance.md`](../02-架构与技术栈/09-性能优化-Performance.md) §22.4。本节为补充实测，§1.3 与既有 findings 保持不变；行数 / 测试数仍沿用 2026-11-04 实测口径（2026-11-24 复核未重新统计）。
+
+| 项 | 实测 | 说明 |
+|---|---|---|
+| 视频暂停 | 1.7–10.9ms | 鼠标释放 → mpv `pause` 属性事件 |
+| 视频恢复 | 1.9–4.3ms | 同上 |
+| UI 按钮更新 | 10.6–13.3ms | 暂停 / 恢复后前端按钮状态刷新 |
+
+- **口径边界**：上述时延为**手动 / 托盘暂停命令路径**，**不包含全屏检测与会话确认**（全屏发现时延仍由 500ms 探针 + 2s 兜底约束，不在本组数据内）。
+- **未测**：GIF / 图片壁纸的暂停与恢复。
 
 ---
 

@@ -6,8 +6,8 @@
 | ---- | ------------------------- |
 | 项目名称 | MirrorStar Wallpaper（镜星壁纸） |
 | 文档版本 | v3.0                      |
-| 更新日期 | 2026-10-11                |
-| 文档状态 | 已实现（已按真实代码合并重组，2026-10）        |
+| 更新日期 | 2026-11-24                |
+| 文档状态 | 已实现（已按真实代码合并重组，2026-10；2026-11-24 按当前实现校准）        |
 
 > 定位：本文档为壁纸轮换功能（随机壁纸 / 定时更换 / 开机更换 / 播放顺序）的唯一权威文档，设计定稿于 2026-09-08（经多轮深度讨论与边界审计）。
 
@@ -46,16 +46,20 @@
 
 | 现有组件 | 复用方式 |
 |---|---|
-| `WallpaperEngine` 原子交换（`prepare_atomic_swap` / `embed_atomic_into` / `wait_new_ready` / `commit_atomic_swap`） | 轮换 apply 的默认执行入口（旧壁纸保持显示至新壁纸就绪） |
-| `set_wallpaper` 三阶段流程 | 手动设壁纸 / Native 图片 / 无旧窗时的回退路径 |
+| `WallpaperEngine` 原子交换（`prepare_atomic_swap` / `build_new_renderer` / `embed_atomic_into` / `wait_new_ready` / `commit_atomic_swap`） | 轮换 apply 的默认执行入口（旧壁纸保持显示至新壁纸就绪） |
+| `set_wallpaper` 三阶段流程（`prepare_set_wallpaper` → 锁外 `construct_renderer` → `complete_set_wallpaper`） | 手动设壁纸 / Native 图片 / 无旧窗时的回退路径 |
 | `PauseReason` 位图（FULLSCREEN/BATTERY/TRAY） | 轮换暂停的抑制信号源 |
-| `pause_all_fast` / `resume_all_fast` | 轮换完成后跟随暂停 |
+| `pause_all_fast` / `resume_all_fast` / `terminate_all_fast` | 轮换完成后跟随暂停；全屏 terminate 策略 |
 | `workerw_check` 桌面就绪兜底 | 既有后台兜底检查；调度器启动不阻塞等待 |
-| `DISPLAYS_SETTING` per-display 防并发集合 | 串行化 guard 的接入点 |
+| `DISPLAYS_SETTING` per-display 防并发集合（`DisplaySettingGuard`） | 串行化 guard 的接入点 |
 | `ConfigManager.update_config` + 防抖 + 热重载 | 轮换配置读取 / 热重载响应 / 写盘模式 |
-| `Arrangement` 枚举 | 已重构为三值多屏排列（Arrangement）；多屏排列唯一来源 = 顶层 `AppConfig.arrangement`（§4.4，DR-2 布局域，独立于轮换配置） |
+| `Arrangement` 枚举 + `layout::plan` | 多屏排列唯一来源 = 顶层 `AppConfig.arrangement`（§4.4，DR-2 布局域） |
+| `mirrorstar_core::scheduler::order` | 采样算法（sequential / shuffle_bag / pseudo_random）与候选过滤 |
+| `mirrorstar_core::scheduler::boot` | 启动解析决策树 `resolve_boot`（纯函数） |
+| `mirrorstar_core::config::playback::PlaybackStore` | `playback.toml` 独立持久化（单元状态 / 历史栈） |
 | `VolumeControl`（共享 COM 缓存） | 新壁纸音量自动继承 |
-| `global_state_changed` broadcast 通道 | 轮换事件转发 |
+| `global_state_changed` broadcast 通道 | `wallpaper-state-changed` 事件转发 |
+| `mirrorstar_core::ui_proto` + `ui_process::bridge` | Slint UI 子进程经 NDJSON stdio 调用命令 / 接收事件，业务命令零复制 |
 
 ---
 
@@ -95,6 +99,10 @@ struct RotationConfig {
     // 多屏排列已提升为顶层 AppConfig.arrangement（布局策略层，§4.4），不再属于本配置
 }
 ```
+
+- `interval_minutes` 双保险：命令层 `update_rotation_config` 硬校验 `[1, 1440]` 并返回 `InvalidConfig`；手改 config.toml 时 core `validate()` clamp 到同范围。
+- `order` 默认 `Sequential`；旧配置持久化的 `shuffle_bag` 默认值经 `migrate_order_default` 一次性迁移为 `sequential`（`order_default_migrated` 置位后不再覆盖用户选择）。
+- 旧版 `[rotation] arrangement` 自动迁移到顶层 `arrangement`（`migrate_legacy_arrangement`），保存时不再写出旧键。
 
 ### 4.2 wallpapers.toml — 壁纸库扩展
 
@@ -154,7 +162,7 @@ enum Arrangement { PerMonitor, AllSame, Span }
 
 ### 4.5 类型参与规则（三层模型）
 
-**Web 类型壁纸不参与轮换**（轮换成本过重：WebView2 冷启动最长 8s）（DR-18）。
+**Web 类型壁纸不参与轮换**（轮换成本过重：WebView2 冷启动历史估算最长 8s，该数值为旧口径、待复测）（DR-18）。
 
 ```
 轮换候选 = 池成员 ∩ 类型允许          ← 两层过滤
@@ -173,37 +181,47 @@ enum Arrangement { PerMonitor, AllSame, Span }
 
 ## 5. 调度器生命周期
 
-单个后台 tokio 任务，随托盘常驻。
+单个后台 tokio 任务（`src-tauri/src/scheduler.rs::run_loop`），随主进程常驻。
 
 ```
-初始化
-  ├─ 读 RotationConfig、Arrangement
+初始化（run_loop 启动阶段）
+  ├─ 读 RotationConfig、Arrangement；layout::plan 建立布局平面
   ├─ 读 playback.toml，按 key 重建单元状态
-  ├─ **启动对账（DR-34）**：current / active_pool / order_cursor / bag_remaining 中引用已删壁纸或已删池的条目 → 清理 / 回退"全部"；
-  │    显示器 key 与当前枚举不匹配的孤儿单元 → 忽略/归档重建（Windows 显示器 id 在拔插、
-  │    驱动更新后可能变化，playback 的 key 会失联；三文件非原子写，崩溃后可能不一致）
-  └─ 枚举显示器 → 建/对齐单元（WorkerW 就绪由既有 workerw_check 后台兜底，不阻塞启动）
+  ├─ 引擎同步 arrangement（set_arrangement，避免 Span/AllSame 几何错位）
+  ├─ **启动对账（DR-34）**：current / active_pool / order_cursor / bag_remaining 中引用
+  │    已删壁纸或已删池的条目 → 清理 / 回退"全部"；显示器 key 与当前枚举不匹配的孤儿
+  │    单元 → 保留但不参与轮换迭代；编排切换按 DR-22 迁移主屏/all 单元状态
+  └─ 枚举显示器 → 建/对齐单元（WorkerW 就绪由 workerw_check 后台兜底）
 ```
 ```
 主循环
   loop {
-    if 全局 enabled 且存在单元 enabled 且其池过滤后 ≥2 张:
-        计算下一 deadline（取各触发源最早）
-    else:
-        sleep 至被 config/事件唤醒（不空转）
-    到点/被唤醒 → 对每个参与单元 execute_unit()
+    每次醒来重读 AppConfig；编排变化 → engine.set_arrangement + rebuild_for_layout
+    reconcile_and_align → 启动对账（引用清理）
+    若 pure_mode::is_active() 或 pause_reasons 非空 → 不安排定时轮换（持帧）
+    否则保留未到期 timer（sleep_until 无漂移），无则 now + interval
+    select! {
+      定时到点 → 执行前重读暂停/纯模式，仍抑制则跳过本轮；否则 rotate_all()
+      wake.notified() → 失效重建全部采样器（DR-23）+ 重算 deadline
+      manual_rx → 目标单元 next（暂停不抑制；纯模式内跳过）
+      pool_apply_rx → 切池后立即按新池换一张（池 1 张也应用；纯模式内跳过）
+      display_check.tick()（3s）→ 显示器 id 集合真变化时 emit displays-changed
+                                 + 重新对账 + rebuild_for_layout
+    }
   }
 execute_unit(unit):
-  1. 采样：order 决定 target id（池空/缺文件/Web → 跳过，DR-18/DR-19）
+  1. 采样：order 决定 target id（池过滤后 <2 → 跳过；Web/缺文件已剔除）
   2. apply(unit, target) —— 见 §8，原子交换、串行执行（DR-17）
-  3. 更新 unit current / cursor / bag → 写 playback（防抖，DR-29）
-  4. emit `wallpaper-rotated` 事件（DR-30）
-  5. 若 apply 完成时处于暂停态 → 新壁纸跟随暂停（DR-20）
+  3. 回写 cursor / bag（无论成败，失败也推进：DR-19）
+  4. 成功后更新 current / 历史栈 → 写 playback（原子写，低频直接落盘）
+  5. emit `wallpaper-rotated` 事件（DR-30）
+  6. 若 apply 完成时处于暂停态 → 新壁纸跟随暂停（DR-20）
 ```
 
 **健壮性**：
-- 调度器任务 panic → 看门狗/日志，配置变更事件可自愈（DR-32）。
+- 调度器任务 panic → 日志，配置变更 / 唤醒事件可自愈（DR-32）。
 - config / playback 文件损坏 → 回退默认值继续运行，不 panic（DR-32）。
+- 手动下一张通道关闭（句柄全部 drop）→ 主循环退出。
 
 ---
 
@@ -213,15 +231,17 @@ execute_unit(unit):
 
 | 触发源 | 类型 | 行为 |
 |---|---|---|
-| 定时间隔 | 时间 | `sleep_until(next_deadline)`，无漂移；暂停期间持帧，恢复后重计（DR-9） |
+| 定时间隔 | 时间 | `sleep_until(next_deadline)`，无漂移；暂停 / 纯模式期间持帧，恢复后重计（DR-9） |
 | 启动 | 事件 | **仅应用启动**时在调度器任务内执行一次 boot 解析（§9） |
 | 唤醒 | 事件 | 睡眠/休眠恢复 → **仅重算 deadline，不推进、不重新 boot**（DR-13） |
-| 手动下一张 | 事件 | 托盘 / UI 触发，作用于当前/主单元；不受暂停限制（DR-9） |
+| 手动下一张 | 事件 | 托盘 / UI 触发，作用于当前/主单元；不受暂停限制（DR-9）；纯模式内跳过 |
+| 切换活跃池 | 事件 | `pool_apply_tx` 请求按新池立即换一张（池内仅 1 张也应用；纯模式内跳过） |
 | 暂停位图变化 | 事件 | pause_reasons 清空（resume_all_fast 后）→ 唤醒调度器重算 deadline（DR-38） |
+| 显示器变化 | 轮询 | 每 3s 比较显示器 id 集合；真变化时 emit `displays-changed` + 重新对账 + 按新布局重建 |
 
 **双触发源处理（DR-13）**：唤醒事件到达时丢弃未完成的定时等待（`select!` 抢先），只重算 deadline，不产生"sleep 过期 + 唤醒事件"两次换图。
 
-**唤醒信号源（实现要点）**：`SchedulerHandle` 持有 `wake: Arc<tokio::sync::Notify>` 与 `manual_tx: UnboundedSender<Option<String>>`（tokio mpsc）。睡眠/休眠恢复、暂停位图清空、config / 池成员 / 编排 / 纯模式退出等变化由各回调调用 `wake.notify_waiters()`（Win32 回调路径经 `SHARED_SCHEDULER` 取句柄）；手动「下一张」经 `manual_tx` 投递目标单元 key。主循环 `select!` 同时等待 `wake.notified()`、`manual_rx.recv()`、定时 sleep 与显示器轮询。显示器变化另由调度器每 3 秒轮询 id 集合（Windows message-only 窗口收不到 `WM_DISPLAYCHANGE` 广播）。开机解析在调度器任务启动阶段完成（`apply_boot` 一次），不存在"事件先于调度器初始化"的丢失问题。
+**唤醒信号源（实现要点）**：`SchedulerHandle` 持有 `wake: Arc<tokio::sync::Notify>`、`manual_tx: UnboundedSender<Option<String>>` 与 `pool_apply_tx: UnboundedSender<String>`（tokio mpsc）。睡眠/休眠恢复、暂停位图清空、config / 池成员 / 编排 / 纯模式退出等变化由各回调调用 `wake.notify_waiters()`（Win32 回调路径经 `SHARED_SCHEDULER` 取句柄）；手动「下一张」经 `manual_tx` 投递目标单元 key；切换活跃池经 `pool_apply_tx`（有缓冲，避免主循环忙碌时 `Notify` 丢失请求）。主循环 `select!` 同时等待 `wake.notified()`、`manual_rx.recv()`、`pool_apply_rx.recv()`、定时 sleep 与 3 秒显示器轮询。显示器变化另由调度器每 3 秒轮询 id 集合（Windows message-only 窗口收不到 `WM_DISPLAYCHANGE` 广播）。开机解析在调度器任务启动阶段完成（`apply_boot` 一次），不存在"事件先于调度器初始化"的丢失问题。
 
 ---
 
@@ -229,14 +249,14 @@ execute_unit(unit):
 
 | 算法 | 行为 | 备注 |
 |---|---|---|
-| 顺序循环 `sequential` | 从激活池有序列表取 `order_cursor` 指向的 id，用后推进 | **id 锚定**，池重排后从当前 id 继续（DR-5） |
-| 洗牌袋 `shuffle_bag` | 池复制 → 打乱成袋 → 抽一张移出；袋空重洗 | 袋内不重复；初始化剔除 Web |
-| 纯随机 `pseudo_random` | 每次独立随机抽取 | 可能连续抽中同一张（接受） |
+| 顺序循环 `sequential` | 从激活池有序列表取 `order_cursor` 指向 id 的下一个（末尾绕回）；游标缺失取第一张 | **id 锚定**，池重排后从当前 id 继续（DR-5）；抽中当前壁纸则再取下一个 |
+| 洗牌袋 `shuffle_bag` | 候选复制 → 打乱成袋 → 抽一张移出；袋空重洗 | 袋内不重复；剔除 Web；抽中当前壁纸则重抽 |
+| 纯随机 `pseudo_random` | 每次独立随机抽取，**排除当前壁纸** | 池过滤后 <2 返回 None（DR-14）；历史文档“可能连续抽中同一张”为旧口径，当前实现已排除当前 id |
 
 边界：
 - 池过滤（类型 + 有效文件）后 <2 张 → 单元空闲，不轮换（DR-14）。
-- 洗牌袋抽到已删除/缺文件 → 袋内移除重抽（DR-11/DR-19）。
-- 顺序游标指向已删 id → 前跳到下一个有效 id。
+- 洗牌袋抽到已删除/缺文件 → 抽取前按当前候选剔除袋内残留，再抽（DR-11/DR-19）。
+- 顺序游标指向已删 id → 前跳到第一个有效候选。
 
 ---
 
@@ -249,15 +269,17 @@ execute_unit(unit):
 - 轮换 apply 进行中：手动命令排队；调度器侧新触发丢弃/重排。
 - AllSame 多屏 apply：顺序逐屏执行，避免同屏竞态。
 
-实现注意：guard 需跨 `prepare_atomic_swap → build_new_renderer → embed_atomic_into → wait_new_ready → commit_atomic_swap`（含锁外冷启动，最长几秒）持有以挡住同屏手动/自动并发，但排队应为**异步感知**设计，避免用同步锁阻塞 tokio worker 线程。
+实现注意：guard 需跨 `prepare_atomic_swap → build_new_renderer → embed_atomic_into → wait_new_ready → commit_atomic_swap`（含锁外冷启动，最长几秒）持有以挡住同屏手动/自动并发；`build_new_renderer` / `wait_new_ready` 经 `spawn_blocking` 执行，避免阻塞 tokio worker 线程。
+
+原子交换阶段 A→C 期间另置全局 `ATOMIC_SWAP_IN_PROGRESS`（RAII 守卫，任何错误路径自动复位）：全屏终止/恢复检测到该标志时跳过本次，避免交换期间重建 WorkerW / 冷启动 mpv 导致 commit 前校验失败或首帧等待超时。
 
 ### 8.2 属性继承（审计确认，DR-25/26/27）
 
 | 属性 | 继承方式 |
 |---|---|
-| 音量 | 新渲染器创建时传入共享 `VolumeControl` → 自动一致（DR-27） |
+| 音量 / 静音 | 新渲染器创建时读取引擎 `RendererConfig` 快照（由 `set_playback_settings` 从 `AppConfig.audio` 种入）+ 共享 `VolumeControl` → 自动一致（DR-27） |
 | 缩放模式 | **继承该单元/屏当前生效的缩放模式**（读 `wallpaper_scaling_modes` per-display 记忆），而非回 Fill（DR-25） |
-| 播放速度 | **新渲染器不继承 speed**（speed 是 per-renderer 独立命令）→ apply 完成后若全局 `video.speed ≠ 1.0`，调度器/命令层补应用（DR-26，审计发现的缺口） |
+| 播放速度 | `RendererConfig.video_speed` 由 `set_playback_settings` 从 `AppConfig.video.speed` 种入，新渲染器创建时即携带该速度（VideoRenderer 在 `after_embed`/IPC 连接后应用）→ **DR-26 的历史缺口已闭合**（2026-11-24 核对；旧文档“新渲染器不继承 speed”已过时） |
 
 ### 8.3 失败路径（DR-19）
 
@@ -268,7 +290,7 @@ apply 失败（文件损坏/离线/进程 spawn 失败）：
 
 ### 8.4 切换中间态：原子交换（方案 C，DR-33）
 
-**问题**（已核实代码）：`set_wallpaper` 三阶段是**阶段 1 锁内先 `close_wallpaper` 关旧 → 阶段 2 锁外建新（视频/Web 冷启动）→ 阶段 3 锁内嵌入**，在"旧已关、新未就绪"之间存在无壁纸窗口（Image 瞬时 / GIF 短 / Video 约 1s / Web 最长 8s，Web 已排除出轮换 DR-18）。该三阶段现仅用于**手动「设为壁纸」**与**回退路径**（Native 图片 / 无旧窗）；轮换默认走下述原子交换。
+**问题**（已核实代码）：`set_wallpaper` 三阶段是**阶段 1 锁内先 `close_wallpaper` 关旧 → 阶段 2 锁外建新（视频/Web 冷启动）→ 阶段 3 锁内嵌入**，在"旧已关、新未就绪"之间存在无壁纸窗口（历史口径：Image 瞬时 / GIF 短 / Video 约 1s / Web 最长 8s，属旧版本估算、待复测；Web 已排除出轮换 DR-18）。该三阶段现仅用于**手动「设为壁纸」**与**回退路径**（Native 图片 / 无旧窗）；轮换默认走下述原子交换。
 
 **约束（代码核查结论）**：
 - `construct_renderer`（锁外，含 `play()`）与 `embed_wallpaper`（锁内）**本就是两阶段分离**——"构建"≠"嵌入显示"。
@@ -298,8 +320,8 @@ prepare_atomic_swap(display_id, source, type)          [引擎锁内, 廉价]
   └─ 返回 AtomicSwapPrepare：Swap(AtomicSwapPending) | Fallback（Native 图片 /
      无旧窗 → 回退 set_wallpaper 三阶段，先关后设）
 
-build_new_renderer(pending)                            [锁外, 旧壁纸持续可见]
-  └─ 创建渲染器（视频 spawn mpv + IPC 连接 ≤2s）
+build_new_renderer(pending)                            [锁外 spawn_blocking, 旧壁纸持续可见]
+  └─ 创建渲染器（视频 spawn mpv + IPC 连接 ≤2s：40×50ms）
      Err → 旧壁纸原封不动，零回滚成本
      BuildOutcome::Skip（new.id == 旧.id）→ 短路跳过整个 swap
 
@@ -307,10 +329,10 @@ build_new_renderer(pending)                            [锁外, 旧壁纸持续�
   步骤A [锁内]: embed_atomic_into(new, display_id)
                 → 新窗以 HWND_BOTTOM 藏在旧之下
                 + after_embed（视频: IPC loadfile, fire-and-forget）
-  步骤B [锁外]: wait_new_ready(new, ATOMIC_SWAP_READY_TIMEOUT, 100ms)
-                - 视频: 轮询 mpv 至 width>0 且 idle-active=no（首帧就绪,
-                 复用 diagnostic_playback_status）
-                - 图片/GIF: 立即就绪（无首帧延迟）
+  步骤B [锁外]: wait_new_ready(new, ATOMIC_SWAP_READY_TIMEOUT=8s, 100ms)
+                - 视频: poll_first_frame_ready 轮询 mpv 至 width>0 且 idle-active=no
+                - 图片/GIF: 轮询首次 WM_PAINT 完成标志（first_frame_ready）
+                - 网页: trait 默认立即就绪（无内容渲染信号，已知限制）
                 - 失败/超时 → terminate new, 返回 Err（旧照常, 零成本）
   步骤C [锁内]: commit_atomic_swap(new, display_id, source, type)
                 + 一次换槽 old→new（wallpapers / pause_senders / mode / sources）
@@ -319,11 +341,13 @@ build_new_renderer(pending)                            [锁外, 旧壁纸持续�
                 → 新（已就绪渲染）瞬时浮现, 无黑屏
 ```
 
+> **当前实测（2026-11-24 dev）**：视频壁纸切换（上一张 379ms / 下一张约 431ms），目标 <0.5s，已达标；**图片切换已实测 825–1943ms**（视频→5115×2826 JPG 就绪 849.6 / 完成 1139.9ms；JPG→7500×5000 PNG 1838.7 / 1943.2ms；回切 825.3 / 929.2ms），**未达 <0.5s**，瓶颈为大图解码/降采样；目标不放宽，列为待优化。
+
 #### 关键设计点
 
 - **旧壁纸无需暂停**：占位 = 旧壁纸保持原状继续显示/播放。构建窗口内我们不关它、不碰它，它天然盖住屏幕（视频继续播、图片静止）。**暂停反而让视频停在某帧、体验更差，因此不做**。
 - **z 序决定性（DR-33）**：新窗以 `HWND_BOTTOM` 藏在旧壁纸之下，故新窗加载期间**旧画面稳定在上层可见**；步骤 C terminate 旧、揭示**已就绪**的新窗 → 切换是一帧瞬时跳变，无黑屏。
-- **首帧就绪等待（DR-33，锁外）**：`after_embed` 为 fire-and-forget（video.rs 注释），不保证首帧已渲染。**必须在步骤 B 锁外轮询 mpv 至 `width>0 且 idle-active=no`（复用 `diagnostic_playback_status`）后才 terminate 旧**；图片/GIF 无首帧延迟、立即就绪。等待在锁外进行且旧壁纸在上层盖屏，故不占引擎锁。
+- **首帧就绪等待（DR-33，锁外）**：`after_embed` 为 fire-and-forget（video.rs 注释），不保证首帧已渲染。**必须在步骤 B 锁外轮询 mpv 至 `width>0 且 idle-active=no`（`poll_first_frame_ready`）后才 terminate 旧**；图片/GIF 自 2026-11 起同样轮询首次 WM_PAINT 完成标志，网页类型为默认立即就绪。等待在锁外进行且旧壁纸在上层盖屏，故不占引擎锁。
 - **引擎单槽 / 回滚 / 一致**：旧壁纸从头到尾**不脱离槽位、不被关闭**，只在步骤 C 锁定临界区内"旧→新一次性换槽 + terminate 旧"。故全程 map 一致、**无瞬时不一致**；build / wait_new_ready 任一失败 → 返回 Err，旧壁纸原封不动，**无需 resume**（失败零代价）。
 - **Native 图片路径**：`ScalingMode` 部分 Image 走 `set_native_wallpaper_internal`（SystemParametersInfo，无 WorkerW/hwnd），无旧窗可压在下面 → **该路径回退现行为**（先关后设），Native 设置本身很快，可接受。
 
@@ -388,6 +412,7 @@ resolve_boot(unit):
 - **恢复当前 = 无条件基础行为**（不受 `rotation.enabled` 门控），修启动空屏（DR-2/DR-12）。
 - 启动恢复的壁纸若是 Web（手动设的延续）→ **允许恢复**（豁免层，DR-18）。
 - on_boot 推进时跳过 Web 取池内下一张。
+- 实现细节：`apply_boot` 逐单元执行并记录 `restore/advance/none` 与耗时；Restore/Advance 成功后更新 current、写入历史栈并 emit `wallpaper-rotated`；单单元失败计入汇总日志但不阻断其余单元。
 
 > 语义确认：`on_boot` 仅在**应用启动**时生效——`on_boot=true` 则启动时推进一张，否则只恢复 current；睡眠/休眠恢复**不重新 boot**，只重算 deadline（DR-13）。
 
@@ -397,7 +422,7 @@ resolve_boot(unit):
 
 ### Layer 1 · 渲染器播放暂停（已有）
 
-`PauseReason` 位图（FULLSCREEN / BATTERY / TRAY）→ `pause_all_fast` 逐渲染器下发命令：
+`PauseReason` 位图（FULLSCREEN / BATTERY / TRAY）→ `pause_all_fast` 逐渲染器下发命令（是否杀进程取决于 `pause.fullscreen_action`，默认 `terminate`）：
 
 | 类型 | 暂停成本 | 全屏暂停 |
 |---|---|---|
@@ -410,11 +435,12 @@ resolve_boot(unit):
 
 ### Layer 2 · 调度器轮换暂停（新增）
 
-- `pause_reasons` 非空 → **抑制轮换触发**（换图动作暂停，不是壁纸播放暂停）。
+- `pause_reasons` 非空 → **抑制定时轮换触发**（换图动作暂停，不是壁纸播放暂停）。
 - 位图清空 → **重算下一次 deadline（不补时）**（DR-9）。
 - 手动下一张不受暂停限制，但 apply 完成后若处于暂停态 → **新壁纸跟随暂停**（DR-20）。
+- **纯净壁纸模式**：`pure_mode::is_active()` 为真时，定时轮换、手动下一张、切池立即换图**全部抑制**（模式内画面与置顶状态不可被破坏）；退出模式后经 `wake` 重算 deadline。
 
-**联动**：调度器读取 `pause_reasons.is_empty()` 决定是否抑制轮换；apply 完成瞬间检测暂停态补发暂停。
+**联动**：调度器读取 `pure_mode::is_active()` 与 `pause_reasons.is_empty()` 决定是否抑制轮换；apply 完成瞬间检测暂停态补发暂停。
 
 ---
 
@@ -428,15 +454,15 @@ resolve_boot(unit):
 - S5 池空 / 仅 1 张 → 只恢复不轮换。
 
 ### 触发
-- T1 定时间隔到点 + 暂停中 → 抑制，恢复后重计。
-- T2 手动下一张 + 暂停中 → 执行，完成后跟随暂停。
+- T1 定时间隔到点 + 暂停中 / 纯模式 → 抑制，恢复后重计。
+- T2 手动下一张 + 暂停中 → 执行，完成后跟随暂停；纯模式内 → 跳过。
 - T3/T4 唤醒 / 池<2 → 唤醒仅重算 deadline，不推进、不重新 boot；池<2 时单元空闲（DR-14）。
 - T5 current 是手动临时覆盖的池外壁纸 → 保持显示，下次轮换回到池内。
 
 ### 采样
-- C1 洗牌袋抽到已删/缺文件 → 袋内移除重抽。
-- C2 顺序游标指向已删 id → 前跳下一个有效 id。
-- C3 纯随机连续抽同张 → 接受（特性）。
+- C1 洗牌袋抽到已删/缺文件 → 抽取前按当前候选剔除袋内残留，再抽。
+- C2 顺序游标指向已删 id → 前跳第一个有效候选。
+- C3 纯随机**排除当前壁纸**，不会连续抽中同一张；历史文档“连续同张接受”为旧口径。
 - C4 袋空重洗。
 - C5 运行中改池（增删/重排/换 active_pool）→ 该单元 bag/cursor **失效重建**，当前壁纸保留（DR-23）。
 
@@ -452,7 +478,7 @@ resolve_boot(unit):
 
 ### 持久化 / 删除 / 多屏排列
 - PS1 playback 写失败 → 内存态继续 + 日志。
-- PS2 写频防抖（DR-29）。
+- PS2 playback 为低频状态，写入采用临时文件 + fsync + rename 原子写，不做增量防抖合并（DR-29 的旧“防抖”表述已简化）。
 - PS3 编排切换迁移（DR-22）。
 - PS4 active_pool 指向已删池 → 回退"全部"池。
 - D1 删当前壁纸 + 轮换开 → 换下一张。
@@ -471,45 +497,52 @@ resolve_boot(unit):
 ## 12. 并发与一致性
 
 - **锁序**（遵循现有约定）：`AppState.wallpaper_engine` (tokio Mutex) → engine 内部锁 → `desktop` (std Mutex)。
-- **串行化 guard**（§8.1）：手动与自动两条 set 路径统一排队；guard 跨 build / 嵌入 / 首帧就绪 / commit 持有须异步感知，不阻塞 tokio worker。
+- **串行化 guard**（§8.1）：手动与自动两条 set 路径统一排队；guard 跨 build / 嵌入 / 首帧就绪 / commit 持有；`build_new_renderer` / `wait_new_ready` 走 `spawn_blocking`，不阻塞 tokio worker。
+- **原子交换互斥**：A→C 期间 `ATOMIC_SWAP_IN_PROGRESS` 置位，全屏终止/恢复路径检测后跳过本次，避免交换期间重建桌面层。
 - **调度器内部无跨单元锁竞争**：采样纯内存计算；apply 复用现有引擎锁 / desktop 锁序（原子交换按锁内、锁外分段）。
-- **单实例**：已有 `ensure_single_instance` 保护（CreateMutexW，main.rs），天然杜绝多实例双调度器竞争（DR-31）。
-- **暂停状态变化唤醒（DR-38）**：暂停抑制轮换期间，`pause_reasons` 清空经 `SchedulerHandle.wake.notify_waiters()` 立刻唤醒调度器重算 deadline（不补时）。
+- **单实例**：`ensure_single_instance` 保护（CreateMutexW，`main.rs`）；第二实例经 `single_instance::signal_primary_instance`（命名事件）唤起已运行实例主窗口，天然杜绝多实例双调度器竞争（DR-31）。
+- **暂停状态变化唤醒（DR-38）**：暂停抑制轮换期间，`pause_reasons` 清空经 `SchedulerHandle.wake.notify_waiters()` 立刻唤醒调度器重算 deadline（不补时）。纯模式退出同样唤醒。
 
 ---
 
 ## 13. 配置热重载响应
 
-接入现有 `ConfigManager` 热重载（`update_config` + **500ms** 防抖 + 文件 watcher + 周期性保存）：
+接入现有 `ConfigManager` 热重载（`update_config` + **500ms** 文件监控防抖 + 300ms 落盘防抖 + 周期性保存）：
 
 | 配置变更 | 调度器响应 |
 |---|---|
-| `interval_minutes` | 重算下次 deadline |
-| `order` | 重建该单元采样器（袋重洗 / 游标保留） |
-| `arrangement` | 多屏排列迁移（§4.4）；多屏排列唯一来源，变更时经通用配置路径（`update_config` / `update_arrangement` / 热更新回调）同步 `WallpaperEngine.arrangement`（引擎锁忙则 warn 跳过，下次配置变更补齐） |
+| `interval_minutes` | 重算下次 deadline；`update_rotation_config` 命令层硬校验 `[1, 1440]`，越界返回 `InvalidConfig`（不由 core 静默 clamp） |
+| `order` | 每次采样读取最新 `rotation.order`；池/配置变更时失效重建采样器（袋重洗 / 游标锚定 current） |
+| `arrangement` | 多屏排列迁移（§4.4）；变更时 `update_config` / `update_arrangement` / 热更新回调同步 `WallpaperEngine.arrangement`（阻塞获取 engine 锁，不复用“锁忙跳过”），并 `wake` 让调度器重建布局 |
 | `enabled`（全局/单元） | 立即参与/退出轮换 |
 | 池成员 / 重排 | 该单元 bag/cursor **整体失效重建**（DR-23，不做增量合并） |
+| `audio` / `video.speed` | `engine.set_playback_settings` 种入新建渲染器；运行态即时变更走 `apply_playback_setting` 广播既有渲染器 |
+| `scaling.modes` | `engine.seed_scaling_modes` 重新种入 per-display 缩放记忆 |
 | `on_boot` | 下次应用启动生效（唤醒不重新 boot） |
 
-**通知机制（实现要点）**：调度器不订阅独立配置通道，而是**每次醒来重读** `AppConfig`；"配置已应用"由 `SchedulerHandle.wake: Arc<tokio::sync::Notify>` 统一唤醒（`notify_waiters()`，与暂停位图变化 / 纯模式退出共用，见 §6），避免轮询。`update_config`（命令路径）与文件 watcher 回调均调用 `wake.notify_waiters()`；手动「下一张」另经 `manual_tx: tokio mpsc::UnboundedSender<Option<String>>`。`update_config` 与调度器 deadline 计算的并发通过 engine 锁/调度器内部互斥串行化。
+**通知机制（实现要点）**：调度器不订阅独立配置通道，而是**每次醒来重读** `AppConfig`；"配置已应用"由 `SchedulerHandle.wake: Arc<tokio::sync::Notify>` 统一唤醒（`notify_waiters()`，与暂停位图变化 / 纯模式退出共用，见 §6），避免轮询。`update_config`（命令路径）与文件 watcher 回调均调用 `wake.notify_waiters()`；手动「下一张」经 `manual_tx`，切换活跃池经 `pool_apply_tx`。`update_config` 与调度器 deadline 计算的并发通过 engine 锁/调度器内部互斥串行化。
 
 ---
 
 ## 14. 命令与 UI 接口
 
-### 命令（Tauri command，全部注册于 `generate_handler!`）
+### 命令（Tauri command；业务命令经 `ui_proto` 桥被 `mirrorstar-ui` 调用）
 
 ```
 get_rotation_config / update_rotation_config
-list_pools / create_pool / update_pool / delete_pool     # 池 CRUD（含成员有序）
-set_active_pool(key, pool_id)                            # 单元绑定激活池
-set_rotation_enabled(key, enabled)                       # 单元/全局（"all"）开关
-next_wallpaper(key?)                                     # 手动下一张（当前/主单元）
+list_pools / create_pool / update_pool / delete_pool / reorder_pools   # 池 CRUD（含成员有序）
+get_unit_states                                                       # 单元状态回读（UnitStateDto）
+set_active_pool(key, pool_id)                                         # 单元绑定激活池 + 立即换图
+set_rotation_enabled(key, enabled)                                    # 单元/全局（"all"）开关
+next_wallpaper(key?)                                                  # 手动下一张（当前/主单元）
+prev_wallpaper(key?)                                                  # 回退历史栈上一张（可返回 None）
 ```
+
+> 命令名与 Tauri 命令逐字一致；`mirrorstar-ui` 通过 `ui_proto` 的 `Request{command, params}` 发起，`ui_process::bridge` 直接映射到 `commands::*`，不复制业务逻辑（历史上“仅经 WebView invoke”的口径已不适用）。
 
 **手动下一张的目标单元（DR-36）**：`next_wallpaper` 缺省作用于**主显示器单元**（`PerMonitor` 下主屏）或唯一单元（`AllSame`/`Span`），可显式传 key 指定其他屏。
 
-> 注（DR-40/E）`set_active_pool` / `set_rotation_enabled` 在 `Arrangement≠PerMonitor`（即 AllSame/Span 单单元）时须校验目标 key 与当前调度单元一致，拒绝指向不存在单元的 key，避免孤儿单元。
+> 注（DR-40/E）`set_active_pool` / `set_rotation_enabled` 在 `Arrangement≠PerMonitor`（即 AllSame/Span 单单元）时须校验目标 key 与当前调度单元一致，拒绝指向不存在单元的 key，避免孤儿单元。校验规则统一由 `layout::validate_unit_key` 提供。
 
 **首次运行默认（DR-37）**：无 playback / 无显式池时 → `active_pool = None`（回退隐式"全部"池）+ `rotation.enabled = false` + `interval_minutes = 30` + `order = sequential` + `on_boot = false`。避免开箱即动。
 
@@ -517,27 +550,38 @@ next_wallpaper(key?)                                     # 手动下一张（当
 
 - 复用 `wallpaper-state-changed`（状态刷新）。
 - 新增 `wallpaper-rotated { key, wallpaper_id }`（DR-30），供 UI 高亮当前壁纸。
+- 显示器热插拔：`displays-changed`（3s 轮询，集合真变化才发射）。
+- 上述事件与其余壳侧事件共 14 个，由 `ui_process::bridge::FORWARDED_EVENTS` 统一转发给 UI 子进程。
 - AllSame 多屏会 emit N 个状态事件，UI 合并去重。
 
 ### UI 元素（原生 UI 子进程 `mirrorstar-ui`）
 
-- **设置面板**：轮换开关（全局）、间隔、算法、on_boot、多屏排列（每屏独立/每屏同图/跨屏合并，多屏排列唯一入口）。
+- **设置面板**：轮换开关（全局）、间隔（NumberStepper 上限 1440）、算法、on_boot、多屏排列（每屏独立/每屏同图/跨屏合并，多屏排列唯一入口）。
 - **池编辑器**：池 CRUD + 成员拖拽排序（自定义顺序载体）。
 - **单元配置**：每屏/全体绑定激活池、单元轮换开关。
 - **壁纸卡片**：显示所属池；Web 壁纸标注"不参与轮换"。
-- **手动"下一张"**：UI 按钮 + 托盘菜单（DR-28，托盘现有 open/pause_resume/quit 三项，新增"下一张壁纸"）。
+- **手动换图**：UI 按钮（下一张 / 上一张）+ 托盘菜单（DR-28；托盘当前 **5 项**：open / next_wallpaper / pause_resume / pure_mode / quit）。
 
 ---
 
 ## 15. 性能与资源预算
 
 - 采样纯内存，开销可忽略；重头在渲染器创建（原子交换的 `build_new_renderer`，或回退路径的 `set_wallpaper`）。
-- **定时间隔范围 1–1440 分钟（默认 30）**：core 下限 clamp = 1 分钟（60s，DR-16），防短间隔反复 spawn/kill 视频进程、与冷启动竞态；UI 滑块上限 1440。
+- **定时间隔范围 1–1440 分钟（默认 30）**：core 下限 clamp = 1 分钟（60s，DR-16），防短间隔反复 spawn/kill 视频进程、与冷启动竞态；UI NumberStepper 上限 1440；命令层对越界值返回 `InvalidConfig`。
 - apply 串行执行（DR-17），杜绝并发换图。
-- AllSame 顺序 apply N 屏；多视频同时冷启动的内存峰值需在文档测试阶段验证。
-- playback 写入防抖（复用 `maybe_save_config` 模式）（DR-29）。
+- AllSame 顺序 apply N 屏；多视频同时冷启动的内存峰值需在文档测试阶段验证（历史待测项）。
+- playback 为低频状态，采用临时文件 + fsync + rename 原子写（DR-29 的“防抖”为旧表述，已简化）。
 - 事件广播容量足够，UI 合并去重。
 - 轮换动作打 tracing 日志（换到哪张、为什么、失败原因）（DR-32）。
+
+**当前实测口径（2026-11-24 dev）**：
+
+| 指标 | 实测 | 目标 |
+|---|---|---|
+| 视频壁纸切换 | 上一张 379ms / 下一张约 431ms | <0.5s（达标） |
+| 暂停态主进程内存 | Private 8.7MB / WS 22.9MB | <25MB（达标） |
+| 图片壁纸切换 | 825–1943ms（2026-11-24 dev，未达标） | <0.5s |
+| WebView2 冷启动 | 历史估算最长 8s（旧口径，待复测） | 不参与轮换（DR-18） |
 
 ---
 
@@ -546,11 +590,12 @@ next_wallpaper(key?)                                     # 手动下一张（当
 ```
 Tauri setup
   ├─ 调度器初始化（见 §5·初始化）：读 RotationConfig/playback → 启动对账（DR-34）→ 枚举显示器建/对齐单元
+  ├─ engine.set_arrangement 同步顶层排列
   ├─ apply_boot() → 启动时一次解析 + 一次 apply（§9）
-  └─ 进入调度器主循环（§5）：`select!` 等待 `wake.notified()` / `manual_rx.recv()` / 定时 sleep / 显示器轮询（§13）
+  └─ 进入调度器主循环（§5）：`select!` 等待 `wake.notified()` / `manual_rx` / `pool_apply_rx` / 定时 sleep / 3s 显示器轮询（§6、§13）
 ```
 
-与现有 Explorer 重启监控 / `WM_DISPLAYCHANGE` / `WM_DPICHANGED` 处理协调：Explorer 重启后壁纸重嵌由现有逻辑负责，调度器状态不受影响。
+与现有 Explorer 重启监控 / `WM_DISPLAYCHANGE` / `WM_DPICHANGED` 处理协调：Explorer 重启后壁纸重嵌由现有逻辑负责，调度器状态不受影响；调度器自身用 3s 轮询兜住 message-only 窗口收不到的显示器变化。
 
 ---
 
@@ -558,9 +603,10 @@ Tauri setup
 
 | 测试点 | 覆盖 |
 |---|---|
-| 采样算法（纯函数） | 顺序游标 id 锚定、洗牌袋不重复/袋空重洗、纯随机、Web 剔除、<2 空闲 |
+| 采样算法（纯函数） | 顺序游标 id 锚定、洗牌袋不重复/袋空重洗、纯随机排除当前、Web 剔除、<2 空闲 |
 | 启动解析决策树 | on_boot × enabled × 池≥2 × current 已删 全组合；current 已删 + 轮换开 → 推进填充避免空屏（DR-21） |
-| 暂停联动 | PauseReason 位图交互（FULLSCREEN/BATTERY/TRAY 叠加）、恢复后重计、新壁纸跟随暂停 |
+| 历史栈 / 上一张 | prev 消费即 pop、连续回退逐级、Busy 不吞历史、失败继续 pop、上限 100 |
+| 暂停联动 | PauseReason 位图交互（FULLSCREEN/BATTERY/TRAY 叠加）、恢复后重计、新壁纸跟随暂停、纯模式抑制 |
 | skip-broken | apply 失败保持旧壁纸 + 游标推进 |
 | 池编辑一致性 | 增删/重排/换 active_pool 后 bag/cursor 失效重建 |
 | 编排迁移 | PerMonitor↔AllSame/Span 状态合并/分发 |
@@ -581,10 +627,10 @@ Tauri setup
 | DR-1 | 调度器 = 换壁纸动作的唯一决策者（WHEN/WHICH/HOW），渲染下放 `WallpaperEngine`（轮换原子交换，Native/无旧窗回退 `set_wallpaper` 三阶段） | 已定 |
 | DR-2 | 多屏排列重构为 PerMonitor/AllSame/Span → 调度单元；同步/去重被吸收；**多屏排列唯一来源 = 顶层 `AppConfig.arrangement`**（DR-2 布局域，独立于轮换配置） | 已定 |
 | DR-3 | 池即有序播放列表（自定义顺序载体），顺序算法追随它 | 已定 |
-| DR-4 | 三种算法全做：顺序循环/洗牌袋/纯随机 | 已定 |
+| DR-4 | 三种算法全做：顺序循环/洗牌袋/纯随机（2026-11-24 核对：纯随机实现已排除当前壁纸，不再允许连续同张） | 已定 |
 | DR-5 | 游标 id 锚定（非 index），重排后从当前 id 继续 | 已定 |
 | DR-6 | 关轮换：全局 `rotation.enabled` + 每单元 `enabled` | 已定 |
-| DR-7 | 触发系统可组合；本期五源：定时/启动/唤醒（仅重算 deadline）/手动/暂停位图变化 | 已定 |
+| DR-7 | 触发系统可组合；本期五源：定时/启动/唤醒（仅重算 deadline）/手动/暂停位图变化（2026-11-24 实现补充：另有切换活跃池 `pool_apply_tx` 与 3s 显示器轮询） | 已定 |
 | DR-8 | 定时用 deadline（sleep_until），无漂移 | 已定 |
 | DR-9 | 轮换跟随暂停；恢复后重计不补时；手动不受暂停限制 | 已定 |
 | DR-10 | 手动设池外壁纸 = 临时覆盖，下次触发换回池内 | 已定 |
@@ -603,18 +649,18 @@ Tauri setup
 | DR-23 | 手动设池内壁纸 → 游标定位到该 id 之后；池外 → 游标不动 | 已定 |
 | DR-24 | 池成员去重 | 已定 |
 | DR-25 | 轮换新壁纸继承该屏当前缩放模式（per-display 记忆） | 已定 |
-| DR-26 | apply 完成后应用全局 speed（新渲染器不继承 speed 的缺口） | 已定 |
+| DR-26 | apply 完成后应用全局 speed（新渲染器不继承 speed 的缺口）——2026-11-24 核对：缺口已闭合，`RendererConfig.video_speed` 由 `set_playback_settings` 种入并在创建时携带 | 已定 |
 | DR-27 | 音量经共享 VolumeControl 自动继承，无需特殊处理 | 已定 |
 | DR-28 | 托盘新增"下一张壁纸"菜单项 | 已定 |
-| DR-29 | playback 写频防抖（复用 maybe_save_config 模式） | 已定 |
-| DR-30 | 新增 `wallpaper-rotated` 事件；复用 `wallpaper-state-changed` | 已定 |
-| DR-31 | 单实例保护已存在（`ensure_single_instance`，CreateMutexW，main.rs），天然防双调度器竞争 | 已确认 |
+| DR-29 | playback 写频防抖（复用 maybe_save_config 模式）——2026-11-24 核对：实现为低频直接原子写（temp+fsync+rename），无防抖合并 | 已定 |
+| DR-30 | 新增 `wallpaper-rotated` 事件；复用 `wallpaper-state-changed`（两者均经 ui_process bridge 转发给 `mirrorstar-ui`） | 已定 |
+| DR-31 | 单实例保护已存在（`ensure_single_instance`，CreateMutexW，main.rs）；第二实例经命名事件唤起主窗口（`single_instance.rs`），天然防双调度器竞争 | 已确认 |
 | DR-32 | 调度器日志（tracing）+ 损坏文件回退 + 任务 panic 自愈 | 已定 |
 | DR-33 | 切换中间态：原子交换（方案 C）——旧壁纸保持显示作占位，`prepare_atomic_swap` → `build_new_renderer` → `embed_atomic_into`（HWND_BOTTOM）→ `wait_new_ready`（锁外首帧就绪）→ `commit_atomic_swap` 后才 terminate 旧，杜绝无壁纸窗口；无需暂停、不离开槽位、回滚零代价。`set_wallpaper` 三阶段仅手动设壁纸/回退。详见 §8.4 | 已定 |
 | DR-34 | 启动对账：孤儿 key、失效引用（current/active_pool/order_cursor/bag_remaining）清理回退（显示器 id 会变、三文件非原子） | 已定 |
 | DR-35 | 隐式"全部"池 = 全集，随库变化，不随池成员 | 已定 |
 | DR-36 | 手动下一张缺省作用于主显示器单元 | 已定 |
-| DR-37 | 首次运行默认：全部池 + rotation.enabled=false + 30min + sequential + on_boot=false | 已定 |
+| DR-37 | 首次运行默认：全部池 + rotation.enabled=false + 30min + sequential + on_boot=false（2026-11-24 核对：`Order::default() = Sequential`，并有旧默认 shuffle_bag→sequential 的一次性迁移） | 已定 |
 | DR-38 | 暂停状态为事件唤醒源：pause_reasons 清空（resume_all_fast 后）经 `SchedulerHandle.wake.notify_waiters()` 唤醒调度器重算 deadline，不补时 | 已定 |
 | DR-39 | AllSame 换图窗口期各屏瞬时 新/旧 混杂为已知接受项（顺序逐屏原子交换） | 已定 |
 | DR-40 | 原子交换双窗安全：以 active_wallpapers map 为唯一权威，pending 新窗对布局逻辑不可见，不屏蔽事件；桌面重建丢弃 in-flight swap + commit 前父窗口校验 | 已定 |

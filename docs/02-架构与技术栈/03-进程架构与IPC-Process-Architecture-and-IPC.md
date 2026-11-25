@@ -6,8 +6,8 @@
 | ---- | ------------------------- |
 | 项目名称 | MirrorStar Wallpaper（镜星壁纸） |
 | 文档版本 | v3.0                      |
-| 更新日期 | 2026-10-11                |
-| 文档状态 | 已实现（已按真实代码合并重组，2026-10）        |
+| 更新日期 | 2026-11-24                |
+| 文档状态 | 已实现（已按真实代码核对，2026-11-24）        |
 
 > 本文由原《进程架构》与《基础设施》的 IPC/序列化章节、以及《UI 框架》的 UI 子进程边界/按需启动/空闲退出/单实例/托盘章节合并去重而成。
 
@@ -42,8 +42,8 @@
 └──────────────┘  │  │ WebView2 环境  │  │  │ 按需启动 · 空闲超时退出  │  │
                   │  └────────────────┘  │  └──────────────────────────┘
                   └──────────────────────┘
-                     ↑ 仅 Web 壁纸时启动      ↑ 托盘"打开主窗口"时启动
-                     ↑ 关闭 Web 壁纸时终止    ↑ 窗口隐藏超时后退出
+                     ↑ 仅 Web 壁纸时启动      ↑ 托盘打开/左键或二次启动时
+                     ↑ 关闭 Web 壁纸时终止    ↑ 关闭即退出/隐藏超时后退出
 ```
 
 **设计原则：**
@@ -56,10 +56,27 @@
 
 **内存优化：**
 - 无 Web 壁纸、无主窗口时，无额外常驻渲染子进程；仅壳进程常驻（视频壁纸时另有按需的 mpv.exe，网页壁纸时另有按需的 --wp-proc 子进程）
-- WebView2 运行时仅加载在子进程中，壳进程不加载 webview2-com
+- 壳进程不创建 WebView2 主窗口/环境；WebView2 仅在网页壁纸 `--wp-proc` 子进程（以及 UI 进程的临时网页预览）中按需加载
 - 子进程在 Web 壁纸关闭时立即终止，释放全部内存
 - UI 子进程在关闭主窗口（关闭按钮 / Alt+F4）时立即退出；托盘隐藏时保留进程，隐藏超时（默认 300s，环境变量 `MIRRORSTAR_UI_IDLE_TIMEOUT_SECS`）后退出回收内存，再次请求可重新拉起；同一时刻至多一个实例
+- UI 子进程由壳侧 Job Object（`JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`）兜底：壳退出/崩溃时内核回收 UI 及其后代（预览 mpv / WebView2），与 UI 自身的正常退出路径互补
 - 无独立看门狗进程（mirrorstar-watchdog 已在阶段2移除）
+
+**当前实测基线（2026-11-24，Debug 构建）**
+
+| 场景 | Private | Working Set |
+|------|---------|-------------|
+| 壳，UI 关闭、暂停态 | 8.7MB | 22.9MB |
+| 壳，UI 关闭、活跃视频态 | 7.7–8.6MB | 21.7–22.8MB |
+| 壳 + UI（不含 mpv） | 14.1–16.7MB | 43.2–46.9MB |
+| mpv 子进程 | 430.8–432.2MB | 202.5–204.1MB |
+
+- 目标（壳进程 Private）：暂停态 <25MB、活跃视频态 <30MB；上表两项均低于目标
+- 壳进程（UI 关闭、视频播放）采样约 **22 线程 / 270 句柄**
+- 启动：冷启动 `setup_ready` 43ms；热启动首次 441ms、后续 133–164ms（目标均 <0.5s）
+- 关闭主窗口：UI 子进程 93ms 内退出；空闲回收默认 300s（`DEFAULT_IDLE_TIMEOUT_SECS = 300`，`src-tauri/src/ui_process/mod.rs`）
+- 视频切换：379–431ms（目标 <0.5s）
+- 上述为单机 Debug 实测值，仅作基线参考，随机器与构建配置变化
 
 **关键澄清：** wp-proc **仅**处理 Web 壁纸。视频壁纸使用外部 `mpv.exe`，GIF/图片在壳进程内渲染，主窗口 UI 由 `mirrorstar-ui.exe` 负责。这**不是**一个统一处理所有壁纸类型的子进程。
 
@@ -116,7 +133,7 @@ fn ensure_single_instance() -> bool {
 
 ### 1.3 子进程架构
 
-壁纸渲染层面存在**两种**按需启动的子进程，由 `ProcessManager`（`crates/mirrorstar-core/src/process/manager.rs`，以实测为准）统一管理：`CreateProcessW` 启动 + 3 秒等待 + `TerminateProcess` 强制终止，提供 `is_running()` / `pid()` / `handle()` 状态查询。此外，主窗口 UI 是**第三种**按需子进程（`mirrorstar-ui.exe`），由壳侧 UI 子进程管理模块负责（见下文）。
+壁纸渲染层面存在**两种**按需启动的子进程，由 `ProcessManager`（`crates/mirrorstar-core/src/process/manager.rs`，以实测为准）统一管理：`CreateProcessW` 启动 + 3 秒等待 + `TerminateProcess` 强制终止，并把子进程关联到 `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE` Job Object（管理器析构/显式停止时由内核兜底终止，避免孤儿进程），提供 `is_running()` / `pid()` / `handle()` 状态查询。此外，主窗口 UI 是**第三种**按需子进程（`mirrorstar-ui.exe`），由壳侧 UI 子进程管理模块负责（见下文）。
 
 #### mpv.exe（视频壁纸子进程）
 
@@ -127,19 +144,20 @@ fn ensure_single_instance() -> bool {
 - **find_mpv() 路径查找策略**：
   1. 优先检查捆绑路径 `<exe_dir>/mpv/mpv.exe`
   2. 回退到系统 PATH 中的 `mpv.exe`
-- **启动参数**（部分）：`--idle=no`、`--loop-file`、`--hwdec=auto`、`--vo=gpu`、`--force-window=yes`、`--input-ipc-server=\\.\pipe\mirrorstar-mpv-{uuid}`、`--title=MirrorStarVideo`
+- **启动参数**（部分）：`--idle=yes`、`--loop-file`、`--hwdec=auto`、`--vo=gpu`、`--force-window=yes`、`--input-ipc-server=\\.\pipe\mirrorstar-mpv-{uuid}`、`--title=MirrorStarVideo`。mpv 以 `--idle=yes` 空窗口启动，**视频文件不作为命令行参数传入**，而是在窗口创建后经 IPC `loadfile` 加载（见 `video.rs`），因此启动参数中不得包含视频路径
 
 #### 壳进程 `--wp-proc` 模式（Web 壁纸子进程）
 
 - **启动方式**：由 `WebRenderer`（`crates/mirrorstar-core/src/wallpaper/web.rs`，代理层）通过 `ProcessManager` 以 `--wp-proc` 模式 spawn 壳进程自身（`mirrorstar-wallpaper.exe --wp-proc`）
 - **控制方式**：`WpProcIpcClient`（`crates/mirrorstar-core/src/ipc/wp_proc.rs`）通过自定义 `WpProcCommand` 协议控制
 - **命名管道**：`\\.\pipe\mirrorstar-wp-{uuid}`（管道名 `mirrorstar-wp-{uuid}`，通过 `--pipe-name` CLI 参数传入）
-- **代码规模**：`crates/mirrorstar-wp-proc/`（5 个文件：com / command / ipc_server / main / webview；已由独立 exe 改为**库 crate**，随壳 exe 分发），使用 `webview2-com` crate
+- **代码规模**：`crates/mirrorstar-wp-proc/`（5 个文件：com / command / ipc_server / lib / webview；已由独立 exe 改为**库 crate**，随壳 exe 分发，由 `lib.rs` 的 `run` / `run_with_argv` 入口调用），使用 `webview2-com` crate
 - **CLI 参数**（`--wp-proc` 之后）：
   - `--source`：初始网页源（URL 或 file:// 路径）
   - `--pipe-name`：命名管道名称
   - `--title`：窗口标题（UUID，用于 `FindWindowW` 查找）
-  - `--rect`：初始窗口位置和大小
+  - `--rect`：初始窗口位置和大小（`x,y,width,height`；缺失或非法时按解析错误退出）
+  - `--cdp-port`：可选 Chrome DevTools 调试端口，**仅测试用**；设置 `MIRRORSTAR_WP_CDP_PORT` 时由壳追加，生产环境不传
 - **实现要点**：
   - 命名管道服务端：`CreateNamedPipeW` + `ConnectNamedPipe` + `BufReader`/`BufWriter`
   - IPC 线程：读取 JSON 命令行 → 反序列化 `WpProcCommand` → mpsc 发送到主线程 → `PostMessageW` 唤醒 → 等待响应 → 序列化写回管道
@@ -150,7 +168,7 @@ fn ensure_single_instance() -> bool {
 
 #### mirrorstar-ui.exe（原生 UI 子进程）
 
-- **启动方式**：托盘菜单"打开主窗口"时，由壳侧 UI 子进程管理模块按需 spawn（`crates/mirrorstar-ui/`，workspace 成员，二进制与主 exe 同目录）
+- **启动方式**：托盘菜单"打开主窗口"、托盘左键切换或二次启动唤起时，由壳侧 UI 子进程管理模块按需 spawn（`crates/mirrorstar-ui/`，workspace 成员，二进制与主 exe 同目录）；拉起+握手在独立线程执行，不阻塞托盘事件线程
 - **UI 技术**：Slint 1.18，**绑定软件渲染**（`default-features=false` + 仅 `renderer-software`），不编译 femtovg/skia，避免 winit 选择 OpenGL 后端带来的额外内存
 - **通信方式**：与壳进程通过 `mirrorstar-core::ui_proto` 的 **NDJSON 行协议 over stdio** 通信，消息类型 `Hello` / `Request` / `Response` / `Event` / `Control`
 - **职责边界**：仅负责界面呈现与用户交互（壁纸库展示、设置面板、拖放、搜索、虚拟化网格、四类预览）；**不复制业务逻辑、不直接读写配置文件**，所有业务经 `Request` 转发至壳侧处理
@@ -161,64 +179,106 @@ fn ensure_single_instance() -> bool {
 
 ### 1.4 COM 初始化策略
 
-MirrorStar **显式**初始化 COM，而非依赖 Tauri 内部初始化。相关进程均使用 STA（单线程单元）模式：
+MirrorStar **显式**初始化 COM，而非依赖 Tauri 内部初始化。实现上以 RAII guard（`ComGuard`）配对 `CoInitializeEx` / `CoUninitialize`，按线程职责选择 apartment：
 
-**壳进程**（`src-tauri/src/lib.rs` 的 `run()`）：
-
-```rust
-// 在主线程初始化 COM 为 STA 模式，与 Tauri/tao 的要求一致。
-// 必须在任何 COM 调用（如 VolumeControl::new）之前完成，
-// 否则 Tauri 的 OleInitialize 会因 COM 已被初始化为 MTA 而失败。
-unsafe {
-    use windows::Win32::System::Com::{CoInitializeEx, COINIT_APARTMENTTHREADED};
-    let hr = CoInitializeEx(None, COINIT_APARTMENTTHREADED);
-    // S_FALSE 表示已初始化，这是正常的
-    if hr.is_err() && hr != windows::core::HRESULT(0x80010106u32 as i32) {
-        // RPC_E_CHANGED_MODE = 0x80010106，如果已初始化为其他模式则忽略
-        hr.ok().expect("COM 初始化失败");
-    }
-}
-```
-
-**wp-proc 子进程**（壳 `--wp-proc` 模式，`crates/mirrorstar-wp-proc/`）：
+**壳进程主线程**（`src-tauri/src/lib.rs` 的 `run()`，STA）：
 
 ```rust
-let hr = unsafe { CoInitializeEx(None, COINIT_APARTMENTTHREADED) };
+// 主线程 STA，与 Tauri/tao 要求一致；必须在任何 COM 调用之前完成。
+let _com_guard = commands::wallpaper::ComGuard::new_sta_or_exit();
 ```
+
+- `new_sta_or_exit()` 调用 `CoInitializeEx(None, COINIT_APARTMENTTHREADED)`
+- `S_OK` / `S_FALSE` → 标记为已初始化，guard 在 `run()` 返回时 Drop 并调用一次 `CoUninitialize`
+- `RPC_E_CHANGED_MODE` → 记录 warn 并跳过 `CoUninitialize`（COM 规则：不允许在别的 apartment 模式下反初始化）
+- 其他错误 → `std::process::exit(1)`（主线程 COM 是必需依赖）
+
+**WASAPI 音量路径**（`commands::wallpaper::ComGuard::new()`，MTA）：
+
+```rust
+let _com_guard = ComGuard::new(); // CoInitializeEx(None, COINIT_MULTITHREADED)
+```
+
+- 在 `spawn_blocking` 线程上按 MTA 初始化，与 `VolumeControl` 的 WASAPI free-threaded 语义匹配
+- `RPC_E_CHANGED_MODE` 时跳过 `CoUninitialize`，失败仅记录 warn
+
+**wp-proc 子进程**（壳 `--wp-proc` 模式，`crates/mirrorstar-wp-proc/src/com.rs`，STA）：
+
+```rust
+ComGuard::new() // CoInitializeEx(None, COINIT_APARTMENTTHREADED)
+```
+
+- 返回 `Err` 时由 `run()` 向上传播，壳入口以退出码 1 结束子进程
+- `RPC_E_CHANGED_MODE` 视为致命错误（WebView2 要求 STA，MTA 下不可用），不再静默继续
 
 **要点：**
-- 壳进程在 `run()` 开头、任何 COM 调用（如 `VolumeControl::new`）之前显式调用 `CoInitializeEx(None, COINIT_APARTMENTTHREADED)`（STA）
-- 处理 `RPC_E_CHANGED_MODE`（`0x80010106`）：如果已初始化为其他模式则忽略，避免因重复初始化导致 panic
-- wp-proc 子进程同样调用 `CoInitializeEx(COINIT_APARTMENTTHREADED)`（STA），为 WebView2 提供正确的 COM 环境
-- **不是**"依赖 Tauri 内部 COM 初始化"——这是显式初始化，确保在 `VolumeControl::new()` 缓存 COM 接口之前 COM 已就绪
+- 壳主线程显式 STA，确保在 `VolumeControl::new()` 缓存 COM 接口、Tauri/tao 初始化之前 COM 已就绪
+- `ComGuard` 的 Drop 统一配对 `CoUninitialize`，并区分"是否真的由本 guard 初始化"（`S_FALSE` 也需配对，`RPC_E_CHANGED_MODE` 不配对）
+- 不存在"依赖 Tauri 内部 COM 初始化"的路径
 
 ### 1.5 启动时序
 
-壳进程 `run()`（`src-tauri/src/lib.rs`）的实际初始化顺序如下。**注意：无看门狗进程 spawn 步骤。**
+壳进程 `run()`（`src-tauri/src/lib.rs`）的实际初始化顺序如下。**注意：无看门狗进程 spawn 步骤。**（`pause_senders` 已移入 `WallpaperEngine`，不再是独立的初始化项。）
 
-1. **`init_logging()`** — tracing + tracing-subscriber + tracing-appender（按日滚动文件 + 标准输出双通道）
-2. **COM 初始化（STA）** — `CoInitializeEx(None, COINIT_APARTMENTTHREADED)`，必须在任何 COM 调用之前完成，处理 `RPC_E_CHANGED_MODE`
-3. **`DesktopIntegrator::new()`** — 保存原始系统壁纸，WorkerW 延迟初始化（此时不查找 WorkerW）
-4. **后台线程 `mirrorstar-workerw-init`** — `std::thread::Builder::spawn` 预初始化 WorkerW，调用 `ensure_initialized()`，失败时记录警告并在首次使用时重试
-5. **`VolumeControl::new()`** — WASAPI 音量控制，缓存 COM 接口（`IMMDeviceEnumerator` + `IAudioSessionManager2`）
-6. **`WallpaperEngine::new()`** — 创建壁纸引擎，传入 desktop 和 volume_control
-7. **`pause_senders` HashMap** — 初始化 `Arc<RwLock<HashMap<String, PauseSender>>>` 快速通道映射
-8. **`ConfigManager::new()` + `start_watching()`** — 配置管理器初始化 + 启动 notify crate 文件监视（热重载，500ms 防抖）
-9. **`start_fullscreen_monitor()`** — `SetWinEventHook(EVENT_SYSTEM_FOREGROUND)` 事件驱动全屏检测 + AtomicBool 状态去抖 + 自身窗口排除
-10. **`WM_POWERBROADCAST` 事件驱动** — 在 explorer 监控窗口的 wndproc 中处理 `PBT_APMPOWERSTATUSCHANGE` 消息，事件触发时一次性调用 `GetSystemPowerStatus` 读取状态（非轮询），电池供电时暂停壁纸
-11. **`start_explorer_restart_monitor()`** — 监听 `TaskbarCreated` 消息（事件驱动，Explorer 重启后重建 WorkerW）；**独立函数 `start_workerw_check()`** — 5 分钟（300 秒）轮询兜底（`is_workerw_valid()` + `check_and_reinitialize()`）
+**Phase 1：Tauri Builder 之前**
+
+1. **启动埋点** — `perf::mark_boot_stage("process_start")`
+2. **数据根初始化** — `config::init_data_root(config::resolve_data_root())`（便携化：数据根 = exe 所在目录），必须早于日志初始化
+3. **panic hook** — `install_panic_hook()`（追加写 `crash.log` + tracing 日志），必须早于其它线程 spawn
+4. **`init_logging()`** — tracing + tracing-subscriber + tracing-appender（按日滚动文件 + 标准输出双通道）；随后记录 `log_init` 生命周期/启动打点并建立 `boot_start` 基线
+5. **COM 初始化（STA）** — `ComGuard::new_sta_or_exit()`，详见 1.4
+6. **`DesktopIntegrator::new()`** — 保存原始系统壁纸，WorkerW 延迟初始化（此时不查找 WorkerW）
+7. **后台线程 `mirrorstar-workerw-init`** — 预初始化 WorkerW，调用 `ensure_initialized()`；失败仅告警并在首次使用时重试，JoinHandle 存 `WORKERW_INIT_THREAD` 供退出 join
+8. **`VolumeControl::new()`** — WASAPI 音量控制（缓存 COM 接口）；失败降级为 `new_disabled()` no-op，并记录 `audio_disabled`
+9. **`WallpaperEngine::new()`** — 传入 desktop 与 volume_control
+10. **`ConfigManager::new()`** — 失败 `std::process::exit(1)`
+11. **后台线程 `mirrorstar-boot-cleanup`** — 清理损坏缩略图、清空 WebView2 缓存目录（`webview2-cache/<pid>/`）、全量日志剪枝；均 best-effort
+12. **应用 GIF 内存策略 / 缩放模式 / 播放设置** — 从配置种入引擎
+13. **`config_manager.start_watching()`** — notify 文件监视（热重载，500ms 防抖）
+14. **`start_fullscreen_monitor()`** — `SetWinEventHook(EVENT_SYSTEM_FOREGROUND)` 事件驱动全屏检测 + 状态去抖 + 自身窗口排除
+15. **`start_explorer_restart_monitor()`** — 处理 `TaskbarCreated`、WorkerW/Progman 销毁、会话解锁、睡眠恢复，统一经 `try_heal_desktop_layer` 自愈；同一监控窗口的 wndproc 处理 `WM_POWERBROADCAST`（`PBT_APMPOWERSTATUSCHANGE` 时一次性 `GetSystemPowerStatus`，非轮询）
+16. **`cleanup_stale_child_processes()`** — 清理上次崩溃遗留的孤儿 `mpv.exe` / `mirrorstar-wp-proc.exe` / `mirrorstar-ui.exe`（仅限当前 exe 目录内）
+17. **`ui_process::init()`** — 解析 `mirrorstar-ui.exe` 路径与空闲阈值，仅初始化管理器，不主动拉起
+18. **`SchedulerHandle::new()`** — 构造轮换调度器共享句柄，存入 `SHARED_SCHEDULER`
+19. **`AppState` 构造** — 组装 config_manager / wallpaper_engine / desktop / scheduler / 托盘状态
+20. **自定义 Tokio runtime** — `worker_threads(2)` + 512KB 栈 + 8 个 blocking 线程，`tauri::async_runtime::set(handle)`
+21. **`liveness_watchdog`** — 必须在 `async_runtime::set()` **之后**启动（5s 采样 / 1.3s 确认 / 60s 冷却）
+
+**Phase 2：Tauri Builder + setup**
+
+22. **Builder** — 注册 `tauri-plugin-dialog` / `tauri-plugin-autostart`，`manage(app_state)`；setup 内依次：
+    - 设置 `SHARED_APP_HANDLE`
+    - 安装 UI 事件桥 `install_event_forwarding` + 启动空闲检查 `spawn_idle_tick`
+    - 安装二次启动监听 `single_instance::install_listener`
+    - 需要时 emit `audio-disabled`；启动内存归因采样（60s）与启动期内存时间线（前 60s，1s 间隔）
+    - 全局壁纸状态订阅任务、配置变更/配置加载错误回调
+    - 创建托盘菜单（5 项）与托盘图标
+    - `start_workerw_check()`（300s 兜底）
+    - `scheduler.start(app.handle())` 启动轮换主循环
+23. **`setup_ready` 打点** — 记录 `PERF-BOOT` 与启动阶段汇总
+
+**Phase 3：事件循环**
+
+24. **`.build(context).run(...)`** — `RunEvent::ExitRequested` 中：`code=None` → `api.prevent_exit()` 保持托盘驻留；`code=Some(_)` → 先 `ui_process::manager().shutdown()` 回收 UI，再 `perform_shutdown_blocking` 统一清理
 
 **关键说明：**
 - 启动序列中**无**看门狗进程 spawn 步骤（`mirrorstar-watchdog` crate 已在阶段2移除）
-- 壳进程崩溃时操作系统自动回收子进程（父子进程关系），不需要独立看门狗进程清理资源
+- 壳进程崩溃时操作系统自动回收子进程（父子进程关系 + Job Object），不需要独立看门狗进程清理资源
 - 主窗口 UI 子进程按需启动：启动时仅创建系统托盘图标，主窗口在用户点击托盘"打开主窗口"时由壳侧按需 spawn `mirrorstar-ui.exe`；关闭主窗口时 UI 子进程立即退出；托盘隐藏超时（默认 300s）后退出回收内存，壳侧不再创建任何 WebView2 主窗口
 
 ### 1.6 崩溃恢复（退出监听）
 
 针对壁纸子进程（mpv / wp-proc）的崩溃，仅通过 `spawn_proc_exit_monitor()`（`crates/mirrorstar-core/src/wallpaper/mod.rs`）监听其退出：当子进程以异常状态退出时，更新壁纸状态为 `Terminated` 并调用 `notify_state_changed` 通知壁纸引擎。
 
-- **无自动 respawn**：子进程崩溃后不会被自动重启，由引擎/用户在收到终止通知后决定后续处理
-- 资源回收由操作系统自动完成（父子进程关系），无需独立看门狗进程
+- **无自动 respawn**：壁纸子进程崩溃后不会被自动重启，由引擎/用户在收到终止通知后决定后续处理
+- 资源回收由操作系统自动完成（父子进程关系 + `ProcessManager` 的 `KILL_ON_JOB_CLOSE` Job Object），无需独立看门狗进程
+
+UI 子进程的回收路径独立于壁纸渲染器：
+
+- **正常关闭**：UI 主动退出事件循环 → stdio EOF → 壳侧协议泵 `on_pump_exit` 清理运行槽位（非 0 退出码才记 warn）
+- **壳退出/崩溃**：壳侧 `UiJobGuard`（`KILL_ON_JOB_CLOSE`）由内核回收 UI 及其后代
+- **异常残留**：下次启动 `cleanup_stale_child_processes()` 按进程名 + 映像路径清理
+- UI 不自动重启，仅在用户再次请求显示主窗口时按需拉起
 
 ---
 
@@ -282,7 +342,7 @@ MirrorStar 在壳进程与子进程之间使用**三套独立**的通信协议�
 
 ### 2.2 HWND 获取方式
 
-两种子进程的窗口 HWND 均在壳进程通过 `FindWindowW` 获取，然后由 `DesktopIntegrator` 执行 WorkerW 嵌入。**HWND 不通过 IPC 回传。**
+两种壁纸子进程（mpv / wp-proc）的窗口 HWND 均在壳进程通过 `FindWindowW` 获取，然后由 `DesktopIntegrator` 执行 WorkerW 嵌入。**HWND 不通过 IPC 回传。**（UI 主窗口不属于桌面层嵌入对象，由 UI 进程自行管理。）
 
 **mpv（视频壁纸）**：
 - 通过窗口标题 `MirrorStarVideo` 查找（`FindWindowW`）
@@ -316,15 +376,15 @@ MirrorStar 在壳进程与子进程之间使用**三套独立**的通信协议�
 MirrorStar 的主窗口不在应用启动时创建，也不由壳创建任何 WebView2 窗口（`tauri.conf.json` 的 `app.windows` 为 `[]`）：
 
 - **按需启动**：用户左键单击托盘图标或选择"打开主窗口"时，壳侧 UI 子进程管理模块 spawn `mirrorstar-ui.exe`，先握手（`Hello`）再显示
-- **关闭即退出**：关闭按钮 / Alt+F4 时 UI 关闭预览、上报 WindowHidden 后主动退出事件循环，进程立即结束，壳侧协议泵经 stdio EOF 清理运行槽位
-- **隐藏空闲退出**：托盘左键隐藏 / 壳侧 Hide 时保留进程，隐藏满空闲超时（默认 300s，环境变量 `MIRRORSTAR_UI_IDLE_TIMEOUT_SECS`）后壳侧退出并回收 UI 子进程（历史记录中"回落至壳内存量级 ≈7.6MB"为旧口径，数值待复测），再次请求可重新拉起
+- **关闭即退出**：关闭按钮 / Alt+F4 时 UI 关闭预览、上报 WindowHidden 后主动退出事件循环，进程立即结束，壳侧协议泵经 stdio EOF 清理运行槽位（2026-11-24 实测 93ms 内退出）
+- **隐藏空闲退出**：托盘左键隐藏 / 壳侧 Hide 时保留进程，隐藏满空闲超时（默认 300s，环境变量 `MIRRORSTAR_UI_IDLE_TIMEOUT_SECS`；常量 `DEFAULT_IDLE_TIMEOUT_SECS`）后壳侧退出并回收 UI 子进程，再次请求可重新拉起。回收后回落至壳内存量级（2026-11-24 实测暂停态 Private 8.7MB / WS 22.9MB；历史记录中的 ≈7.6MB 为旧口径）
 - **单实例**：同一时刻至多一个 UI 子进程实例
 - **用户主动唤起时置前聚焦**：显示 / 还原 / 置前路径调用 `SetForegroundWindow`（壳侧先 `AllowSetForegroundWindow(ui_pid)`），使任务栏按钮恢复「一次点击最小化、再一次还原」；受前台锁限制时仅记日志。纯净模式等非用户主动场景仍禁止抢前台；窗口标题保持"镜星壁纸"，被全屏检测按标题精确排除
 
 此策略的优势：
 
 - 托盘常驻场景下，用户不操作 UI 时零 UI 进程开销，聚焦壁纸渲染性能
-- 主窗口静置时壳 + UI 的内存占用显著低于旧 WebView2 方案（历史记录中的合计 private ≈ 16.8MB 为旧口径，数值待复测）
+- 主窗口静置时壳 + UI 的内存占用显著低于旧 WebView2 方案：2026-11-24 实测（不含 mpv）Private 14.1–16.7MB / WS 43.2–46.9MB；历史记录中的合计 private ≈16.8MB 为旧口径
 
 ### 3.2 系统托盘
 

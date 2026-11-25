@@ -33,6 +33,8 @@ wp-proc 是 MirrorStar 的 Web 壁纸子进程，由壳进程 `mirrorstar-wallpa
 
 > 校正说明（v8 深度审查，2026-10-11）：原表记 `main.rs` 441 / `command.rs` 1132 / `com.rs` 114 / `ipc_server.rs` 1469 / `webview.rs` 1274，为 v6.0 时期快照。`main.rs` 已更名为 `lib.rs`（纯库 crate 化）。§2 / §3 中历史 finding 记录的 `main.rs:NNN` 行号为当时快照，保留不改写。
 > 行数快照（2026-11-04）：lib.rs 457 / command.rs 1412 / com.rs 96 / ipc_server.rs 1334 / webview.rs 2035（合计 5124 行），上表已按此快照更新；§6 中的 5795 行为 v8 审查（2026-10-11）时的快照，保留作历史记录。
+>
+> 2026-11-24 复核：结构与默认值未变，行数/测试数快照仍为 2026-11-04。
 
 ### 1.3 测试覆盖
 

@@ -8,6 +8,7 @@
 > - 审查日期：2026-07-25 | 模块路径：`src-tauri/src/` | 源文件数：12
 > - **2026-10-11 深度审查复核（历史）**：当时实际源文件数已增至 **20**（约 14,115 行），本文件 §1~§5 的历史数字多为失真，详见新增 **§6 深度审查**。
 > - **2026-11-04 复核**：当前实际源文件数为 **21**（含新增 `single_instance.rs`，约 **15,110** 行），§1.1/§1.2 已按当前代码校正。
+> - **2026-11-24 复核**：**21** 个源文件；`tauri::generate_handler!` 注册命令 **39** 个（config 4 / rotation 12 / system 8 / wallpaper 15），此前 **36** 为历史值。
 
 > **注（主窗口原生 UI 重构后，2026-10-02）**：本文涉及的主窗口 WebView2 相关实现（`WebviewWindowBuilder`、`MAIN_WINDOW_BROWSER_ARGS`、`webview_memory` 挂起/裁剪、CSP、`wpfile://`）已随主窗口重构**移除**；壳不再创建 WebView2 主窗口，主窗口改由 `mirrorstar-ui.exe`（Slint）承载。本文保留为历史记录。
 
@@ -17,8 +18,8 @@
 
 `src-tauri` 应用层是镜星壁纸的 Windows 客户端壳，承担五项核心职责：
 
-1. **Tauri 命令层**：通过 `#[tauri::command]` 把 36 个前端可调用命令（壁纸生命周期 / 配置管理 / 系统控制 / 轮播）封装为对 `mirrorstar-core`（`ConfigManager` / `WallpaperEngine` / `DesktopIntegrator`）的薄封装。（原文记 24 个为历史值，2026-10-11 复核为 36。）
-2. **Win32 平台集成**：启动四类后台监控线程——全屏检测（`SetWinEventHook`）、Explorer 重启监控（`TaskbarCreated` 消息窗口）、WorkerW 兜底检查（5 分钟间隔）、视频卡帧存活看护（`liveness_watchdog`）；处理 `WM_POWERBROADCAST` 电源事件。
+1. **Tauri 命令层**：通过 `#[tauri::command]` 把 **39** 个前端可调用命令（壁纸生命周期 15 / 配置管理 4 / 系统控制 8 / 轮播 12）封装为对 `mirrorstar-core`（`ConfigManager` / `WallpaperEngine` / `DesktopIntegrator`）的薄封装。（原文记 24 个、2026-10-11 复核记 36 个均为历史值，2026-11-24 复核为 39。）
+2. **Win32 平台集成**：启动四类后台监控线程——全屏检测（`SetWinEventHook` 系统/对象事件 + 500ms QUNS/前台根轻量探针 + 2s 全量兜底 + 400ms 会话确认）、Explorer 重启监控（`TaskbarCreated` 消息窗口）、WorkerW 兜底检查（5 分钟间隔）、视频卡帧存活看护（`liveness_watchdog`）；处理 `WM_POWERBROADCAST` 电源事件。
 3. **进程生命周期管理**：`run()` 顺序初始化 COM（STA）→ DesktopIntegrator → WorkerW 预初始化线程 → VolumeControl → WallpaperEngine → ConfigManager → 监控线程 → Tauri Builder；另含新增的**轮播调度器（`scheduler.rs`）**与 **UI 子进程托管（`ui_process/`，管理 `mirrorstar-ui.exe`）**。`perform_shutdown_blocking` 按 LIFO 顺序 + 幂等守卫 + 多个超时上界统一清理。
 4. **前端事件桥接**：通过 `app.emit(...)` 把后端状态变更（壁纸增删改 / 状态切换 / 桌面状态 / 配置变更 / 缩略图进度）通知前端；订阅 `WallpaperEngine::global_state_changed` broadcast 通道统一转发 `wallpaper-state-changed`。
 5. ~~**自定义协议**：注册 `wpfile` URI scheme handler，支持 HTTP Range / HEAD 请求~~ —— **已消解**：`wpfile` / `register_uri_scheme` 在代码中已零命中，随 2026-10-02 原生主窗口重构整体移除。
@@ -37,7 +38,7 @@
 | config.rs | 235 | 配置命令（`get_config` / `update_config` / `get_arrangement` / `update_arrangement`）+ `validate_config_fields` 字段范围校验（委托 `mirrorstar-core::config::validation`，ST-TD-005） |
 | rotation.rs | 233 | 轮播命令 12 个（`get_rotation_config` / `update_rotation_config` / `list_pools` / `create_pool` / `update_pool` / `delete_pool` / `reorder_pools` / `get_unit_states` / `set_active_pool` / `set_rotation_enabled` / `next_wallpaper` / `prev_wallpaper`）**（原文档缺失）** |
 | system.rs | 262 | 系统级命令 8 个（`get_displays` / `get_memory_report` / `report_lifecycle_mark` / `check_desktop_status` / `set_interaction_mode` / `open_file_dialog` / `toggle_auto_start` / `get_auto_start_status`；原文档所列 `toggle_interaction` / `quit_app` **已不存在**）+ ST-002 回调式文件对话框 |
-| wallpaper.rs | 2183 | 壁纸生命周期命令（注册 12 个）+ `ComGuard` RAII + `DisplaySettingGuard` 防竞态 + `validate_wallpaper_file_path` / `validate_volume` / `validate_speed` / `parse_scaling_mode` 纯函数 + 36 个单元测试 |
+| wallpaper.rs | 2183 | 壁纸生命周期命令（注册 15 个，含新增 `set_mute` / `apply_playback_setting` / `apply_scaling_mode`；2026-10-11 复核记 12 个为历史值）+ `ComGuard` RAII + `DisplaySettingGuard` 防竞态 + `validate_wallpaper_file_path` / `validate_volume` / `validate_speed` / `parse_scaling_mode` 纯函数 + 36 个单元测试 |
 
 #### platform/
 | 文件 | 行数 | 主要内容 |
@@ -68,6 +69,8 @@
 | paths.rs | 59 | `mirrorstar-ui.exe` 路径解析（同目录命中 / PATH 兜底） |
 
 > **合计（2026-11-04 复核）**：21 个源文件、约 **14,482** 行。
+
+> **UI 子进程现状（2026-11-24 复核）**：`mirrorstar-ui.exe` 首次打开走 `StartupGate`（9 条启动快照 + 2s 兜底），显示前由 `window_effects::prepare_show` 收口 DWM 过渡/模糊；热打开首次 441ms、后续 133–164ms，关闭 93ms。
 
 ### 1.3 测试覆盖
 
@@ -463,7 +466,7 @@
 | `cargo test -p mirrorstar-core --lib -- --skip mpv_backend` | **712 passed / 0 failed / 30 ignored** |
 | `cargo test -p mirrorstar-wallpaper` | lib 193 passed / 3 ignored；config_flow 6 passed；wallpaper_flow 6 passed / 29 ignored |
 
-**公开 API 证据表**：从 `src-tauri/src/` 采集 `pub` / `pub(crate)` 的 `fn`/`struct`/`enum`/`const`/`static`/`type` 共 **122 个符号**，逐个全仓引用搜索，结果 **内部引用 122（100%） / 仅测试引用 0 / 仅文档引用 0 / 无任何引用 0**。命令注册 **36 定义 / 36 注册**（`lib.rs:1124-1161`），无未注册命令。
+**公开 API 证据表**：从 `src-tauri/src/` 采集 `pub` / `pub(crate)` 的 `fn`/`struct`/`enum`/`const`/`static`/`type` 共 **122 个符号**，逐个全仓引用搜索，结果 **内部引用 122（100%） / 仅测试引用 0 / 仅文档引用 0 / 无任何引用 0**。命令注册 **36 定义 / 36 注册**（`lib.rs:1124-1161`，2026-10-11 快照；2026-11-24 复核为 39），无未注册命令。
 
 ### 6.2 死代码
 
@@ -476,7 +479,7 @@
 | FD-SCHED-1 | 低 | `scheduler.rs:254` | `pub(crate) fn flush_playback` 仅本文件内部调用（175/187/206/248/406/429/505/525/537/564），无跨模块调用方 | 待确认（可见性可收窄） |
 | FD-SCHED-2 | 低 | `scheduler.rs:98` | `pub store: PlaybackStore` 字段全仓仅 `self.store.save(...)`（:259）使用 | 待确认（涉及 `pub` 字段布局） |
 | FD-SCHED-3 | 低 | `scheduler.rs:88-91` | `pub struct RotatedPayload` 及 `pub key`/`pub wallpaper_id` 仅本文件 `emit_rotated`（1276-1286）构造 | 待确认（事件负载契约，稳妥保留） |
-| FD-CMD-1/2 | 信息 | `commands/*` | 36 个 `#[tauri::command]` 全部注册；私有/`pub(crate)` helper 调用方齐全 | 无死代码 |
+| FD-CMD-1/2 | 信息 | `commands/*` | 39 个 `#[tauri::command]` 全部注册（2026-10-11 复核时 36 个为历史快照）；私有/`pub(crate)` helper 调用方齐全 | 无死代码 |
 | — | 信息 | `create_or_show_main_window` | `src-tauri/src/` 与 `tests/` 内**已无定义与调用**（被 UI 子进程方案取代），仅残留 `docs/` | 文档陈旧（见 6.5） |
 
 `ui_process/` 全部 `pub`/`pub(crate)` API 调用方齐全（`IDLE_TIMEOUT_ENV`/`init`/`manager`/`open_main_window`/`is_running`/`request_show`/`send`/`tick_idle`/`shutdown`/`FORWARDED_EVENTS`/`install_event_forwarding`/`handle_request` 等）；`#[cfg(test)]` 辅助（`bridge.rs:325`、`paths.rs:42`、`mod.rs:574`）均有实际测试引用。
@@ -529,7 +532,7 @@
 |---|---|---|---|
 | DOC-1 | §1.2 文件清单 | 描述失真 | 文档记 12 文件，实际 **20** 文件；缺 `scheduler.rs`、`ui_process/{mod,bridge,paths}.rs`、`platform/{liveness_watchdog,pure_mode,pure_mode_input}.rs`、`commands/rotation.rs` |
 | DOC-2 | §1.2 行数 | 描述失真 | 差异最大 `fullscreen.rs` 563→**1801**（+1238）、`lib.rs` 773→**1292**（+519） |
-| DOC-3 | §1.1/§1.2 命令数 | 描述失真 | 文档记 24 个，实际 `generate_handler!` 注册 **36** 个；清单含已不存在的 `quit_app`/`toggle_interaction`/`regenerate_thumbnails`/`update_positions` |
+| DOC-3 | §1.1/§1.2 命令数 | 描述失真 | 文档记 24 个，实际 `generate_handler!` 注册 **36** 个（2026-11-24 复核为 **39** 个）；清单含已不存在的 `quit_app`/`toggle_interaction`/`regenerate_thumbnails`/`update_positions` |
 | DOC-4 | §1.1 职责 5（`wpfile`） | 已消解 | `wpfile`/`register_uri_scheme` 零命中，已随 2026-10-02 重构移除（正文已补删除线标注） |
 | DOC-5 | §1.3 单元测试数 | 描述失真 | 文档记约 49，实测 **约 196**（`#[test]` 178 + `#[tokio::test]` 18） |
 | DOC-6 | §1.3 集成测试 | 描述失真 | `wallpaper_flow` 文档记约 25 / 仅 4 个 CI 可执行，实测 **35 / 29 ignore / 6 个 CI 可执行** |
@@ -573,4 +576,4 @@
 
 ### 6.8 审查小结
 
-`src-tauri` 应用层经多轮重构后**无生产死代码**（122 公开符号 100% 内部引用、clippy 零告警、36/36 命令注册），**无对 core/wp-proc 的逻辑重复实现**。主要问题集中在三类：①跨渲染器/监控线程 Win32 骨架重复（RD-PLAT-*，多为运行期路径，保守保留）；②受 `include_str!` 测试契约保护的样板重复（RD-CORE-1、RD-SCHED-1）；③文档严重滞后（§1.2 仅记 12/20 文件、§1.3 测试数差 4 倍、§5.2/§5.3 整节已消解）。本轮完成 9 项零行为变更清理（注释修正 + 一处 `pub` 收窄 + doc 06 全面校正），全部待确认项维持现状。
+`src-tauri` 应用层经多轮重构后**无生产死代码**（122 公开符号 100% 内部引用、clippy 零告警、36/36 命令注册；命令数 2026-10-11 快照为 36，2026-11-24 复核为 39），**无对 core/wp-proc 的逻辑重复实现**。主要问题集中在三类：①跨渲染器/监控线程 Win32 骨架重复（RD-PLAT-*，多为运行期路径，保守保留）；②受 `include_str!` 测试契约保护的样板重复（RD-CORE-1、RD-SCHED-1）；③文档严重滞后（§1.2 仅记 12/20 文件、§1.3 测试数差 4 倍、§5.2/§5.3 整节已消解）。本轮完成 9 项零行为变更清理（注释修正 + 一处 `pub` 收窄 + doc 06 全面校正），全部待确认项维持现状。
