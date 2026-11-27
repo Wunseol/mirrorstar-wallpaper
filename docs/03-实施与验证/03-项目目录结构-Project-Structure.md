@@ -53,7 +53,7 @@ members = [
     "crates/mirrorstar-wp-proc",
     "crates/mirrorstar-ui",
 ]
-# [workspace.package] version = "0.1.6", edition = "2021", rust-version = "1.80"
+# [workspace.package] version = "0.1.7", edition = "2021", rust-version = "1.80"
 # 依赖在 [workspace.dependencies] 统一声明，子 crate 以 workspace = true 引用
 ```
 

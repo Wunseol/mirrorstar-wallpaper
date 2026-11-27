@@ -544,11 +544,12 @@ pub(crate) fn try_resume_all_fast(reason: PauseReason) -> Option<Vec<String>> {
 
 /// 原子交换进行中？（只读查询，互斥决策判定条件）
 ///
-/// 仅读取全局 `ATOMIC_SWAP_IN_PROGRESS` 标志，供全屏终止/恢复的跳过分支使用。
-/// 置位/复位由调度器侧 `AtomicSwapInProgressGuard`（RAII，scheduler.rs）负责。
+/// 仅读取全局 `ATOMIC_SWAP_IN_PROGRESS` 计数，供全屏终止/恢复的跳过分支使用。
+/// 计数 `> 0` 即存在进行中的原子交换（手动设壁纸与轮播可能在不同显示器并发）。
+/// 增减由调度器侧 `AtomicSwapInProgressGuard`（RAII，scheduler.rs）负责。
 /// 抽成纯函数便于单测直接验证跳过决策，无需触碰 SHARED_ENGINE 全局。
 pub(crate) fn atomic_swap_in_progress() -> bool {
-    ATOMIC_SWAP_IN_PROGRESS.load(Ordering::SeqCst)
+    ATOMIC_SWAP_IN_PROGRESS.load(Ordering::SeqCst) > 0
 }
 
 /// 阻塞式恢复所有壁纸（供后台恢复线程使用）

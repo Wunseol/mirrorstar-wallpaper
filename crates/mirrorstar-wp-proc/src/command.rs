@@ -1638,7 +1638,9 @@ mod tests {
             "webview.rs 应定义并引用音量/静音恢复脚本常量"
         );
         assert_eq!(
-            source.matches(".AddScriptToExecuteOnDocumentCreated(").count(),
+            source
+                .matches(".AddScriptToExecuteOnDocumentCreated(")
+                .count(),
             2,
             "应注入 CSP 与音量/静音恢复两个文档创建脚本"
         );

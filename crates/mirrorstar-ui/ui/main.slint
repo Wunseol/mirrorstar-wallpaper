@@ -1084,6 +1084,12 @@ export component MainWindow inherits Window {
     callback playback-refresh-tick();
     callback rotated-toast-tick();
 
+    // ── 程序化关闭回焦（Task 9.7.2）：Rust 关闭面板/预览/池编辑后，焦点可能仍停留在
+    // 已被销毁的输入框上；此时把焦点交回根 FocusScope，保证快捷键立即可用。
+    changed settings-open => { if (!root.settings-open) { kb-root.focus(); } }
+    changed preview-id => { if (root.preview-id == "") { kb-root.focus(); } }
+    changed editing-pool-id => { if (root.editing-pool-id == "") { kb-root.focus(); } }
+
     // Toast 自动消隐
     Timer {
         interval: 3s;
@@ -1247,6 +1253,14 @@ export component MainWindow inherits Window {
             height: Theme.topbar-height;
             background: Theme.panel;
 
+            // 顶栏背景（标题/状态/空白）点击把焦点交回根 FocusScope；
+            // 搜索容器 / 添加 / 齿轮等控件在其上层，命中不受影响。
+            TouchArea {
+                width: 100%;
+                height: 100%;
+                clicked => { kb-root.focus(); }
+            }
+
             HorizontalLayout {
                 width: 100%;
                 height: 100%;
@@ -1283,6 +1297,13 @@ export component MainWindow inherits Window {
                     border-width: 1px;
                     border-color: root.search-active ? Theme.accent : Theme.border;
 
+                    // 点击输入框内边距时聚焦搜索框（而不是被顶栏背景清焦点）。
+                    TouchArea {
+                        width: 100%;
+                        height: 100%;
+                        clicked => { search-input.focus(); }
+                    }
+
                     if (root.search-keyword == "") : Text {
                         x: 10px;
                         y: 0;
@@ -1304,6 +1325,16 @@ export component MainWindow inherits Window {
                         vertical-alignment: center;
                         text <=> root.search-keyword;
                         edited => { root.search-changed(self.text); }
+                        // 回车结束搜索输入，焦点交回根 FocusScope（不能停在 None）。
+                        accepted => { kb-root.focus(); }
+                        // Escape 退出搜索输入：失焦但保留当前关键字与筛选结果。
+                        key-pressed(event) => {
+                            if (event.text == Key.Escape) {
+                                kb-root.focus();
+                                return accept;
+                            }
+                            return reject;
+                        }
                     }
                 }
 
@@ -1318,7 +1349,7 @@ export component MainWindow inherits Window {
                         : Theme.button-prominent;
 
                     add-hover := TouchArea {
-                        clicked => { root.add-requested(); }
+                        clicked => { kb-root.focus(); root.add-requested(); }
                     }
 
                     Text {
@@ -1375,7 +1406,7 @@ export component MainWindow inherits Window {
                     border-color: root.settings-open ? Theme.accent : Theme.border;
 
                     gear-hover := TouchArea {
-                        clicked => { root.settings-toggled(); }
+                        clicked => { kb-root.focus(); root.settings-toggled(); }
                     }
 
                     if (root.settings-open) : CloseIcon {
@@ -1437,6 +1468,13 @@ export component MainWindow inherits Window {
                     width: parent.width;
                     height: root.content-height;
 
+                    // 网格空白（卡片之外）点击把焦点交回根 FocusScope；卡片在其上层。
+                    TouchArea {
+                        width: 100%;
+                        height: 100%;
+                        clicked => { kb-root.focus(); }
+                    }
+
                     for card[i] in root.cards : WallpaperCardUi {
                         card-w: root.card-w;
                         card-h: root.card-h;
@@ -1455,12 +1493,12 @@ export component MainWindow inherits Window {
                         drag-ghost: root.drag-ghost;
                         drag-ghost-offset-x: root.drag-ghost-offset-x;
                         drag-ghost-offset-y: root.drag-ghost-offset-y;
-                        clicked(id) => { root.select-card(id); }
-                        set-wallpaper(id) => { root.set-as-wallpaper(id); }
-                        delete-requested(id) => { root.request-delete(id); }
-                        preview-requested(id) => { root.request-preview(id); }
+                        clicked(id) => { kb-root.focus(); root.select-card(id); }
+                        set-wallpaper(id) => { kb-root.focus(); root.set-as-wallpaper(id); }
+                        delete-requested(id) => { kb-root.focus(); root.request-delete(id); }
+                        preview-requested(id) => { kb-root.focus(); root.request-preview(id); }
                         drag-ended() => { root.drag-ended(); }
-                        drag-started(id, gw, gh) => { root.drag-started(id, gw, gh); }
+                        drag-started(id, gw, gh) => { kb-root.focus(); root.drag-started(id, gw, gh); }
                     }
 
                     // 拖拽插入指示线（插入位 k 表示"插到原第 k 项之前"，见 dnd::insert_index）
@@ -1532,6 +1570,7 @@ export component MainWindow inherits Window {
                     DragAction.copy
                 }
                 dropped(event) => {
+                    kb-root.focus();
                     root.drag-commit(event.data, root.drop-index);
                     return event.proposed-action;
                 }
@@ -1613,10 +1652,12 @@ export component MainWindow inherits Window {
                 height: Math.max(0px, parent.height - 2px);
                 background: transparent;
 
-                // 吞掉落在面板上的点击，避免穿透到下方网格（Flickable 已在其上层）。
+                // 吞掉落在面板上的点击，避免穿透到下方网格（Flickable 已在其上层）；
+                // 同时把焦点交回根 FocusScope，清掉输入框残留的焦点竖线。
                 TouchArea {
                     width: 100%;
                     height: 100%;
+                    clicked => { kb-root.focus(); }
                 }
 
         settings-flick := Flickable {
@@ -1635,6 +1676,14 @@ export component MainWindow inherits Window {
                 height: panel-layout.preferred-height + 24px;
                 background: transparent;
 
+                // 滚动内容背景（区块标题 / 标签 / 空白）点击把焦点交回根 FocusScope。
+                // 位于控件之下；Flickable 在拖动超过阈值时接管手势，拖拽滚动不受影响。
+                TouchArea {
+                    width: 100%;
+                    height: 100%;
+                    clicked => { kb-root.focus(); }
+                }
+
                 panel-layout := VerticalLayout {
                     x: 12px;
                     y: 12px;
@@ -1650,7 +1699,7 @@ export component MainWindow inherits Window {
                         current-index: root.display-index;
                         enabled: root.display-dropdown-enabled;
                         expanded: root.dd-open && root.dd-id == 1;
-                        open-requested(x, y, w, idx) => { root.dd-toggle(1, x, y, w, idx); }
+                        open-requested(x, y, w, idx) => { kb-root.focus(); root.dd-toggle(1, x, y, w, idx); }
                     }
                     Dropdown {
                         id: 2;
@@ -1658,7 +1707,7 @@ export component MainWindow inherits Window {
                         options: root.scaling-options;
                         current-index: root.scaling-index;
                         expanded: root.dd-open && root.dd-id == 2;
-                        open-requested(x, y, w, idx) => { root.dd-toggle(2, x, y, w, idx); }
+                        open-requested(x, y, w, idx) => { kb-root.focus(); root.dd-toggle(2, x, y, w, idx); }
                     }
                     Dropdown {
                         id: 3;
@@ -1666,7 +1715,7 @@ export component MainWindow inherits Window {
                         options: root.arrangement-options;
                         current-index: root.arrangement-index;
                         expanded: root.dd-open && root.dd-id == 3;
-                        open-requested(x, y, w, idx) => { root.dd-toggle(3, x, y, w, idx); }
+                        open-requested(x, y, w, idx) => { kb-root.focus(); root.dd-toggle(3, x, y, w, idx); }
                     }
                     Dropdown {
                         id: 4;
@@ -1674,7 +1723,7 @@ export component MainWindow inherits Window {
                         options: root.fullscreen-options;
                         current-index: root.fullscreen-index;
                         expanded: root.dd-open && root.dd-id == 4;
-                        open-requested(x, y, w, idx) => { root.dd-toggle(4, x, y, w, idx); }
+                        open-requested(x, y, w, idx) => { kb-root.focus(); root.dd-toggle(4, x, y, w, idx); }
                     }
 
                     // ── 播放 ──
@@ -1688,20 +1737,20 @@ export component MainWindow inherits Window {
                             preferred-width: 84px;
                             label: "上一张";
                             enabled: root.prev-enabled;
-                            clicked => { root.prev-requested(); }
+                            clicked => { kb-root.focus(); root.prev-requested(); }
                         }
                         PanelButton {
                             horizontal-stretch: 1;
                             label: root.pause-label;
                             enabled: root.pause-enabled;
                             prominent: true;
-                            clicked => { root.pause-toggled(); }
+                            clicked => { kb-root.focus(); root.pause-toggled(); }
                         }
                         PanelButton {
                             preferred-width: 84px;
                             label: "下一张";
                             enabled: root.next-enabled;
-                            clicked => { root.next-requested(); }
+                            clicked => { kb-root.focus(); root.next-requested(); }
                         }
                     }
                     VolumeRow {
@@ -1710,15 +1759,15 @@ export component MainWindow inherits Window {
                         enabled: root.audio-controls-enabled;
                         muted: root.muted;
                         value <=> root.volume-pos;
-                        committed(v) => { root.volume-committed(v); }
-                        mute-toggled(v) => { root.mute-toggled(v); }
+                        committed(v) => { kb-root.focus(); root.volume-committed(v); }
+                        mute-toggled(v) => { kb-root.focus(); root.mute-toggled(v); }
                     }
                     SpeedRow {
                         label: "播放速度";
                         value-text: root.speed-text;
                         value <=> root.speed-pos;
-                        committed(v) => { root.speed-committed(v); }
-                        stepped(d) => { root.speed-stepped(d); }
+                        committed(v) => { kb-root.focus(); root.speed-committed(v); }
+                        stepped(d) => { kb-root.focus(); root.speed-stepped(d); }
                     }
 
                     // ── 系统 ──
@@ -1726,17 +1775,17 @@ export component MainWindow inherits Window {
                     ToggleSwitch {
                         label: "开机自启";
                         checked: root.auto-start;
-                        toggled(v) => { root.auto-start-toggled(v); }
+                        toggled(v) => { kb-root.focus(); root.auto-start-toggled(v); }
                     }
                     ToggleSwitch {
                         label: "电池供电时暂停";
                         checked: root.pause-on-battery;
-                        toggled(v) => { root.pause-on-battery-toggled(v); }
+                        toggled(v) => { kb-root.focus(); root.pause-on-battery-toggled(v); }
                     }
                     ToggleSwitch {
                         label: "鼠标交互模式";
                         checked: root.interaction-mode;
-                        toggled(v) => { root.interaction-mode-toggled(v); }
+                        toggled(v) => { kb-root.focus(); root.interaction-mode-toggled(v); }
                     }
 
                     // ── 轮换 ──
@@ -1744,12 +1793,12 @@ export component MainWindow inherits Window {
                     ToggleSwitch {
                         label: "启用壁纸轮换";
                         checked: root.rotation-enabled;
-                        toggled(v) => { root.rotation-enabled-toggled(v); }
+                        toggled(v) => { kb-root.focus(); root.rotation-enabled-toggled(v); }
                     }
                     ToggleSwitch {
                         label: "开机时换一张";
                         checked: root.rotation-on-boot;
-                        toggled(v) => { root.rotation-on-boot-toggled(v); }
+                        toggled(v) => { kb-root.focus(); root.rotation-on-boot-toggled(v); }
                     }
                     NumberStepper {
                         label: "轮换间隔（分钟）";
@@ -1759,6 +1808,7 @@ export component MainWindow inherits Window {
                         text <=> root.rotation-interval-text;
                         step(d) => { root.rotation-interval-step(d); }
                         submitted(s) => { root.rotation-interval-submitted(s); }
+                        blur-requested() => { kb-root.focus(); }
                     }
                     Dropdown {
                         id: 5;
@@ -1766,7 +1816,7 @@ export component MainWindow inherits Window {
                         options: root.order-options;
                         current-index: root.rotation-order-index;
                         expanded: root.dd-open && root.dd-id == 5;
-                        open-requested(x, y, w, idx) => { root.dd-toggle(5, x, y, w, idx); }
+                        open-requested(x, y, w, idx) => { kb-root.focus(); root.dd-toggle(5, x, y, w, idx); }
                     }
                     PanelHint { text: root.rotation-order-hint; }
 
@@ -1780,7 +1830,7 @@ export component MainWindow inherits Window {
                             x: 0; y: 1px; width: 120px; height: 24px;
                             label: "＋ 新建壁纸池";
                             prominent: true;
-                            clicked => { root.pool-create-requested(); }
+                            clicked => { kb-root.focus(); root.pool-create-requested(); }
                         }
                     }
 
@@ -1788,12 +1838,12 @@ export component MainWindow inherits Window {
                         data: pool;
                         editing: root.editing-pool-id == pool.id;
                         confirming: root.pending-delete-pool-id == pool.id;
-                        select(id) => { root.pool-select(id); }
-                        move-up(id) => { root.pool-move(id, -1); }
-                        move-down(id) => { root.pool-move(id, 1); }
-                        request-delete(id) => { root.pool-delete-requested(id); }
-                        confirm-delete(id) => { root.pool-delete-confirmed(id); }
-                        cancel-delete() => { root.pool-delete-cancelled(); }
+                        select(id) => { kb-root.focus(); root.pool-select(id); }
+                        move-up(id) => { kb-root.focus(); root.pool-move(id, -1); }
+                        move-down(id) => { kb-root.focus(); root.pool-move(id, 1); }
+                        request-delete(id) => { kb-root.focus(); root.pool-delete-requested(id); }
+                        confirm-delete(id) => { kb-root.focus(); root.pool-delete-confirmed(id); }
+                        cancel-delete() => { kb-root.focus(); root.pool-delete-cancelled(); }
                     }
                     if (root.pool-rows.length == 0) : PanelHint { text: "尚无壁纸池"; }
 
@@ -1815,7 +1865,7 @@ export component MainWindow inherits Window {
                                 background: Theme.panel;
                                 border-radius: Theme.radius-sm;
 
-                                TextInput {
+                                pool-name-input := TextInput {
                                     x: 6px; y: 0;
                                     width: parent.width - 92px;
                                     height: parent.height;
@@ -1824,14 +1874,22 @@ export component MainWindow inherits Window {
                                     font-size: 12px;
                                     vertical-alignment: center;
                                     text <=> root.editing-pool-name;
-                                    accepted => { root.pool-rename(self.text); }
+                                    accepted => { root.pool-rename(self.text); kb-root.focus(); }
+                                    // Escape 退出重命名输入：失焦但保留草稿名称。
+                                    key-pressed(event) => {
+                                        if (event.text == Key.Escape) {
+                                            kb-root.focus();
+                                            return accept;
+                                        }
+                                        return reject;
+                                    }
                                 }
                                 PanelButton {
                                     x: parent.width - 80px; y: 1px;
                                     width: 74px; height: 24px;
                                     label: "保存名称";
                                     prominent: true;
-                                    clicked => { root.pool-rename(root.editing-pool-name); }
+                                    clicked => { root.pool-rename(root.editing-pool-name); kb-root.focus(); }
                                 }
                             }
 
@@ -1839,9 +1897,9 @@ export component MainWindow inherits Window {
                             for m in root.member-rows : MemberRowUi {
                                 data: m;
                                 removable: true;
-                                move-up(id) => { root.pool-member-move(id, -1); }
-                                move-down(id) => { root.pool-member-move(id, 1); }
-                                remove(id) => { root.pool-member-remove(id); }
+                                move-up(id) => { kb-root.focus(); root.pool-member-move(id, -1); }
+                                move-down(id) => { kb-root.focus(); root.pool-member-move(id, 1); }
+                                remove(id) => { kb-root.focus(); root.pool-member-remove(id); }
                             }
                             if (root.member-rows.length == 0) : PanelHint { text: "该池暂无成员"; }
 
@@ -1849,7 +1907,7 @@ export component MainWindow inherits Window {
                             for a in root.available-rows : MemberRowUi {
                                 data: a;
                                 removable: false;
-                                add(id) => { root.pool-member-add(id); }
+                                add(id) => { kb-root.focus(); root.pool-member-add(id); }
                             }
                             if (root.available-rows.length == 0) : PanelHint { text: "没有可添加的壁纸"; }
                         }
@@ -1863,15 +1921,15 @@ export component MainWindow inherits Window {
                         pool-options: root.pool-options;
                         dd-id: 100 + i;
                         dd-expanded: root.dd-open && root.dd-id == 100 + i;
-                        dd-open-requested(id, x, y, w, idx) => { root.dd-toggle(id, x, y, w, idx); }
-                        enabled-toggled(key, v) => { root.unit-enabled-toggled(key, v); }
+                        dd-open-requested(id, x, y, w, idx) => { kb-root.focus(); root.dd-toggle(id, x, y, w, idx); }
+                        enabled-toggled(key, v) => { kb-root.focus(); root.unit-enabled-toggled(key, v); }
                     }
 
                     // ── 关于 ──
                     SectionTitle { text: "关于"; }
                     PanelHint { text: root.about-version; }
                     PanelHint { text: "镜星壁纸 · 原生设置面板"; }
-                    RepoLink { clicked => { root.open-repo(); } }
+                    RepoLink { clicked => { kb-root.focus(); root.open-repo(); } }
                 }
             }
         }

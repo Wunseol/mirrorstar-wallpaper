@@ -14,7 +14,9 @@
 //! 单元 key 校验（DR-40）：`AllSame` / `Span` 仅允许全局单元 `"all"`；`PerMonitor`
 //! 依显示器枚举校验 key 命中，缺省回退主显示器（DR-36）。孤儿单元一律拒绝。
 
-use mirrorstar_core::config::settings::{RotationConfig, MAX_INTERVAL_MINUTES, MIN_INTERVAL_MINUTES};
+use mirrorstar_core::config::settings::{
+    RotationConfig, MAX_INTERVAL_MINUTES, MIN_INTERVAL_MINUTES,
+};
 use mirrorstar_core::config::Pool;
 use mirrorstar_core::layout::{self, LayoutMonitor};
 use mirrorstar_core::ui_proto::UnitStateDto;

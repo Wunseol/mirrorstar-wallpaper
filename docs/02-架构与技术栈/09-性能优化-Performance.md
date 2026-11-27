@@ -678,12 +678,12 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass `
 
 | 项目 | 字节 | MiB | 证据 | 压缩后占安装包比例 |
 | ---- | ---- | --- | ---- | ------------------ |
-| NSIS 安装包 | 43,221,146 B | 41.22 MiB | `target/release/bundle/nsis/MirrorStar Wallpaper_0.1.6_x64-setup.exe` | 100% |
+| NSIS 安装包 | 43,233,062 B | 41.23 MiB | `target/release/bundle/nsis/MirrorStar Wallpaper_0.1.7_x64-setup.exe` | 100% |
 | 随包 `mpv/mpv.exe` | 123,164,160 B | 117.46 MiB | bundle resources | 压缩后 ≈ 34.1 MiB，≈ **83%** |
-| 随包 `mirrorstar-ui.exe` | 11,854,848 B | 11.31 MiB | bundle resources | 压缩后 ≈ 4.16 MiB，≈ **10%** |
-| 随包 `mirrorstar-wallpaper.exe` | 9,954,816 B | 9.49 MiB | bundle 主程序 | 压缩后 ≈ 2.80 MiB，≈ **7%** |
+| 随包 `mirrorstar-ui.exe` | 11,885,056 B | 11.33 MiB | bundle resources | 压缩后 ≈ 4.16 MiB，≈ **10%** |
+| 随包 `mirrorstar-wallpaper.exe` | 9,966,592 B | 9.50 MiB | bundle 主程序 | 压缩后 ≈ 2.80 MiB，≈ **7%** |
 | 随包 `mpv/license` | 19,873 B | — | bundle resources | 可忽略 |
-| **未压缩载荷合计** | **144,993,697 B** | **138.28 MiB** | 上列随包载荷求和 | — |
+| **未压缩载荷合计** | **145,035,681 B** | **138.32 MiB** | 上列随包载荷求和 | — |
 
 **压缩证据**：内存内 Deflate(Optimal) 实测压缩率——`mpv.exe` 39.5%、`mirrorstar-ui.exe` 51.0%、主 `mirrorstar-wallpaper.exe` 41.4%（v0.1.1 同构载荷基线）；NSIS 采用 LZMA，实压缩比 Deflate 再优约 **26.6%**（v0.1.3 安装包 43,049,955 / Deflate 合计 58,621,322 ≈ 0.734）；上述压缩率为历史基线，未含 2026-11-03 静态 CRT 增量（两 exe 合计 +294,912 B）。
 
@@ -692,6 +692,8 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass `
 > **版本复核（静态 CRT 重打包，2026-11-03）**：安装包 43,184,314 B / 41.18 MiB @16:51:38，`mirrorstar-ui.exe` 11,845,632 B @16:47:45，`mirrorstar-wallpaper.exe` 9,849,856 B @16:51:38；较 2026-10-27 制品安装包 +134,359 B（+0.31%），两个自研 exe 合计 +294,912 B（各自携带一份静态 CRT，属预期成本）。
 
 > **版本复核（v0.1.6，2026-11-24）**：上表已按 `MirrorStar Wallpaper_0.1.6_x64-setup.exe` 重新打包后复核更新。本次实测：安装包 43,221,146 B / 41.22 MiB @23:48:49（`ProductVersion=0.1.6`，SHA256 `939FD311…10DD286`）；`mirrorstar-ui.exe` 11,854,848 B / 11.31 MiB @23:44:57；`mirrorstar-wallpaper.exe` 9,954,816 B / 9.49 MiB @23:48:49（`ProductVersion=0.1.6`）；`mpv.exe`（123,164,160 B / 117.46 MiB）与 `mpv/license`（19,873 B）未变；未压缩载荷合计 144,993,697 B / 138.28 MiB。较 2026-11-03 制品安装包 +36,832 B（+0.09%）。
+
+> **版本复核（v0.1.7，2026-11-27）**：上表已按 `MirrorStar Wallpaper_0.1.7_x64-setup.exe` 重新打包后复核更新。本次实测：安装包 43,233,062 B / 41.23 MiB @20:57:22（`ProductVersion=0.1.7`，SHA256 `E71EE2A4…FA944`）；`mirrorstar-ui.exe` 11,885,056 B / 11.33 MiB @20:53:33；`mirrorstar-wallpaper.exe` 9,966,592 B / 9.50 MiB @20:57:22（`ProductVersion=0.1.7`）；`mpv.exe`（123,164,160 B / 117.46 MiB）与 `mpv/license`（19,873 B）未变；未压缩载荷合计 145,035,681 B / 138.32 MiB。较 0.1.6 制品安装包 +11,916 B（+0.0276%）。
 
 **主因排序**：
 

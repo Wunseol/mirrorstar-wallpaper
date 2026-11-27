@@ -9,8 +9,8 @@
 pub fn prepare_show(window: &slint::Window) {
     use windows::Win32::Foundation::BOOL;
     use windows::Win32::Graphics::Dwm::{
-        DwmEnableBlurBehindWindow, DwmSetWindowAttribute, DWM_BLURBEHIND, DWM_BB_ENABLE,
-        DWMWA_TRANSITIONS_FORCEDISABLED,
+        DwmEnableBlurBehindWindow, DwmSetWindowAttribute, DWMWA_TRANSITIONS_FORCEDISABLED,
+        DWM_BB_ENABLE, DWM_BLURBEHIND,
     };
 
     let Some(hwnd) = crate::drop_target::hwnd_of(window) else {

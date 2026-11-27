@@ -38,7 +38,7 @@
 graph LR
     P3[P3: Web 壁纸子进程 ✅] --> P4[P4: 体验优化 ✅]
     P4 --> P2[P2: 架构优化与清理 ✅]
-    P2 --> P5[P5: 打包发布 ✅ 已打包 0.1.6]
+    P2 --> P5[P5: 打包发布 ✅ 已打包 0.1.7（2026-11-27）]
     P5 --> P6[P6: 主窗口原生 UI 重构 ✅]
 
     style P3 fill:#4CAF50,color:#fff
@@ -63,7 +63,7 @@ graph LR
 | Phase 3 | Web 壁纸子进程 | ✅ 已完成 |
 | Phase 4 | 体验优化 | ✅ 已完成 |
 | Phase 2 | 架构优化与代码清理 | ✅ 已完成 |
-| Phase 5 | 打包发布 | ✅ 已打包 0.1.6（2026-11-24） |
+| Phase 5 | 打包发布 | ✅ 已打包 0.1.7（2026-11-27） |
 | Phase 6 | 主窗口原生 UI 重构 | ✅ 已完成 |
 | Phase 1 | 前端 UI 补全 | ⚫ 已废弃（历史，能力迁至 Phase 6） |
 
@@ -98,11 +98,11 @@ graph LR
 - 托盘菜单增加「暂停/恢复壁纸」快捷项，文本随状态动态切换。
 - 配置校验、GIF 内存策略、进程/管道会话清理等多项重构。
 
-**Phase 5：打包发布 ✅ 已打包 0.1.6（2026-11-24）**
+**Phase 5：打包发布 ✅ 已打包 0.1.7（2026-11-27）**
 
 - `bundle.targets = ["nsis"]`；资源捆绑 `mpv.exe` 与 `mirrorstar-ui.exe`；图标/标识配置就绪。
 - 发布由本地执行 `cargo tauri build` 打包 NSIS 安装包后人工发布（不依赖 Node/npm）。
-- 0.1.6 NSIS 安装包已生成：`target/release/bundle/nsis/MirrorStar Wallpaper_0.1.6_x64-setup.exe`（2026-11-24）。
+- 0.1.7 NSIS 安装包已生成：`target/release/bundle/nsis/MirrorStar Wallpaper_0.1.7_x64-setup.exe`（2026-11-27）。
 - 待办：正式发布（发布渠道与时间待定）。
 
 **Phase 6：主窗口原生 UI 重构 ✅**
@@ -136,7 +136,7 @@ graph LR
 | Web 壁纸子进程 | ✅ 已实现 | 壳 `--wp-proc` 模式（`mirrorstar-wp-proc` 库 crate）+ `WpProcIpcClient` + `WebRenderer` |
 | 主窗口原生 UI | ✅ 已实现 | `crates/mirrorstar-ui/`（Slint）虚拟化网格、设置、四类预览、键盘/拖放交互 |
 | 壁纸轮换调度 | ✅ 已实现 | 调度器与多屏排列（`mirrorstar-core/src/scheduler/`，壳侧 `scheduler.rs`） |
-| 打包发布 | ✅ 已打包 0.1.6（2026-11-24），正式发布待定 | NSIS 安装包 + 资源捆绑，产物 `target/release/bundle/nsis/MirrorStar Wallpaper_0.1.6_x64-setup.exe` |
+| 打包发布 | ✅ 已打包 0.1.7（2026-11-27），正式发布待定 | NSIS 安装包 + 资源捆绑，产物 `target/release/bundle/nsis/MirrorStar Wallpaper_0.1.7_x64-setup.exe` |
 
 > 各模块的职责与规模细节见 [模块设计](../02-架构与技术栈/02-模块设计-Module-Design.md) 与 [项目目录结构](./03-项目目录结构-Project-Structure.md)。
 

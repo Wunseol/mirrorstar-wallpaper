@@ -633,9 +633,41 @@ export component NumberStepper inherits Rectangle {
     callback step(int);
     /// 回车提交的原始文本（可能非法，由 Rust 解析 + clamp）。
     callback submitted(string);
+    /// 请求宿主交还焦点：输入框失焦后焦点须回到根 FocusScope（不能停在 None，
+    /// 否则全局快捷键派发链中断）。
+    callback blur-requested();
+    /// 本次聚焦期间是否发生过失焦提交（避免初次绑定即提交）。
+    property <bool> was-focused: false;
+    /// 回车 / ± 路径已自行处理，失焦时不再重复提交或提交未确认文本。
+    property <bool> skip-commit-on-blur: false;
+
+    // 失焦落点与提交语义：获得焦点时标记；焦点离开时（点击别处）提交当前文本。
+    // 回车与 ± 路径会先置 skip-commit-on-blur，由各自逻辑处理。
+    // `changed input.has-focus` 不被解析器接受，改用属性镜像驱动。
+    property <bool> input-focused: input.has-focus;
+    changed input-focused => {
+        if (root.input-focused) {
+            root.was-focused = true;
+        } else if (root.was-focused) {
+            root.was-focused = false;
+            if (!root.skip-commit-on-blur) {
+                root.submitted(input.text);
+            }
+            root.skip-commit-on-blur = false;
+        }
+    }
 
     height: 28px;
     background: transparent;
+
+    // 点击本行空白/标签区域时请求父级把焦点交回根 FocusScope：Slint 中点击非可聚焦
+    // 元素不会自动转移焦点，否则 TextInput 的焦点竖线会一直闪烁到窗口重建。
+    // 失焦提交由上面的 `changed input-focused` 统一处理。
+    bg-hit := TouchArea {
+        width: 100%;
+        height: 100%;
+        clicked => { root.blur-requested(); }
+    }
 
     Text {
         x: 0;
@@ -665,7 +697,7 @@ export component NumberStepper inherits Rectangle {
             width: 32px;
             height: 28px;
             enabled: root.minus-enabled;
-            clicked => { root.step(-1); }
+            clicked => { root.skip-commit-on-blur = true; root.step(-1); root.blur-requested(); }
         }
 
         Text {
@@ -701,7 +733,12 @@ export component NumberStepper inherits Rectangle {
             vertical-alignment: center;
             enabled: root.enabled;
             text <=> root.text;
-            accepted => { root.submitted(self.text); }
+            // 回车提交一次后请求失焦，避免焦点竖线常驻；失焦时不重复提交。
+            accepted => {
+                root.skip-commit-on-blur = true;
+                root.submitted(self.text);
+                root.blur-requested();
+            }
         }
     }
 
@@ -722,7 +759,7 @@ export component NumberStepper inherits Rectangle {
             width: 32px;
             height: 28px;
             enabled: root.plus-enabled;
-            clicked => { root.step(1); }
+            clicked => { root.skip-commit-on-blur = true; root.step(1); root.blur-requested(); }
         }
 
         Text {

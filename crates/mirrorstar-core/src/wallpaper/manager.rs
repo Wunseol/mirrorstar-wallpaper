@@ -81,7 +81,9 @@ pub(crate) struct GifMemoryConfig {
 ///
 /// // 阶段 3（重新获取 engine 锁）：嵌入 WorkerW + 注册状态
 /// let mut engine = state.wallpaper_engine.lock().await;
-/// engine.complete_set_wallpaper(renderer, display_id, source, wp_type)?;
+/// engine.complete_set_wallpaper(
+///     renderer, display_id, source, wp_type, pending.defer_clear_native,
+/// )?;
 /// ```
 pub struct SetWallpaperPending {
     /// 壁纸模式（Native 或 WorkerW）
@@ -111,15 +113,19 @@ pub struct SetWallpaperPending {
 /// 原子交换的最大首帧就绪等待超时（视频 mpv 冷启动 + loadfile 渲染，锁外等待）
 pub const ATOMIC_SWAP_READY_TIMEOUT: Duration = Duration::from_secs(8);
 
-/// 原子交换进行中标志（全局静态）
+/// 进行中的原子交换数量（全局静态计数器）
 ///
 /// 原子交换阶段 A→C（`embed_atomic_into` 嵌入新窗 → `commit_atomic_swap` 换槽）
-/// 期间置位，src-tauri 全屏终止/恢复检测到该标志时跳过本次操作（事件会重复触发，
+/// 期间计数 +1，结束后 -1；`> 0` 表示有交换进行中。改为计数而非布尔值，是因为
+/// 手动"设为壁纸"与轮播可能在不同显示器上并发交换——先完成的那个不能把仍在其
+/// 他显示器上进行的交换误标为"已结束"。
+///
+/// src-tauri 全屏终止/恢复检测到计数 `> 0` 时跳过本次操作（事件会重复触发，
 /// 可容忍偶发跳过）。防止全屏处置在原子交换期间重建 WorkerW / 冷启动 mpv，导致
 /// commit 前校验失败（"新窗父窗口已非当前 WorkerW"）或新窗首帧等待超时。
-/// 置位/复位由 src-tauri 调度器（`src-tauri/src/scheduler.rs`）的 RAII 守卫负责。
-pub static ATOMIC_SWAP_IN_PROGRESS: std::sync::atomic::AtomicBool =
-    std::sync::atomic::AtomicBool::new(false);
+/// 增减由 src-tauri 共享编排（`src-tauri/src/wallpaper_switch.rs`）的 RAII 守卫负责。
+pub static ATOMIC_SWAP_IN_PROGRESS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
 
 /// 原子交换准备结果（阶段 1 `prepare_atomic_swap` 的返回值）
 pub enum AtomicSwapPrepare {
@@ -140,13 +146,16 @@ pub struct AtomicSwapPending {
     /// 当前旧渲染器 id（由 `wallpaper_sources` 派生），供 `build_new_renderer`
     /// 短路"新图 == 旧图"以及 `commit_atomic_swap` 换槽。
     pub old_renderer_id: Option<String>,
+    /// 当前显示器记录的缩放模式（`scaling_mode_for`，含 "all"/默认回退），
+    /// 供 `build_new_renderer` 短路"同图同模式"。
+    pub old_scaling_mode: ScalingMode,
 }
 
 /// `build_new_renderer` 的返回值
 pub enum BuildOutcome {
     /// 构建成功，新渲染器已 `play()`，待调用方锁外 `wait_new_ready`
     Ready(Box<dyn WallpaperRenderer>),
-    /// 新图与旧图相同（id 一致），无需更换——短路跳过整个 swap
+    /// 新图与旧图相同（id 一致）**且缩放模式一致**，无需更换——短路跳过整个 swap
     Skip,
 }
 
@@ -949,6 +958,24 @@ impl WallpaperEngine {
         self.wallpapers.contains_key(display_id) || self.wallpaper_mode.contains_key(display_id)
     }
 
+    /// 同目标短路判定：目标壁纸与当前壁纸完全一致（来源/类型 + 缩放模式）。
+    ///
+    /// 供共享切换编排（`src-tauri/src/wallpaper_switch.rs`）在构建渲染器前短路：
+    /// 仅比较 `renderer_id` 会漏掉"同一张图、用户改了缩放模式"的场景（必须重建
+    /// 才能让新缩放模式生效），故同时比较 [`Self::scaling_mode_for`]。
+    pub fn same_target(
+        &self,
+        display_id: &str,
+        source: &WallpaperSource,
+        wallpaper_type: WallpaperType,
+        scaling_mode: ScalingMode,
+    ) -> bool {
+        self.wallpaper_sources
+            .get(display_id)
+            .is_some_and(|(s, t)| renderer_id(s, *t) == renderer_id(source, wallpaper_type))
+            && self.scaling_mode_for(display_id) == scaling_mode
+    }
+
     /// 返回当前存在活跃壁纸（WorkerW 或原生）的全部显示器 id。
     ///
     /// 供调度器在多屏排列变更时按新布局关闭"不再属于新布局"的渲染器
@@ -1611,6 +1638,8 @@ impl WallpaperEngine {
     /// - **绝不关闭旧壁纸**（与 `prepare_set_wallpaper` 不同，那是阶段 1 先关旧）。
     /// - 记录当前旧渲染器 `id`（由 `wallpaper_sources` 派生），供 `build_new_renderer`
     ///   短路新图 == 旧图，以及 `commit_atomic_swap` 换槽。
+    /// - 记录该显示器当前缩放模式快照（`scaling_mode_for`，含 "all"/默认回退），
+    ///   供 `build_new_renderer` 判定"同图同模式"才短路。
     ///
     /// # 回退
     ///
@@ -1634,10 +1663,12 @@ impl WallpaperEngine {
         }
 
         let config = self.renderer_config();
+        let old_scaling_mode = self.scaling_mode_for(display_id);
         AtomicSwapPrepare::Swap(AtomicSwapPending {
             config,
             clear_native: false,
             old_renderer_id,
+            old_scaling_mode,
         })
     }
 
@@ -1664,7 +1695,8 @@ impl WallpaperEngine {
                 let mut desktop = self.desktop.lock().map_err(|e| {
                     MirrorStarError::DesktopIntegration(format!("获取桌面集成器锁失败: {}", e))
                 })?;
-                desktop.embed_wallpaper(hwnd, display_id, self.arrangement)
+                // pending 语义：只嵌入不登记，commit 成功时才由 commit_atomic_swap 登记
+                desktop.embed_wallpaper_pending(hwnd, display_id, self.arrangement)
             };
             if let Err(e) = embed_result {
                 tracing::warn!(error = %e, display_id, "原子交换：阶段 A 新窗嵌入失败，终止新窗、保持旧壁纸");
@@ -1690,12 +1722,17 @@ impl WallpaperEngine {
     /// 与阶段 B（引擎锁外 `wait_new_ready`：首帧就绪）。
     ///
     /// 执行步骤（换槽临界区）：
+    /// 0. 纯净壁纸模式复核：阶段 B 期间若用户进入纯净模式（旧窗可能已被摘出/置顶），
+    ///    弃置新窗并取消换槽，避免 terminate 已置顶的旧窗导致 `lifted` 悬空
     /// 1. DR-40 commit 前校验：新窗父窗口仍为当前 WorkerW，否则放弃 commit（terminate 新窗）。
     ///    校验先于换槽，校验失败时旧壁纸仍在 map 未动，无需回滚，也不会因 Drop 误杀旧壁纸
+    ///    校验通过后在同一 desktop 锁作用域内把 pending 窗登记进 `active_wallpapers`
     /// 2. 校验通过后才 `self.wallpapers.remove(display_id)` 取旧（P1-5：A/B 阶段旧窗始终在 map）
     /// 3. 一次换槽（复用 `register_renderer_maps`，不先关旧）
     /// 4. 按当前全局 `PauseReason` 位图对新渲染器补发暂停（DR-20）
-    /// 5. terminate 旧渲染器（失败则强毁旧 hwnd 兜底）
+    /// 5. 写回本显示器缩放模式记忆（`wallpaper_scaling_modes`，仅在与当前生效值
+    ///    不同时写，避免把 "all"/默认回退物化成 per-display 条目）
+    /// 6. terminate 旧渲染器（失败则强毁旧 hwnd 兜底）
     ///
     /// 任何失效步骤在换槽前返回 `Err` 并 terminate 新渲染器；旧壁纸全程在 map、未动，
     /// 无需重嵌回滚。换槽后无 `Err` 路径，返回 `Ok(())`。
@@ -1705,16 +1742,38 @@ impl WallpaperEngine {
         display_id: &str,
         source: &WallpaperSource,
         wallpaper_type: WallpaperType,
+        scaling_mode: ScalingMode,
     ) -> Result<(), MirrorStarError> {
+        // 纯净壁纸模式复核：路由只在入口判定一次，阶段 B 在锁外等待首帧期间用户
+        // 可能已进入纯净模式（旧窗被 `detach_for_pure_mode` 置顶/摘出）。此时若继续
+        // 换槽并 terminate 旧窗，会让 pure_mode.lifted 指向已销毁窗口。弃置新窗、
+        // 保持旧壁纸与纯模式登记原样。
+        if crate::pure_mode::is_active() {
+            tracing::warn!(
+                display_id,
+                "原子交换：阶段 B 期间进入纯净壁纸模式，弃置新窗、取消换槽"
+            );
+            let _ = new_renderer.terminate();
+            return Err(MirrorStarError::DesktopIntegration(
+                "原子交换已取消：期间进入纯净壁纸模式".to_string(),
+            ));
+        }
+
         // DR-40 commit 前校验：新窗父窗口仍为当前 WorkerW，否则放弃 commit（terminate 新窗）。
         // 校验必须先于换槽：若先 remove 旧窗，校验失败路径上 old_renderer 随函数返回被 Drop，
         // Drop 会终止旧壁纸进程（VideoRenderer::drop），导致屏幕空白且轮换永不提交。
+        // 同一 desktop 锁作用域内完成"校验 → 登记 pending 窗"：pending 窗此前未入
+        // `active_wallpapers`，只有校验通过才转为正式登记；失败时登记表仍指向旧窗。
         if let Some(hwnd) = new_renderer.hwnd() {
             let parent_ok = {
-                let desktop = self.desktop.lock().map_err(|e| {
+                let mut desktop = self.desktop.lock().map_err(|e| {
                     MirrorStarError::DesktopIntegration(format!("获取桌面集成器锁失败: {}", e))
                 })?;
-                desktop.is_attached_to_wallpaper_layer(hwnd)
+                let ok = desktop.is_attached_to_wallpaper_layer(hwnd);
+                if ok {
+                    desktop.commit_active_wallpaper(display_id, hwnd, self.arrangement);
+                }
+                ok
             };
             if !parent_ok {
                 tracing::warn!(
@@ -1737,6 +1796,14 @@ impl WallpaperEngine {
 
         // 按当前全局 PauseReason 位图对新渲染器补发暂停（DR-20）
         self.apply_pause_reasons_to(display_id);
+
+        // 写回缩放模式记忆，使后续 scaling_mode_for 反映本显示器实际生效的模式。
+        // 仅在目标值与当前生效值不同时写：否则每次换图都会把 "all"/默认回退
+        // 物化成 per-display 条目，导致后续修改 "all" 缩放对该屏失效。
+        if self.scaling_mode_for(display_id) != scaling_mode {
+            self.wallpaper_scaling_modes
+                .insert(display_id.to_string(), scaling_mode);
+        }
 
         // terminate 旧渲染器（失败强毁旧 hwnd 兜底）
         if let Some(mut old) = old_renderer {
@@ -2684,17 +2751,30 @@ pub fn renderer_id(source: &WallpaperSource, wallpaper_type: WallpaperType) -> S
 /// 阶段 2（锁外）：构建新渲染器并 `play()`（DR-33 步骤 build_new）。
 ///
 /// 复用 `construct_renderer`。失败返回 `Err`（旧壁纸原封不动，零回滚）。
-/// 若新渲染器 id 与 `pending.old_renderer_id` 一致，返回 `BuildOutcome::Skip`
-/// （短路径跳过整个 swap），不创建渲染器。
+/// 若新渲染器 id 与 `pending.old_renderer_id` 一致**且**缩放模式也一致，返回
+/// `BuildOutcome::Skip`（短路径跳过整个 swap），不创建渲染器。
 pub fn build_new_renderer(
     source: &WallpaperSource,
     wallpaper_type: WallpaperType,
     scaling_mode: ScalingMode,
     pending: &AtomicSwapPending,
 ) -> Result<BuildOutcome, MirrorStarError> {
-    if pending.old_renderer_id.as_deref() == Some(renderer_id(source, wallpaper_type).as_str()) {
-        tracing::info!("原子交换：新图与旧图相同，短路跳过 swap");
+    let new_renderer_id = renderer_id(source, wallpaper_type);
+    if should_skip_atomic_swap(
+        pending.old_renderer_id.as_deref(),
+        pending.old_scaling_mode,
+        &new_renderer_id,
+        scaling_mode,
+    ) {
+        tracing::info!("原子交换：新图与旧图相同且缩放模式一致，短路跳过 swap");
         return Ok(BuildOutcome::Skip);
+    }
+    if pending.old_renderer_id.as_deref() == Some(new_renderer_id.as_str()) {
+        tracing::info!(
+            old = ?pending.old_scaling_mode,
+            new = ?scaling_mode,
+            "原子交换：同一图片但缩放模式变化，需重建渲染器"
+        );
     }
     let renderer = construct_renderer(
         source,
@@ -2704,6 +2784,19 @@ pub fn build_new_renderer(
         pending.clear_native,
     )?;
     Ok(BuildOutcome::Ready(renderer))
+}
+
+/// "同目标短路"判定（纯函数）：新旧渲染器 id 与缩放模式均一致时才可跳过 swap。
+///
+/// 仅比较 id 会漏掉"同一张图片、用户改了缩放模式"的场景——此时必须重建渲染器
+/// 才能让新缩放模式生效。
+fn should_skip_atomic_swap(
+    old_id: Option<&str>,
+    old_scaling: ScalingMode,
+    new_id: &str,
+    new_scaling: ScalingMode,
+) -> bool {
+    old_id == Some(new_id) && old_scaling == new_scaling
 }
 
 /// 阶段 3（锁外）：等待新渲染器首帧就绪（DR-33 步骤 wait_new_ready）。
@@ -4309,6 +4402,8 @@ mod tests {
 
     #[test]
     fn atomic_swap_three_phase_keeps_old_until_commit_and_terminates_it() {
+        // 纯净模式是进程级全局标志，与并行的纯模式测试串行，避免 commit 复核误判。
+        let _pure_mode_lock = PURE_MODE_FLAG_TEST_MUTEX.lock().unwrap();
         // B1 三段式 + P1-5：旧壁纸在 A 阶段全程留在 map，仅到 C 换槽临界区才移除并 terminate。
         let mut eng = create_test_engine();
         let src = WallpaperSource::File("C:/w/scene.mp4".to_string());
@@ -4337,8 +4432,14 @@ mod tests {
         );
 
         // 阶段 C（锁内换槽）：一次换槽 → 新登记、旧 terminate。
-        eng.commit_atomic_swap(new, "d1", &src, WallpaperType::Video)
-            .unwrap();
+        eng.commit_atomic_swap(
+            new,
+            "d1",
+            &src,
+            WallpaperType::Video,
+            ScalingMode::default(),
+        )
+        .unwrap();
         assert!(eng.wallpapers.contains_key("d1"), "换槽后新窗应在 map");
         assert!(
             old_shared.lock().unwrap().terminated,
@@ -4369,9 +4470,49 @@ mod tests {
     }
 
     #[test]
+    fn same_target_true_for_same_source_and_scaling() {
+        // 同图 + 同缩放模式 → 短路为 true（不重建）。
+        let mut eng = create_test_engine();
+        let src = WallpaperSource::File("C:/w/scene.mp4".to_string());
+        let (old, _shared) = MockRenderer::new();
+        eng.register_renderer_maps(Box::new(old), "d1", &src, WallpaperType::Video);
+        eng.wallpaper_scaling_modes
+            .insert("d1".to_string(), ScalingMode::Fit);
+
+        assert!(eng.same_target("d1", &src, WallpaperType::Video, ScalingMode::Fit));
+    }
+
+    #[test]
+    fn same_target_false_when_scaling_mode_differs() {
+        // 同图但缩放模式不同 → false（必须重建让新缩放生效）。
+        let mut eng = create_test_engine();
+        let src = WallpaperSource::File("C:/w/scene.mp4".to_string());
+        let (old, _shared) = MockRenderer::new();
+        eng.register_renderer_maps(Box::new(old), "d1", &src, WallpaperType::Video);
+        eng.wallpaper_scaling_modes
+            .insert("d1".to_string(), ScalingMode::Fit);
+
+        assert!(!eng.same_target("d1", &src, WallpaperType::Video, ScalingMode::Fill));
+    }
+
+    #[test]
+    fn same_target_false_for_different_source() {
+        // 异图 → false；无记录显示器亦为 false。
+        let mut eng = create_test_engine();
+        let old_src = WallpaperSource::File("C:/w/scene.mp4".to_string());
+        let (old, _shared) = MockRenderer::new();
+        eng.register_renderer_maps(Box::new(old), "d1", &old_src, WallpaperType::Video);
+
+        let new_src = WallpaperSource::File("C:/w/other.mp4".to_string());
+        assert!(!eng.same_target("d1", &new_src, WallpaperType::Video, ScalingMode::default()));
+        assert!(!eng.same_target("d2", &old_src, WallpaperType::Video, ScalingMode::default()));
+    }
+
+    #[test]
     fn atomic_swap_commit_succeeds_under_global_pause() {
         // B1 × B3 兼容：全局暂停位图非空时 commit 换槽仍须成功（补发暂停不破坏换槽），
         // 旧窗照常 terminate、新窗入槽。暂停补发经 `pause_senders` 通道下发。
+        let _pure_mode_lock = PURE_MODE_FLAG_TEST_MUTEX.lock().unwrap();
         let mut eng = create_test_engine();
         let src = WallpaperSource::File("C:/w/b.mp4".to_string());
 
@@ -4381,13 +4522,215 @@ mod tests {
 
         let (new, new_shared) = MockRenderer::new();
         let new = eng.embed_atomic_into(Box::new(new), "d1").unwrap();
-        eng.commit_atomic_swap(new, "d1", &src, WallpaperType::Gif)
+        eng.commit_atomic_swap(new, "d1", &src, WallpaperType::Gif, ScalingMode::default())
             .unwrap();
         assert!(eng.wallpapers.contains_key("d1"));
         assert!(old_shared.lock().unwrap().terminated, "旧窗应 terminate");
         assert!(
             !new_shared.lock().unwrap().terminated,
             "新窗不应被 terminate"
+        );
+    }
+
+    #[test]
+    fn commit_atomic_swap_does_not_materialize_inherited_scaling_mode() {
+        // 目标缩放模式与该屏当前生效值一致（来自 "all" 回退）时不得写入 per-display
+        // 条目，否则后续修改 "all" 缩放会被该条目遮蔽。
+        let _pure_mode_lock = PURE_MODE_FLAG_TEST_MUTEX.lock().unwrap();
+        let mut eng = create_test_engine();
+        eng.wallpaper_scaling_modes
+            .insert("all".to_string(), ScalingMode::Fit);
+        let src = WallpaperSource::File("C:/w/fit.mp4".to_string());
+        let (old, _old_shared) = MockRenderer::new();
+        eng.register_renderer_maps(Box::new(old), "d1", &src, WallpaperType::Video);
+
+        let (new, _new_shared) = MockRenderer::new();
+        let new = eng.embed_atomic_into(Box::new(new), "d1").unwrap();
+        eng.commit_atomic_swap(new, "d1", &src, WallpaperType::Video, ScalingMode::Fit)
+            .unwrap();
+        assert!(
+            !eng.wallpaper_scaling_modes.contains_key("d1"),
+            "继承 'all' 时不应物化 per-display 缩放条目"
+        );
+        assert_eq!(
+            eng.wallpaper_scaling_modes.get("all"),
+            Some(&ScalingMode::Fit),
+            "'all' 条目应保持不变"
+        );
+    }
+
+    #[test]
+    fn commit_atomic_swap_writes_explicit_scaling_mode_override() {
+        // 显式传入与当前生效值不同的缩放模式时，必须写回该屏记忆。
+        let _pure_mode_lock = PURE_MODE_FLAG_TEST_MUTEX.lock().unwrap();
+        let mut eng = create_test_engine();
+        eng.wallpaper_scaling_modes
+            .insert("all".to_string(), ScalingMode::Fit);
+        let src = WallpaperSource::File("C:/w/fill.mp4".to_string());
+        let (old, _old_shared) = MockRenderer::new();
+        eng.register_renderer_maps(Box::new(old), "d1", &src, WallpaperType::Video);
+
+        let (new, _new_shared) = MockRenderer::new();
+        let new = eng.embed_atomic_into(Box::new(new), "d1").unwrap();
+        eng.commit_atomic_swap(new, "d1", &src, WallpaperType::Video, ScalingMode::Fill)
+            .unwrap();
+        assert_eq!(
+            eng.wallpaper_scaling_modes.get("d1"),
+            Some(&ScalingMode::Fill),
+            "显式覆盖应写入 per-display 条目"
+        );
+    }
+
+    #[test]
+    fn commit_atomic_swap_aborts_when_pure_mode_activated_during_wait() {
+        // 阶段 B 期间进入纯净模式：commit 必须弃置新窗、保留旧窗与 map 原状。
+        let _pure_mode_lock = PURE_MODE_FLAG_TEST_MUTEX.lock().unwrap();
+        crate::pure_mode::set_active(false);
+        let mut eng = create_test_engine();
+        let src = WallpaperSource::File("C:/w/pure.mp4".to_string());
+        let (old, old_shared) = MockRenderer::new();
+        eng.register_renderer_maps(Box::new(old), "d1", &src, WallpaperType::Video);
+
+        let (new, new_shared) = MockRenderer::new();
+        let new = eng.embed_atomic_into(Box::new(new), "d1").unwrap();
+        crate::pure_mode::set_active(true);
+        let result = eng.commit_atomic_swap(
+            new,
+            "d1",
+            &src,
+            WallpaperType::Video,
+            ScalingMode::default(),
+        );
+        crate::pure_mode::set_active(false);
+
+        assert!(result.is_err(), "纯净模式激活后 commit 应取消换槽");
+        assert!(
+            !old_shared.lock().unwrap().terminated,
+            "旧窗不应被 terminate"
+        );
+        assert!(
+            new_shared.lock().unwrap().terminated,
+            "新窗应被终止（弃置）"
+        );
+        assert!(eng.wallpapers.contains_key("d1"), "旧壁纸应仍在 map");
+    }
+
+    // ========== 原子交换同目标短路：含缩放模式（纯函数）==========
+
+    #[test]
+    fn should_skip_atomic_swap_matrix() {
+        // 同 id 同模式 → 可跳过（无任何变化）
+        assert!(should_skip_atomic_swap(
+            Some("file:a.mp4"),
+            ScalingMode::Fill,
+            "file:a.mp4",
+            ScalingMode::Fill
+        ));
+        // 同 id 异模式 → 不可跳过（需重建以应用新缩放模式）
+        assert!(!should_skip_atomic_swap(
+            Some("file:a.mp4"),
+            ScalingMode::Fill,
+            "file:a.mp4",
+            ScalingMode::Fit
+        ));
+        // 异 id 同模式 → 不可跳过（要换图）
+        assert!(!should_skip_atomic_swap(
+            Some("file:a.mp4"),
+            ScalingMode::Fill,
+            "file:b.mp4",
+            ScalingMode::Fill
+        ));
+        // 异 id 异模式 → 不可跳过
+        assert!(!should_skip_atomic_swap(
+            Some("file:a.mp4"),
+            ScalingMode::Fill,
+            "file:b.mp4",
+            ScalingMode::Fit
+        ));
+        // 无旧渲染器 → 不可跳过
+        assert!(!should_skip_atomic_swap(
+            None,
+            ScalingMode::Fill,
+            "file:a.mp4",
+            ScalingMode::Fill
+        ));
+    }
+
+    #[test]
+    fn atomic_swap_pending_records_old_scaling_mode() {
+        // 登记旧渲染器并写入缩放模式记忆 → prepare 快照应反映该模式，
+        // 短路判定须同时比较 id 与模式（不真正创建渲染器，避免启动 mpv）。
+        let mut eng = create_test_engine();
+        let src = WallpaperSource::File("C:/w/scene.mp4".to_string());
+        let (old, _old_shared) = MockRenderer::new();
+        eng.register_renderer_maps(Box::new(old), "d1", &src, WallpaperType::Video);
+        eng.wallpaper_scaling_modes
+            .insert("d1".to_string(), ScalingMode::Fill);
+
+        let pending = match eng.prepare_atomic_swap("d1", &src, WallpaperType::Video) {
+            AtomicSwapPrepare::Swap(pending) => pending,
+            _ => panic!("WorkerW 旧壁纸 + 非 Native 应返回 Swap"),
+        };
+        assert_eq!(
+            pending.old_scaling_mode,
+            ScalingMode::Fill,
+            "pending 应记录该显示器当前缩放模式"
+        );
+
+        let same_id = renderer_id(&src, WallpaperType::Video);
+        assert!(
+            should_skip_atomic_swap(
+                pending.old_renderer_id.as_deref(),
+                pending.old_scaling_mode,
+                &same_id,
+                ScalingMode::Fill
+            ),
+            "同图同模式应短路"
+        );
+        assert!(
+            !should_skip_atomic_swap(
+                pending.old_renderer_id.as_deref(),
+                pending.old_scaling_mode,
+                &same_id,
+                ScalingMode::Fit
+            ),
+            "同图不同模式不应短路（需重建以应用新模式）"
+        );
+    }
+
+    // ── 源码契约：原子交换 pending 窗不提前污染桌面登记表 ─────────────────
+
+    #[test]
+    fn atomic_swap_embeds_pending_and_registers_only_on_commit() {
+        let source = include_str!("manager.rs");
+        // 阶段 A 段落：只允许 pending 嵌入，不得直接调用普通 embed_wallpaper
+        let embed = source_segment(
+            source,
+            "pub fn embed_atomic_into(",
+            "pub fn commit_atomic_swap(",
+        );
+        // 运行期拼接搜索串，避免 include_str! 把测试自身的字面量计入匹配。
+        let pending_call = ["embed_wallpaper", "_pending("].join("");
+        assert!(
+            embed.contains(&pending_call),
+            "阶段 A 应调用 {pending_call}（嵌入但不登记）"
+        );
+        let plain_call = ["embed_wallpaper", "("].join("");
+        assert!(
+            !embed.contains(&plain_call),
+            "阶段 A 不应直接调用 {plain_call}（会提前覆盖旧窗登记）"
+        );
+
+        // 阶段 C 段落：校验通过后必须把 pending 窗转为正式登记
+        let commit = source_segment(
+            source,
+            "pub fn commit_atomic_swap(",
+            "fn apply_pause_reasons_to(",
+        );
+        let register_call = ["commit_active", "_wallpaper"].join("");
+        assert!(
+            commit.contains(&register_call),
+            "commit 应按 {register_call} 登记 pending 窗"
         );
     }
 

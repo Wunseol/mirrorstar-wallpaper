@@ -9,7 +9,7 @@
 - **模块路径**：`crates/mirrorstar-core/src/wallpaper/`
 - **职责**：壁纸渲染器抽象、状态管理与子进程句柄 RAII，是项目最大且最复杂的模块。模块通过 `WallpaperRenderer` trait 统一四种壁纸类型（`ImageRenderer` / `GifRenderer` / `VideoRenderer` / `WebRenderer`）的生命周期接口，由 `WallpaperEngine` 集中管理多显示器壁纸实例与状态机。模块分为以下几个层次：
   - **核心抽象层**（`mod.rs`）：`WallpaperState` / `ScalingMode` / `GifMemoryStrategy` / `PauseCommand` / `PauseSender` / `WallpaperRenderer` trait、`calculate_scaling`、`create_pause_channel`、`PauseReason` 位图、`OwnedProcHandle` RAII、`spawn_proc_exit_monitor` 共享函数、屏幕分辨率缓存。
-  - **引擎层**（`manager.rs` + `mode_dispatch.rs` + `fast_path.rs`）：`WallpaperEngine` 状态机、三阶段 `set_wallpaper` 流程、Native/WorkerW 模式分发、快速控制路径（`pause_all_fast` / `resume_all_fast` / `set_volume_fast` / `toggle_mute_fast`）。
+  - **引擎层**（`manager.rs` + `mode_dispatch.rs` + `fast_path.rs`）：`WallpaperEngine` 状态机、原子交换（手动/轮播共用）与先关后设回退、Native/WorkerW 模式分发、快速控制路径（`pause_all_fast` / `resume_all_fast` / `set_volume_fast` / `toggle_mute_fast`）。
   - **渲染器层**：GDI 渲染器（`gdi_base.rs` + `gdi_cache.rs` + `image.rs` + `gif.rs` + `gif_decode.rs` + `gif_memory.rs`）与子进程渲染器（`subprocess_base.rs` + `video.rs` + `web.rs`）。
 - **核心结构**：
   - `WallpaperEngine`：管理所有壁纸实例，提供 `set_wallpaper`/`pause_all_fast`/`resume_all_fast`/`shutdown` 等方法
@@ -24,6 +24,16 @@
   - 暂停时像素释放（Image 暂停时通过 `GdiCache.release_bitmap()` 释放缓冲并丢弃 pixels；GIF 经 `GifRenderData::handle_pause` 按内存策略释放帧；恢复时重新解码 / 重绘）
   - `PauseReason` 位图协调多暂停源
   - `GdiRendererBase`/`SubprocessRendererBase` 基类消除渲染器间重复逻辑
+
+### 切换编排（原子交换与回退，2026-11-27）
+
+> 手动「设为壁纸」与轮播 apply 现共用同一套切换编排，源码位于 `src-tauri/src/wallpaper_switch.rs`。
+
+- 共享编排 `switch_wallpaper`：按目标类型与运行态路由原子交换 / 先关后设回退 / Native / Web / 纯净模式，手动与轮播复用。
+- `embed_atomic_into` 使用 `DesktopIntegrator::embed_wallpaper_pending`（嵌入但不登记 `active_wallpapers`）；`commit_atomic_swap` 成功后调用 `commit_active_wallpaper` 登记新窗。
+- `commit_atomic_swap` 同时写回 `wallpaper_scaling_modes`，缩放模式记忆不再因切换丢失。
+- 同目标短路比较 `renderer_id` **与缩放模式**，两者都一致时直接成功返回、不重建。
+- `ATOMIC_SWAP_IN_PROGRESS` 为计数型标志，支持手动与轮播在不同显示器并发交换。
 
 ### 2026-11-24 切换与暂停实测补充
 
@@ -44,7 +54,7 @@
 | 文件 | 行数 | 主要内容 |
 |---|---|---|
 | mod.rs | 1460 | 模块入口、WallpaperState/ScalingMode/GifMemoryStrategy/PauseCommand/PauseSender/WallpaperRenderer trait、calculate_scaling、PauseReason 位图、OwnedProcHandle、spawn_proc_exit_monitor、屏幕分辨率缓存 |
-| manager.rs | 4459 | WallpaperEngine 状态机、RendererConfig、三阶段 set_wallpaper 流程、construct_renderer、embed_and_register_renderer、close_wallpaper、纯净壁纸模式入口、原子交换、渲染器存活探针与自愈 |
+| manager.rs | 4459 | WallpaperEngine 状态机、RendererConfig、原子交换（手动/轮播共用）与先关后设回退、construct_renderer、embed_and_register_renderer、close_wallpaper、纯净壁纸模式入口、渲染器存活探针与自愈 |
 | gif.rs | 2000 | GifRenderer GIF 渲染器（WM_TIMER 驱动帧推进 + 后台解码线程 + 4 种内存管理策略） |
 | video.rs | 2504 | VideoRenderer 视频渲染器（mpv 子进程 + MpvIpcClient + WASAPI 音量控制 + pause 线程 COM MTA） |
 | fast_path.rs | 1329 | WallpaperEngine 快速通道扩展（pause/resume/volume/mute 快速路径 + PauseReason 位图协调） |

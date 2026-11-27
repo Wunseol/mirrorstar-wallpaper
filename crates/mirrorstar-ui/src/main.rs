@@ -267,7 +267,10 @@ enum Revert {
     None,
     Volume(f32),
     /// 音量 + 静音态回滚（拖动音量自动取消静音后，命令失败需一并还原静音态）。
-    VolumeAndMute { volume: f32, muted: bool },
+    VolumeAndMute {
+        volume: f32,
+        muted: bool,
+    },
     Mute(bool),
     Speed(f32),
     AutoStart(bool),
@@ -652,14 +655,7 @@ fn install_handlers(
                         log(format!(
                             "托盘切换窗口：visible={visible} minimized={minimized} action={next:?}"
                         ));
-                        apply_window_action(
-                            &ui,
-                            next,
-                            &client_for_drop,
-                            &store,
-                            &gstate,
-                            &add_job,
-                        );
+                        apply_window_action(&ui, next, &client_for_drop, &store, &gstate, &add_job);
                         client_for_control.report_visibility(next != focus::WindowAction::Hide);
                     }
                     #[cfg(not(windows))]
@@ -1822,7 +1818,8 @@ fn refresh_settings(
         if write_speed {
             g.last_speed_pos = Some(speed_pos);
         }
-        let write_interval = g.last_interval_text.as_deref() != Some(rotation_interval_text.as_str());
+        let write_interval =
+            g.last_interval_text.as_deref() != Some(rotation_interval_text.as_str());
         if write_interval {
             g.last_interval_text = Some(rotation_interval_text.clone());
         }
@@ -3178,7 +3175,10 @@ fn install_settings_handlers(
                     args,
                     after: AfterMutation::Settings,
                     revert: if value > 0.0 && was_muted {
-                        Revert::VolumeAndMute { volume: previous, muted: true }
+                        Revert::VolumeAndMute {
+                            volume: previous,
+                            muted: true,
+                        }
                     } else {
                         Revert::Volume(previous)
                     },
@@ -3865,6 +3865,66 @@ fn apply_playback_value(store: &mut AppStore, value: Value) -> Result<(), String
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 数字输入框失焦后焦点必须交还根 FocusScope（经 `blur-requested` 通知宿主），
+    /// 不得 `clear-focus()` 到 None：焦点为 None 会中断 Slint 的按键派发链，
+    /// 导致空格/方向键等全局快捷键失效。失焦提交由 `changed input-focused` 统一处理。
+    #[test]
+    fn number_stepper_blur_returns_focus_and_commits() {
+        let widgets = include_str!("../ui/widgets.slint");
+        let stepper = widgets
+            .split("export component NumberStepper")
+            .nth(1)
+            .expect("widgets.slint 应包含 NumberStepper");
+        let stepper = stepper.split("export component").next().unwrap_or(stepper);
+        assert!(
+            stepper.contains("blur-requested"),
+            "失焦/回车/± 应通知宿主把焦点交回根 FocusScope"
+        );
+        assert!(
+            stepper.contains("skip-commit-on-blur"),
+            "回车与 ± 路径需抑制失焦重复提交"
+        );
+        assert!(
+            stepper.contains("root.submitted(input.text)"),
+            "焦点离开输入框时应提交当前文本，避免显示值与配置不一致"
+        );
+        assert!(
+            !stepper.contains("clear-focus"),
+            "不得把焦点清成 None（会中断全局快捷键派发）"
+        );
+    }
+
+    /// main.slint 的焦点边角契约：点击面清焦点、Escape 退出输入、程序化关闭回焦、
+    /// 内部拖拽结束回焦；失焦一律回到根 `kb-root`，不使用 `clear-focus()`。
+    #[test]
+    fn main_slint_focus_edges_are_wired() {
+        let main = include_str!("../ui/main.slint");
+        for needle in [
+            "changed settings-open",
+            "changed preview-id",
+            "changed editing-pool-id",
+            "search-input.focus()",
+            "blur-requested",
+            "kb-root.focus()",
+            "Key.Escape",
+        ] {
+            assert!(main.contains(needle), "main.slint 应包含 {needle}");
+        }
+        assert!(
+            !main.contains("clear-focus"),
+            "main.slint 不得把焦点清成 None（会中断全局快捷键派发）"
+        );
+        // 内部拖拽结束同样把焦点交回根：断言 `root.drag-commit` 之前不远处有回焦。
+        let commit_at = main
+            .find("root.drag-commit")
+            .expect("main.slint 应包含内部拖拽提交");
+        let before = &main[commit_at.saturating_sub(200)..commit_at];
+        assert!(
+            before.contains("kb-root.focus()"),
+            "内部拖拽 dropped 应先回焦再提交"
+        );
+    }
 
     /// 进程隔离的临时目录（复用统一命名，测试结束清理）。
     fn temp_dir(tag: &str) -> std::path::PathBuf {

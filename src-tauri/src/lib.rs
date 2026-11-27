@@ -5,6 +5,8 @@ pub mod single_instance;
 mod state;
 // UI 子进程管理器与协议桥（壳模式下托管原生主窗口 UI 子进程）。
 mod ui_process;
+// 壁纸切换共享编排（手动「设为壁纸」与轮播共用）。
+mod wallpaper_switch;
 
 use mirrorstar_core::{
     init_logging, ConfigKind, ConfigLoadError, ConfigManager, DesktopIntegrator, PauseReason,

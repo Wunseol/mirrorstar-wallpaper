@@ -1,4 +1,4 @@
-﻿﻿# MirrorStar Wallpaper（镜星壁纸）需求文档 — 非功能性需求 / Non-Functional Requirements
+﻿﻿﻿﻿﻿﻿﻿﻿# MirrorStar Wallpaper（镜星壁纸）需求文档 — 非功能性需求 / Non-Functional Requirements
 
 [← 返回文档索引](../index.md) > [需求文档](./01-项目概述-Overview.md) > 非功能性需求
 
@@ -42,7 +42,7 @@
 
 | 需求 ID | 需求名称 | 指标 | 验收标准 |
 |---------|----------|------|----------|
-| NFR-008 | 二进制体积 | 主进程 < 10MB | Release 编译后的主进程可执行文件不超过 10MB（历史数据口径：仅主进程 exe，不含外部 mpv.exe 约 15-25MB 和系统 WebView2 Runtime 组件）。2026-11-24 复核 0.1.6 Release 主 exe 9,954,816 B ≈9.95MB，满足 <10MB；不含 mpv.exe 与 mirrorstar-ui.exe |
+| NFR-008 | 二进制体积 | 主进程 < 10MB | Release 编译后的主进程可执行文件不超过 10MB（历史数据口径：仅主进程 exe，不含外部 mpv.exe 约 15-25MB 和系统 WebView2 Runtime 组件）。2026-11-27 复核 0.1.7 Release 主 exe 9,966,592 B ≈9.97MB，满足 <10MB；不含 mpv.exe 与 mirrorstar-ui.exe |
 | NFR-009 | 无运行时依赖 | 无需 .NET/JRE | 不依赖 .NET Runtime、Java Runtime 等大型运行时 |
 | NFR-010 | WebView2 依赖 | 系统自带 | WebView2 使用 Windows 10/11 系统自带的 Edge WebView2 Runtime |
 | NFR-011 | mpv 依赖 | 外部可执行文件 | mpv 以外部可执行文件（mpv.exe）形式随程序分发，通过命名管道 IPC 通信（非 libmpv 动态链接库） |

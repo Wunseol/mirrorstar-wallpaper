@@ -1,7 +1,7 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 
 use mirrorstar_core::layout::ALL_UNIT_KEY;
-use mirrorstar_core::{Arrangement, ConfigManager, ScalingMode, WallpaperSource};
+use mirrorstar_core::{Arrangement, ConfigManager, ScalingMode, WallpaperSource, WallpaperType};
 use tauri::{Emitter, State};
 
 use crate::state::AppState;
@@ -129,18 +129,6 @@ fn classify_thumbnail_failure(
     ThumbnailFailureKind::Unrecoverable
 }
 
-/// `wallpaper-loading` 事件 payload（v16-C-009）
-///
-/// Web 壁纸冷启动时 emit，前端展示进度提示，
-/// 避免 WebView2 初始化 5-15s 期间用户误以为应用卡死。
-/// 字段命名与 `wallpaper-state-changed`（payload 为 display_id 字符串）保持
-/// display_id 语义一致，message 为用户可见的中文提示文案。
-#[derive(serde::Serialize, Clone)]
-struct WallpaperLoadingPayload<'a> {
-    display_id: &'a str,
-    message: &'a str,
-}
-
 /// `wallpaper-gif-oversized` 事件 payload（v16-C-010）
 ///
 /// GIF 壁纸首帧（降采样后）超 8MB 阈值（4K GIF 场景）时 emit，提示用户
@@ -188,7 +176,7 @@ pub(crate) struct ComGuard {
 }
 
 impl ComGuard {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         // COM 初始化（MTA 模式）：与 VolumeControl 的 WASAPI free-threaded 语义匹配，
         // 不同于主线程的 STA（见 `src-tauri/src/lib.rs`）。
         let initialized = unsafe {
@@ -975,9 +963,13 @@ pub async fn set_wallpaper(
     }
 }
 
-/// `set_wallpaper` 的单显示器执行体：解析缩放记忆 + 获取「设置中」标志 + 三阶段应用。
+/// `set_wallpaper` 的单显示器执行体：解析缩放记忆 + 共享切换编排。
 ///
 /// 由 [`set_wallpaper`] 的单显示器路径与 `"all"` 广播路径共享，保证两条路径行为一致。
+/// 实际切换（Native / 原子交换 / 三阶段回退）、per-display guard、同目标短路与
+/// Web `wallpaper-loading` 提示均委托 [`crate::wallpaper_switch::switch_wallpaper`]；
+/// 本函数只保留手动路径的既有职责：缩放记忆解析、GIF 超大检查与
+/// `wallpaper-state-changed` 事件。
 async fn set_wallpaper_inner(
     app: &tauri::AppHandle,
     state: &State<'_, AppState>,
@@ -992,122 +984,63 @@ async fn set_wallpaper_inner(
         let engine = state.wallpaper_engine.lock().await;
         scaling_mode.unwrap_or_else(|| engine.scaling_mode_for(&display))
     };
-    // T15：获取 per-display "设置中" 标志，防止并发 set_wallpaper 同一 display 时
-    // WorkerW 3 阶段流程竞态导致渲染器进程泄漏。guard 在函数返回时 Drop 自动移除标志。
-    let _setting_guard = DisplaySettingGuard::acquire(display.clone())?;
     let source = WallpaperSource::File(entry.file_path.clone());
     let wp_type = entry.wallpaper_type;
 
-    // 判断是否为原生壁纸模式
-    let is_native = mirrorstar_core::wallpaper::manager::determine_wallpaper_mode(&source, wp_type)
-        == mirrorstar_core::wallpaper::manager::WallpaperMode::Native;
-
-    let engine = state.wallpaper_engine.clone();
     let display_for_emit = display.clone();
 
-    if is_native {
-        // 原生壁纸：快速路径，在锁内完成（注册表写入 + SystemParametersInfo，<100ms）
-        let result = tokio::task::spawn_blocking(move || {
-            let mut engine = engine.blocking_lock();
-            engine.prepare_for_wallpaper(&display, wp_type)?;
-            // 原生壁纸路径
-            if let WallpaperSource::File(path) = &source {
-                engine.set_native_wallpaper_internal(
-                    &display,
-                    path,
-                    scaling_mode,
-                    &source,
-                    wp_type,
-                )?;
-            }
-            Ok::<(), mirrorstar_core::MirrorStarError>(())
-        })
-        .await
-        .map_err(|e| {
-            mirrorstar_core::MirrorStarError::TaskJoin(format!("任务 join 失败: {}", e))
-        })?;
-        result?;
-    } else {
-        // WorkerW 壁纸：3 阶段模式，减少锁持有时间
-        // 阶段 1：获取配置 + 关闭现有壁纸（短暂持锁）
-        let renderer_config = {
-            let mut engine = engine.lock().await;
-            engine.prepare_for_wallpaper(&display, wp_type)?;
-            // 配置为播放设置的真相源：新建渲染器前同步一次，消除本命令（直连）
-            // 与 UI 音量/静音写入（异步 mutation 队列）之间的竞态。
-            let cfg = state.config_manager.get_config();
-            engine.set_playback_settings(cfg.audio.volume, cfg.audio.muted, cfg.video.speed);
-            engine.renderer_config()
-        };
-
-        // Web 类型总是走冷启动路径（WebView2 初始化 5-15s），提前 emit
-        // `wallpaper-loading` 让前端展示进度提示，避免用户误以为卡死。
-        if wp_type == mirrorstar_core::config::WallpaperType::Web {
-            if let Err(e) = app.emit(
-                "wallpaper-loading",
-                WallpaperLoadingPayload {
-                    display_id: &display_for_emit,
-                    message: "正在初始化网页壁纸引擎，预计 5-15 秒...",
-                },
-            ) {
-                tracing::warn!(error = %e, "emit wallpaper-loading 失败");
-            }
-        }
-
-        // 阶段 2：创建并播放渲染器（无 engine 锁，耗时操作）
-        //
-        // v16-C-010: GIF 类型在此阶段同步检测首帧是否超 8MB 阈值（4K GIF 场景），
-        // 超阈值时返回 gif_oversized=true，由外层 emit warning 提示用户播放可能不流畅。
-        // 检测复用 decode_gif_first_frame 的降采样逻辑，与 v10-C 跳过判断阈值一致，
-        // 预测结果与实际跳过行为一致。首帧解码会重复一次（GifRenderer::play 内再解码），
-        // 开销 <500ms 可接受（set_wallpaper 非高频操作）。
-        let source_clone = source.clone();
-        let (renderer, gif_oversized) = tokio::task::spawn_blocking(move || {
-            // T-005: spawn_blocking 线程初始化 COM（MTA），使 Video 类型
-            // VideoRenderer::play() 内的 VolumeControl WASAPI 调用可用
-            // （tokio 默认不在 blocking 线程初始化 COM）。
-            // _com_guard 离开作用域时自动调用 CoUninitialize。
-            let _com_guard = ComGuard::new();
-            // v16-C-010: GIF 类型检测首帧超阈值（4K GIF），非 GIF 类型直接 false
-            let gif_oversized = if wp_type == mirrorstar_core::config::WallpaperType::Gif {
-                if let WallpaperSource::File(p) = &source_clone {
-                    mirrorstar_core::wallpaper::gif_decode::gif_first_frame_oversized(p)
-                } else {
-                    false
-                }
+    // v16-C-010: GIF 类型在 blocking 线程同步检测首帧是否超 8MB 阈值（4K GIF 场景），
+    // 超阈值时 emit warning 提示用户播放可能不流畅。检测复用 decode_gif_first_frame
+    // 的降采样逻辑，与 v10-C 跳过判断阈值一致，预测结果与实际跳过行为一致。
+    // 检测失败（join 失败）按 false 处理，不影响壁纸设置本身。
+    let gif_oversized = if wp_type == WallpaperType::Gif {
+        let check_source = source.clone();
+        tokio::task::spawn_blocking(move || {
+            if let WallpaperSource::File(path) = &check_source {
+                mirrorstar_core::wallpaper::gif_decode::gif_first_frame_oversized(path)
             } else {
                 false
-            };
-            let renderer = mirrorstar_core::wallpaper::manager::create_and_play_renderer(
-                &source_clone,
-                wp_type,
-                scaling_mode,
-                &renderer_config,
-            )?;
-            Ok::<_, mirrorstar_core::MirrorStarError>((renderer, gif_oversized))
+            }
         })
         .await
-        .map_err(|e| {
-            mirrorstar_core::MirrorStarError::TaskJoin(format!("任务 join 失败: {}", e))
-        })??;
+        .unwrap_or(false)
+    } else {
+        false
+    };
 
-        // v16-C-010: 4K GIF 首帧超阈值时 emit warning，前端 toast 提示用户
-        // 播放可能不流畅（v15-B-005 同步解码兜底导致帧率下降）
-        if gif_oversized {
-            if let Err(e) = app.emit(
-                "wallpaper-gif-oversized",
-                GifOversizedPayload {
-                    display_id: &display_for_emit,
-                },
-            ) {
-                tracing::warn!(error = %e, "emit wallpaper-gif-oversized 失败");
-            }
-        }
+    // 共享编排：per-display guard / 同目标短路 / 播放设置同步 / Web loading 提示 /
+    // 原子交换或三阶段回退均由 `switch_wallpaper` 负责（手动与轮播共用）。
+    let outcome = crate::wallpaper_switch::switch_wallpaper(
+        crate::wallpaper_switch::SwitchEnv {
+            app: Some(app),
+            config_manager: Some(&state.config_manager),
+        },
+        &state.wallpaper_engine,
+        &display,
+        &source,
+        wp_type,
+        scaling_mode,
+        crate::wallpaper_switch::SwitchPolicy::MANUAL,
+    )
+    .await?;
 
-        // 阶段 3：嵌入并注册（短暂持锁）
-        {
-            let mut engine = engine.lock().await;
-            engine.embed_and_register_renderer(renderer, &display, &source, wp_type)?;
+    // 手动命令需要明确告知"该屏正在切换"（轮播则静默跳过）。
+    if matches!(outcome, crate::wallpaper_switch::SwitchOutcome::Busy) {
+        return Err(mirrorstar_core::MirrorStarError::DesktopIntegration(
+            format!("显示器 {} 正在切换壁纸，请稍后再试", display),
+        ));
+    }
+
+    // v16-C-010: 4K GIF 首帧超阈值时 emit warning，前端 toast 提示用户
+    // 播放可能不流畅（v15-B-005 同步解码兜底导致帧率下降）
+    if gif_oversized {
+        if let Err(e) = app.emit(
+            "wallpaper-gif-oversized",
+            GifOversizedPayload {
+                display_id: &display_for_emit,
+            },
+        ) {
+            tracing::warn!(error = %e, "emit wallpaper-gif-oversized 失败");
         }
     }
 

@@ -18,7 +18,7 @@
 ### 1.1 现状缺口（已确认）
 
 - 应用**开机后不会自动恢复或更换任何壁纸**，WorkerW 壁纸画面不跨重启保留 → 空屏缺口。
-- 换壁纸路径分两类：手动「设为壁纸」与回退路径走 `set_wallpaper` 三阶段（关旧 → 锁外创建渲染器 → 锁内嵌入 WorkerW 注册）；轮换默认走 `WallpaperEngine` 的**原子交换**（`prepare_atomic_swap` → `build_new_renderer` → `embed_atomic_into` → `wait_new_ready` → `commit_atomic_swap`），旧壁纸保持显示直到新壁纸就绪。
+- 换壁纸路径：手动「设为壁纸」与轮换共用 `WallpaperEngine` 的**原子交换**编排（`prepare_atomic_swap` → `build_new_renderer` → `embed_atomic_into` → `wait_new_ready` → `commit_atomic_swap`），旧壁纸保持显示直到新壁纸首帧就绪；仅 Native 目标、Web 目标、纯净模式活跃与无旧窗时回退 `set_wallpaper` 三阶段（关旧 → 锁外创建渲染器 → 锁内嵌入 WorkerW 注册）。
 - 现有配置层（`AppConfig`）无任何轮换概念；多屏排列（Arrangement）为三值 `Arrangement::{PerMonitor, AllSame, Span}`，且唯一来源为顶层 `AppConfig.arrangement`（DR-2 布局域，独立于轮换配置）。
 - 无任何调度 / 定时 / 随机 / 顺序机制。
 
@@ -37,7 +37,7 @@
 **调度器 = 换壁纸动作的唯一决策者。**
 
 - 决策三件事：**WHEN**（何时触发）、**WHICH**（从哪个候选池取）、**HOW**（用什么采样算法）→ 解析出目标壁纸 id。
-- **渲染执行完全下放**给 `WallpaperEngine`：轮换默认走原子交换（旧壁纸保持显示至新壁纸就绪）；Native 图片 / 无旧窗时回退 `set_wallpaper` 三阶段。调度器不进入渲染层。
+- **渲染执行完全下放**给 `WallpaperEngine`：轮换与手动设壁纸共用同一原子交换编排（旧壁纸保持显示至新壁纸首帧就绪）；仅 Native 目标 / Web 目标 / 纯净模式活跃 / 无旧窗时回退 `set_wallpaper` 三阶段。调度器不进入渲染层。
 - 负责轮换播放状态（游标 / 当前壁纸 / 洗牌袋）的持久化与恢复。
 
 一句话：**调度器决策，渲染层执行，配置层落盘。**
@@ -46,8 +46,8 @@
 
 | 现有组件 | 复用方式 |
 |---|---|
-| `WallpaperEngine` 原子交换（`prepare_atomic_swap` / `build_new_renderer` / `embed_atomic_into` / `wait_new_ready` / `commit_atomic_swap`） | 轮换 apply 的默认执行入口（旧壁纸保持显示至新壁纸就绪） |
-| `set_wallpaper` 三阶段流程（`prepare_set_wallpaper` → 锁外 `construct_renderer` → `complete_set_wallpaper`） | 手动设壁纸 / Native 图片 / 无旧窗时的回退路径 |
+| `WallpaperEngine` 原子交换（`prepare_atomic_swap` / `build_new_renderer` / `embed_atomic_into` / `wait_new_ready` / `commit_atomic_swap`） | 手动设壁纸与轮换 apply 的共同默认执行入口（旧壁纸保持显示至新壁纸首帧就绪） |
+| `set_wallpaper` 三阶段流程（`prepare_set_wallpaper` → 锁外 `construct_renderer` → `complete_set_wallpaper`） | 仅 Native 目标 / Web 目标 / 纯净模式 / 无旧窗时的回退路径 |
 | `PauseReason` 位图（FULLSCREEN/BATTERY/TRAY） | 轮换暂停的抑制信号源 |
 | `pause_all_fast` / `resume_all_fast` / `terminate_all_fast` | 轮换完成后跟随暂停；全屏 terminate 策略 |
 | `workerw_check` 桌面就绪兜底 | 既有后台兜底检查；调度器启动不阻塞等待 |
@@ -290,14 +290,14 @@ apply 失败（文件损坏/离线/进程 spawn 失败）：
 
 ### 8.4 切换中间态：原子交换（方案 C，DR-33）
 
-**问题**（已核实代码）：`set_wallpaper` 三阶段是**阶段 1 锁内先 `close_wallpaper` 关旧 → 阶段 2 锁外建新（视频/Web 冷启动）→ 阶段 3 锁内嵌入**，在"旧已关、新未就绪"之间存在无壁纸窗口（历史口径：Image 瞬时 / GIF 短 / Video 约 1s / Web 最长 8s，属旧版本估算、待复测；Web 已排除出轮换 DR-18）。该三阶段现仅用于**手动「设为壁纸」**与**回退路径**（Native 图片 / 无旧窗）；轮换默认走下述原子交换。
+**问题**（已核实代码）：`set_wallpaper` 三阶段是**阶段 1 锁内先 `close_wallpaper` 关旧 → 阶段 2 锁外建新（视频/Web 冷启动）→ 阶段 3 锁内嵌入**，在"旧已关、新未就绪"之间存在无壁纸窗口（历史口径：Image 瞬时 / GIF 短 / Video 约 1s / Web 最长 8s，属旧版本估算、待复测；Web 已排除出轮换 DR-18）。该三阶段现在仅用于**回退路径**（Native 目标 / Web 目标 / 纯净模式活跃 / 无旧窗）；手动「设为壁纸」与轮换默认共用下述原子交换，旧壁纸保持显示到新壁纸首帧就绪。
 
 **约束（代码核查结论）**：
 - `construct_renderer`（锁外，含 `play()`）与 `embed_wallpaper`（锁内）**本就是两阶段分离**——"构建"≠"嵌入显示"。
 - `embed_wallpaper` 已证明安全：`SetParent → SetWindowPos(HWND_BOTTOM) → 无 WS_VISIBLE 创建 → ShowWindow`，**新窗口嵌入路径自身不闪窗**。
 - 视频媒体必须嵌入且定尺寸后才能 `after_embed` 加载（DR E：修复 E_OUTOFMEMORY）。
 
-**选型：原子交换（方案 C）**——**旧壁纸保持显示作占位，新壁纸就绪后才关旧**，彻底消除无壁纸窗口，且不改、不增渲染器类型。
+**选型：原子交换（方案 C）**——**旧壁纸保持显示作占位，新壁纸就绪后才关旧**，彻底消除无壁纸窗口，且不改、不增渲染器类型。原子交换现为**手动设壁纸与轮播的共同默认路径**；先关后设仅保留给 Native 目标、Web 目标、纯净模式活跃与无旧窗场景。
 
 | 方案 | 消除窗口 | 需预知下张 | 内存 | 改动 |
 |---|---|---|---|---|
@@ -317,8 +317,8 @@ prepare_atomic_swap(display_id, source, type)          [引擎锁内, 廉价]
   ├─ 快照 renderer_config / clear_native
   ├─ 记录当前 renderer id —— 旧壁纸不动（不 close/不 hide/不 pause、
   │   不离开槽位），继续播放盖住屏幕
-  └─ 返回 AtomicSwapPrepare：Swap(AtomicSwapPending) | Fallback（Native 图片 /
-     无旧窗 → 回退 set_wallpaper 三阶段，先关后设）
+  └─ 返回 AtomicSwapPrepare：Swap(AtomicSwapPending) | Fallback（Native 目标 /
+     Web 目标 / 纯净模式活跃 / 无旧窗 → 回退 set_wallpaper 三阶段，先关后设）
 
 build_new_renderer(pending)                            [锁外 spawn_blocking, 旧壁纸持续可见]
   └─ 创建渲染器（视频 spawn mpv + IPC 连接 ≤2s：40×50ms）
@@ -328,6 +328,7 @@ build_new_renderer(pending)                            [锁外 spawn_blocking, �
 原子交换三步（阶段 A→B→C）                            [旧壁纸全程稳定在上层]
   步骤A [锁内]: embed_atomic_into(new, display_id)
                 → 新窗以 HWND_BOTTOM 藏在旧之下
+                + 经 embed_wallpaper_pending 嵌入，不登记 active_wallpapers
                 + after_embed（视频: IPC loadfile, fire-and-forget）
   步骤B [锁外]: wait_new_ready(new, ATOMIC_SWAP_READY_TIMEOUT=8s, 100ms)
                 - 视频: poll_first_frame_ready 轮询 mpv 至 width>0 且 idle-active=no
@@ -336,6 +337,7 @@ build_new_renderer(pending)                            [锁外 spawn_blocking, �
                 - 失败/超时 → terminate new, 返回 Err（旧照常, 零成本）
   步骤C [锁内]: commit_atomic_swap(new, display_id, source, type)
                 + 一次换槽 old→new（wallpapers / pause_senders / mode / sources）
+                + 写回 wallpaper_scaling_modes；commit_active_wallpaper 登记新窗
                 + 按当前全局 PauseReason 对新补发暂停（DR-20, 重读当前态）
                 + terminate 旧（失败则强毁旧 hwnd 兜底）
                 → 新（已就绪渲染）瞬时浮现, 无黑屏
@@ -349,16 +351,17 @@ build_new_renderer(pending)                            [锁外 spawn_blocking, �
 - **z 序决定性（DR-33）**：新窗以 `HWND_BOTTOM` 藏在旧壁纸之下，故新窗加载期间**旧画面稳定在上层可见**；步骤 C terminate 旧、揭示**已就绪**的新窗 → 切换是一帧瞬时跳变，无黑屏。
 - **首帧就绪等待（DR-33，锁外）**：`after_embed` 为 fire-and-forget（video.rs 注释），不保证首帧已渲染。**必须在步骤 B 锁外轮询 mpv 至 `width>0 且 idle-active=no`（`poll_first_frame_ready`）后才 terminate 旧**；图片/GIF 自 2026-11 起同样轮询首次 WM_PAINT 完成标志，网页类型为默认立即就绪。等待在锁外进行且旧壁纸在上层盖屏，故不占引擎锁。
 - **引擎单槽 / 回滚 / 一致**：旧壁纸从头到尾**不脱离槽位、不被关闭**，只在步骤 C 锁定临界区内"旧→新一次性换槽 + terminate 旧"。故全程 map 一致、**无瞬时不一致**；build / wait_new_ready 任一失败 → 返回 Err，旧壁纸原封不动，**无需 resume**（失败零代价）。
-- **Native 图片路径**：`ScalingMode` 部分 Image 走 `set_native_wallpaper_internal`（SystemParametersInfo，无 WorkerW/hwnd），无旧窗可压在下面 → **该路径回退现行为**（先关后设），Native 设置本身很快，可接受。
+- **Native 图片路径**：`ScalingMode` 部分 Image 走 `set_native_wallpaper_internal`（SystemParametersInfo，无 WorkerW/hwnd），无旧窗可压在下面 → **该路径回退现行为**（先关后设），Native 设置本身很快，可接受。Web 目标（无内容首帧信号）、纯净模式活跃（需保持 `lifted` / 临时覆盖窗状态）同样回退先关后设。
+- **并发交换（计数标志）**：全局 `ATOMIC_SWAP_IN_PROGRESS` 已由 `AtomicBool` 改为计数型 `AtomicUsize`（guard 构造 +1、Drop −1，`atomic_swap_in_progress()` 返回 `count > 0`），支持手动与轮播在不同显示器并发交换：先完成的一方不会复位标志，全屏处置与桌面自愈不会在任一交换中途插入。
 
 其余细节（同目标短路、config 新鲜度、terminate 旧兜底、并发纪律、新壁纸暂停跟随 DR-20、内存、事件）均并入上文「运行时序」注释，不再单独展开。
 
 #### 双窗安全（DR-40）
 
-- 唯一权威 = `active_wallpapers` map：Explorer 重嵌 / 移除均按 map 读写，不扫描 WorkerW 子窗口（已核实 `desktop/mod.rs`）。因此**已嵌入但未注册进 map 的 pending 新窗，对布局逻辑天然不可见**，不会误被重嵌 / 误清除。
+- 唯一权威 = engine `wallpapers` map 与 `DesktopIntegrator.active_wallpapers`：Explorer 重嵌 / 移除均按这两张 map 读写，不扫描 WorkerW 子窗口（已核实 `desktop/mod.rs`）。阶段 A 使用不登记的嵌入入口 `embed_wallpaper_pending`，commit 成功后才由 `commit_active_wallpaper` 登记，因此**已嵌入但未注册的 pending 新窗，对布局逻辑天然不可见**，不会误被重嵌 / 误清除；阶段 B/C 失败时两张表仍指向旧窗，无需回滚。
 - **不采用全局事件屏蔽**。
 - DPI / 显示器变化由各壁纸窗按自己的 hwnd 自处理（`gdi_base.rs` 的 `WM_DPICHANGED`/`WM_DISPLAYCHANGE` 处理），pending 新窗同样能正确自定位。
-- **桌面重建（Explorer 重启）**：重嵌入口先**中止该 display 的 in-flight swap**（terminate 新窗、清 pending 注册），再按 map 重嵌旧窗，不产生孤儿窗口。
+- **桌面重建（Explorer 重启）**：pending 新窗在 commit 前不在 engine `wallpapers` 与 `DesktopIntegrator.active_wallpapers` 两张 map 内，自愈只会处理旧窗（必要时重建旧渲染器并重嵌）；随后 `commit_atomic_swap` 的父链校验会因新窗失效而失败，弃置 pending 新窗，旧壁纸保持/恢复，不产生孤儿窗口。
 - **commit 前校验**：pending 窗的父窗口仍为当前 WorkerW，否则放弃 commit（terminate 新窗），由正常重嵌接管旧窗。
 
 ### 8.5 Span（跨屏合并）编排的实际行为（Task 4 审计）
@@ -656,14 +659,14 @@ Tauri setup
 | DR-30 | 新增 `wallpaper-rotated` 事件；复用 `wallpaper-state-changed`（两者均经 ui_process bridge 转发给 `mirrorstar-ui`） | 已定 |
 | DR-31 | 单实例保护已存在（`ensure_single_instance`，CreateMutexW，main.rs）；第二实例经命名事件唤起主窗口（`single_instance.rs`），天然防双调度器竞争 | 已确认 |
 | DR-32 | 调度器日志（tracing）+ 损坏文件回退 + 任务 panic 自愈 | 已定 |
-| DR-33 | 切换中间态：原子交换（方案 C）——旧壁纸保持显示作占位，`prepare_atomic_swap` → `build_new_renderer` → `embed_atomic_into`（HWND_BOTTOM）→ `wait_new_ready`（锁外首帧就绪）→ `commit_atomic_swap` 后才 terminate 旧，杜绝无壁纸窗口；无需暂停、不离开槽位、回滚零代价。`set_wallpaper` 三阶段仅手动设壁纸/回退。详见 §8.4 | 已定 |
+| DR-33 | 切换中间态：原子交换（方案 C）——旧壁纸保持显示作占位，`prepare_atomic_swap` → `build_new_renderer` → `embed_atomic_into`（HWND_BOTTOM）→ `wait_new_ready`（锁外首帧就绪）→ `commit_atomic_swap` 后才 terminate 旧，杜绝无壁纸窗口；无需暂停、不离开槽位、回滚零代价。适用范围为**轮换 + 手动设壁纸**；`set_wallpaper` 三阶段仅 Native 目标 / Web 目标 / 纯净模式 / 无旧窗回退。详见 §8.4 | 已定 |
 | DR-34 | 启动对账：孤儿 key、失效引用（current/active_pool/order_cursor/bag_remaining）清理回退（显示器 id 会变、三文件非原子） | 已定 |
 | DR-35 | 隐式"全部"池 = 全集，随库变化，不随池成员 | 已定 |
 | DR-36 | 手动下一张缺省作用于主显示器单元 | 已定 |
 | DR-37 | 首次运行默认：全部池 + rotation.enabled=false + 30min + sequential + on_boot=false（2026-11-24 核对：`Order::default() = Sequential`，并有旧默认 shuffle_bag→sequential 的一次性迁移） | 已定 |
 | DR-38 | 暂停状态为事件唤醒源：pause_reasons 清空（resume_all_fast 后）经 `SchedulerHandle.wake.notify_waiters()` 唤醒调度器重算 deadline，不补时 | 已定 |
 | DR-39 | AllSame 换图窗口期各屏瞬时 新/旧 混杂为已知接受项（顺序逐屏原子交换） | 已定 |
-| DR-40 | 原子交换双窗安全：以 active_wallpapers map 为唯一权威，pending 新窗对布局逻辑不可见，不屏蔽事件；桌面重建丢弃 in-flight swap + commit 前父窗口校验 | 已定 |
+| DR-40 | 原子交换双窗安全：以 engine `wallpapers` map 与 `DesktopIntegrator.active_wallpapers` 为唯一权威；pending 新窗在 commit 前对两张 map 与布局逻辑均不可见（阶段 A 使用不登记的嵌入入口，commit 成功后才登记），不屏蔽事件；桌面重建时自愈只处理旧窗，commit 父链校验失败则弃置 pending 新窗 | 已定 |
 
 ---
 

@@ -91,7 +91,7 @@ graph LR
 | 壁纸引擎 → 音频控制 | 单向 | 引擎控制壁纸音频的音量和静音          |
 | 渲染器 / 进程管理 → IPC  | 单向 | mpv 走命名管道 mpv 原生 JSON IPC；wp-proc 走命名管道自定义 JSON 行协议；壳↔UI 另有 `ui_proto` stdio 通道      |
 | 轮换调度器 → 布局域 | 单向 | `layout::plan` 为纯函数，产出 `LayoutPlane`（单元→显示器映射、主屏）；调度器/命令层只消费 |
-| 轮换调度器 → 壁纸引擎 | 单向 | 调度器只做决策；执行下放引擎的原子交换，Native/无旧窗回退 `set_wallpaper` 三阶段 |
+| 轮换调度器 → 壁纸引擎 | 单向 | 调度器只做决策；执行下放引擎的原子交换（与手动设壁纸共用），Native/Web/纯净模式/无旧窗回退 `set_wallpaper` 三阶段 |
 | 轮换调度器 → 配置管理 | 单向（读） | 每轮醒来重读 `AppConfig` 与池（rotation / arrangement / 壁纸库） |
 | 轮换调度器 → playback.toml | 单向（写） | `PlaybackStore` 独立原子写（temp+fsync+rename），不经 `ConfigManager` / 热重载（DR-15） |
 | 系统托盘 → 轮换调度器 | 单向 | `next_wallpaper` 经 `scheduler.manual_tx`（内联托盘 **5 项**：open / next_wallpaper / pause_resume / pure_mode / quit） |
@@ -153,35 +153,37 @@ flowchart TD
 
 ### 2.2 壁纸切换清理流程
 
-当前有两条换图路径，清理策略不同：
+当前手动设壁纸与轮换 apply **共用两套路径**（按目标类型与运行态路由）：
 
-- **手动「设为壁纸」**：`set_wallpaper_inner` → `prepare_set_wallpaper`（锁内关闭旧壁纸，Native 清除延迟到新窗嵌入后）→ `construct_renderer`（锁外构建/播放）→ `complete_set_wallpaper`（锁内嵌入 + 注册 + 补清除旧 Native）。
-- **轮换 apply**：原子交换，旧壁纸在 `commit_atomic_swap` 前**不关闭、不隐藏、不暂停**，新壁纸就绪后一次换槽并 terminate 旧（见 §8.4）。
+- **原子交换（默认）**：目标为 WorkerW 动画壁纸且存在可用的 WorkerW 旧渲染器时，手动「设为壁纸」与轮换 apply 都走原子交换；旧壁纸在 `commit_atomic_swap` 前**不关闭、不隐藏、不暂停**，新壁纸首帧就绪后一次换槽并 terminate 旧（见调度器文档 §8.4）。
+- **先关后设回退（三阶段）**：仅 Native 目标 / Web 目标 / 纯净壁纸模式活跃 / 无旧窗时走 `set_wallpaper_inner` → `prepare_set_wallpaper`（锁内关闭旧壁纸，旧 Native 系统壁纸清除延迟到新窗嵌入后）→ `construct_renderer`（锁外构建/播放）→ `complete_set_wallpaper`（锁内嵌入 + 注册 + 补清除旧 Native）。
 
 ```mermaid
 flowchart TD
-    A[用户选择新壁纸 / 调度器轮换] --> B{当前是否有活跃壁纸?}
-    B -->|否| C[直接启动新壁纸]
-    B -->|是| D[acquire DisplaySettingGuard<br/>按显示器串行化]
-    D --> E[prepare_set_wallpaper 锁内关闭旧壁纸<br/>Native 清除可延迟]
+    A[用户手动设为壁纸 / 调度器轮换] --> B{目标类型与运行态}
+    B -->|WorkerW 动画且存在 WorkerW 旧窗| R1
+    B -->|Native 目标 / Web 目标 / 纯净模式 / 无旧窗| D[acquire DisplaySettingGuard<br/>按显示器串行化]
+    D --> E[prepare_set_wallpaper 锁内关闭旧壁纸<br/>旧 Native 清除可延迟]
     E --> F[锁外 construct_renderer 构建并 play]
     F --> G[complete_set_wallpaper 锁内嵌入 + 注册]
     G --> H[补清除旧 Native / terminate 旧渲染器]
-    H --> I[新壁纸嵌入 WorkerW 显示]
-    C --> I
+    H --> I[新壁纸显示]
 
-    subgraph ATOMIC["轮换原子交换（不先关旧）"]
+    subgraph ATOMIC["原子交换（手动 / 轮播共用，不先关旧）"]
       R1[prepare_atomic_swap<br/>旧壁纸保持占位] --> R2[build_new_renderer 锁外]
-      R2 --> R3[embed_atomic_into<br/>新窗 HWND_BOTTOM]
+      R2 --> R3[embed_atomic_into<br/>新窗 HWND_BOTTOM，暂不登记]
       R3 --> R4[wait_new_ready 锁外首帧]
-      R4 --> R5[commit_atomic_swap<br/>换槽后 terminate 旧]
+      R4 --> R5[commit_atomic_swap<br/>换槽 + 登记新窗后 terminate 旧]
     end
+    R5 --> I
 ```
+
+> 原子交换中 pending 新窗在 `commit_atomic_swap` 成功前不写入 `DesktopIntegrator.active_wallpapers`（阶段 A 使用不登记的嵌入入口），失败时登记表仍指向旧窗。
 
 **清理步骤详解：**
 
 1. **按显示器串行化**：`DisplaySettingGuard::acquire(display_id)` 在手动 set 与调度器 apply 两条路径统一排队；acquire 失败视为该屏 Busy，调度器静默跳过。
-2. **关闭旧壁纸**：`prepare_set_wallpaper` 锁内关闭旧渲染器；若旧壁纸为 Native，可延迟清除系统壁纸，待新窗嵌入完成后补清除，避免“先黑后设”的窗口。
+2. **关闭旧壁纸（仅回退路径）**：原子交换路径在 `commit_atomic_swap` 前不关闭旧渲染器；仅 Native / Web / 纯净模式 / 无旧窗的回退路径由 `prepare_set_wallpaper` 锁内关闭旧渲染器；若旧壁纸为 Native，可延迟清除系统壁纸，待新窗嵌入完成后补清除，避免“先黑后设”的窗口。
 3. **终止子进程**：渲染器 `terminate()` 优先经 IPC 优雅退出（mpv `quit` / wp-proc `terminate`），进程管理器等待默认 **3s** 后强杀；不同渲染器的连接/等待预算不同（例如 mpv IPC 连接 40×50ms=2s、wp-proc 连接 160×50ms=8s）。
 4. **关闭管道**：渲染器 Drop / terminate 时关闭命名管道与事件监听，释放句柄。
 5. **持久化边界**：“设为壁纸 / 轮换”**不修改** `wallpapers.toml`；只有 `remove_wallpaper` 才删除库条目并清理文件（历史文档中“切换时从 wallpapers.toml 移除旧条目”为旧口径，已废止）。

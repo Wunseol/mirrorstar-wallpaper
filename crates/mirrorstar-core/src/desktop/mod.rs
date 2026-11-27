@@ -146,6 +146,11 @@ pub struct DesktopIntegrator {
     /// WorkerW 窗口句柄（壁纸嵌入目标）
     workerw_hwnd: Option<HWND>,
     /// 活跃壁纸窗口：显示器ID -> (壁纸窗口 HWND, 布局方式)
+    ///
+    /// 仅在窗口"正式生效"时写入：常规嵌入路径（`embed_wallpaper`）嵌入成功后立即登记；
+    /// 原子交换阶段 A（`embed_wallpaper_pending`）只嵌入不登记，待 `commit_atomic_swap`
+    /// 成功时才由 `commit_active_wallpaper` 登记——避免 pending 新窗覆盖旧窗登记，
+    /// 导致阶段 B/C 失败后登记表指向已销毁的新窗、旧窗脱管。
     active_wallpapers: HashMap<String, (HWND, Arrangement)>,
     /// 用户原始系统壁纸路径
     original_wallpaper: Option<String>,
@@ -349,6 +354,51 @@ impl DesktopIntegrator {
         display_id: &str,
         arrangement: Arrangement,
     ) -> Result<(), MirrorStarError> {
+        self.embed_wallpaper_inner(hwnd, display_id, arrangement, true)
+    }
+
+    /// 将壁纸窗口嵌入指定显示器，但**不登记**到 `active_wallpapers`。
+    ///
+    /// 供原子交换阶段 A（`embed_atomic_into`）使用：新窗先藏在旧壁纸之下完成嵌入，
+    /// 此时登记表仍指向旧窗；只有 `commit_atomic_swap` 成功后才通过
+    /// [`Self::commit_active_wallpaper`] 登记新窗。若阶段 B/C 失败，登记表保持指向
+    /// 旧窗（旧窗仍在显示），不会误指向已销毁的新窗导致旧窗脱管。
+    ///
+    /// 嵌入失败时的半嵌入限制与 [`Self::embed_wallpaper`] 相同（见其文档）。
+    pub fn embed_wallpaper_pending(
+        &mut self,
+        hwnd: HWND,
+        display_id: &str,
+        arrangement: Arrangement,
+    ) -> Result<(), MirrorStarError> {
+        self.embed_wallpaper_inner(hwnd, display_id, arrangement, false)
+    }
+
+    /// 把已嵌入的 pending 窗转为正式登记（原子交换 commit 时调用）。
+    ///
+    /// 覆盖该显示器原有条目（若有），使 `active_wallpapers` 指向新窗；旧窗由调用方
+    /// 负责终止。
+    pub fn commit_active_wallpaper(
+        &mut self,
+        display_id: &str,
+        hwnd: HWND,
+        arrangement: Arrangement,
+    ) {
+        self.active_wallpapers
+            .insert(display_id.to_string(), (hwnd, arrangement));
+    }
+
+    /// `embed_wallpaper` / `embed_wallpaper_pending` 的公共实现。
+    ///
+    /// `register=true`（常规路径）嵌入成功后立即登记；`false`（原子交换 pending 路径）
+    /// 不登记，由调用方在 commit 成功时登记。
+    fn embed_wallpaper_inner(
+        &mut self,
+        hwnd: HWND,
+        display_id: &str,
+        arrangement: Arrangement,
+        register: bool,
+    ) -> Result<(), MirrorStarError> {
         self.ensure_initialized()?;
         let workerw_hwnd = self.workerw_hwnd.ok_or(MirrorStarError::WorkerWNotFound)?;
         // 校验桌面已初始化（progman_hwnd 存在）；progman 句柄仅用于 raised desktop
@@ -367,8 +417,10 @@ impl DesktopIntegrator {
         )?;
         // raised desktop 下保证 WorkerW 位于 Progman 子窗口最底层（否则壁纸会盖住桌面图标）。
         worker_w::ensure_workerw_zorder(progman_hwnd, workerw_hwnd);
-        self.active_wallpapers
-            .insert(display_id.to_string(), (hwnd, arrangement));
+        if register {
+            self.active_wallpapers
+                .insert(display_id.to_string(), (hwnd, arrangement));
+        }
         tracing::info!(display_id, hwnd = hwnd.0 as isize, "壁纸窗口已嵌入桌面");
         Ok(())
     }
@@ -1476,6 +1528,74 @@ mod tests {
         assert!(
             segment.contains(&defview_check),
             "reassert_zorder 应调用 {defview_check} 校验壁纸与图标层相对位置"
+        );
+    }
+
+    /// 源码契约：pending 嵌入不得写入 `active_wallpapers`，只有 commit 成功才登记。
+    ///
+    /// 原子交换阶段 A 用 `embed_wallpaper_pending` 嵌入新窗时，若提前登记会覆盖旧窗
+    /// 条目；阶段 B/C 失败后登记表将指向已销毁的新窗，旧窗脱管。因此 pending 路径
+    /// 必须以 `register=false` 走 `embed_wallpaper_inner`，常规路径 `register=true`。
+    ///
+    /// 沿用仓库 `include_str!` 惯例，并在运行期拼接搜索串，避免测试自身字面量自匹配。
+    #[test]
+    fn embed_wallpaper_pending_does_not_register_active_wallpaper() {
+        let source = include_str!("mod.rs");
+
+        // ① pending 路径调用 inner(..., false)
+        let pending_sig = ["pub fn embed_wallpaper", "_pending("].join("");
+        let pending_start = source
+            .find(&pending_sig)
+            .expect("源码应包含 embed_wallpaper_pending 定义");
+        let pending_end = pending_start
+            + source[pending_start..]
+                .find("/// 把已嵌入的 pending 窗转为正式登记")
+                .expect("embed_wallpaper_pending 之后应紧跟 commit_active_wallpaper 文档");
+        let pending = &source[pending_start..pending_end];
+        let inner_prefix = ["embed_wallpaper", "_inner(hwnd, display_id, arrangement, "].join("");
+        let no_register_call = [inner_prefix.as_str(), "false)"].join("");
+        assert!(
+            pending.contains(&no_register_call),
+            "embed_wallpaper_pending 应调用 {no_register_call}（嵌入但不登记）"
+        );
+
+        // ② 常规路径调用 inner(..., true)
+        let plain_sig = ["pub fn embed_wallpaper", "("].join("");
+        let plain_start = source
+            .find(&plain_sig)
+            .expect("源码应包含 embed_wallpaper 定义");
+        let plain_end = plain_start
+            + source[plain_start..]
+                .find(&pending_sig)
+                .expect("embed_wallpaper 之后应有 embed_wallpaper_pending 定义");
+        let plain = &source[plain_start..plain_end];
+        let register_call = [inner_prefix.as_str(), "true)"].join("");
+        assert!(
+            plain.contains(&register_call),
+            "embed_wallpaper 应调用 {register_call}（保持原登记行为）"
+        );
+
+        // ③ inner 内 active_wallpapers.insert 受 if register 保护
+        let inner_sig = ["fn embed_wallpaper", "_inner("].join("");
+        let inner_start = source
+            .find(&inner_sig)
+            .expect("源码应包含 embed_wallpaper_inner 定义");
+        let after_sig = inner_start + inner_sig.len();
+        let inner_end = after_sig
+            + source[after_sig..]
+                .find("fn get_cached_displays(")
+                .expect("embed_wallpaper_inner 之后应有 get_cached_displays 定义");
+        let inner = &source[inner_start..inner_end];
+        let register_guard = ["if register", " {"].join("");
+        let field = ["active_wallpapers"].join("");
+        let insert_method = ["insert", "("].join("");
+        let guard_pos = inner
+            .find(&register_guard)
+            .expect("embed_wallpaper_inner 应含 if register 分支");
+        let after_guard = &inner[guard_pos..];
+        assert!(
+            after_guard.contains(&field) && after_guard.contains(&insert_method),
+            "embed_wallpaper_inner 的 {field} {insert_method} 必须位于 if register 分支内"
         );
     }
 }

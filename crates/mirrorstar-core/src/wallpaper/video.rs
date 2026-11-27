@@ -183,7 +183,9 @@ fn apply_initial_audio(
     }
     if !volume_ok {
         // 重试窗口耗尽仍未成功：慢启动（4K / 冷盘）时会话可能更晚注册，延迟再试一次。
-        std::thread::sleep(std::time::Duration::from_millis(AUDIO_SESSION_LATE_RETRY_MS));
+        std::thread::sleep(std::time::Duration::from_millis(
+            AUDIO_SESSION_LATE_RETRY_MS,
+        ));
         let result = vc
             .lock()
             .unwrap_or_else(|e| e.into_inner())
@@ -1167,7 +1169,9 @@ impl WallpaperRenderer for VideoRenderer {
                         }
                     }
                     if probe_outcome == VideoProbeResult::Retry {
-                        tracing::warn!("video-params 多次重试仍未就绪，跳过解码队列调优（不影响播放）");
+                        tracing::warn!(
+                            "video-params 多次重试仍未就绪，跳过解码队列调优（不影响播放）"
+                        );
                     }
                     match outcome {
                         ProbeOutcome::HasAudio => {
@@ -1177,7 +1181,10 @@ impl WallpaperRenderer for VideoRenderer {
                         }
                         ProbeOutcome::Silent => {
                             // 确认无音轨（静音视频）：直接跳过 WASAPI，不打 WARN。
-                            tracing::debug!(pid = pid_for_audio, "视频无音轨，跳过 WASAPI 音量设置");
+                            tracing::debug!(
+                                pid = pid_for_audio,
+                                "视频无音轨，跳过 WASAPI 音量设置"
+                            );
                         }
                         ProbeOutcome::TimedOut => {
                             // 探测超时回退：仍按重试预算下发（含延迟兜底），仅 debug 级日志，

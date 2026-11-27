@@ -120,6 +120,8 @@ sequenceDiagram
     end
 ```
 
+> **原子交换的嵌入与登记契约（2026-11-27）**：`DesktopIntegrator` 新增 `embed_wallpaper_pending`（嵌入但不登记 `active_wallpapers`）与 `commit_active_wallpaper`（commit 时登记新窗），供原子交换的阶段 A / 阶段 C 使用；普通 `embed_wallpaper` 仍在嵌入成功后立即登记。
+
 #### 1.1.1 raised desktop 兼容分支（Windows 11 24H2/25H2）
 
 Windows 11 24H2/25H2 启用 raised desktop 后，桌面层级发生变化：`Progman` 带 `WS_EX_NOREDIRECTIONBITMAP` 扩展样式，承载壁纸的 `WorkerW` 变为 `Progman` 的**直接子窗口**，不再存在旧层级的顶层兄弟 `WorkerW`。若沿用旧查找逻辑会找不到 WorkerW 或嵌错层，因此实现中增加了以下兼容分支：

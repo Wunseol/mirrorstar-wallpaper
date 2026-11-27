@@ -31,21 +31,19 @@
 //!
 //! ## 应用路径（DR-33 原子交换）
 //!
-//! `apply_to_display` 走三段式：锁内 `prepare_atomic_swap`（旧壁纸保持占位）→ 锁内
-//! `embed_atomic_into`（阶段 A：嵌入 + after_embed/loadfile）→ 锁外 `wait_new_ready`
-//! （阶段 B：首帧就绪）→ 锁内 `commit_atomic_swap`（阶段 C：一次换槽，DR-40 双窗安全）。
-//! 入口为 `display_id` acquire per-display guard（B2）贯穿全程，防轮换与手动/另一轮换
-//! 同屏并发。Native 图片 / 无现有壁纸回退现有 `set_wallpaper` 同步便利路径（先关后设，
-//! DR-33 注）。失败保持旧壁纸、游标已推进跳过（DR-19）。
+//! `apply_to_display` 不再自带编排，而是委托共享模块
+//! [`crate::wallpaper_switch::switch_wallpaper`]（手动「设为壁纸」与轮播共用）：
+//! 目标为 WorkerW 动画类壁纸时走原子交换（旧壁纸保持占位到新壁纸首帧就绪），
+//! Native / Web / 纯净模式 / 无旧窗时自动回退既有先关后设路径。per-display
+//! guard、同目标短路与 Busy 语义均由共享编排统一处理。失败保持旧壁纸、游标已
+//! 推进跳过（DR-19）。
 
 use std::collections::{HashMap, HashSet};
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use crate::commands::wallpaper::DisplaySettingGuard;
 use mirrorstar_core::config::{DisplayInfo, PlaybackState, PlaybackStore, Unit};
 use mirrorstar_core::layout::{self, LayoutMonitor, LayoutPlane};
 use mirrorstar_core::scheduler::{
@@ -53,35 +51,12 @@ use mirrorstar_core::scheduler::{
     SamplerState,
 };
 use mirrorstar_core::{
-    build_new_renderer, wait_new_ready, AppConfig, Arrangement, AtomicSwapPrepare, BuildOutcome,
-    ConfigManager, DesktopIntegrator, MirrorStarError, ScalingMode, WallpaperEngine,
-    WallpaperRenderer, WallpaperSource, WallpaperType, ATOMIC_SWAP_IN_PROGRESS,
-    ATOMIC_SWAP_READY_TIMEOUT,
+    AppConfig, Arrangement, ConfigManager, DesktopIntegrator, MirrorStarError, ScalingMode,
+    WallpaperEngine, WallpaperSource, WallpaperType,
 };
 use tauri::Emitter;
 use tokio::sync::mpsc::{self, UnboundedReceiver, UnboundedSender};
 use tokio::sync::Notify;
-
-/// 原子交换进行中守卫（RAII）。
-///
-/// 构造时置位 `ATOMIC_SWAP_IN_PROGRESS`，Drop 时复位。在 `apply_to_display` 的
-/// 原子交换路径（阶段 A 嵌入 → B 首帧就绪 → C commit）创建，确保：
-/// - 全屏终止/恢复检测到标志时跳过本次（state.rs 见 terminate_all_fast_blocking /
-///   resume_all_fast_blocking），避免交换期间重建 WorkerW / 冷启动 mpv
-/// - 任何错误路径（wait_new_ready 失败 / commit 校验失败）退出作用域时自动复位，
-///   不会残留 true 卡死后续全屏处置
-struct AtomicSwapInProgressGuard;
-impl AtomicSwapInProgressGuard {
-    fn new() -> Self {
-        ATOMIC_SWAP_IN_PROGRESS.store(true, Ordering::SeqCst);
-        Self
-    }
-}
-impl Drop for AtomicSwapInProgressGuard {
-    fn drop(&mut self) {
-        ATOMIC_SWAP_IN_PROGRESS.store(false, Ordering::SeqCst);
-    }
-}
 
 /// `wallpaper-rotated` 事件负载（DR-30）。
 #[derive(serde::Serialize, Clone)]
@@ -1189,8 +1164,10 @@ async fn apply_unit_pool_now(
         // 空池 / 唯一候选即现图：保持现图，不做无意义的重建（避免闪屏）。
         PoolApplyPlan::Keep => {}
         PoolApplyPlan::Apply(id) => {
-            if apply_wallpaper_to_unit(handle, layout, key, &id, /* record_history = */ true, app)
-                .await
+            if apply_wallpaper_to_unit(
+                handle, layout, key, &id, /* record_history = */ true, app,
+            )
+            .await
                 == UnitApplyResult::Applied
             {
                 emit_rotated(app, key, &id);
@@ -1323,13 +1300,14 @@ async fn apply_wallpaper_to_unit(
     UnitApplyResult::Failed
 }
 
-/// 原子交换 apply（设计 §8.4，方案 C，DR-33 / DR-40）。
+/// 轮播的单显示器 apply（委托共享编排）。
 ///
-/// 三段式：A `embed_atomic_into`（锁内嵌入 + loadfile）→ B `wait_new_ready`
-/// （锁外首帧就绪）→ C `commit_atomic_swap`（锁内换槽）。B2：入口即为 `display_id`
-/// acquire per-display guard 并贯穿 A→B→C 全程持有，防轮换与手动/另一轮换同屏并发。
+/// 迁移自原三段式实现（A `embed_atomic_into` → B `wait_new_ready` → C
+/// `commit_atomic_swap`），现统一由 [`crate::wallpaper_switch::switch_wallpaper`]
+/// 执行（手动「设为壁纸」与轮播共用）：per-display guard、同目标短路、Native /
+/// Web / 纯净模式回退与原子交换均在共享模块内完成。
 ///
-/// 返回 `ApplyOutcome`：`Swapped` 已换槽、`Skipped` 同目标短路（未换）、`Busy` 该屏
+/// 返回 `ApplyOutcome`：`Swapped` 已切换、`Skipped` 同目标短路（未换）、`Busy` 该屏
 /// 正在切换（静默跳过）；`Err` 表示失败（旧壁纸原封不动，零回滚）。
 async fn apply_to_display(
     engine: &Arc<tokio::sync::Mutex<WallpaperEngine>>,
@@ -1338,80 +1316,30 @@ async fn apply_to_display(
     wallpaper_type: WallpaperType,
     scaling_mode: ScalingMode,
 ) -> Result<ApplyOutcome, MirrorStarError> {
-    // B2：贯穿 A→B→C 全程持有 per-display guard。acquire 失败说明该屏 busy
-    //（手动 set_wallpaper / 另一轮换进行中）→ 静默跳过该显示器，不算错误。
-    let _guard = match DisplaySettingGuard::acquire(display_id.to_string()) {
-        Ok(guard) => guard,
-        Err(_) => {
+    use crate::wallpaper_switch::{switch_wallpaper, SwitchEnv, SwitchOutcome, SwitchPolicy};
+
+    match switch_wallpaper(
+        SwitchEnv {
+            app: None,
+            config_manager: None,
+        },
+        engine,
+        display_id,
+        &source,
+        wallpaper_type,
+        scaling_mode,
+        SwitchPolicy::SCHEDULER,
+    )
+    .await
+    {
+        Ok(SwitchOutcome::Switched) => Ok(ApplyOutcome::Swapped),
+        Ok(SwitchOutcome::Skipped) => Ok(ApplyOutcome::Skipped),
+        Ok(SwitchOutcome::Busy) => {
+            // 该显示器正在切换（手动 / 另一轮换）：静默跳过，不算错误。
             tracing::info!(display_id, "轮换跳过：显示器正在切换");
-            return Ok(ApplyOutcome::Busy);
+            Ok(ApplyOutcome::Busy)
         }
-    };
-
-    // 阶段 1（锁内，廉价）：快照配置，旧壁纸保持占位；Native / 无旧窗 → Fallback。
-    let pending = {
-        let mut eng = engine.lock().await;
-        eng.prepare_atomic_swap(display_id, &source, wallpaper_type)
-    };
-
-    match pending {
-        AtomicSwapPrepare::Fallback { .. } => {
-            // 原生图片或暂无旧窗 → 回退现有同步 set_wallpaper（先关后设，DR-33 注）。
-            let mut eng = engine.lock().await;
-            eng.set_wallpaper(display_id, &source, wallpaper_type, scaling_mode)?;
-            Ok(ApplyOutcome::Swapped)
-        }
-        AtomicSwapPrepare::Swap(pending) => {
-            let commit_source = source.clone();
-            // 阶段 2（锁外）：build_new_renderer（不持引擎锁）。
-            let built =
-                tokio::task::spawn_blocking(move || -> Result<BuildOutcome, MirrorStarError> {
-                    build_new_renderer(&source, wallpaper_type, scaling_mode, &pending)
-                })
-                .await
-                .map_err(|e| MirrorStarError::TaskJoin(format!("任务 join 失败: {e}")))?;
-
-            match built {
-                Ok(BuildOutcome::Skip) => {
-                    // 新图与旧图相同 → 短路，无需换槽。
-                    Ok(ApplyOutcome::Skipped)
-                }
-                Ok(BuildOutcome::Ready(renderer)) => {
-                    // 阶段 A→C 全程置"原子交换进行中"标志，全屏终止/恢复
-                    // 检测到该标志时跳过本次（见 state.rs），防止交换期间重建 WorkerW
-                    // 导致 commit 前校验失败。守卫 Drop 时（含所有错误路径）自动复位。
-                    let _swap_guard = AtomicSwapInProgressGuard::new();
-                    // 阶段 A（锁内）：嵌入 + after_embed（loadfile）。旧壁纸保持占位。
-                    let mut renderer = {
-                        let mut eng = engine.lock().await;
-                        eng.embed_atomic_into(renderer, display_id)?
-                    };
-                    // 阶段 B（锁外，不持引擎锁）：首帧就绪（视频等待加载）。
-                    let ready = tokio::task::spawn_blocking(
-                        move || -> (Result<(), MirrorStarError>, Box<dyn WallpaperRenderer>) {
-                            let result = wait_new_ready(
-                                &mut renderer,
-                                ATOMIC_SWAP_READY_TIMEOUT,
-                                Duration::from_millis(100),
-                            );
-                            (result, renderer)
-                        },
-                    )
-                    .await
-                    .map_err(|e| MirrorStarError::TaskJoin(format!("任务 join 失败: {e}")))?;
-                    let (ready_result, mut renderer) = ready;
-                    if let Err(e) = ready_result {
-                        let _ = renderer.terminate();
-                        return Err(e);
-                    }
-                    // 阶段 C（锁内）：一次换槽 old→new + 补发暂停（DR-20）+ terminate 旧。
-                    let mut eng = engine.lock().await;
-                    eng.commit_atomic_swap(renderer, display_id, &commit_source, wallpaper_type)?;
-                    Ok(ApplyOutcome::Swapped)
-                }
-                Err(e) => Err(e),
-            }
-        }
+        Err(e) => Err(e),
     }
 }
 
@@ -1477,6 +1405,8 @@ fn emit_rotated(app: &tauri::AppHandle, key: &str, wallpaper_id: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::wallpaper_switch::AtomicSwapInProgressGuard;
+    use mirrorstar_core::WallpaperRenderer;
 
     /// 构造布局平面：PerMonitor 时 keys 即各显示器单元（primary 指向其中一个）；
     /// AllSame / Span 时以全局单元 key（`layout::ALL_UNIT_KEY`）承载全部，primary 仅作默认值。
@@ -1962,6 +1892,33 @@ mod tests {
         drop(guard);
         // 复位后：跳过分支不再命中。
         assert!(!crate::state::atomic_swap_in_progress());
+    }
+
+    /// 测试 c：计数语义——并发交换必须全部结束才复位为 false。
+    ///
+    /// 手动设壁纸与轮播可能在不同显示器并发交换：先结束的守卫不能把仍在进行的交换
+    /// 误标为"已结束"。guard A/B 同时存活 → 计数 2（true）；drop A → 计数 1（仍 true）；
+    /// drop B → 计数 0（false）。
+    #[test]
+    fn test_atomic_swap_flag_counts_concurrent_swaps() {
+        let _lock = ATOMIC_SWAP_TEST_LOCK.lock().unwrap();
+        assert!(!crate::state::atomic_swap_in_progress());
+        let guard_a = AtomicSwapInProgressGuard::new();
+        let guard_b = AtomicSwapInProgressGuard::new();
+        assert!(
+            crate::state::atomic_swap_in_progress(),
+            "两个守卫同时存活时计数应 > 0"
+        );
+        drop(guard_a);
+        assert!(
+            crate::state::atomic_swap_in_progress(),
+            "仅 drop 一个守卫后仍有交换进行中，应保持 true"
+        );
+        drop(guard_b);
+        assert!(
+            !crate::state::atomic_swap_in_progress(),
+            "全部守卫 drop 后计数归零，应复位为 false"
+        );
     }
 
     // ── prev_wallpaper（上一张回退，边界 1/3/8/9）测试 ──────────────────
